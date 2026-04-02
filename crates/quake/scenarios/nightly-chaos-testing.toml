@@ -1,0 +1,79 @@
+name = "nightly-chaos-testing"
+
+# Global config
+cl.config.logging.log_level = "debug"
+
+latency_emulation = true
+engine_api_connection = "rpc"
+
+# Topology:
+# 10 validators in 4 AWS regions
+# - blue, green, purple: us-east-2
+# - cyan: us-west-2
+# - red, orange, yellow: eu-central-1
+# - pink, grey, brown: ap-northeast-1
+#
+# 2 full nodes in 2 locations
+#
+# Internal full nodes:
+# - 1 full node - us-east-1
+# - 1 full node  - us-west-2
+
+# us-east-2 validators
+[nodes.validator-blue]
+region = "us-east-2"
+cl_persistent_peers = ["validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
+
+[nodes.validator-green]
+region = "us-east-2"
+cl_persistent_peers = ["validator-blue", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
+
+[nodes.validator-purple]
+region = "us-east-2"
+cl_persistent_peers = ["validator-blue", "validator-green", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
+
+# us-west-2 validator
+[nodes.validator-cyan]
+region = "us-west-2"
+cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
+
+# eu-central-1 validators
+[nodes.validator-red]
+region = "eu-central-1"
+cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
+
+[nodes.validator-orange]
+region = "eu-central-1"
+cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
+
+[nodes.validator-yellow]
+region = "eu-central-1"
+cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-pink", "validator-grey", "validator-brown"]
+
+# ap-northeast-1 validators
+[nodes.validator-pink]
+region = "ap-northeast-1"
+cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-grey", "validator-brown"]
+start_at = 30
+
+[nodes.validator-grey]
+region = "ap-northeast-1"
+cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-brown"]
+start_at = 30
+
+[nodes.validator-brown]
+region = "ap-northeast-1"
+cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey"]
+start_at = 30
+
+# us-east-1 full node
+[nodes.full-stg-blue]
+region = "us-east-1"
+cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
+start_at = 150
+
+# us-west-2 full node
+[nodes.full-prod-teal]
+region = "us-west-2"
+cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
+start_at = 150

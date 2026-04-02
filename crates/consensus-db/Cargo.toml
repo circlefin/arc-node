@@ -1,0 +1,38 @@
+[package]
+name = "arc-consensus-db"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+mock = ["dep:mockall"]
+
+[dependencies]
+alloy-rpc-types-engine = { workspace = true, features = ["ssz"] }
+arc-consensus-types.workspace = true
+bytes.workspace = true
+bytesize.workspace = true
+ethereum_ssz = { workspace = true }
+malachitebft-app-channel.workspace = true
+malachitebft-core-types.workspace = true
+malachitebft-proto.workspace = true
+mockall = { workspace = true, optional = true }
+prost.workspace = true
+redb.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+alloy-primitives = { workspace = true, features = ["getrandom"] }
+alloy-rpc-types-engine = { workspace = true, features = ["arbitrary"] }
+arbitrary = { workspace = true }
+arc-consensus-types = { workspace = true, features = ["arbitrary"] }
+mockall = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

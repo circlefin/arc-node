@@ -1,0 +1,22 @@
+# Configuration for cargo audit
+
+[advisories]
+# Ignore specific advisories by ID
+ignore = [
+    # ring 0.16.20 - Some AES functions may panic when overflow checking is enabled
+    "RUSTSEC-2025-0009",
+    # ring 0.16.20 is unmaintained - waiting for libp2p to update dependencies
+    "RUSTSEC-2025-0010",
+
+    # Transitive dependencies from reth/alloy that we cannot update directly:
+    # bincode is unmaintained - used by reth-nippy-jar, reth-stages
+    "RUSTSEC-2025-0141",
+    # derivative is unmaintained - used by various reth crates
+    "RUSTSEC-2024-0388",
+    # paste is unmaintained - used by alloy-primitives
+    "RUSTSEC-2024-0436",
+    # rustls-pemfile is unmaintained - used by reqwest via reth
+    "RUSTSEC-2025-0134",
+    # lru IterMut violates Stacked Borrows - used by discv5, reth-network
+    "RUSTSEC-2026-0002",
+]

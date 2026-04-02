@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 1s
+scrape_configs:
+{{#each nodes}}
+  - job_name: "{{execution.inner.name}}"
+    metrics_path: "/"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:{{execution.metrics_port}}']
+        labels:
+          client_name: "reth"
+          client_type: "execution"
+{{/each}}
+  - job_name: "cadvisor"
+    metrics_path: "/metrics"
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+        labels:
+          client_name: "cadvisor"
+          client_type: "infrastructure"
+{{#each nodes}}
+  - job_name: "{{consensus.inner.name}}"
+    metrics_path: "/metrics"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:{{consensus.metrics_port}}']
+        labels:
+          client_name: "malachite"
+          client_type: "consensus"
+{{/each}}

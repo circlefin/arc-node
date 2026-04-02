@@ -1,0 +1,43 @@
+[package]
+name = "spammer"
+description = "Transaction spammer"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "spammer"
+path = "src/main.rs"
+
+[dependencies]
+alloy-consensus = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-rpc-types-txpool = { workspace = true }
+alloy-signer = { workspace = true }
+alloy-signer-local = { workspace = true }
+alloy-sol-types = { workspace = true }
+arc-version = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+clap-verbosity-flag = { workspace = true, features = ["tracing"] }
+color-eyre = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+humantime = "2.1"
+k256 = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = "0.28.0"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["ansi", "env-filter", "fmt"] }
+tungstenite = "0.28.0"
+url = { workspace = true, features = ["serde"] }
+
+[lints]
+workspace = true

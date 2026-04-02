@@ -1,0 +1,21 @@
+# Global config
+cl.config.logging.log_level = "info"
+cl.config.consensus.p2p.rpc_max_size = "42 Mib"
+
+[nodes.validator1]
+[nodes.validator2]
+[nodes.validator3]
+[nodes.validator4]
+[nodes.validator5]
+[nodes.validator6]
+[nodes.validator7]
+start_at = 10
+
+[nodes.full1]
+[nodes.full2]
+start_at = 20
+
+[nodes.full3]
+cl.config.value_sync.parallel_requests = 1
+start_at = 10
+

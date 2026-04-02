@@ -1,0 +1,218 @@
+# Copyright 2026 Circle Internet Group, Inc. All rights reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+openapi: 3.0.0
+info:
+  title: Arc RPC
+  version: 0.1.0
+  description: |
+    Hand-maintained OpenAPI summary of custom ARC RPC methods.
+    Implementation layout:
+      - Namespace glue: `crates/node/src/rpc/arc.rs`
+      - Certificate method logic: `crates/node/src/rpc/get_certificate.rs`
+      - Shared constants/errors: `crates/node/src/rpc/common.rs`
+    Each future method will follow the same pattern: its own file + delegation from `arc.rs`.
+servers:
+  - url: http://localhost:8545
+    description: Local node JSON-RPC
+tags:
+  - name: ARC
+    description: ARC custom consensus RPC methods on `reth`
+paths:
+  /:
+    post:
+      tags: [ARC]
+      summary: JSON-RPC endpoint for ARC methods
+      operationId: arc_rpc
+      description: |
+        Single JSON-RPC 2.0 POST endpoint. Methods currently implemented under the `arc` namespace:
+
+          1. arc_getCertificate(height: u64) -> RpcCommitCertificate
+             Returns the consensus commit certificate for the specified height if available.
+             Error Mapping (error.code -> meaning):
+               -32602 Invalid params (height < 1)
+               -32004 Not found (no certificate upstream)
+               -32005 Upstream unreachable (connect errors)
+               -32603 Internal (timeout / decode / generic upstream HTTP status)
+             Curl Example:
+               curl -s -X POST -H 'Content-Type: application/json' \
+                 --data '{"jsonrpc":"2.0","method":"arc_getCertificate","params":[7],"id":1}' \
+                 http://127.0.0.1:8545
+
+          2. arc_getVersion() -> RpcVersionInfo
+             Returns version/build information for the node execution layer.
+             Fields:
+               git_version: Git tag or short commit hash
+               git_commit: Full git commit hash
+               git_short_hash: Short git commit hash
+               cargo_version: Cargo package version
+             Curl Example:
+               curl -s -X POST -H 'Content-Type: application/json' \
+                 --data '{"jsonrpc":"2.0","method":"arc_getVersion","params":[],"id":1}' \
+                 http://127.0.0.1:8545
+
+        NOTE: This path '/' is shared by all JSON-RPC methods; separate request/response schemas are provided for clarity.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/JsonRpcRequest_arc_getCertificate'
+                - $ref: '#/components/schemas/JsonRpcRequest_arc_getVersion'
+      responses:
+        '200':
+          description: JSON-RPC success or error response for any listed method
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/JsonRpcSuccess_arc_getCertificate'
+                  - $ref: '#/components/schemas/JsonRpcSuccess_arc_getVersion'
+                  - $ref: '#/components/schemas/JsonRpcError'
+components:
+  schemas:
+    ErrorObject:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: integer
+        message:
+          type: string
+    JsonRpcRequest_arc_getCertificate:
+      type: object
+      required: [jsonrpc, method, params, id]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        method:
+          type: string
+          enum: ["arc_getCertificate"]
+        params:
+          type: array
+          minItems: 1
+          maxItems: 1
+          items:
+            type: integer
+            minimum: 1
+            format: int64
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+    JsonRpcSuccess_arc_getCertificate:
+      type: object
+      required: [jsonrpc, id, result]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+        result:
+          $ref: '#/components/schemas/RpcCommitCertificate'
+    JsonRpcRequest_arc_getVersion:
+      type: object
+      required: [jsonrpc, method, params, id]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        method:
+          type: string
+          enum: ["arc_getVersion"]
+        params:
+          type: array
+          maxItems: 0
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+    JsonRpcSuccess_arc_getVersion:
+      type: object
+      required: [jsonrpc, id, result]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+        result:
+          $ref: '#/components/schemas/RpcVersionInfo'
+    JsonRpcError:
+      type: object
+      required: [jsonrpc, id, error]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+        error:
+          $ref: '#/components/schemas/ErrorObject'
+    Address:
+      type: string
+      pattern: '^0x[a-fA-F0-9]{40}$'
+    ValueId:
+      type: string
+      pattern: '^0x[a-fA-F0-9]{64}$'
+    RpcCommitSignature:
+      type: object
+      required: [address, signature]
+      properties:
+        address:
+          $ref: '#/components/schemas/Address'
+        signature:
+          type: string
+          description: Base64-encoded bytes
+    RpcCommitCertificate:
+      type: object
+      required: [height, round, block_hash, signatures]
+      properties:
+        height:
+          type: integer
+          minimum: 1
+          format: uint64
+        round:
+          type: integer
+          minimum: 0
+          format: int64
+        block_hash:
+          $ref: '#/components/schemas/ValueId'
+        signatures:
+          type: array
+          items:
+            $ref: '#/components/schemas/RpcCommitSignature'
+    RpcVersionInfo:
+      type: object
+      required: [git_version, git_commit, git_short_hash, cargo_version]
+      properties:
+        git_version:
+          type: string
+        git_commit:
+          type: string
+        git_short_hash:
+          type: string
+        cargo_version:
+          type: string

@@ -1,0 +1,341 @@
+[workspace]
+resolver = "2"
+
+members = ["crates/*", "crates/test/checks", "crates/test/framework"]
+exclude = ["crates/test"]
+
+[workspace.package]
+version      = "0.0.1"
+edition      = "2024"
+readme       = "README.md"
+license      = "Apache-2.0"
+exclude      = [".github/"]
+rust-version = "1.91"
+publish      = false
+repository   = "https://github.com/circlefin/arc-node"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
+[workspace.lints.clippy]
+collapsible_if = "allow"
+unwrap_used = "deny"
+
+[workspace.dependencies]
+
+# eth
+alloy-consensus = { version = "1.6.3", default-features = false }
+alloy-eips = { version = "1.6.3", default-features = false }
+alloy-evm = { version = "0.27.2", default-features = false }
+alloy-genesis = { version = "1.6.3", default-features = false }
+
+alloy-network = { version = "1.6.3", default-features = false }
+
+# op
+alloy-primitives = { version = "1.5.6", default-features = false, features = ["map-foldhash"] }
+alloy-provider = { version = "1.6.3", features = ["reqwest"], default-features = false }
+alloy-rlp = { version = "0.3.13", default-features = false, features = ["core-net"] }
+alloy-rpc-types = { version = "1.6.3", features = ["eth"], default-features = false }
+alloy-rpc-types-admin = { version = "1.6.3", default-features = false }
+alloy-rpc-types-engine = { version = "1.6.3", default-features = false }
+alloy-rpc-types-eth = { version = "1.6.3", default-features = false }
+alloy-rpc-types-trace = { version = "1.6.3", default-features = false }
+alloy-rpc-types-txpool = { version = "1.6.3", default-features = false }
+alloy-serde = { version = "1.6.3", default-features = false }
+alloy-signer = { version = "1.6.3", default-features = false }
+alloy-signer-local = { version = "1.6.3", default-features = false, features = ["mnemonic"] }
+alloy-sol-macro = "1.5.6"
+alloy-sol-types = { version = "1.5.6", default-features = false }
+alloy-transport-ws = { version = "1.6.3", default-features = false }
+
+arbitrary = "1.3"
+
+# internal crates
+arc-checks = { version = "0.0.1", path = "crates/test/checks" }
+arc-consensus-db = { version = "0.0.1", path = "crates/consensus-db" }
+arc-consensus-types = { version = "0.0.1", path = "crates/types" }
+arc-eth-engine = { version = "0.0.1", path = "crates/eth-engine" }
+arc-evm = { version = "0.0.1", path = "crates/evm" }
+arc-evm-node = { version = "0.0.1", path = "crates/evm-node" }
+arc-execution-config = { version = "0.0.1", path = "crates/execution-config" }
+arc-execution-payload = { version = "0.0.1", path = "crates/execution-payload" }
+arc-execution-txpool = { version = "0.0.1", path = "crates/execution-txpool" }
+arc-execution-validation = { version = "0.0.1", path = "crates/execution-validation" }
+arc-mesh-analysis = { version = "0.0.1", path = "crates/mesh-analysis" }
+arc-node-consensus = { version = "0.0.1", path = "crates/malachite-app" }
+arc-node-consensus-cli = { version = "0.0.1", path = "crates/malachite-cli" }
+arc-node-execution = { version = "0.0.1", path = "crates/node" }
+arc-precompiles = { version = "0.0.1", path = "crates/precompiles" }
+arc-remote-signer = { version = "0.0.1", path = "crates/remote-signer" }
+arc-shared = { version = "0.0.1", path = "crates/shared" }
+arc-signer = { version = "0.0.1", path = "crates/signer" }
+arc-snapshots = { version = "0.0.1", path = "crates/snapshots" }
+arc-test-framework = { version = "0.0.1", path = "crates/test/framework" }
+arc-version = { version = "0.0.1", path = "crates/version" }
+
+# async
+async-trait = "0.1.68"
+atomic-time = "0.1"
+axum               = "0.8"
+backon = { version = "1.5", default-features = false, features = ["std-blocking-sleep", "tokio-sleep"] }
+base64             = "0.22.0"
+bip32 = { version = "0.5.3", default-features = false, features = ["secp256k1", "std"] }
+bip39 = { version = "2.2.0", default-features = false, features = ["std"] }
+
+# arc
+bon = "2.3.0"
+bytes = { version = "1.5", default-features = false }
+bytesize           = "1.3"
+
+# for eip-4844
+cc = "=1.2.15"
+chrono = "0.4.44"
+clap = "4"
+clap-verbosity-flag = { version = "3.0.4", features = ["tracing"] }
+color-eyre         = "0.6"
+config             = { version = "0.14", features = ["toml"], default-features = false }
+# TODO: When we build for a windows target on an ubuntu runner, crunchy tries to
+# get the wrong path, update this when the workflow has been updated
+#
+# See: https://github.com/eira-fransham/crunchy/issues/13
+crunchy = "=0.2.2"
+deranged = "0.5.5"
+directories        = "5.0.1"
+
+# p2p
+dotenvy = "0.15"
+ed25519-dalek = "2.0"
+# misc
+# crypto
+
+# ssz encoding
+ethereum_ssz = "0.9.0"
+ethereum_ssz_derive = "0.9.0"
+eyre = "0.6"
+futures = "0.3"
+futures-util = { version = "0.3", default-features = false }
+hash-db = "=0.15.2"
+hex = { version = "0.4.3", features = ["serde"] }
+
+# http
+humantime = "2.1"
+humantime-serde = "1.1"
+indexmap = "2"
+itertools = "0.14"
+
+# rpc
+jsonrpsee = "0.26.0"
+jsonrpsee-types = "0.26.0"
+jsonwebtoken = "9.3.1"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+lz4 = "1.28.1"
+
+# metrics
+metrics = "0.24.0"
+mockall = "0.14.0"
+multihash = "0.19.3"
+once_cell = { version = "1.19", default-features = false, features = ["critical-section"] }
+oneline-eyre = "0.1"
+
+# reth
+parking_lot = "0.12"
+
+# proc-macros
+proc-macro2 = "1.0"
+prometheus-client = "0.23"
+prometheus-parse = "0.2.5"
+proptest = "1.7"
+prost              = "0.13"
+prost-build        = "0.13"
+protox             = "0.8.0"
+quote = "1.0"
+ractor = { version = "0.15.10", default-features = false, features = ["async-trait", "tokio_runtime"] }
+#FIXME rand = "0.9"
+rand = { version = "0.8.5", features = ["std_rng", "small_rng"] }
+# rand 8 for secp256k1
+redb               = "2.6.0"
+reqwest = { version = "0.12", default-features = false }
+reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-consensus-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-e2e-test-utils = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-engine-local = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-ipc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-network = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-node-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-node-core = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-node-metrics = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-prune-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-rpc-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-rpc-server-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+
+# revm
+revm = { version = "34.0.0", default-features = false }
+revm-context-interface = { version = "14.0.0", default-features = false }
+revm-database = { version = "10.0.0", default-features = false }
+revm-inspectors = "0.34.2"
+revm-interpreter = { version = "32.0.0", default-features = false }
+revm-primitives = { version = "22.0.0", default-features = false }
+
+rmcp = { version = "0.16", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rstest = "0.24.0"
+schemars = "1.0"
+schnellru = "0.2"
+secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "recovery"] }
+serde = { version = "1.0", default-features = false }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+serde_with = { version = "3", default-features = false, features = ["macros"] }
+serial_test = "3"
+sha3 = "0.10.5"
+signature          = "2.2.0"
+# Security fix for RUSTSEC-2025-0047
+slab = "0.4.11"
+
+# spammer
+spammer = { version = "0.0.1", path = "crates/spammer" }
+
+strum = { version = "0.27", default-features = false }
+strum_macros = "0.27"
+syn = "2.0"
+tar = "0.4"
+tempfile = "3.20"
+thiserror = { version = "2.0.0", default-features = false }
+
+# tokio
+tokio = { version = "1.44.2", default-features = false }
+tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-native-roots"] }
+tokio-util = { version = "0.7.4", features = ["codec"] }
+
+# config
+toml = "0.8"
+tonic = "0.12"
+tonic-build = "0.12"
+tower = "0.5"
+tracing = { version = "0.1.0", default-features = false }
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi"] }
+url = { version = "2.3", default-features = false }
+uuid = { version = "1", default-features = false, features = ["v4"] }
+vergen-git2 = { version = "9.1.0", default-features = false }
+wiremock = "0.6"
+
+[workspace.dependencies.malachitebft-app]
+package = "arc-malachitebft-app"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[workspace.dependencies.malachitebft-app-channel]
+package = "arc-malachitebft-app-channel"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[workspace.dependencies.malachitebft-codec]
+package = "arc-malachitebft-codec"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[workspace.dependencies.malachitebft-config]
+package = "arc-malachitebft-config"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[workspace.dependencies.malachitebft-core-consensus]
+package = "arc-malachitebft-core-consensus"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[workspace.dependencies.malachitebft-core-state-machine]
+package = "arc-malachitebft-core-state-machine"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[workspace.dependencies.malachitebft-core-types]
+package = "arc-malachitebft-core-types"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[workspace.dependencies.malachitebft-network]
+package = "arc-malachitebft-network"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[workspace.dependencies.malachitebft-peer]
+package = "arc-malachitebft-peer"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[workspace.dependencies.malachitebft-proto]
+package = "arc-malachitebft-proto"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[workspace.dependencies.malachitebft-signing]
+package = "arc-malachitebft-signing"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[workspace.dependencies.malachitebft-signing-ed25519]
+package = "arc-malachitebft-signing-ed25519"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[workspace.dependencies.malachitebft-sync]
+package = "arc-malachitebft-sync"
+git = "https://github.com/circlefin/malachite.git"
+rev = "6d95e673"
+
+[profile.dev]
+# enable basic optimizations (otherwise reth can't process txs)
+opt-level = 1
+
+[profile.dev.package."*"]
+# Compile all dependencies (but not workspace crates) with higher optimization.
+# This significantly speeds up test execution for compute-heavy deps (crypto,
+# hashing, EVM) while keeping workspace crate rebuild times fast for development.
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+opt-level = 3 # maximize speed; use "z" if minimizing size
+codegen-units = 1
+strip = true
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
+[patch.crates-io]
+# Fix for https://rustsec.org/advisories/RUSTSEC-2025-0055
+# This version of `ark-relations` includes a fix for the issue,
+# as it bumped `tracing-subscriber` to v0.3.0.
+ark-relations = { git = "https://github.com/arkworks-rs/snark.git", rev = "9c528529763f1a0a2e0cba83528f93d32247d621" }

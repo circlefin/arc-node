@@ -1,0 +1,5 @@
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
+
+[net]
+git-fetch-with-cli = true

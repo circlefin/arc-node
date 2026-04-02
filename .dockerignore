@@ -1,0 +1,74 @@
+# Rust build artifacts
+target/
+rust-toolchain.toml
+**/*.rs.bk
+
+# Quake artifacts
+/quake
+.quake/
+
+# Terraform state
+.terraform
+.terraform.*
+terraform.tfstate*
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+docs/
+*.md
+
+# Test files
+tests/
+**/*.test.ts
+**/*.test.js
+
+# Node.js (if any)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build assets
+datadir/
+contracts/
+
+# Docker
+Dockerfile*
+docker-compose*
+.dockerignore
+docker-bake.hcl
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Scripts (if not needed for build)
+scripts/
+deployments/

@@ -1,0 +1,186 @@
+{
+  "__elements": {},
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "11.2.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "panel", "id": "timeseries", "name": "Time series", "version": "" }
+  ],
+  "annotations": { "list": [] },
+  "description": "Block execution stage analysis: consensus vs execution timing, stage duration breakdown, and Amdahl's law proportions.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "uid": "arc-payload-build",
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 2,
+      "panels": [],
+      "title": "Block Execution Stages",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "p99 stage durations, averaged across validators.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text",
+            "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line",
+            "fillOpacity": 10, "gradientMode": "none", "lineInterpolation": "linear",
+            "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto", "spanNulls": false,
+            "stacking": { "group": "A", "mode": "normal" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 1 },
+      "id": 21,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true, "showLegendValues": false },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "avg(reth_arc_payload_stage_duration_seconds{stage=\"state_setup\",quantile=\"0.99\"})", "legendFormat": "state_setup", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "avg(reth_arc_payload_stage_duration_seconds{stage=\"pre_execution\",quantile=\"0.99\"})", "legendFormat": "pre_execution", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "avg(reth_arc_payload_stage_duration_seconds{stage=\"tx_execution\",quantile=\"0.99\"})", "legendFormat": "tx_execution", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "avg(reth_arc_payload_stage_duration_seconds{stage=\"post_execution\",quantile=\"0.99\"})", "legendFormat": "post_execution (state root)", "refId": "D" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "avg(reth_arc_payload_stage_duration_seconds{stage=\"assembly_and_sealing\",quantile=\"0.99\"})", "legendFormat": "assembly_and_sealing", "refId": "E" }
+      ],
+      "title": "Stage Durations p99 (avg, stacked)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Fraction of block build time spent in EVM transaction execution — the only stage Block-STM can parallelize. Above 50% (green) = strong case for parallelization. 20-50% (yellow) = conditional. Below 20% (red) = serial overhead dominates, don't bother.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "blue", "mode": "fixed" },
+          "custom": {
+            "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text",
+            "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line",
+            "fillOpacity": 5, "gradientMode": "none", "lineInterpolation": "linear",
+            "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto", "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "area" }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.2 },
+              { "color": "green", "value": 0.5 }
+            ]
+          },
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 9 },
+      "id": 30,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true, "showLegendValues": true },
+        "tooltip": { "hideZeros": false, "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "avg(reth_arc_payload_stage_duration_seconds{stage=\"tx_execution\",quantile=\"0.5\"}) / (avg(reth_arc_payload_stage_duration_seconds{stage=\"state_setup\",quantile=\"0.5\"}) + avg(reth_arc_payload_stage_duration_seconds{stage=\"pre_execution\",quantile=\"0.5\"}) + avg(reth_arc_payload_stage_duration_seconds{stage=\"tx_execution\",quantile=\"0.5\"}) + avg(reth_arc_payload_stage_duration_seconds{stage=\"post_execution\",quantile=\"0.5\"}) + avg(reth_arc_payload_stage_duration_seconds{stage=\"assembly_and_sealing\",quantile=\"0.5\"}))", "legendFormat": "tx_execution fraction (p50)", "refId": "A" }
+      ],
+      "title": "Block-STM Parallelization Potential (Amdahl's Law f)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "p99 block execution (payload build) and block consensus (generate + validate) durations, averaged across validators.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text",
+            "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line",
+            "fillOpacity": 0, "gradientMode": "none", "lineInterpolation": "linear",
+            "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto", "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 15 },
+      "id": 60,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true, "showLegendValues": false },
+        "tooltip": { "hideZeros": false, "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "avg(reth_arc_payload_total_duration_seconds{quantile=\"0.99\"})", "legendFormat": "execution p99", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "avg(histogram_quantile(0.99, rate(arc_malachite_app_block_build_time_bucket[$__rate_interval])))", "legendFormat": "consensus p99", "refId": "B" }
+      ],
+      "title": "Consensus vs Execution",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Build outcome rates averaged across validators. better = sealed block, aborted = not better than current best, cancelled = interrupted.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text",
+            "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line",
+            "fillOpacity": 0, "gradientMode": "none", "lineInterpolation": "linear",
+            "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto", "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 21 },
+      "id": 10,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true, "showLegendValues": false },
+        "tooltip": { "hideZeros": false, "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "avg(rate(reth_arc_payload_build_outcome_total{outcome=\"better\"}[$__rate_interval]))", "legendFormat": "better", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "avg(rate(reth_arc_payload_build_outcome_total{outcome=\"aborted\"}[$__rate_interval]))", "legendFormat": "aborted", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "avg(rate(reth_arc_payload_build_outcome_total{outcome=\"cancelled\"}[$__rate_interval]))", "legendFormat": "cancelled", "refId": "C" }
+      ],
+      "title": "Build Outcomes",
+      "type": "timeseries"
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["arc", "payload", "reth"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"],
+    "time_options": ["5m", "15m", "30m", "1h", "3h", "6h", "12h", "24h", "2d", "7d", "30d"]
+  },
+  "timezone": "browser",
+  "title": "Block Execution Stages",
+  "version": 2,
+  "weekStart": ""
+}

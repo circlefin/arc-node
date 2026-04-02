@@ -1,0 +1,62 @@
+[package]
+name = "arc-execution-e2e"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+integration = ["arc-evm-node/integration"]
+
+[dependencies]
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-network.workspace = true
+
+# Alloy
+alloy-primitives.workspace = true
+alloy-rpc-types-engine.workspace = true
+alloy-rpc-types-eth.workspace = true
+arc-evm-node = { path = "../evm-node" }
+# Arc crates
+arc-execution-config = { path = "../execution-config", features = ["test-utils"] }
+arc-execution-txpool = { path = "../execution-txpool" }
+arc-precompiles = { path = "../precompiles" }
+
+# Error handling
+eyre.workspace = true
+futures-util.workspace = true
+jsonrpsee = { workspace = true, features = ["http-client"] }
+reth-chainspec.workspace = true
+
+# Reth test utilities
+reth-e2e-test-utils.workspace = true
+reth-ethereum.workspace = true
+reth-ethereum-engine-primitives.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-node-api.workspace = true
+reth-node-builder = { workspace = true, features = ["test-utils"] }
+reth-node-core.workspace = true
+
+# Reth primitives
+reth-primitives-traits.workspace = true
+reth-provider.workspace = true
+reth-rpc-api.workspace = true
+reth-rpc-server-types.workspace = true
+reth-tasks.workspace = true
+reth-transaction-pool.workspace = true
+
+# Async
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+
+[dev-dependencies]
+alloy-sol-types.workspace = true
+arc-precompiles = { path = "../precompiles", features = ["test-utils"] }
+reth-tracing.workspace = true
+rstest.workspace = true
+
+[lints]
+workspace = true

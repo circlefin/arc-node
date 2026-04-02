@@ -1,0 +1,39 @@
+[package]
+name = "arc-remote-signer"
+version.workspace = true
+edition.workspace = true
+readme.workspace = true
+license.workspace = true
+exclude.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+integration = []
+# Run integration tests that require a live remote signer.
+integration-remote-signer = []
+
+[dependencies]
+arc-consensus-types = { workspace = true }
+async-trait = { workspace = true }
+backon = { workspace = true, features = ["tokio-sleep"] }
+ed25519-dalek = { workspace = true }
+eyre = { workspace = true }
+hex = { workspace = true }
+malachitebft-core-types = { workspace = true }
+malachitebft-signing = { workspace = true }
+prometheus-client = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tonic = { workspace = true, features = ["tls"] }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[build-dependencies]
+protox = { workspace = true }
+tonic-build = { workspace = true }
+
+[lints]
+workspace = true

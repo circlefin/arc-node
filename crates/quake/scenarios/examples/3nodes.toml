@@ -1,0 +1,7 @@
+# Minimal 3-validator network. Works with the default Average load profile
+# even though mesh_n_low=4 exceeds the 2 available peers. Gossipsub treats
+# mesh_n_low as a graft trigger, not a hard minimum, so nodes simply attempt
+# to add peers on each heartbeat and proceed when none are available.
+[nodes.validator1]
+[nodes.validator2]
+[nodes.validator3]

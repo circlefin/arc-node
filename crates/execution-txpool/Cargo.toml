@@ -1,0 +1,47 @@
+[package]
+name = "arc-execution-txpool"
+version.workspace = true
+edition.workspace = true
+readme.workspace = true
+license.workspace = true
+exclude.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+
+[dependencies]
+alloy-primitives.workspace = true
+arc-execution-config.workspace = true
+arc-execution-validation.workspace = true
+arc-precompiles.workspace = true
+arc-shared.workspace = true
+eyre.workspace = true
+metrics.workspace = true
+parking_lot.workspace = true
+reth-chainspec.workspace = true
+reth-ethereum = { workspace = true, features = ["pool"] }
+reth-ethereum-primitives.workspace = true
+reth-evm.workspace = true
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+reth-primitives-traits.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }
+reth-storage-api.workspace = true
+reth-tracing.workspace = true
+reth-transaction-pool = { workspace = true, features = ["test-utils"] }
+schnellru.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+alloy-consensus.workspace = true
+reth-evm-ethereum = { workspace = true, default-features = false, features = ["std"] }
+reth-provider = { workspace = true, features = ["test-utils"] }
+reth-transaction-pool = { workspace = true, features = ["test-utils"] }
+serial_test.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

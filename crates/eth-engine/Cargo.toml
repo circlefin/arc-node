@@ -1,0 +1,60 @@
+[package]
+name = "arc-eth-engine"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+mocks = ["dep:mockall"]
+
+[dependencies]
+
+# alloy crates
+alloy-consensus         = { workspace = true }
+alloy-genesis           = { workspace = true }
+alloy-primitives        = { workspace = true }
+alloy-rpc-types         = { workspace = true }
+alloy-rpc-types-engine  = { workspace = true, features = ["jwt", "serde"] }
+alloy-rpc-types-txpool  = { workspace = true }
+alloy-sol-macro         = { workspace = true }
+alloy-sol-types         = { workspace = true }
+arc-consensus-types = { workspace = true }
+arc-execution-config = { workspace = true }
+
+async-trait = { workspace = true }
+backon = { workspace = true }
+ethereum_serde_utils = "0.8.0"
+eyre = { workspace = true }
+hex = { workspace = true }
+jsonrpsee = { workspace = true }
+jsonrpsee-types = { workspace = true }
+jsonwebtoken = { workspace = true }
+malachitebft-core-types = { workspace = true }
+mockall = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["blocking", "json", "stream", "rustls-tls", "native-tls-vendored"] }
+reth-chainspec = { workspace = true }
+reth-ipc = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+alloy-rpc-types-eth = { workspace = true }
+arc-evm-node = { workspace = true }
+arc-execution-txpool = { workspace = true }
+mockall = { workspace = true }
+reth-node-builder = { workspace = true, features = ["test-utils"] }
+reth-tasks = { workspace = true }
+rstest = { workspace = true }
+tempfile = "3.8"
+url = { workspace = true }
+wiremock = { workspace = true }
+
+[lints]
+workspace = true

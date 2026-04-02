@@ -1,0 +1,160 @@
+name = "testnet"
+description = "A reproduction of the testnet configuration with latency emulation enabled."
+
+# Global config
+cl.config.logging.log_level = "debug"
+
+cl.config.consensus.p2p.discovery.num_inbound_peers = 50
+cl.config.consensus.p2p.discovery.num_outbound_peers = 50
+
+latency_emulation = true
+engine_api_connection = "rpc"
+
+# Topology (testnet reproduction):
+# 10 validators in 4 AWS regions
+# - blue, green, purple: us-east-2
+# - cyan: us-west-2
+# - red, orange, yellow: eu-central-1
+# - pink, grey, brown: ap-northeast-1
+#
+# 15 full nodes in 5 locations
+#
+# Internal full nodes:
+# - 5 full nodes - us-east-1
+# - 1 full node  - us-west-2
+#
+# External full nodes:
+# (Note: exact locations and counts are unknown; this is an approximation
+#  based on the number of connections observed in validator metrics)
+# - 6 full nodes - eu-west-2 (QuickNode)
+# - 1 full node  - us-west-1 (Alchemy)
+# - 1 full node  - us-west-2 (Blockdaemon)
+# - 1 full node  - eu-central-1 (DRPC)
+
+[node_groups]
+US_EU_VALIDATORS = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow"]
+
+# us-east-2 validators
+[nodes.validator-blue]
+region = "us-east-2"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+
+[nodes.validator-green]
+region = "us-east-2"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+
+[nodes.validator-purple]
+region = "us-east-2"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+
+# us-west-2 validator
+[nodes.validator-cyan]
+region = "us-west-2"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+
+# eu-central-1 validators
+[nodes.validator-red]
+region = "eu-central-1"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+
+[nodes.validator-orange]
+region = "eu-central-1"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+
+[nodes.validator-yellow]
+region = "eu-central-1"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+
+# ap-northeast-1 validators
+[nodes.validator-pink]
+region = "ap-northeast-1"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+start_at = 30
+
+[nodes.validator-grey]
+region = "ap-northeast-1"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+start_at = 30
+
+[nodes.validator-brown]
+region = "ap-northeast-1"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+start_at = 30
+
+# us-east-1 full nodes
+[nodes.full-stg-blue]
+region = "us-east-1"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+start_at = 150
+
+[nodes.full-stg-green]
+region = "us-east-1"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+start_at = 150
+
+[nodes.full-blue]
+region = "us-east-1"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+start_at = 20
+
+[nodes.full-green]
+region = "us-east-1"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+start_at = 20
+
+[nodes.full-stg-purple]
+region = "us-east-1"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+start_at = 150
+
+# us-west-2 full node
+[nodes.full-prod-teal]
+region = "us-west-2"
+cl_persistent_peers = ["ALL_VALIDATORS"]
+start_at = 150
+
+# external full nodes
+[nodes.full-quicknode1]
+region = "eu-west-2"
+cl_persistent_peers = ["US_EU_VALIDATORS"]
+start_at = 50
+
+[nodes.full-quicknode2]
+region = "eu-west-2"
+cl_persistent_peers = ["US_EU_VALIDATORS"]
+start_at = 50
+
+[nodes.full-quicknode3]
+region = "eu-west-2"
+cl_persistent_peers = ["US_EU_VALIDATORS"]
+start_at = 50
+
+[nodes.full-quicknode4]
+region = "eu-west-2"
+cl_persistent_peers = ["US_EU_VALIDATORS"]
+start_at = 50
+
+[nodes.full-quicknode5]
+region = "eu-west-2"
+cl_persistent_peers = ["US_EU_VALIDATORS"]
+start_at = 50
+
+[nodes.full-quicknode6]
+region = "eu-west-2"
+cl_persistent_peers = ["US_EU_VALIDATORS"]
+start_at = 50
+
+[nodes.full-alchemy1]
+region = "us-west-1"
+cl_persistent_peers = ["US_EU_VALIDATORS"]
+start_at = 50
+
+[nodes.full-blockdaemon1]
+region = "us-west-2"
+cl_persistent_peers = ["US_EU_VALIDATORS"]
+start_at = 50
+
+[nodes.full-drpc1]
+region = "eu-central-1"
+cl_persistent_peers = ["US_EU_VALIDATORS"]
+start_at = 50

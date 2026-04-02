@@ -1,0 +1,97 @@
+# RPC Proxy - routes requests to node EL and CL RPC endpoints
+# Access patterns:
+#   WS   /<node-name>/el/ws      -> ws://<node-private-ip>:8546  (Execution Layer WebSocket)
+#   POST /<node-name>/el         -> http://<node-private-ip>:8545  (Execution Layer / Reth)
+#   GET  /<node-name>/cl/metrics -> http://<node-private-ip>:29000/metrics (Consensus Layer Metrics)
+#   POST /<node-name>/cl         -> http://<node-private-ip>:31000  (Consensus Layer / Malachite)
+
+%{~ for i, n in nodes }
+upstream ${n.name}_el {
+    server ${n.private_ip}:8545;
+}
+upstream ${n.name}_el_ws {
+    server ${n.private_ip}:8546;
+}
+upstream ${n.name}_cl {
+    server ${n.private_ip}:31000;
+}
+%{~ endfor }
+
+# Resolve node name -> private IP for CL metrics proxying
+map $metrics_node $metrics_backend {
+%{~ for i, n in nodes }
+    ${n.name} ${n.private_ip};
+%{~ endfor }
+    default "";
+}
+
+server {
+    listen 8080;
+    server_name localhost;
+
+    # Route to node's Execution Layer WebSocket (Reth WS, port 8546)
+    # Example: WS /node0/el/ws -> node0_el_ws upstream
+    # MUST appear before the EL HTTP location — nginx regex locations use
+    # first-match-wins order, and the EL regex also matches /el/ws paths.
+    location ~ ^/(?<node>[^/]+)/el/ws$ {
+        proxy_pass http://$${node}_el_ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_connect_timeout 10s;
+    }
+
+    # Route to node's Execution Layer (Reth JSON-RPC, port 8545)
+    # Example: POST /node0/el -> node0_el upstream
+    location ~ ^/(?<node>[^/]+)/el(?<path>/.*)?$ {
+        proxy_pass http://$${node}_el$path$is_args$args;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Content-Type "application/json";
+        proxy_read_timeout 30s;
+        proxy_connect_timeout 10s;
+    }
+
+    # Route CL metrics requests to the node's consensus layer metrics endpoint
+    # Example: GET /node0/cl/metrics -> http://<node0-private-ip>:29000/metrics
+    # MUST appear before the CL HTTP location — nginx regex locations use
+    # first-match-wins order, and the CL regex also matches /cl/metrics paths.
+    location ~ ^/(?<metrics_node>[^/]+)/cl/metrics$ {
+        proxy_pass http://$metrics_backend:29000/metrics;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_read_timeout 10s;
+        proxy_connect_timeout 5s;
+    }
+
+    # Route to node's Consensus Layer (Malachite RPC, port 31000)
+    # Example: POST /node0/cl -> node0_cl upstream
+    location ~ ^/(?<node>[^/]+)/cl(?<path>/.*)?$ {
+        proxy_pass http://$${node}_cl$path$is_args$args;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Content-Type "application/json";
+        proxy_read_timeout 30s;
+        proxy_connect_timeout 10s;
+    }
+
+    # Health check endpoint
+    location /health {
+        return 200 'OK';
+        add_header Content-Type text/plain;
+    }
+
+    # List available nodes
+    location /nodes {
+        default_type application/json;
+        return 200 '{"nodes": [%{~ for i, n in nodes }${i > 0 ? "," : ""}"${n.name}"%{~ endfor }]}';
+    }
+}

@@ -1,0 +1,8 @@
+{
+  "description": "Predefined arc-remote-signer public keys for dev AWS account (dev/arc/remote-signer/{1,2,3})",
+  "keys": [
+    "0x22faef225605e08abb380a5da398b609b6641cd7d1e4d718cc0fe6ecd8a2a094",
+    "0x784ad3ae1bbac71ff39311bca0de2517cdfa727857c5a2a5cbf395d9af3af43a",
+    "0x65957d56ed7cdd8e9f55e2f4cc2905fe337ac7f05d74f2f17280a7489ee24413"
+  ]
+}

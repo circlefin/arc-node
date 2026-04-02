@@ -1,0 +1,92 @@
+global:
+  scrape_interval: 1s
+scrape_configs:
+  - job_name: "arc_localdev"
+    metrics_path: "/"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+        labels:
+          client_name: "reth"
+          client_type: "execution"
+  - job_name: "arc_execution0"
+    metrics_path: "/"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:9100']
+        labels:
+          client_name: "reth"
+          client_type: "execution"
+  - job_name: "arc_execution1"
+    metrics_path: "/"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:9101']
+        labels:
+          client_name: "reth"
+          client_type: "execution"
+  - job_name: "arc_execution2"
+    metrics_path: "/"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:9102']
+        labels:
+          client_name: "reth"
+          client_type: "execution"
+  - job_name: "arc_execution3"
+    metrics_path: "/"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:9103']
+        labels:
+          client_name: "reth"
+          client_type: "execution"
+  - job_name: "arc_execution4"
+    metrics_path: "/"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:9104']
+        labels:
+          client_name: "reth"
+          client_type: "execution"
+
+  - job_name: "arc_consensus0"
+    metrics_path: "/metrics"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:29000']
+        labels:
+          client_name: "malachite"
+          client_type: "consensus"
+  - job_name: "arc_consensus1"
+    metrics_path: "/metrics"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:29001']
+        labels:
+          client_name: "malachite"
+          client_type: "consensus"
+  - job_name: "arc_consensus2"
+    metrics_path: "/metrics"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:29002']
+        labels:
+          client_name: "malachite"
+          client_type: "consensus"
+  - job_name: "arc_consensus3"
+    metrics_path: "/metrics"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:29003']
+        labels:
+          client_name: "malachite"
+          client_type: "consensus"
+  - job_name: "arc_consensus4"
+    metrics_path: "/metrics"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:29004']
+        labels:
+          client_name: "malachite"
+          client_type: "consensus"

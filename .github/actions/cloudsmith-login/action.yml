@@ -1,0 +1,66 @@
+name: Cloudsmith Docker Login
+description: Exchange GitHub OIDC token for Cloudsmith credentials and log in to the Docker registry.
+
+inputs:
+  registry:
+    description: Cloudsmith Docker registry hostname
+    required: true
+  org:
+    description: Cloudsmith organization
+    required: false
+    default: circle
+  service-slug:
+    description: Cloudsmith OIDC service account slug
+    required: false
+    default: arc-publisher-gha-service
+
+runs:
+  using: composite
+  steps:
+    - name: Get Cloudsmith token
+      id: get-token
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      env:
+        CLOUDSMITH_ORG: ${{ inputs.org }}
+        CLOUDSMITH_SERVICE_SLUG: ${{ inputs.service-slug }}
+      with:
+        script: |-
+          let oidc_token;
+          try {
+            oidc_token = await core.getIDToken();
+            core.setSecret(oidc_token);
+          } catch (error) {
+            core.setFailed(`Failed to get OIDC token: ${error}`);
+            return;
+          }
+          try {
+            const response = await fetch(`https://api.cloudsmith.io/openid/${process.env.CLOUDSMITH_ORG}/`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                oidc_token: oidc_token,
+                service_slug: process.env.CLOUDSMITH_SERVICE_SLUG
+              }),
+              signal: AbortSignal.timeout(30000),
+            });
+            if (!response.ok) {
+              core.setFailed(`Cloudsmith OIDC exchange failed: ${response.status} ${response.statusText}`);
+              return;
+            }
+            const data = await response.json();
+            core.setSecret(data.token);
+            core.setOutput('cloudsmith_user', process.env.CLOUDSMITH_SERVICE_SLUG);
+            core.setOutput('cloudsmith_token', data.token);
+          } catch (error) {
+            core.setFailed(`Failed to login to Cloudsmith: ${error}`);
+            return;
+          }
+
+    - name: Login to Cloudsmith
+      uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ steps.get-token.outputs.cloudsmith_user }}
+        password: ${{ steps.get-token.outputs.cloudsmith_token }}

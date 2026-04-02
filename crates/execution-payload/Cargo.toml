@@ -1,0 +1,53 @@
+[package]
+name = "arc-execution-payload"
+version.workspace = true
+edition.workspace = true
+readme.workspace = true
+license.workspace = true
+exclude.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+
+[dependencies]
+
+# alloy
+alloy-consensus.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+arc-execution-txpool.workspace = true
+eyre.workspace = true
+metrics.workspace = true
+
+# reth
+reth-basic-payload-builder.workspace = true
+reth-chainspec.workspace = true
+reth-consensus-common.workspace = true
+reth-errors.workspace = true
+reth-ethereum = { workspace = true, features = ["storage-api"] }
+reth-ethereum-engine-primitives.workspace = true
+reth-ethereum-payload-builder.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm.workspace = true
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+reth-payload-builder.workspace = true
+reth-payload-primitives.workspace = true
+reth-primitives-traits.workspace = true
+reth-revm.workspace = true
+reth-storage-api.workspace = true
+reth-transaction-pool.workspace = true
+
+# revm
+revm.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+reth-transaction-pool = { workspace = true, features = ["test-utils"] }
+tokio = { workspace = true, features = ["full"] }
+tracing-test = "0.2"
+
+[lints]
+workspace = true

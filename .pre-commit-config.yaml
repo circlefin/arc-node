@@ -1,0 +1,54 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+        -   id: fix-byte-order-marker
+        -   id: check-case-conflict
+        -   id: check-merge-conflict
+        -   id: check-symlinks
+        -   id: check-yaml
+        -   id: check-toml
+        -   id: end-of-file-fixer
+        -   id: mixed-line-ending
+        -   id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: rust-clippy
+        name: lint and fix rust code
+        entry: cargo clippy --all-features --fix --allow-dirty -- -D warnings
+        language: system
+        files: \.rs$
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+      - id: rust-fmt
+        name: format rust code
+        entry: cargo fmt --all
+        language: system
+        files: \.rs$
+        pass_filenames: false
+        always_run: true
+      - id: cargo-sort-check
+        name: sort rust dependencies
+        entry: cargo sort --workspace
+        language: system
+        files: Cargo\.toml$
+        pass_filenames: false
+        always_run: true
+      - id: buf-format
+        name: format protobuf files
+        entry: buf format -w
+        language: system
+        files: \.proto$
+        pass_filenames: false
+        always_run: true
+
+  - repo: https://github.com/pre-commit/mirrors-eslint
+    rev: v9.32.0
+    hooks:
+      - id: eslint
+        name: lint and fix javascript code
+        args: [--fix]

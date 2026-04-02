@@ -1,0 +1,67 @@
+name: arc_testnet_monitoring
+
+services:
+  prometheus:
+    image: prom/prometheus
+    #image: prom/prometheus:v2.42.0 # Debian 12 seems to use a fairly old version of prometheus
+    container_name: prometheus
+    ports:
+      - {{default monitoring_bind_host "127.0.0.1"}}:9090:9090
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./data/prometheus:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-lifecycle" # Allow dynamic reloading of config file with a POST request to the /-/reload endpoint
+
+  grafana:
+    image: grafana/grafana-oss
+    # if you are running as root then set it to 0
+    # else find the right id with the id -u command
+    user: '501'
+    container_name: grafana
+    ports:
+      - {{default monitoring_bind_host "127.0.0.1"}}:3000:3000
+    volumes:
+      - ./data/grafana:/var/lib/grafana
+      - {{deployments_dir}}/monitoring/config-grafana/provisioning:/etc/grafana/provisioning
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      GF_LOG_LEVEL: info
+      GF_ANALYTICS_ENABLED: false
+      GF_ANALYTICS_REPORTING_ENABLED: false
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: false
+      GF_ANALYTICS_CHECK_FOR_UPDATES: false
+      GF_ANALYTICS_FEEDBACK_LINKS_ENABLED: false
+      GF_SECURITY_DISABLE_GRAVATAR: true
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards-data/default.json
+      GF_USERS_DEFAULT_THEME: system
+      GF_USERS_EDITORS_CAN_ADMIN: true
+      GF_AUTH_ANONYMOUS_ENABLED: true
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
+      GF_AUTH_BASIC_ENABLED: false
+      GF_NEWS_NEWS_FEED_ENABLED: false
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 1s
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    ports:
+      - {{default monitoring_bind_host "127.0.0.1"}}:8080:8080
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    command:
+      - "--store_container_labels=true"
+      - "--docker_only=true"
+
+networks:
+  arc_network-monitoring:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

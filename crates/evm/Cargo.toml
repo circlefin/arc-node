@@ -1,0 +1,63 @@
+[package]
+name = "arc-evm"
+version.workspace = true
+edition.workspace = true
+readme.workspace = true
+license.workspace = true
+exclude.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+arbitrary = [
+    "alloy-consensus/arbitrary",
+    "alloy-eips/arbitrary",
+    "alloy-primitives/arbitrary",
+    "revm-primitives/arbitrary",
+    "revm/arbitrary",
+    "reth-ethereum/arbitrary",
+]
+integration = ["arc-precompiles/integration"]
+
+[dependencies]
+# alloy
+alloy-consensus = { workspace = true, features = ["serde"] }
+alloy-eips.workspace = true
+alloy-evm.workspace = true
+alloy-primitives.workspace = true
+alloy-rpc-types-engine.workspace = true
+alloy-sol-types.workspace = true
+
+# arc
+arc-execution-config.workspace = true
+arc-precompiles.workspace = true
+
+# reth
+reth-chainspec.workspace = true
+reth-ethereum = { workspace = true, features = ["node-api", "provider", "evm"] }
+reth-ethereum-primitives.workspace = true
+reth-evm.workspace = true
+reth-node-api.workspace = true
+reth-primitives-traits.workspace = true
+
+# revm
+revm.workspace = true
+revm-context-interface.workspace = true
+revm-interpreter.workspace = true
+revm-primitives.workspace = true
+
+# misc
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+alloy-genesis.workspace = true
+alloy-rpc-types-trace.workspace = true
+arc-execution-config = { workspace = true, features = ["test-utils"] }
+arc-precompiles.workspace = true
+revm-inspectors.workspace = true
+rstest.workspace = true
+
+[lints]
+workspace = true

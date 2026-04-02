@@ -1,0 +1,188 @@
+{
+  "timestamp": "1758617247",
+  "NativeFiatToken": {
+    "proxy": {
+      "admin": "0x2454fd9B923cD74d690bf500b4120E2BAEe3781a"
+    },
+    "owner": "0x46F6a3Fb2F3E897c7A4c3aD1B18D864884cf0FAc",
+    "pauser": "0xc9dE92071ceadbfFf0ee4d222B7E0F9bF9c8A584",
+    "masterMinter": "0x7f44B75d3EE7414c61ac3a255BE1fD0Ec140130D",
+    "rescuer": "0xf496BB9e77c05Ce18452ae6d444D87Cd04EbD4F3",
+    "blacklister": "0x334FF04B5d0E14Abbc1019F62981f7A4eEc5298C",
+    "minters": [
+      {
+        "address": "0x281CBe8Dd1D7B64995133EbA264dfb5b21e9e053",
+        "allowance": "1000000000000000000000000"
+      }
+    ]
+  },
+  "ProtocolConfig": {
+    "proxy": {
+      "admin": "0xdC151920e1F7CD214a108a3Ad0E6a586d46ca015"
+    },
+    "owner": "0xE73C02301f1e6877Ad8B5FB7cfbbD51AF97bC0Ca",
+    "controller": "0xFdfC974f9A66bd01353f39dfC32E6BaBC6f22ff6",
+    "pauser": "0xe054635B17c4Bd648b820ecf5Ab832688733AAD1",
+    "beneficiary": "0x65E0a200006D4FF91bD59F9694220dafc49dbBC1",
+    "feeParams": {
+      "alpha": "20",
+      "kRate": "25",
+      "inverseElasticityMultiplier": "5000",
+      "minBaseFee": "1",
+      "maxBaseFee": "1000",
+      "blockGasLimit": "30000000"
+    },
+    "consensusParams": {
+      "timeoutProposeMs": "3000",
+      "timeoutProposeDeltaMs": "500",
+      "timeoutPrevoteMs": "1000",
+      "timeoutPrevoteDeltaMs": "500",
+      "timeoutPrecommitMs": "1000",
+      "timeoutPrecommitDeltaMs": "500",
+      "timeoutRebroadcastMs": "1000",
+      "targetBlockTimeMs": "500"
+    }
+  },
+  "ValidatorManager": {
+    "proxy": {
+      "admin": "0xfD9A0965Db3D6376f498347f4C129bA6c72f9628"
+    },
+    "PermissionedValidatorManager": {
+      "proxy": {
+        "admin": "0xEe33d2085E034E5B9D9346C775f10D6ea284D620"
+      },
+      "owner": "0xE2Ffed765eEc0cc29507Be6328CD7Ac8E110f02A",
+      "validatorRegisterers": [
+        "0x9ED6CB4C5651d81C50Ea3109D55E87c913cc2Ba7",
+        "0x90A963443ADaBdDB73bCa009795E94f0E7b9b0e9"
+      ],
+      "controllers": [
+        "0xae7713c841C0E4d96c28479eB1BD3E73A6E3B48E",
+        "0xb4e1373fEbB3bB1750cC2Ee7C4eeaFA113bbCE4f",
+        "0x9d6E79502e3B2b94178830BA6Bb76A7f54f9ff61",
+        "0x30D30792030b8B499760dB18C447aa0d83003932",
+        "0xfc8D6aa4F924C410E0F2449bed4b0CaCfC8f1F1A",
+        "0x2247f8fEF4b001eD8785eb5e292Ff8829D755012",
+        "0xBD62385032AE4c8BF1BA2743A187F4e6c7462061",
+        "0xa3ae2E82b6195b425b8C2Da8D5DB84f7dd1380B6",
+        "0x9965a08ba97ed0332FCbBf8188f9700Aca620860"
+      ]
+    },
+    "validators": [
+      {
+        "publicKey": "0xfdbcdaad0c66b97534141879ba6128a6a108609d7d68b4c66c69804fd8c989ad",
+        "votingPower": "2000"
+      },
+      {
+        "publicKey": "0xa5bf8cec34f820f8f6b8385ade09ab771be1c04500ca912de1b3cb09e43b86e8",
+        "votingPower": "2000"
+      },
+      {
+        "publicKey": "0x385e0c5aeca4f54c442b5bf0b2320a79b2a67386df4d5461f3b358f957667480",
+        "votingPower": "2000"
+      }
+    ]
+  },
+  "prefund": [
+    {
+      "address": "0x2454fd9B923cD74d690bf500b4120E2BAEe3781a",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x46F6a3Fb2F3E897c7A4c3aD1B18D864884cf0FAc",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xc9dE92071ceadbfFf0ee4d222B7E0F9bF9c8A584",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x7f44B75d3EE7414c61ac3a255BE1fD0Ec140130D",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xf496BB9e77c05Ce18452ae6d444D87Cd04EbD4F3",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x334FF04B5d0E14Abbc1019F62981f7A4eEc5298C",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x281CBe8Dd1D7B64995133EbA264dfb5b21e9e053",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xdC151920e1F7CD214a108a3Ad0E6a586d46ca015",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xE73C02301f1e6877Ad8B5FB7cfbbD51AF97bC0Ca",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xFdfC974f9A66bd01353f39dfC32E6BaBC6f22ff6",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xe054635B17c4Bd648b820ecf5Ab832688733AAD1",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xfD9A0965Db3D6376f498347f4C129bA6c72f9628",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xEe33d2085E034E5B9D9346C775f10D6ea284D620",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xE2Ffed765eEc0cc29507Be6328CD7Ac8E110f02A",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x9ED6CB4C5651d81C50Ea3109D55E87c913cc2Ba7",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x90A963443ADaBdDB73bCa009795E94f0E7b9b0e9",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xae7713c841C0E4d96c28479eB1BD3E73A6E3B48E",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xb4e1373fEbB3bB1750cC2Ee7C4eeaFA113bbCE4f",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x9d6E79502e3B2b94178830BA6Bb76A7f54f9ff61",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x30D30792030b8B499760dB18C447aa0d83003932",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xfc8D6aa4F924C410E0F2449bed4b0CaCfC8f1F1A",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x2247f8fEF4b001eD8785eb5e292Ff8829D755012",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xBD62385032AE4c8BF1BA2743A187F4e6c7462061",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xa3ae2E82b6195b425b8C2Da8D5DB84f7dd1380B6",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x9965a08ba97ed0332FCbBf8188f9700Aca620860",
+      "balance": "1000000000000000000000"
+    }
+  ]
+}

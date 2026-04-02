@@ -1,0 +1,19 @@
+{
+	"project_name": "${project_name}",
+    "provider": "remote",
+    "control_center": ${jsonencode({
+        name        = cc.name,
+        public_ip   = cc.public_ip,
+        subnet_ips  = cc.network_ips,
+        instance_id = cc.instance_id
+    })},
+	"nodes": ${jsonencode({
+        for n in nodes:
+            n.name => {
+                name        = n.name
+                public_ip   = n.public_ip
+                subnet_ips  = n.network_ips
+                instance_id = n.instance_id
+            }
+        })}
+}

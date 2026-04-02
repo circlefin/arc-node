@@ -1,0 +1,444 @@
+name: {{compose_project_name}}
+
+x-health-retry:
+  &health-retry
+  interval: 1s
+  timeout: 10s
+  retries: 30
+
+x-aws-base:
+  &aws-base
+  AWS_PROFILE: ${AWS_PROFILE:-}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID:
+  AWS_SECRET_ACCESS_KEY:
+  AWS_SESSION_TOKEN:
+
+services:
+
+{{#each nodes}}
+  {{execution.inner.name}}:
+    container_name: {{execution.inner.name}}
+    image: {{../images.el}}
+    entrypoint: ["/app/assets/entrypoint_el.sh"]
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/8545' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      {{#each execution.inner.subnet_ips}}
+      {{@key}}:
+        ipv4_address: {{this}}
+      {{/each}}
+      host-access:
+    volumes:
+      - ./{{name}}/reth:/data/reth/execution-data
+      - ./assets:/app/assets
+      - ./logs:/var/log/arc
+      {{#if ../latency_emulation}}
+      - ./{{name}}/latency_setup.sh:/usr/local/bin/latency_setup.sh
+      {{/if}}
+      {{#unless ../rpc}}
+      - ./{{name}}/sockets:/sockets/
+      {{/unless}}
+    ports:
+      - "{{execution.http_port}}:8545" # HTTP
+      - "{{execution.ws_port}}:8546" # WS
+      - "{{execution.authrpc_port}}:8551" # AuthRPC
+      - "{{execution.metrics_port}}:9001" # Metrics
+      - "{{execution.pprof_port}}:6061" # Pprof
+    environment:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      ARC_LOG_FILE: /var/log/arc/{{execution.inner.name}}.log
+      RUST_LOG: debug,net::peers=trace,net::discovery=trace,net::discv5=trace
+    command:
+      - "node"
+      - "--datadir=/data/reth/execution-data"
+      - "--chain=/app/assets/genesis.json"
+      - "--http.port=8545"
+      - "--http.addr=0.0.0.0"
+      - "--http.corsdomain=*"
+      - "--ws.port=8546"
+      - "--ws.addr=0.0.0.0"
+      - "--ws.origins=*"
+      - "--metrics=0.0.0.0:9001"
+      - "--log.file.directory=/var/log/arc"
+      - "--log.file.max-files=0"
+      {{#each execution.cli_flags}}
+      - "{{{this}}}"
+      {{/each}}
+      - "--arc-rpc-upstream-url=http://{{consensus.inner.name}}:31000"
+      {{#if ../rpc}}
+      - "--authrpc.addr=0.0.0.0"
+      - "--authrpc.port=8551"
+      - "--authrpc.jwtsecret=/app/assets/jwtsecret"
+      - "--ipcdisable"
+      {{else}}
+      - "--ipcpath=/sockets/reth.ipc"
+      - "--auth-ipc"
+      - "--auth-ipc.path=/sockets/auth.ipc"
+      {{/if}}
+      - "--p2p-secret-key=/data/reth/execution-data/nodekey" # default is <datadir>/discovery-secret and randomly generated
+      {{#if (lookup ../trusted_peers this.name)}}
+      - "--trusted-peers={{lookup ../trusted_peers this.name}}"
+      {{/if}}
+
+  {{consensus.inner.name}}:
+    container_name: {{consensus.inner.name}}
+    image: {{../images.cl}}
+    entrypoint: ["/app/assets/entrypoint_cl.sh"]
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+    networks:
+      {{#each consensus.inner.subnet_ips}}
+      {{@key}}:
+        ipv4_address: {{this}}
+      {{/each}}
+      host-access:
+    depends_on:
+      {{execution.inner.name}}:
+        condition: service_healthy
+      {{#if remote_signer}}
+      {{name}}-signer-proxy:
+        condition: service_healthy
+      {{/if}}
+    volumes:
+      - ./{{name}}/malachite:/app/.malachite/
+      - ./assets:/app/assets
+      - ./logs:/var/log/arc
+      {{#if ../latency_emulation}}
+      - ./{{name}}/latency_setup.sh:/usr/local/bin/latency_setup.sh
+      {{/if}}
+      {{#unless ../rpc}}
+      - ./{{name}}/sockets:/sockets/
+      {{/unless}}
+    ports:
+      - "{{consensus.consensus_port}}:27000" # Consensus
+      - "{{consensus.metrics_port}}:29000" # Metrics
+      - "{{consensus.pprof_port}}:6060" # Pprof
+      - "{{consensus.rpc_port}}:31000" # RPC
+    environment:
+      ARC_LOG_FILE: /var/log/arc/{{consensus.inner.name}}.log
+      ARC_HALT_AT_BLOCK_HEIGHT: 0
+      ARC_GENESIS_FILE_PATH: /app/assets/genesis.json
+    command:
+      - "start"
+      - "--home=/app/.malachite"
+      {{#each consensus.cli_flags}}
+      - "{{{this}}}"
+      {{/each}}
+      {{#if ../rpc}}
+      - "--eth-rpc-endpoint=http://{{execution.inner.name}}:8545"
+      - "--execution-endpoint=http://{{execution.inner.name}}:8551"
+      - "--execution-jwt=/app/assets/jwtsecret"
+      {{else}}
+      - "--eth-socket=/sockets/reth.ipc"
+      - "--execution-socket=/sockets/auth.ipc"
+      {{/if}}
+      {{#if follow}}
+      - "--follow"
+      {{#each follow_endpoints}}
+      - "--follow.endpoint={{this}}"
+      {{/each}}
+      {{/if}}
+      {{#unless consensus_enabled}}
+      - "--no-consensus"
+      {{/unless}}
+
+  {{#if ../images.el_upgrade}}
+
+  {{execution.inner.name}}_u:
+    container_name: {{execution.inner.name}}_u
+    image: {{../images.el_upgrade}}
+    entrypoint: ["/app/assets/entrypoint_el.sh"]
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/8545' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      {{#each execution.inner.subnet_ips}}
+      {{@key}}:
+        ipv4_address: {{this}}
+      {{/each}}
+      host-access:
+    volumes:
+      - ./{{name}}/reth:/data/reth/execution-data
+      - ./assets:/app/assets
+      - ./logs:/var/log/arc
+      {{#if ../latency_emulation}}
+      - ./{{name}}/latency_setup.sh:/usr/local/bin/latency_setup.sh
+      {{/if}}
+      {{#unless ../rpc}}
+      - ./{{name}}/sockets:/sockets/
+      {{/unless}}
+    ports:
+      - "{{execution.http_port}}:8545" # HTTP
+      - "{{execution.ws_port}}:8546"   # WS
+      - "{{execution.authrpc_port}}:8551" # AuthRPC
+      - "{{execution.metrics_port}}:9001" # Metrics
+      - "{{execution.pprof_port}}:6061" # Pprof
+    environment:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      ARC_LOG_FILE: /var/log/arc/{{execution.inner.name}}.log
+      RUST_LOG: debug,net::peers=trace,net::discovery=trace,net::discv5=trace
+    command:
+      - "node"
+      - "--datadir=/data/reth/execution-data"
+      - "--chain=/app/assets/genesis.json"
+      - "--http.port=8545"
+      - "--http.addr=0.0.0.0"
+      - "--http.corsdomain=*"
+      - "--ws.port=8546"
+      - "--ws.addr=0.0.0.0"
+      - "--ws.origins=*"
+      - "--metrics=0.0.0.0:9001"
+      - "--log.file.directory=/var/log/arc"
+      - "--log.file.max-files=0"
+      {{#each execution.cli_flags}}
+      - "{{{this}}}"
+      {{/each}}
+      - "--arc-rpc-upstream-url=http://{{consensus.inner.name}}{{#if ../images.cl_upgrade}}_u{{/if}}:31000"
+      {{#if ../rpc}}
+      - "--authrpc.addr=0.0.0.0"
+      - "--authrpc.port=8551"
+      - "--authrpc.jwtsecret=/app/assets/jwtsecret"
+      - "--ipcdisable"
+      {{else}}
+      - "--ipcpath=/sockets/reth.ipc"
+      - "--auth-ipc"
+      - "--auth-ipc.path=/sockets/auth.ipc"
+      {{/if}}
+      - "--p2p-secret-key=/data/reth/execution-data/nodekey"
+      {{#if (lookup ../trusted_peers this.name)}}
+      - "--trusted-peers={{lookup ../trusted_peers this.name}}"
+      {{/if}}
+  {{/if}}
+
+  {{#if ../images.cl_upgrade}}
+
+  {{consensus.inner.name}}_u:
+    container_name: {{consensus.inner.name}}_u
+    image: {{../images.cl_upgrade}}
+    entrypoint: ["/app/assets/entrypoint_cl.sh"]
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+    networks:
+      {{#each consensus.inner.subnet_ips}}
+      {{@key}}:
+        ipv4_address: {{this}}
+      {{/each}}
+      host-access:
+    depends_on:
+      {{execution.inner.name}}_u:
+        condition: service_healthy
+      {{#if remote_signer}}
+      {{name}}-signer-proxy:
+        condition: service_healthy
+      {{/if}}
+    volumes:
+      - ./{{name}}/malachite:/app/.malachite/
+      - ./assets:/app/assets
+      - ./logs:/var/log/arc
+      {{#if ../latency_emulation}}
+      - ./{{name}}/latency_setup.sh:/usr/local/bin/latency_setup.sh
+      {{/if}}
+      {{#unless ../rpc}}
+      - ./{{name}}/sockets:/sockets/
+      {{/unless}}
+    ports:
+      - "{{consensus.consensus_port}}:27000"
+      - "{{consensus.metrics_port}}:29000"
+      - "{{consensus.pprof_port}}:6060" # Pprof
+      - "{{consensus.rpc_port}}:31000" # RPC
+    environment:
+      ARC_LOG_FILE: /var/log/arc/{{consensus.inner.name}}.log
+      ARC_HALT_AT_BLOCK_HEIGHT: 0
+      ARC_GENESIS_FILE_PATH: /app/assets/genesis.json
+    command:
+      - "start"
+      - "--home=/app/.malachite"
+      {{#each consensus.cli_flags_upgraded}}
+      - "{{{this}}}"
+      {{/each}}
+      {{#if ../rpc}}
+      - "--eth-rpc-endpoint=http://{{execution.inner.name}}_u:8545"
+      - "--execution-endpoint=http://{{execution.inner.name}}_u:8551"
+      - "--execution-jwt=/app/assets/jwtsecret"
+      {{else}}
+      - "--eth-socket=/sockets/reth.ipc"
+      - "--execution-socket=/sockets/auth.ipc"
+      {{/if}}
+      {{#if follow}}
+      - "--follow"
+      {{#each follow_endpoints}}
+      - "--follow.endpoint={{this}}"
+      {{/each}}
+      {{/if}}
+      {{#unless consensus_enabled}}
+      - "--no-consensus"
+      {{/unless}}
+  {{/if}}
+
+  {{! Copied and modified from deployments/remote-signer.yaml }}
+  {{#if remote_signer}}
+  {{name}}-signer-proxy:
+    container_name: {{name}}-signer-proxy
+    image: "${REMOTE_SIGNER_IMAGE}"
+    platform: linux/amd64
+    networks:
+      {{#each consensus.inner.subnet_ips}}
+      {{@key}}:
+      {{/each}}
+      host-access:
+    environment:
+      <<: *aws-base
+      APP_ENV: ${APP_ENV:-dev}
+      APP_PROVIDER_ENCLAVE_CLIENT_BASEURL: http://{{name}}-signer-enclave:10350
+      APP_PROVIDER_SECRETS_LOCALSTACK_ENABLED: false
+      APP_SERVICE_SIGNER_KEYID: ${APP_SERVICE_SIGNER{{inc @index}}_KEYID:-dev/arc/remote-signer/{{remote_signer}}}
+      APP_PROVIDER_AWSKMS_ARNS: ${APP_PROVIDER_AWSKMS_ARNS}
+      APP_PROVIDER_ENCLAVE_NITROENCLAVE_ENABLED: ${APP_PROVIDER_ENCLAVE_NITROENCLAVE_ENABLED:-false}
+    ulimits:
+      memlock: -1
+    volumes:
+      - "${AWS_PROFILE_PATH:-/dev/null}:/home/circle/.aws/credentials"
+      - "${AWS_PROFILE_PATH:-/dev/null}:/root/.aws/credentials"
+    depends_on:
+      {{name}}-signer-enclave:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f --insecure --http2-prior-knowledge -H 'Content-Type: application/grpc' -X POST http://localhost:10340"]
+      <<: *health-retry
+
+  {{name}}-signer-enclave:
+    container_name: {{name}}-signer-enclave
+    image: "${REMOTE_SIGNER_IMAGE}"
+    platform: linux/amd64
+    networks:
+      {{#each consensus.inner.subnet_ips}}
+      {{@key}}:
+      {{/each}}
+      host-access:
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      CGO_CFLAGS: "-O -D__BLST_PORTABLE__"
+      CGO_CFLAGS_ALLOW: "-O -D__BLST_PORTABLE__"
+      APP_NITROENCLAVE_ENABLED: ${APP_NITROENCLAVE_ENABLED:-false}
+    ulimits:
+      memlock: -1
+    entrypoint: ["/usr/local/circle/run_enclave.dev.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f --insecure http://localhost:10350/ping"]
+      <<: *health-retry
+  {{/if}}
+
+{{/each}}
+  ### Blockscout ###
+
+  # Blockscout will be available at http://localhost
+  blockscout-db-init:
+    extends:
+      file: {{deployments_dir}}/blockscout.yaml
+      service: db-init
+    volumes:
+      - ./blockscout/db:/var/lib/postgresql/data
+    networks:
+      - blockscout
+
+  blockscout-db:
+    depends_on:
+      blockscout-db-init:
+        condition: service_completed_successfully
+    extends:
+      file: {{deployments_dir}}/blockscout.yaml
+      service: db
+    volumes:
+      - ./blockscout/db:/var/lib/postgresql/data
+    networks:
+      - blockscout
+
+  blockscout-backend:
+    depends_on:
+      blockscout-db:
+        condition: service_healthy
+      {{nodes.0.execution.inner.name}}:
+        condition: service_healthy
+    extends:
+      file: {{deployments_dir}}/blockscout.yaml
+      service: backend
+    environment:
+        ETHEREUM_JSONRPC_HTTP_URL: http://host.docker.internal:8545/
+        ETHEREUM_JSONRPC_TRACE_URL: http://host.docker.internal:8545/
+        ETHEREUM_JSONRPC_WS_URL: ws://host.docker.internal:8546/
+        CHAIN_ID: '1337'
+    volumes:
+      - ./blockscout/logs/:/app/logs/
+      - ./blockscout/dets/:/app/dets/
+      - {{deployments_dir}}/monitoring/config-blockscout/proxy:/etc/nginx/templates:ro
+    networks:
+      - blockscout
+
+  blockscout-frontend:
+    depends_on:
+      - blockscout-backend
+    extends:
+      file: {{deployments_dir}}/blockscout.yaml
+      service: frontend
+    volumes:
+      - {{deployments_dir}}/monitoring/config-blockscout/frontend/.curlrc:/home/nextjs/.curlrc:ro
+    networks:
+      - blockscout
+
+  blockscout-proxy:
+    depends_on:
+      - blockscout-backend
+      - blockscout-frontend
+    extends:
+      file: {{deployments_dir}}/blockscout.yaml
+      service: proxy
+    volumes:
+      - {{deployments_dir}}/monitoring/config-blockscout/proxy:/etc/nginx/templates:ro
+    networks:
+      - blockscout
+
+# Internal networks cannot route to external networks, enforcing subnet isolation.
+# This is necessary because Docker Desktop does not isolate bridge networks by default.
+# Port publishing still works with internal networks.
+networks:
+{{#each networks}}
+  {{name}}:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: {{subnet}}
+{{/each}}
+  # Blockscout uses host.docker.internal to access nodes
+  blockscout:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+  # Non-internal network for port publishing from containers on internal subnet networks
+  host-access:
+    driver: bridge
+
+secrets:
+  GITHUB_TOKEN:
+    environment: GITHUB_TOKEN

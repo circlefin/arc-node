@@ -1,0 +1,3 @@
+# Formatting style edition (separate from Rust language edition in Cargo.toml)
+# Using 2015 for formatting style while project uses Rust edition 2024
+style_edition = "2015"

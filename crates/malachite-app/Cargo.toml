@@ -1,0 +1,94 @@
+[package]
+name = "arc-node-consensus"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+pprof = ["dep:pprof_hyper_server"]
+
+# allocator
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+tikv-jemallocator = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = "0.17.0"
+
+[dependencies]
+alloy-consensus = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-provider = { workspace = true, features = ["ws"] }
+alloy-rlp = { workspace = true }
+alloy-rpc-types-engine = { workspace = true, features = ["ssz"] }
+alloy-rpc-types-eth = { workspace = true }
+alloy-transport-ws.workspace = true
+arc-consensus-db.workspace = true
+arc-consensus-types.workspace = true
+arc-eth-engine.workspace = true
+arc-node-consensus-cli.workspace = true
+arc-shared.workspace = true
+arc-signer.workspace = true
+arc-version.workspace = true
+atomic-time.workspace = true
+axum = { workspace = true, features = ["macros"] }
+backon.workspace = true
+base64.workspace = true
+bon.workspace = true
+bytes.workspace = true
+bytesize.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+ethereum_ssz = { workspace = true }
+eyre.workspace = true
+futures.workspace = true
+hex.workspace = true
+humantime.workspace = true
+itertools.workspace = true
+malachitebft-app-channel.workspace = true
+malachitebft-core-state-machine.workspace = true
+malachitebft-core-types.workspace = true
+malachitebft-network.workspace = true
+malachitebft-peer.workspace = true
+malachitebft-sync.workspace = true
+multihash.workspace = true
+oneline-eyre.workspace = true
+pprof_hyper_server = { version = "0.2", features = ["pprof"], optional = true }
+ractor.workspace = true
+rand.workspace = true
+redb.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_with = { workspace = true, features = ["macros", "base64"] }
+sha3.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+alloy-primitives = { workspace = true }
+alloy-rpc-types-engine = { workspace = true, features = ["arbitrary"] }
+arbitrary = { workspace = true }
+arc-consensus-db = { workspace = true, features = ["mock"] }
+arc-consensus-types = { workspace = true, features = ["arbitrary"] }
+arc-eth-engine = { workspace = true, features = ["mocks"] }
+assert_cmd = "2.0"
+malachitebft-network = { workspace = true }
+malachitebft-peer = { workspace = true, features = ["rand"] }
+mockall = { workspace = true }
+predicates = "3.0"
+proptest = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,223 @@
+name: arc-monitoring
+
+services:
+
+  ### Monitoring ###
+
+  # Node exporter for monitoring system metrics
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    restart: unless-stopped
+    user: "0:0"
+    ports:
+      - 9090:9090
+    volumes:
+      - ./config-prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./data-prometheus:/prometheus
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=3d"
+      - "--storage.tsdb.retention.size=5GB"
+      - "--storage.tsdb.wal-compression"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  grafana:
+    image: grafana/grafana-oss
+    container_name: grafana
+    restart: unless-stopped
+    user: "0:0"
+    ports:
+      - 3000:3000
+    volumes:
+      - ./data-grafana:/var/lib/grafana
+      - ./config-grafana/provisioning:/etc/grafana/provisioning
+      - ./config-grafana/grafana.ini:/etc/grafana/grafana.ini
+    extra_hosts:
+      - host.docker.internal:host-gateway
+      # Blackhole access to AWS IMDS to mitigate SSRF to instance metadata
+      - "169.254.169.254:0.0.0.0"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    environment:
+      GF_LOG_LEVEL: info
+      GF_ANALYTICS_ENABLED: false
+      GF_ANALYTICS_REPORTING_ENABLED: false
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: false
+      GF_ANALYTICS_CHECK_FOR_UPDATES: false
+      GF_ANALYTICS_FEEDBACK_LINKS_ENABLED: false
+      GF_SECURITY_DISABLE_GRAVATAR: true
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards-data/default.json
+      GF_USERS_DEFAULT_THEME: system
+      GF_USERS_EDITORS_CAN_ADMIN: true
+      GF_AUTH_ANONYMOUS_ENABLED: true
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_BASIC_ENABLED: false
+      GF_NEWS_NEWS_FEED_ENABLED: false
+
+  ### Block explorer ###
+
+  # Blockscout will be available at http://localhost
+  blockscout-proxy:
+    image: nginx
+    container_name: blockscout-proxy
+    restart: unless-stopped
+    depends_on:
+      - blockscout-backend
+      - blockscout-frontend
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ./config-blockscout/proxy:/etc/nginx/templates:ro
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    environment:
+      BACK_PROXY_PASS: http://blockscout-backend:4000
+      FRONT_PROXY_PASS: http://blockscout-frontend:3000
+    ports:
+      - target: 80
+        published: 80
+
+  blockscout-frontend:
+    image: ghcr.io/blockscout/frontend:latest
+    pull_policy: always
+    restart: always
+    container_name: blockscout-frontend
+    extra_hosts:
+      - "localhost:host-gateway"
+    volumes:
+      - ./config-blockscout/frontend/.curlrc:/home/nextjs/.curlrc:ro
+    env_file:
+      - ./config-blockscout/frontend/frontend.env
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    environment:
+      # Override for SSM tunnel access on forwarded TCP port
+      NEXT_PUBLIC_API_HOST: localhost:${blockscout_ssm_port}
+      NEXT_PUBLIC_APP_HOST: localhost:${blockscout_ssm_port}
+    depends_on:
+      - blockscout-backend
+
+  blockscout-backend:
+    image: ghcr.io/blockscout/blockscout:latest
+    user: "0:0"
+    pull_policy: always
+    restart: always
+    stop_grace_period: 5m
+    container_name: blockscout-backend
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    env_file:
+      - ./config-blockscout/backend.env
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    depends_on:
+      blockscout-db:
+        condition: service_healthy
+    volumes:
+      - ./blockscout/logs/:/app/logs/
+      - ./blockscout/dets/:/app/dets/
+      - ./config-blockscout/proxy:/etc/nginx/templates:ro
+    environment:
+        ETHEREUM_JSONRPC_HTTP_URL: http://${some_node_private_ip}:8545/
+        ETHEREUM_JSONRPC_TRACE_URL: http://${some_node_private_ip}:8545/
+        ETHEREUM_JSONRPC_WS_URL: ws://${some_node_private_ip}:8546/
+        CHAIN_ID: '1337'
+        FIRST_BLOCK: '0'
+        INDEXER_CATCHUP_BLOCKS_BATCH_SIZE: '100'
+    secrets:
+      - blockscout_db_password
+    command: >-
+      sh -c "export DATABASE_URL=\"postgresql://blockscout:$$(cat /run/secrets/blockscout_db_password)@blockscout-db:5432/blockscout\" &&
+      bin/blockscout eval \"Elixir.Explorer.ReleaseTasks.create_and_migrate()\" &&
+      bin/blockscout start"
+
+  blockscout-db-init:
+    image: postgres:17
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    entrypoint:
+      - sh
+      - -c
+      - |
+        chown -R 2000:2000 /var/lib/postgresql/data
+    volumes:
+      - ./blockscout/db:/var/lib/postgresql/data
+
+  blockscout-db:
+    image: postgres:17
+    user: "2000:2000"
+    shm_size: 256m
+    container_name: blockscout-db
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    depends_on:
+      blockscout-db-init:
+        condition: service_completed_successfully
+    ports:
+      - target: 5432
+        published: 7432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockscout -d blockscout"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    volumes:
+      - ./blockscout/db:/var/lib/postgresql/data
+    environment:
+        POSTGRES_DB: 'blockscout'
+        POSTGRES_USER: 'blockscout'
+        POSTGRES_PASSWORD_FILE: /run/secrets/blockscout_db_password
+    secrets:
+      - blockscout_db_password
+    command: postgres -c 'max_connections=200' -c 'client_connection_check_interval=60000'
+
+networks:
+  arc_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16
+
+secrets:
+  blockscout_db_password:
+    file: ./blockscout_db_password

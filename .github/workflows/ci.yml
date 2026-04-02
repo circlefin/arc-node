@@ -1,0 +1,285 @@
+name: Public CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches:
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Rust: fmt, deps, lint run in parallel -> unit tests after lint passes
+  # ---------------------------------------------------------------------------
+
+  rust-fmt:
+    name: Rust Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+  rust-deps:
+    name: Rust Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install cargo-sort
+        run: cargo install cargo-sort
+
+      - name: Run cargo sort check
+        run: cargo sort --workspace --check
+
+  rust-lint:
+    name: Rust Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev zlib1g-dev
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+          cache-shared-key: rust-build
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  rust-test:
+    name: Rust Unit Tests
+    needs: rust-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev zlib1g-dev
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-shared-key: rust-build
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Run unit tests
+        run: cargo nextest run --locked --workspace
+
+  rust-integration-test:
+    name: Rust Integration Tests
+    needs: rust-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Init public submodules
+        run: git submodule update --init contracts/lib/forge-std contracts/lib/openzeppelin-contracts contracts/lib/openzeppelin-contracts-upgradeable
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev zlib1g-dev
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Read Foundry version
+        id: foundry-version
+        run: echo "version=$(cat .foundry-version)" >> $GITHUB_OUTPUT
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ steps.foundry-version.outputs.version }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Start integration services
+        run: make up
+
+      - name: Run integration tests
+        run: cargo nextest run --locked --workspace --features integration
+
+  # ---------------------------------------------------------------------------
+  # Protocol Buffers (standalone, no deps)
+  # ---------------------------------------------------------------------------
+
+  proto:
+    name: Protocol Buffers
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Buf lint, format, and breaking change detection
+        uses: bufbuild/buf-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          push: false
+          archive: false
+
+  # ---------------------------------------------------------------------------
+  # Solidity Contracts: lint (fast) -> build -> test
+  # ---------------------------------------------------------------------------
+
+  contracts-lint:
+    name: Contracts Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Init public submodules
+        run: git submodule update --init contracts/lib/forge-std contracts/lib/openzeppelin-contracts contracts/lib/openzeppelin-contracts-upgradeable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Read Foundry version
+        id: foundry-version
+        run: echo "version=$(cat .foundry-version)" >> $GITHUB_OUTPUT
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ steps.foundry-version.outputs.version }}
+
+      - name: Run forge lint
+        run: forge lint
+
+      # scripts/ and tests/ depend on types from an external submodule.
+      # Without it, TypeScript cannot resolve types and eslint reports
+      # no-unsafe-* errors across the entire import chain.
+      - name: Run eslint
+        run: |
+          npx eslint --ignore-pattern 'scripts/' --ignore-pattern 'tests/'
+          ! grep -R 'it.only' tests/ -q
+
+  contracts-build:
+    name: Contracts Build
+    needs: contracts-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Init public submodules
+        run: git submodule update --init contracts/lib/forge-std contracts/lib/openzeppelin-contracts contracts/lib/openzeppelin-contracts-upgradeable
+
+      - name: Read Foundry version
+        id: foundry-version
+        run: echo "version=$(cat .foundry-version)" >> $GITHUB_OUTPUT
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ steps.foundry-version.outputs.version }}
+
+      - name: Build contracts
+        run: forge build --sizes
+
+  contracts-test:
+    name: Contracts Tests
+    needs: contracts-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Init public submodules
+        run: git submodule update --init contracts/lib/forge-std contracts/lib/openzeppelin-contracts contracts/lib/openzeppelin-contracts-upgradeable
+
+      - name: Read Foundry version
+        id: foundry-version
+        run: echo "version=$(cat .foundry-version)" >> $GITHUB_OUTPUT
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ steps.foundry-version.outputs.version }}
+
+      - name: Run Foundry tests
+        run: forge test -vvv --gas-report
+
+  # ---------------------------------------------------------------------------
+  # Docker Images
+  # ---------------------------------------------------------------------------
+
+  docker-build:
+    name: Docker Build (${{ matrix.target }})
+    needs: [rust-lint, contracts-build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: execution
+            dockerfile: deployments/Dockerfile.execution
+          - target: consensus
+            dockerfile: deployments/Dockerfile.consensus
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get short SHA
+        id: short-sha
+        run: echo "sha=$(echo ${{ github.sha }} | cut -c1-8)" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.target }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: release-runtime
+          push: false
+          build-args: |
+            BUILD_PROFILE=release
+            GIT_COMMIT_HASH=${{ github.sha }}
+            GIT_VERSION=${{ github.ref_name }}
+            GIT_SHORT_HASH=${{ steps.short-sha.outputs.sha }}
+          build-contexts: |
+            certs=deployments/certs
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

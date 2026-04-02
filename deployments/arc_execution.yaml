@@ -1,0 +1,67 @@
+name: arc_network-execution
+
+services:
+  arc_execution:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.execution
+      target: dev-runtime
+      additional_contexts:
+        certs: ./certs
+      args:
+        BUILD_PROFILE: ${BUILD_PROFILE:-release}
+        CHAIN: ${CHAIN:-localdev}
+        FEATURES: ${EL_FEATURES:-default js-tracer}
+        ARC_IDEMPOTENT_BUILD: ${ARC_IDEMPOTENT_BUILD:-false}
+    image: arc_execution:latest
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - arc_network
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/8545' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - ../assets/localdev:/app/assets
+      - ./entrypoint_arc_execution.sh:/usr/local/bin/entrypoint.sh
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 6161:6061 # Pprof
+    command:
+      - "node"
+      - "-vvv"
+      - "-d"
+      - "--datadir=/data/reth/execution-data"
+      - "--chain=/app/assets/genesis.json"
+      - "--http"
+      - "--http.port=8545"
+      - "--http.addr=0.0.0.0"
+      - "--http.corsdomain=*"
+      - "--http.api=admin,net,eth,web3,debug,txpool,trace"
+      - "--ws"
+      - "--ws.port=8546"
+      - "--ws.addr=0.0.0.0"
+      - "--ws.origins=*"
+      - "--ws.api=admin,net,eth,web3,debug,txpool,trace"
+      - "--enable-arc-rpc"
+      - "--ipcpath=/sockets/reth.ipc"
+      - "--auth-ipc"
+      - "--auth-ipc.path=/sockets/auth.ipc"
+      - "--metrics=0.0.0.0:9001"
+      - "--txpool.nolocals"
+      - "--txpool.max-account-slots=500" # This is increased to 500 to allow for more transactions to be included in the pending pool
+      # - "--builder.gaslimit=3600000000" # default * 100
+      # - "--builder.interval=10ms"
+      # - "--builder.deadline=1" # The deadline in seconds for when the payload builder job should resolve
+      # - "--builder.max-tasks=10" # default=3
+      # - "--txpool.gas-limit=300000000" # default * 10
+      # - "--blobpool.pricebump=1"
+      # - "--txpool.pending-max-count=50000" # default=10000
+      # - "--txpool.queued-max-count=50000" # default=10000
+
+networks:
+  arc_network:
