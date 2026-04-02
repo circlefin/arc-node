@@ -1,0 +1,178 @@
+{
+  "timestamp": "1757515087",
+  "NativeFiatToken": {
+    "proxy": {
+      "admin": "0x49f78af090F1f98e7184B7f61f1F1a8a8064b40d"
+    },
+    "owner": "0xDC29Bab4A7d5425cA44eeF20a5B67E3D897F9a03",
+    "pauser": "0xbc639a0A060E5831a7c437b491B8d3C1f58F554e",
+    "masterMinter": "0xc7EdB7223a08a11D05cbE83F436816F1dc7Ea541",
+    "rescuer": "0x28E2716951f9fC8dF918e1BeDB54E4e2BDB2a362",
+    "blacklister": "0xE29672dcF004AE74da3700262D384ce23de16729",
+    "minters": [
+      {
+        "address": "0x735A7918f97Fbd3Cb5A5f72B0D1dDfdc9a7D8A86",
+        "allowance": "1000000000000000000000000"
+      }
+    ]
+  },
+  "ProtocolConfig": {
+    "proxy": {
+      "admin": "0xD2C1210Ce932A416e1f9f3147E404d37696D0c41"
+    },
+    "owner": "0x2904f3A8226630b40cD5BF414fF5c112E2A0aAC6",
+    "controller": "0x5196FF0e6f24ca69d07539A0547fD84988D29feE",
+    "pauser": "0xe09f434194E5430301F8D80fD1B7676A1052DF47",
+    "beneficiary": "0xa693CC18Aa09d33dD388013B7A02E5Ff863b8760",
+    "feeParams": {
+      "alpha": "20",
+      "kRate": "25",
+      "inverseElasticityMultiplier": "5000",
+      "minBaseFee": "1",
+      "maxBaseFee": "1000",
+      "blockGasLimit": "30000000"
+    }
+  },
+  "ValidatorManager": {
+    "proxy": {
+      "admin": "0x605fa3FeF59b7bA218c910E6671Ce88CB9D2F1bf"
+    },
+    "PermissionedValidatorManager": {
+      "proxy": {
+        "admin": "0x456f90Eb4023Bcc821C1a9164046C1Bd92898696"
+      },
+      "owner": "0x5f5dC64f8926Dd61C57812565D308c04Be68546A",
+      "validatorRegisterers": [
+        "0xB8217B0eFa254e56f902DB6cCA2f1Cd88E5251d5",
+        "0x5F3b933Bb7637944683eE6CECE4a24C8E1205c42"
+      ],
+      "controllers": [
+        "0xca1e629E0652bbf5784c2b8D0B45723Bd61D5FEE",
+        "0x6A34bC9F35a753A946D1829082E804980f8F35D3",
+        "0x18965Fff34CaFD729159E761f552915D85D6cE79",
+        "0xa1C4230035EA81ECE502a1D316910C6d60b04cE8",
+        "0x749Deb48FE74bbbC3aADeEaF19ED03F3f39e5ce4",
+        "0x0E5BeEEC3eBCF2b6FF35b6eB7D55fB775D8C7264",
+        "0x030eefff3aE6e1d3b04B16d1AC7df4498dC29317",
+        "0xE3A331A13d27B1E63Be687b9b773b4e362823ff0",
+        "0x0799c3ac9FB9c7BD89979D63A664Bf10Eaf008FB"
+      ]
+    },
+    "validators": [
+      {
+        "publicKey": "0x8396f9da70e4daf1af3bcba234d7247f34bceee859a83b09d9b22e938ce0eccb",
+        "votingPower": "2000"
+      },
+      {
+        "publicKey": "0x634059e702a3d9991215218098266f65cd363f82e4a8f82862bdcc36761116da",
+        "votingPower": "2000"
+      },
+      {
+        "publicKey": "0xc3dcde30cbe413e56c023514d2eef54db3ef7330542ae0adc3122696175d194e",
+        "votingPower": "2000"
+      }
+    ]
+  },
+  "prefund": [
+    {
+      "address": "0x49f78af090F1f98e7184B7f61f1F1a8a8064b40d",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xDC29Bab4A7d5425cA44eeF20a5B67E3D897F9a03",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xbc639a0A060E5831a7c437b491B8d3C1f58F554e",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xc7EdB7223a08a11D05cbE83F436816F1dc7Ea541",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x28E2716951f9fC8dF918e1BeDB54E4e2BDB2a362",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xE29672dcF004AE74da3700262D384ce23de16729",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x735A7918f97Fbd3Cb5A5f72B0D1dDfdc9a7D8A86",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xD2C1210Ce932A416e1f9f3147E404d37696D0c41",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x2904f3A8226630b40cD5BF414fF5c112E2A0aAC6",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x5196FF0e6f24ca69d07539A0547fD84988D29feE",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xe09f434194E5430301F8D80fD1B7676A1052DF47",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x605fa3FeF59b7bA218c910E6671Ce88CB9D2F1bf",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x456f90Eb4023Bcc821C1a9164046C1Bd92898696",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x5f5dC64f8926Dd61C57812565D308c04Be68546A",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xB8217B0eFa254e56f902DB6cCA2f1Cd88E5251d5",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x5F3b933Bb7637944683eE6CECE4a24C8E1205c42",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xca1e629E0652bbf5784c2b8D0B45723Bd61D5FEE",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x6A34bC9F35a753A946D1829082E804980f8F35D3",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x18965Fff34CaFD729159E761f552915D85D6cE79",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xa1C4230035EA81ECE502a1D316910C6d60b04cE8",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x749Deb48FE74bbbC3aADeEaF19ED03F3f39e5ce4",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x0E5BeEEC3eBCF2b6FF35b6eB7D55fB775D8C7264",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x030eefff3aE6e1d3b04B16d1AC7df4498dC29317",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0xE3A331A13d27B1E63Be687b9b773b4e362823ff0",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x0799c3ac9FB9c7BD89979D63A664Bf10Eaf008FB",
+      "balance": "1000000000000000000000"
+    }
+  ]
+}

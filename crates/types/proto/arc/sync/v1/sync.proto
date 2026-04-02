@@ -1,0 +1,80 @@
+// Copyright 2026 Circle Internet Group, Inc. All rights reserved.
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package arc.sync.v1;
+
+import "arc/consensus/v1/consensus.proto";
+
+message PeerId {
+  bytes id = 1;
+}
+
+message Status {
+  PeerId peer_id = 1;
+  uint64 height = 2;
+  uint64 earliest_height = 3;
+}
+
+message ValueRequest {
+  uint64 range_start = 1;
+  uint64 range_end = 2;
+}
+
+message ValueResponse {
+  uint64 start_height = 1;
+  repeated SyncedValue values = 2;
+}
+
+message SyncedValue {
+  bytes value_bytes = 1;
+  CommitCertificate certificate = 2;
+}
+
+message CommitSignature {
+  // TODO: Add flag (no vote, nil, value?)
+  arc.consensus.v1.Address validator_address = 1;
+  arc.consensus.v1.Signature signature = 2;
+}
+
+message CommitCertificate {
+  uint64 height = 1;
+  uint32 round = 2;
+  arc.consensus.v1.ValueId value_id = 3;
+  repeated CommitSignature signatures = 4;
+}
+
+message ProposedValue {
+  uint64 height = 1;
+  uint32 round = 2;
+  optional uint32 valid_round = 3;
+  arc.consensus.v1.Address proposer = 4;
+  arc.consensus.v1.Value value = 5;
+  bool validity = 6;
+}
+
+message SyncRequest {
+  oneof request {
+    ValueRequest value_request = 1;
+  }
+}
+
+message SyncResponse {
+  oneof response {
+    ValueResponse value_response = 1;
+  }
+}

@@ -1,0 +1,25 @@
+[profile.default]
+src = 'contracts/src'
+out = 'contracts/out/forge'
+libs = ['node_modules', 'contracts/lib']
+test = 'contracts/test'
+cache_path  = 'contracts/cache/forge'
+optimizer_runs = 200
+solc_version = "0.8.29"
+evm_version = "prague"
+remappings = [
+    "forge-std/=contracts/lib/forge-std/src/",
+    "@openzeppelin/contracts-upgradeable/=contracts/lib/openzeppelin-contracts-upgradeable/contracts/",
+    "@openzeppelin/contracts/=contracts/lib/openzeppelin-contracts/contracts/",
+]
+fs_permissions = [
+  { access = "read", path = "./assets/artifacts/" },
+  { access = "read", path = "./contracts/out/hardhat/contracts/src" },
+  { access = "write", path = "./contracts/cache" },
+  { access = "write", path = "./assets/*/genesis.json" }
+]
+
+# Lint configuration
+[lint]
+ignore = ["contracts/test/scripts/*.t.sol"]
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

@@ -1,0 +1,42 @@
+# This file is only used to build the images for the testnet
+
+name: {{testnet_name}}-builders
+
+services:
+{{#each reth_builds}}
+  {{this.service_name}}:
+    build:
+      context: {{@root.quake_dir}}/..
+      dockerfile: deployments/Dockerfile.execution
+      target: dev-runtime
+      additional_contexts:
+        certs: {{@root.quake_dir}}/../deployments/certs
+      args:
+        BUILD_PROFILE: ${BUILD_PROFILE:-release}
+        CHAIN: ${CHAIN:-localdev}
+        FEATURES: ${EL_FEATURES:-default js-tracer}
+        ARC_IDEMPOTENT_BUILD: ${ARC_IDEMPOTENT_BUILD:-false}
+      secrets:
+        - GITHUB_TOKEN
+    image: {{this.tag}}
+{{/each}}
+{{#each malachite_builds}}
+  {{this.service_name}}:
+    build:
+      context: {{@root.quake_dir}}/..
+      dockerfile: deployments/Dockerfile.consensus
+      target: dev-runtime
+      additional_contexts:
+        certs: {{@root.quake_dir}}/../deployments/certs
+      args:
+        BUILD_PROFILE: ${BUILD_PROFILE:-release}
+        FEATURES: ${CL_FEATURES:-}
+        ARC_IDEMPOTENT_BUILD: ${ARC_IDEMPOTENT_BUILD:-false}
+      secrets:
+        - GITHUB_TOKEN
+    image: {{this.tag}}
+{{/each}}
+
+secrets:
+  GITHUB_TOKEN:
+    environment: GITHUB_TOKEN

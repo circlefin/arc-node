@@ -1,0 +1,122 @@
+#cloud-config
+# For Amazon Linux 2023 (AL2023) - does NOT support apt/packages sections
+hostname: cc
+manage_etc_hosts: false
+groups:
+  - docker
+users:
+  - name: ${username}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: sudo,docker
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+write_files:
+  - path: /etc/exports
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # NFS exports - share directory with all nodes in VPC
+      /home/${username}/shared ${vpc_cidr}(rw,sync,no_subtree_check,no_root_squash)
+  - path: /home/${username}/spammer.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      docker run --rm --network host -u 0 -v $PWD:/work -w /work spammer:latest $@
+  # SSH private key for CC to SSH to nodes (same key used by all instances)
+  - path: /home/${username}/.ssh/id_rsa
+    owner: ${username}:${username}
+    permissions: "0600"
+    content: |
+      ${indent(6, ssh_private_key)}
+  # Parallel SSH script: executes the same command on multiple nodes in parallel
+  - path: /home/${username}/pssh.sh
+    owner: ${username}:${username}
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # Usage: pssh.sh "command" ip1 ip2 ip3 ...
+      # Executes command on all IPs in parallel, fails if any command fails.
+      set -euo pipefail
+      CMD="$$1"
+      shift
+      SSH_OPTS="-o StrictHostKeyChecking=no -o LogLevel=ERROR"
+      USER="${username}"
+      TMPDIR=$$(mktemp -d)
+      trap "rm -rf $$TMPDIR" EXIT
+      i=0
+      for IP in "$$@"; do
+          (ssh $$SSH_OPTS $$USER@$$IP "$$CMD"; echo $$? > "$$TMPDIR/$$i") &
+          ((i++))
+      done
+      wait
+      FAILED=0
+      for f in "$$TMPDIR"/*; do
+          [ -f "$$f" ] && [ "$$(cat "$$f")" != "0" ] && FAILED=1
+      done
+      exit $$FAILED
+runcmd:
+# Set up 4 GiB swap to prevent hard OOM kills (dd instead of fallocate for XFS compatibility)
+  - dd if=/dev/zero of=/swapfile bs=1M count=4096
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' >> /etc/fstab
+# Tell the kernel to prefer killing containers (which hit their Docker memory limits) over heavy swapping
+  - echo 'vm.swappiness=10' > /etc/sysctl.d/99-swap.conf
+  - sysctl -p /etc/sysctl.d/99-swap.conf
+# Install packages via dnf (Amazon Linux 2023)
+# Note: curl-minimal, jq, nfs-utils, iproute are pre-installed
+  - dnf install -y docker tmux
+# Configure and start NFS server
+  - mkdir -p /home/${username}/shared
+  - chown ${username}:${username} /home/${username}/shared
+  - chmod 755 /home/${username}/shared
+  - ln -s /home/${username}/shared /shared
+  - systemctl enable nfs-server
+  - systemctl start nfs-server
+  - exportfs -ra
+# Install Docker Compose v2 plugin (not available in AL2023 repos)
+  - mkdir -p /usr/local/lib/docker/cli-plugins
+  - curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" -o /usr/local/lib/docker/cli-plugins/docker-compose
+  - chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+# Create directories required by compose + quake
+  - mkdir -p /home/${username}/monitoring/{config-prometheus,config-grafana,config-blockscout,blockscout/{logs,dets}}
+  - mkdir -p /home/${username}/{rpc-proxy,pprof-proxy}
+# Write monitoring secrets (base64 decoded to avoid YAML quoting issues)
+  - echo '${blockscout_db_password_b64}' | base64 -d > /home/${username}/monitoring/blockscout_db_password
+# Fix ownership of all generated assets
+  - chown -R ${username}:${username} /home/${username}/
+  - chown -R 1000:1000 /home/${username}/monitoring/blockscout/{logs,dets}
+# Start docker service
+  - systemctl start docker
+  - systemctl enable docker
+# Protect critical host processes from OOM killer (-1000 = never kill).
+# Persists across SSM agent restarts via systemd drop-in.
+  - mkdir -p /etc/systemd/system/amazon-ssm-agent.service.d
+  - |
+    cat > /etc/systemd/system/amazon-ssm-agent.service.d/oom.conf <<'DROPIN'
+    [Service]
+    OOMScoreAdjust=-1000
+    DROPIN
+  - systemctl daemon-reload
+  - |
+    for proc in amazon-ssm-agent ssm-agent-worker nfsd dockerd sshd; do
+      pgrep -x "$$proc" | while read pid; do
+        echo -1000 > /proc/$$pid/oom_score_adj
+      done
+    done
+# Indicate that the server is ready for post-installation tasks.
+  - date > /etc/done
+# Pull images in parallel so that when the node instances are created, the images are ready to start
+  - |
+    docker pull nginx --quiet &
+    docker pull grafana/grafana-oss --quiet &
+    docker pull prom/prometheus --quiet &
+    docker pull prom/node-exporter:latest --quiet &
+    docker pull ghcr.io/blockscout/frontend:$${BLOCKSCOUT_FRONTEND_TAG:-latest} --quiet &
+    docker pull ghcr.io/blockscout/$${BLOCKSCOUT_REPO:-blockscout}:$${BLOCKSCOUT_TAG:-latest} --quiet &
+    docker pull postgres:17 --quiet &
+    wait
+    echo "docker images" && docker images

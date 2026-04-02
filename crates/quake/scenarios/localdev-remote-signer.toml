@@ -1,0 +1,18 @@
+[nodes.validator1]
+remote_signer = 1
+
+[nodes.validator2]
+remote_signer = 2
+
+[nodes.validator3]
+remote_signer = 3
+
+[nodes.validator4]
+# Triggers an error if uncommented,
+# because only 3 predefined keys for remote signers are currently available
+# remote_signer = 4
+
+[nodes.validator5]
+# Triggers an error if uncommented,
+# because only 3 predefined keys for remote signers are currently available
+# remote_signer = 5

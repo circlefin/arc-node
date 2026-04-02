@@ -1,0 +1,96 @@
+# Symmetric Explicit Peering Sentry Topology
+#
+# Demonstrates symmetric explicit peering between validators and sentries.
+# Both validators and sentries list each other as persistent peers with
+# explicit peering enabled, guaranteeing eager push message delivery
+# regardless of mesh membership.
+#
+# GossipSub explicit peering must be symmetric — both sides must list each
+# other. If only one side enables it, the explicit side will PRUNE GRAFTs
+# from the other, preventing mesh formation. See sentry_asymmetric.toml for
+# an asymmetric alternative using mesh prioritization.
+#
+# Network topology:
+#
+#   validator1 ──┐
+#   validator2 ──┤── sentry-1 ◄── full1
+#   validator3 ──┤── sentry-2 ◄── full2
+#   validator4 ──┘
+#
+# (◄── means full nodes connect out to sentries; sentries do not list full nodes as peers)
+#
+# Validators peer with all sentries and other validators (explicit, persistent_peers_only).
+# Sentries peer with all validators and each other (explicit, high load).
+
+# Validators only peer with their sentries and other validators.
+[nodes.validator1]
+cl_persistent_peers = ["sentry-1", "sentry-2", "ALL_VALIDATORS"]
+cl_persistent_peers_only = true
+cl_gossipsub.explicit_peering = true
+subnets = ["trusted"]
+[nodes.validator1.el.config]
+trusted_peers = ["sentry-1", "sentry-2", "ALL_VALIDATORS"]
+trusted_only = true
+
+[nodes.validator2]
+cl_persistent_peers = ["sentry-1", "sentry-2", "ALL_VALIDATORS"]
+cl_persistent_peers_only = true
+cl_gossipsub.explicit_peering = true
+subnets = ["trusted"]
+[nodes.validator2.el.config]
+trusted_peers = ["sentry-1", "sentry-2", "ALL_VALIDATORS"]
+trusted_only = true
+
+[nodes.validator3]
+cl_persistent_peers = ["sentry-1", "sentry-2", "ALL_VALIDATORS"]
+cl_persistent_peers_only = true
+cl_gossipsub.explicit_peering = true
+subnets = ["trusted"]
+[nodes.validator3.el.config]
+trusted_peers = ["sentry-1", "sentry-2", "ALL_VALIDATORS"]
+trusted_only = true
+
+[nodes.validator4]
+cl_persistent_peers = ["sentry-1", "sentry-2", "ALL_VALIDATORS"]
+cl_persistent_peers_only = true
+cl_gossipsub.explicit_peering = true
+subnets = ["trusted"]
+[nodes.validator4.el.config]
+trusted_peers = ["sentry-1", "sentry-2", "ALL_VALIDATORS"]
+trusted_only = true
+
+# Sentries connect only to their validators and other sentries (full nodes connect out to sentries, not the reverse).
+[nodes.sentry-1]
+cl_persistent_peers = ["sentry-2", "ALL_VALIDATORS"]
+cl_gossipsub.explicit_peering = true
+cl_gossipsub.load = "high"
+subnets = ["trusted", "untrusted"]
+[nodes.sentry-1.el.config]
+trusted_peers = ["ALL_VALIDATORS"]
+tx_propagation_policy = "Trusted"
+disable_discovery = true
+
+[nodes.sentry-2]
+cl_persistent_peers = ["sentry-1", "ALL_VALIDATORS"]
+cl_gossipsub.explicit_peering = true
+cl_gossipsub.load = "high"
+subnets = ["trusted", "untrusted"]
+[nodes.sentry-2.el.config]
+trusted_peers = ["ALL_VALIDATORS"]
+tx_propagation_policy = "Trusted"
+disable_discovery = true
+
+# Full nodes only peer with their sentry.
+[nodes.full1]
+cl_persistent_peers = ["sentry-1"]
+subnets = ["untrusted"]
+[nodes.full1.el.config]
+trusted_peers = ["sentry-1"]
+tx_propagation_policy = "Trusted"
+
+[nodes.full2]
+cl_persistent_peers = ["sentry-2"]
+subnets = ["untrusted"]
+[nodes.full2.el.config]
+trusted_peers = ["sentry-2"]
+tx_propagation_policy = "Trusted"

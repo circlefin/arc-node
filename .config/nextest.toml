@@ -1,0 +1,23 @@
+# Nextest configuration for arc-node
+# See: https://nexte.st/docs/configuration/
+
+[profile.default]
+# Default profile settings (local development)
+fail-fast = true
+
+[profile.ci]
+# CI-specific profile: run with `cargo nextest run --profile ci`
+# Ensures all tests run to completion so CI gets the full picture of failures.
+fail-fast = false
+
+# Retry flaky tests with exponential backoff.
+# Tests are retried up to 2 times with increasing delay between attempts.
+retries = { backoff = "exponential", count = 2, delay = "1s", max-delay = "10s" }
+
+# Detect tests that hang or run unreasonably long.
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+# JUnit XML output for CI reporting and test analytics.
+[profile.ci.junit]
+path = "target/nextest/ci/junit.xml"
+report-name = "arc-node-ci"

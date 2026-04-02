@@ -1,0 +1,52 @@
+[package]
+name = "arc-precompiles"
+version.workspace = true
+edition.workspace = true
+readme.workspace = true
+license.workspace = true
+exclude.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "generate_pq_test_vectors"
+path = "src/bin/generate_pq_test_vectors.rs"
+
+[features]
+integration = []
+test-utils = []
+
+[dependencies]
+
+# alloy
+alloy-evm.workspace = true
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+arc-execution-config.workspace = true
+
+# local crates
+reth-ethereum = { workspace = true, features = ["evm"] }
+reth-evm.workspace = true
+
+# revm
+revm.workspace = true
+revm-context-interface.workspace = true
+revm-interpreter.workspace = true
+revm-primitives.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, default-features = false, features = ["alloc"] }
+slh-dsa = "0.2.0-rc.4"
+thiserror.workspace = true
+
+[dev-dependencies]
+alloy-consensus.workspace = true
+arc-evm.workspace = true
+arc-execution-config = { workspace = true, features = ["test-utils"] }
+reth-chainspec.workspace = true
+reth-ethereum-forks.workspace = true
+revm-context-interface.workspace = true
+serde_with.workspace = true
+
+[lints]
+workspace = true

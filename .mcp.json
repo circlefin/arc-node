@@ -1,0 +1,9 @@
+{
+    "mcpServers": {
+        "quake": {
+            "command": "cargo",
+            "args": ["run", "--bin", "quake", "--", "mcp"],
+            "cwd": "${workspaceFolder}"
+        }
+    }
+}

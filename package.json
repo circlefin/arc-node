@@ -1,0 +1,30 @@
+{
+  "name": "arc-contracts",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "compile": "make build-contract genesis",
+    "test": "make smoke",
+    "clean": "make clean"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "@eslint/js": "^9.32.0",
+    "@noble/ed25519": "^2.3.0",
+    "@noble/hashes": "^1.8.0",
+    "@nomicfoundation/hardhat-foundry": "^1.2.0",
+    "@nomicfoundation/hardhat-toolbox-viem": "^4.1.0",
+    "@nomicfoundation/hardhat-viem": "^2.1.0",
+    "c-kzg": "^2.1.2",
+    "eslint": "^9.32.0",
+    "eslint-plugin-chai-friendly": "^1.1.0",
+    "hardhat": "^2.26.0",
+    "prettier": "^3.6.2",
+    "typescript-eslint": "^8.39.0",
+    "viem": "^2.33.0",
+    "zod": "^3.25.76"
+  }
+}

@@ -1,0 +1,66 @@
+# Follow Mode + Pruning + Snapshot Recovery Test
+#
+# Test plan:
+#   1. Network starts: 4 validators + full-p2p + snapshot (syncs via libp2p) + arc-node (RPC follow)
+#   2. Wait for ~120 blocks (~60s) so pruning kicks in
+#   3. Stop snapshot, take EL+CL snapshot, restart snapshot
+#   4. Copy snapshot's data to arc-node's data directory
+#   5. Start arc-node (catches up via RPC follow from full-p2p)
+#   6. Query arc-node: eth_getBalance, eth_getTransactionByHash, eth_getLogs
+#
+# Topology:
+#   validators ──── full-p2p ──── snapshot
+#                      │
+#                   arc-node (RPC follow + tx forwarding via full-p2p)
+#
+# Pruning profiles:
+#   - Validators: --minimal preset + bodies.distance=100 for short test runs
+#   - full-p2p:   default (archive) — serves as follow target and tx forwarder
+#   - snapshot:   --full preset + bodies.distance=100 (serves queries + snapshots)
+#   - arc-node:   --full preset + bodies.distance=100 (serves RPC queries after recovery)
+#
+# bodies.distance=100 gives ~50s at 0.5s blocks — enough for snapshot operations.
+# Production would use the preset default (237600 / ~33hr).
+
+# Global defaults: --minimal preset with short bodies retention for testing
+el.config.prune.preset = "minimal"
+el.config.prune.bodies.distance = 100
+el.config.prune.block-interval = 5
+
+cl.config.prune.certificates_distance = 100
+
+# Trusted perimeter: only propagate txs to trusted peers.
+# Validators, full-p2p, and snapshot gossip freely among themselves;
+# arc-node (external) is excluded and receives no transaction gossip.
+el.config.trusted_peers = ["ALL_VALIDATORS", "full-p2p", "snapshot"]
+el.config.tx_propagation_policy = "Trusted"
+
+[nodes.validator1]
+[nodes.validator2]
+[nodes.validator3]
+[nodes.validator4]
+
+# full-p2p is the only externally-exposed node, enable MEV protection
+# and restrict RPC surface. arc-node forwards transactions here via --rpc.forwarder.
+[nodes.full-p2p]
+el.config.tx_propagation_policy = "Trusted"
+el.config.http.api = ["eth", "net", "web3"]
+el.config.ws.api = ["eth", "net", "web3"]
+el.config.arc.hide_pending_txs = true
+
+# libp2p sync-only full node — --full profile (snapshot source + follow target)
+[nodes.snapshot]
+start_at = 10
+cl.config.consensus.enabled = false
+el.config.prune.preset = "full"
+
+# RPC follow node — quake starts it at block 11, script stops it immediately,
+# restores from snapshot, then restarts via docker compose.
+# Transactions submitted to arc-node are forwarded to full-p2p via --rpc.forwarder.
+[nodes.arc-node]
+follow = true
+start_at = 11
+follow_endpoints = ["full-p2p"]
+el.config.trusted_peers = []
+el.config.prune.preset = "full"
+el.config.rpc.forwarder = "http://full-p2p_el:8545"

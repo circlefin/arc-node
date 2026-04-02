@@ -1,0 +1,24 @@
+name = "db-upgrade"
+description = "DB upgrade testing scenario with 3 validators. Tests upgrade of a single validator (call perturb upgrade validator1)."
+
+# Use RPC connection for Engine API
+engine_api_connection = "rpc"
+
+# Starting versions (what the testnet begins with)
+# IMAGE_REGISTRY_URL should be defined as an environment variable or in the .env file.
+image_cl="${IMAGE_REGISTRY_URL}/arc-consensus:0.3.1"
+image_el="${IMAGE_REGISTRY_URL}/arc-execution:0.3.1"
+
+# Upgrade versions (what we upgrade to during the test)
+image_cl_upgrade="arc_consensus:latest"
+image_el_upgrade="arc_execution:latest"
+
+# Global config
+cl.config.logging.log_level = "info"
+
+[nodes.validator1]
+[nodes.validator2]
+[nodes.validator3]
+
+[nodes.full1]
+[nodes.full2]

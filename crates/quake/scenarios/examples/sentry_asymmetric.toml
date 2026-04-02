@@ -1,0 +1,83 @@
+# Explicit Peering Sentry Topology
+#
+# Demonstrates asymmetric explicit peering: validators use explicit peering
+# among themselves for guaranteed eager push, while sentries use mesh
+# prioritization and high gossipsub load to relay messages to/from validators.
+#
+# Explicit peering cannot be asymmetric in GossipSub — if a sentry marks a
+# validator as an explicit peer, the sentry will PRUNE any GRAFT from that
+# validator, preventing normal mesh formation. Instead, sentries rely on
+# mesh prioritization (persistent peers scored higher) and high load profile
+# (mesh_n=10) to keep validators in their mesh.
+#
+# Network topology:
+#
+#   validator1 ──┐
+#   validator2 ──┤── sentry-1 ◄── full1
+#   validator3 ──┤── sentry-2 ◄── full2
+#   validator4 ──┘
+#
+# (◄── means full nodes connect out to sentries; sentries do not list full nodes as peers)
+#
+# Validators peer only with other validators (explicit peering).
+# Sentries peer with all validators and each other (mesh prioritization + high load).
+
+# Validators only peer with other validators in the same network.
+# Explicit peering ensures all other validators will receive the eager push regardless of the mesh_n factor
+[nodes.validator1]
+subnets = ["trusted"]
+cl_persistent_peers = ["ALL_VALIDATORS"]
+cl_gossipsub.explicit_peering = true
+el.config.trusted_peers = ["ALL_VALIDATORS"]
+
+[nodes.validator2]
+subnets = ["trusted"]
+cl_persistent_peers = ["ALL_VALIDATORS"]
+cl_gossipsub.explicit_peering = true
+el.config.trusted_peers = ["ALL_VALIDATORS"]
+
+[nodes.validator3]
+subnets = ["trusted"]
+cl_persistent_peers = ["ALL_VALIDATORS"]
+cl_gossipsub.explicit_peering = true
+el.config.trusted_peers = ["ALL_VALIDATORS"]
+
+[nodes.validator4]
+subnets = ["trusted"]
+cl_persistent_peers = ["ALL_VALIDATORS"]
+cl_gossipsub.explicit_peering = true
+el.config.trusted_peers = ["ALL_VALIDATORS"]
+
+
+# Sentries connect only to their validators and other sentries (full nodes connect out to sentries, not the reverse).
+# Gossibsub explicit peering cannot be asymmetric (validators don't includes sentries as persistent peers)
+# Instead, enable mesh prioritization to ensure sentries eager push messages to validators and other sentries
+# Increase the mesh size on validators to accomodate all other nodes.
+# Note: explicit peers do not count against the mesh size. With "high" this means at most 15 other (full) nodes can directly mesh with this sentry
+
+[nodes.sentry-1]
+subnets = ["trusted", "untrusted"]
+cl_persistent_peers = ["sentry-2", "ALL_VALIDATORS"]
+cl_gossipsub.mesh_prioritization = true
+cl_gossipsub.load = "high"
+el.config.trusted_peers = ["sentry-2", "ALL_VALIDATORS"]
+
+[nodes.sentry-2]
+subnets = ["trusted", "untrusted"]
+cl_persistent_peers = ["sentry-1", "ALL_VALIDATORS"]
+cl_gossipsub.mesh_prioritization = true
+cl_gossipsub.load = "high"
+el.config.trusted_peers = ["sentry-1", "ALL_VALIDATORS"]
+
+# Full nodes only peer with their sentry.
+[nodes.full1]
+subnets = ["untrusted"]
+cl_persistent_peers = ["sentry-1"]
+el.config.trusted_peers = ["sentry-1"]
+el.config.tx_propagation_policy = "Trusted"
+
+[nodes.full2]
+subnets = ["untrusted"]
+cl_persistent_peers = ["sentry-2"]
+el.config.trusted_peers = ["sentry-2"]
+el.config.tx_propagation_policy = "Trusted"

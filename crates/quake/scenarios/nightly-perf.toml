@@ -1,0 +1,12 @@
+# Deterministic 5-validator scenario for reproducible performance benchmarking.
+# No latency emulation, no chaos, no staggered starts.
+latency_emulation = false
+
+# This scenario requires metrics to be collected, action runner cannot connect to 127.0.0.1
+monitoring_bind_host = "0.0.0.0"
+
+[nodes.validator1]
+[nodes.validator2]
+[nodes.validator3]
+[nodes.validator4]
+[nodes.validator5]

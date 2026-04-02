@@ -1,0 +1,123 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+datadir/
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+
+# Dependency directories
+node_modules/
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Microbundle cache
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# dotenv environment variables file
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.contract-ops
+
+# Rust-specific
+**/*.rs.bk
+*.pdb
+
+# Test artifacts
+/test-results/
+/coverage/
+/volumes
+
+# Backup files
+*.orig
+*.rej
+
+# Temporary files
+*.tmp
+*.temp
+.tmp_ai_logs/
+
+# Build output
+/dist/
+/build/
+logs/
+typechain-types/
+nodes/
+
+# old cache path
+/cache/
+/cache_forge/
+
+# Foundry
+broadcast/
+
+# Quake
+.quake/
+/quake
+.terraform/
+.terraform.*
+terraform.tfstate*
+terraform.tfvars*
+
+# Spammer
+/spammer
+
+# Claude — ignore local/personal files, track shared config
+.claude/settings.local.json
+.claude/CLAUDE.md
+.claude/memory/
+.claude/worktrees/
+.claude/todo.md
+.claude/skills/**
+!.claude/skills/
+!.claude/skills/*/
+!.claude/skills/*/**
+.planning
+
+deployments/certs/*
+!deployments/certs/.gitkeep

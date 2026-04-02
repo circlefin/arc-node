@@ -1,0 +1,49 @@
+#cloud-config
+# For Amazon Linux 2023 (AL2023) - does NOT support apt/packages sections
+hostname: ${id}
+manage_etc_hosts: false
+groups:
+  - docker
+users:
+  - name: ${username}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: sudo,docker
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+runcmd:
+# Set up 4 GiB swap to prevent hard OOM kills (dd instead of fallocate for XFS compatibility)
+  - dd if=/dev/zero of=/swapfile bs=1M count=4096
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' >> /etc/fstab
+# Prefer killing containers (which hit their Docker memory limits) over heavy swapping
+  - echo 'vm.swappiness=10' > /etc/sysctl.d/99-swap.conf
+  - sysctl -p /etc/sysctl.d/99-swap.conf
+# Install packages via dnf (Amazon Linux 2023)
+# Note: curl-minimal, jq, nfs-utils are pre-installed
+  - dnf install -y docker tmux iproute-tc
+# Install Docker Compose v2 plugin (not available in AL2023 repos)
+  - mkdir -p /usr/local/lib/docker/cli-plugins
+  - curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" -o /usr/local/lib/docker/cli-plugins/docker-compose
+  - chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+# Start docker
+  - systemctl start docker
+  - systemctl enable docker
+# Pull Docker images from GHCR
+# TODO: instead of docker login, use the EC2_Pull_Access instance profile, which has permission to pull images from GHCR 
+#   https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/roles/details/EC2_Pull_Access?section=permissions
+  - echo ${github_token} | docker login ghcr.io -u ${github_user} --password-stdin
+  - docker pull ${consensus_image}
+  - docker pull ${execution_image}
+  - docker images
+# Create directories for Arc files (config will be symlinked to NFS after mount)
+  - mkdir -p /home/${username}/data/malachite
+  - mkdir -p /home/${username}/data/reth
+  - chown -R ${username}:${username} /home/${username}/data
+# Create NFS mount point
+  - mkdir -p /shared
+  - chown ${username}:${username} /shared
+# Indicate ready for post-installation tasks
+  - date > /etc/done

@@ -1,0 +1,47 @@
+[package]
+name = "arc-node-consensus-cli"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+arc-consensus-types.workspace = true
+
+# arc
+arc-snapshots.workspace = true
+arc-version.workspace = true
+
+axum = { workspace = true }
+bip32 = { workspace = true }
+bip39 = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+color-eyre = { workspace = true }
+directories = { workspace = true }
+eyre = { workspace = true }
+hex = { workspace = true }
+itertools = { workspace = true }
+
+# malachite
+malachitebft-app.workspace = true
+malachitebft-config.workspace = true
+rand = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }
+url = { workspace = true }
+
+[dev-dependencies]
+lz4.workspace = true
+tar.workspace = true
+tempfile = { workspace = true }
+wiremock.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+# 5 nodes across multiple isolated sub-networks (default, trusted, and untrusted)
+# with validator3 bridging trusted/untrusted and validator4 bridging untrusted/default
+
+[nodes.validator1]
+subnets = ["trusted"]
+
+[nodes.validator2]
+subnets = ["trusted"]
+
+[nodes.validator3]
+subnets = ["trusted", "untrusted"]
+
+[nodes.validator4]
+subnets = ["untrusted", "default"]
+
+[nodes.full1]

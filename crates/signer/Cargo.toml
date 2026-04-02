@@ -1,0 +1,37 @@
+[package]
+name = "arc-signer"
+version.workspace = true
+edition.workspace = true
+readme.workspace = true
+license.workspace = true
+exclude.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+default = ["local", "remote"]
+local = ["dep:malachitebft-signing-ed25519"]
+remote = ["dep:arc-remote-signer"]
+integration = ["local", "remote"]
+# Run integration tests that require a live remote signer (e.g. make up / remote-signer.yaml).
+# CI uses --workspace --features integration,integration-remote-signer. Propagate so
+# "cargo test -p arc-signer --features integration-remote-signer" also runs arc-remote-signer's tests.
+integration-remote-signer = ["integration", "arc-remote-signer/integration-remote-signer"]
+
+[dependencies]
+arc-consensus-types = { workspace = true }
+arc-remote-signer = { workspace = true, optional = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+hex = { workspace = true }
+malachitebft-signing-ed25519 = { workspace = true, optional = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+malachitebft-signing-ed25519 = { workspace = true, features = ["rand"] }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+
+[lints]
+workspace = true

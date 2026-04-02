@@ -1,0 +1,13 @@
+engine_api_connection = "rpc"
+
+# IMAGE_REGISTRY_URL should be defined as an environment variable or in the .env file.
+image_cl="${IMAGE_REGISTRY_URL}/arc-consensus:0.5.0-rc1"
+image_el="${IMAGE_REGISTRY_URL}/arc-execution:0.5.0-rc1"
+image_cl_upgrade="arc_consensus:latest"
+image_el_upgrade="arc_execution:latest"
+
+[nodes.validator1]
+[nodes.validator2]
+[nodes.validator3]
+[nodes.validator4]
+[nodes.validator5]

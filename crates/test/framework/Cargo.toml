@@ -1,0 +1,24 @@
+[package]
+name = "arc-test-framework"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+arc-consensus-types.workspace = true
+async-trait.workspace = true
+eyre.workspace = true
+malachitebft-core-types.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+rstest.workspace = true
+
+[lints]
+workspace = true

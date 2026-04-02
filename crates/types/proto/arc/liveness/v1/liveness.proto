@@ -1,0 +1,62 @@
+// Copyright 2026 Circle Internet Group, Inc. All rights reserved.
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package arc.liveness.v1;
+
+import "arc/consensus/v1/consensus.proto";
+
+message PolkaSignature {
+  // TODO: Add flag (no vote, nil, value?)
+  arc.consensus.v1.Address validator_address = 1;
+  arc.consensus.v1.Signature signature = 2;
+}
+
+message PolkaCertificate {
+  uint64 height = 1;
+  uint32 round = 2;
+  arc.consensus.v1.ValueId value_id = 3;
+  repeated PolkaSignature signatures = 4;
+}
+
+message RoundSignature {
+  arc.consensus.v1.VoteType vote_type = 1;
+  arc.consensus.v1.Address validator_address = 2;
+  arc.consensus.v1.Signature signature = 3;
+  // This is optional since a vote can be NIL.
+  optional arc.consensus.v1.ValueId value_id = 4;
+}
+
+enum RoundCertificateType {
+  ROUND_CERTIFICATE_TYPE_PRECOMMIT = 0;
+  ROUND_CERTIFICATE_TYPE_SKIP = 1;
+}
+
+message RoundCertificate {
+  uint64 height = 1;
+  uint32 round = 2;
+  RoundCertificateType cert_type = 3;
+  repeated RoundSignature signatures = 4;
+}
+
+message LivenessMessage {
+  oneof message {
+    arc.consensus.v1.SignedMessage vote = 1;
+    PolkaCertificate polka_certificate = 2;
+    RoundCertificate round_certificate = 3;
+  }
+}

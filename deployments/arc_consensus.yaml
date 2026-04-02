@@ -1,0 +1,28 @@
+name: arc_network-consensus
+
+services:
+  arc_consensus:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.consensus
+      target: dev-runtime
+      additional_contexts:
+        certs: ./certs
+      args:
+        BUILD_PROFILE: ${BUILD_PROFILE:-release}
+        FEATURES: ${CL_FEATURES:-}
+        ARC_IDEMPOTENT_BUILD: ${ARC_IDEMPOTENT_BUILD:-false}
+    environment:
+      ARC_HALT_AT_BLOCK_HEIGHT: 0 # Set it to a non-zero value to plan a coordinated update
+      # ARC_CONSENSUS_DB_CACHE_SIZE_BYTES: 1073741824 # 1 GiB (default)
+    volumes:
+      - ../assets/localdev:/root/assets
+      - ./entrypoint_arc_consensus.sh:/usr/local/bin/entrypoint.sh
+    image: arc_consensus:latest
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - arc_network
+
+networks:
+  arc_network:

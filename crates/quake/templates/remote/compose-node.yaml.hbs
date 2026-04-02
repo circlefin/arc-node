@@ -1,0 +1,121 @@
+name: {{compose_project_name}}
+
+services:
+  {{el_container_name}}:
+    image: {{images.el}}
+    container_name: {{el_container_name}}
+    entrypoint: ["/assets/entrypoint_el.sh"]
+    restart: unless-stopped
+    mem_limit: 2560M
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/8545' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 8545:8545 # HTTP
+      - 8546:8546 # WS
+      - 8551:8551 # AuthRPC
+      - 9001:9001 # Metrics
+      - 6161:6061 # Pprof
+      - 30303:30303 # P2P
+    user: "0:0" # run as root to be able to write to the bind mounts
+    volumes:
+      # Use absolute paths because compose.yaml is a symlink and relative paths
+      # would resolve relative to the symlink target, not the symlink location
+      - {{remote_home_dir}}/assets/:/assets
+      - {{remote_home_dir}}/data/reth:/data/reth
+      - {{remote_home_dir}}/logs:/var/log/arc
+      - /shared:/shared:ro
+      {{#unless rpc}}
+      - shared-socket-volume:/sockets/
+      {{/unless}}
+    environment:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      ARC_LOG_FILE: /var/log/arc/{{el_container_name}}.log
+    command:
+      - "node"
+      - "--datadir=/data/reth"
+      - "--chain=/assets/genesis.json"
+      - "--http.port=8545"
+      - "--http.addr=0.0.0.0"
+      - "--http.corsdomain=*"
+      - "--ws.port=8546"
+      - "--ws.addr=0.0.0.0"
+      - "--ws.origins=*"
+      - "--metrics=0.0.0.0:9001"
+      {{#each el_cli_flags}}
+      - "{{{this}}}"
+      {{/each}}
+      - "--arc-rpc-upstream-url=http://{{cl_container_name}}:31000"
+      {{!-- - "--bootnodes=enode://..." --}}
+      {{#if rpc}}
+      - "--authrpc.addr=0.0.0.0"
+      - "--authrpc.port=8551"
+      - "--authrpc.jwtsecret=/assets/jwtsecret"
+      - "--ipcdisable"
+      {{else}}
+      - "--ipcpath=/sockets/reth.ipc"
+      - "--auth-ipc"
+      - "--auth-ipc.path=/sockets/auth.ipc"
+      {{/if}}
+      - "--p2p-secret-key=/data/reth/execution-data/nodekey"
+      {{#if trusted_peers}}
+      - "--trusted-peers={{trusted_peers}}"
+      {{/if}}
+
+  {{cl_container_name}}:
+    image: {{images.cl}}
+    container_name: {{cl_container_name}}
+    entrypoint: ["/assets/entrypoint_cl.sh"]
+    depends_on:
+      {{el_container_name}}:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 1024M
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 27000:27000 # Consensus
+      - 29000:29000 # Metrics
+      - 6060:6060 # Pprof
+      - 31000:31000 # RPC
+    user: "0:0" # run as root to be able to write to the bind mounts
+    volumes:
+      # Use absolute paths because compose.yaml is a symlink and relative paths
+      # would resolve relative to the symlink target, not the symlink location
+      - {{remote_home_dir}}/assets/:/assets
+      - {{remote_home_dir}}/data/malachite:/data/malachite
+      - {{remote_home_dir}}/logs:/var/log/arc
+      # Mount /shared so symlinks to NFS can be resolved inside the container
+      - /shared:/shared:ro
+      {{#unless rpc}}
+      - shared-socket-volume:/sockets/
+      {{/unless}}
+    environment:
+      ARC_LOG_FILE: /var/log/arc/{{cl_container_name}}.log
+      ARC_GENESIS_FILE_PATH: /assets/genesis.json
+    command:
+      # - "--log-format=json"
+      - "--log-level=debug"
+      - "start"
+      - "--home=/data/malachite"
+      {{#each cl_cli_flags}}
+      - "{{{this}}}"
+      {{/each}}
+      {{#if rpc}}
+      - "--eth-rpc-endpoint=http://{{el_container_name}}:8545"
+      - "--execution-endpoint=http://{{el_container_name}}:8551"
+      - "--execution-jwt=/assets/jwtsecret"
+      {{else}}
+      - "--eth-socket=/sockets/reth.ipc"
+      - "--execution-socket=/sockets/auth.ipc"
+      {{/if}}
+
+{{#unless rpc}}
+volumes:
+  shared-socket-volume:
+{{/unless}}

@@ -1,0 +1,22 @@
+[package]
+name = "arc-shared"
+version.workspace = true
+edition.workspace = true
+readme.workspace = true
+license.workspace = true
+exclude.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+# No features
+
+[dependencies]
+metrics.workspace = true
+
+[dev-dependencies]
+# No dev-dependencies
+
+[lints]
+workspace = true

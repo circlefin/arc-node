@@ -1,0 +1,70 @@
+[package]
+name = "arc-evm-node"
+version.workspace = true
+edition.workspace = true
+readme.workspace = true
+license.workspace = true
+exclude.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+arbitrary = ["alloy-rpc-types-engine/arbitrary"]
+integration = ["arc-evm/integration"]
+
+[dependencies]
+alloy-consensus = { workspace = true, features = ["serde"] }
+alloy-network.workspace = true
+alloy-primitives.workspace = true
+alloy-rpc-types-engine.workspace = true
+alloy-rpc-types-eth.workspace = true
+arc-consensus-types.workspace = true
+arc-evm.workspace = true
+arc-execution-config.workspace = true
+arc-execution-payload.workspace = true
+arc-execution-txpool.workspace = true
+arc-execution-validation.workspace = true
+arc-version.workspace = true
+async-trait.workspace = true
+backon.workspace = true
+eyre.workspace = true
+jsonrpsee.workspace = true
+reqwest.workspace = true
+reth-chainspec.workspace = true
+reth-engine-local.workspace = true
+reth-engine-primitives.workspace = true
+reth-ethereum = { workspace = true, features = ["node-api", "node", "provider", "network", "evm", "pool", "cli", "js-tracer"] }
+reth-ethereum-engine-primitives.workspace = true
+reth-ethereum-payload-builder.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm.workspace = true
+reth-network.workspace = true
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+reth-payload-primitives.workspace = true
+reth-primitives-traits.workspace = true
+reth-provider.workspace = true
+reth-rpc.workspace = true
+reth-rpc-api.workspace = true
+reth-rpc-builder.workspace = true
+reth-rpc-eth-api.workspace = true
+reth-rpc-eth-types.workspace = true
+reth-rpc-server-types.workspace = true
+reth-tracing.workspace = true
+reth-transaction-pool.workspace = true
+revm.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_with.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+arc-execution-config = { path = "../execution-config", features = ["test-utils"] }
+revm-primitives.workspace = true
+
+[lints]
+workspace = true

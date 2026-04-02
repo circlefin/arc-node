@@ -1,0 +1,26 @@
+name: rpc-proxy
+
+services:
+  # Routes RPC requests to nodes by name
+  # Example: POST http://localhost:8080/rpc/node0 -> http://<node0-private-ip>:8545
+  rpc-proxy:
+    image: nginx
+    container_name: rpc-proxy
+    volumes:
+      - ./rpc-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+networks:
+  arc_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16

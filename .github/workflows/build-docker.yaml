@@ -1,0 +1,210 @@
+name: Build Docker
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+    branches:
+      - master
+      - release/*
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: docker.cloudsmith.io
+  REGISTRY_NAMESPACE: circle/arc
+
+jobs:
+  build:
+    if: >-
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.labels.*.name, 'build-docker')
+    name: Build ${{ matrix.image }} (${{ matrix.platform }})
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - arc-execution
+          - arc-consensus
+        platform:
+          - linux/amd64
+          - linux/arm64
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - name: Compute short hash
+        id: vars
+        env:
+          SHA: ${{ github.sha }}
+        run: echo "short_hash=${SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build image
+        id: build
+        uses: docker/bake-action@82490499d2e5613fcead7e128237ef0b0ea210f7 # v7.0.0
+        with:
+          source: .
+          files: docker-bake.hcl
+          targets: ${{ matrix.image }}
+          set: |
+            ${{ matrix.image }}.platform=${{ matrix.platform }}
+            ${{ matrix.image }}.tags=
+            ${{ matrix.image }}.output=type=oci,tar=false,dest=/tmp/image
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GIT_COMMIT_HASH: ${{ github.sha }}
+          GIT_VERSION: ${{ github.ref_name }}
+          GIT_SHORT_HASH: ${{ steps.vars.outputs.short_hash }}
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@97e0b3872f55f89b95b2f65b3dbab56962816478 # v0.34.2
+        with:
+          input: /tmp/image
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL
+          limit-severities-for-sarif: true
+          exit-code: '1'
+
+      - name: Upload Trivy scan results
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: trivy-${{ matrix.image }}-${{ matrix.arch }}
+          path: trivy-results.sarif
+
+      - name: Login to Cloudsmith
+        if: ${{ github.event_name == 'push' }}
+        uses: ./.github/actions/cloudsmith-login
+        with:
+          registry: ${{ env.REGISTRY }}
+
+      - name: Push image by digest
+        if: ${{ github.event_name == 'push' }}
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}
+          BAKE_METADATA: ${{ steps.build.outputs.metadata }}
+        run: |
+          DIGEST=$(echo "${BAKE_METADATA}" | jq -r '."${{ matrix.image }}"."containerimage.digest"')
+          if [ -z "${DIGEST}" ] || [ "${DIGEST}" = "null" ]; then
+            echo "::error::Failed to extract digest from build metadata"
+            exit 1
+          fi
+          skopeo copy "oci:/tmp/image" "docker://${IMAGE}@${DIGEST}"
+          rm -rf /tmp/image
+          PLATFORM_SLUG=$(echo "${{ matrix.platform }}" | tr '/' '-')
+          mkdir -p "/tmp/digests/${{ matrix.image }}"
+          echo "${DIGEST}" > "/tmp/digests/${{ matrix.image }}/${PLATFORM_SLUG}"
+
+      - name: Upload digest
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.image }}/*
+          if-no-files-found: error
+
+  manifest:
+    if: ${{ github.event_name == 'push' }}
+    name: Manifest ${{ matrix.image }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    needs: [build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - arc-execution
+          - arc-consensus
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Login to Cloudsmith
+        uses: ./.github/actions/cloudsmith-login
+        with:
+          registry: ${{ env.REGISTRY }}
+
+      - name: Download digests
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          pattern: digest-${{ matrix.image }}-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - name: Create and inspect multi-arch manifest
+        id: manifest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          TAG="${IMAGE}:${VERSION}"
+
+          # Build digest args from all platform artifacts
+          DIGEST_ARGS=()
+          for f in /tmp/digests/*; do
+            DIGEST_ARGS+=("${IMAGE}@$(cat "$f")")
+          done
+
+          if [ ${#DIGEST_ARGS[@]} -eq 0 ]; then
+            echo "::error::No digest files found"
+            exit 1
+          fi
+
+          # Create and push the manifest list
+          docker buildx imagetools create -t "${TAG}" "${DIGEST_ARGS[@]}"
+
+          MANIFEST_DIGEST=$(docker buildx imagetools inspect "${TAG}" --raw | sha256sum | awk '{print "sha256:"$1}')
+          echo "digest=${MANIFEST_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image-with-digest=${IMAGE}@${MANIFEST_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@17ae1740179002c89186b61233e0f892c3118b11 # v0.23.0
+        with:
+          image: ${{ steps.manifest.outputs.image-with-digest }}
+          artifact-name: sbom-${{ matrix.image }}.spdx.json
+          output-file: sbom-${{ matrix.image }}.spdx.json
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@07e74fc4e78d1aad915e867f9a094073a9f71527 # v4.0.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          sbom-path: sbom-${{ matrix.image }}.spdx.json
+          push-to-registry: true

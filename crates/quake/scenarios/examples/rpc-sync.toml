@@ -1,0 +1,42 @@
+# Follow Mode Example
+#
+# This scenario demonstrates follow mode where a full node
+# fetches blocks from validators via RPC instead of P2P consensus.
+#
+# - 4 validators participate in consensus
+# - 1 full node syncs via libp2p, with consensus disabled (sync_only mode)
+# - Multiple full nodes sync via RPC (follow mode)
+
+[nodes.validator1]
+[nodes.validator2]
+[nodes.validator3]
+[nodes.validator4]
+
+# libp2p sync-only full node (no consensus/gossip, only sync protocol)
+[nodes.full_p2p]
+cl.config.consensus.enabled = false
+
+# Follow full nodes
+[nodes.full1]
+follow = true
+follow_endpoints = ["validator1", "validator2", "validator3", "validator4"]
+
+[nodes.full2]
+start_at = 100
+follow = true
+follow_endpoints = ["full1"]
+
+[nodes.full3]
+start_at = 200
+follow = true
+follow_endpoints = ["full2"]
+
+[nodes.full4]
+start_at = 200
+follow = true
+follow_endpoints = ["full3"]
+
+[nodes.full5]
+start_at = 200
+follow = true
+follow_endpoints = ["full4"]
