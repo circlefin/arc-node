@@ -25,7 +25,7 @@ use tracing::{debug, warn};
 
 use crate::generator::TxGenerator;
 use crate::latency::{compute_tx_hash, timestamp_now, TxSubmitted};
-use crate::spammer::RateLimiter;
+use crate::rate_limiter::RateLimiter;
 use crate::ws::{is_connection_error, WsClient, WsClientBuilder};
 
 /// Configuration for `TxSender` behavior.
@@ -161,25 +161,17 @@ impl TxSender {
         };
         let start_time = Instant::now();
         loop {
-            match self.rate_limiter.inc() {
-                Some(true) => {
-                    let tx = match &mut self.tx_source {
-                        TxSource::Channel { rx, .. } => rx.recv().await,
-                        _ => unreachable!(),
-                    };
-                    if let Some(tx) = tx {
-                        self.send(tx, wait_response).await?;
-                    } else {
-                        break;
-                    }
-                }
-                Some(false) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
-                }
-                None => {
-                    break;
-                }
+            if !self.rate_limiter.wait().await {
+                break;
+            }
+            let tx = match &mut self.tx_source {
+                TxSource::Channel { rx, .. } => rx.recv().await,
+                _ => unreachable!(),
+            };
+            if let Some(tx) = tx {
+                self.send(tx, wait_response).await?;
+            } else {
+                break;
             }
 
             if self.max_time > 0 && start_time.elapsed().as_secs() >= self.max_time {
@@ -207,63 +199,53 @@ impl TxSender {
         let start_time = Instant::now();
         let mut consecutive_failures: HashMap<usize, u32> = HashMap::new();
         loop {
-            match self.rate_limiter.inc() {
-                Some(true) => {
-                    let TxSource::Backpressure(generator) = &mut self.tx_source else {
-                        unreachable!("run_backpressure called in channel mode");
-                    };
-                    let Some((signed_tx, account_index)) = generator.next_tx().await? else {
-                        // All accounts exhausted
-                        break;
-                    };
-                    let result = self.send_and_wait(signed_tx).await?;
-                    // Re-borrow generator — the previous borrow was released for send_and_wait(&mut self).
-                    let TxSource::Backpressure(generator) = &mut self.tx_source else {
-                        unreachable!();
-                    };
-                    match result {
-                        SendOutcome::Accepted => {
-                            consecutive_failures.remove(&account_index);
-                            generator.ack_nonce(account_index);
-                        }
-                        SendOutcome::Transient(reason) => {
+            if !self.rate_limiter.wait().await {
+                break;
+            }
+            let TxSource::Backpressure(generator) = &mut self.tx_source else {
+                unreachable!("run_backpressure called in channel mode");
+            };
+            let Some((signed_tx, account_index)) = generator.next_tx().await? else {
+                break;
+            };
+            let result = self.send_and_wait(signed_tx).await?;
+            let TxSource::Backpressure(generator) = &mut self.tx_source else {
+                unreachable!();
+            };
+            match result {
+                SendOutcome::Accepted => {
+                    consecutive_failures.remove(&account_index);
+                    generator.ack_nonce(account_index);
+                }
+                SendOutcome::Transient(reason) => {
+                    debug!(
+                        "TxSender {}: transient error for account {}, backing off: {}",
+                        self.id, account_index, reason
+                    );
+                    tokio::time::sleep(TRANSIENT_BACKOFF).await;
+                }
+                SendOutcome::Rejected(reason) => {
+                    let count = consecutive_failures.entry(account_index).or_default();
+                    *count += 1;
+                    if *count >= MAX_CONSECUTIVE_FAILURES {
+                        warn!(
+                            "TxSender {}: account {} failed {} times consecutively, skipping (last error: {})",
+                            self.id, account_index, count, reason
+                        );
+                        consecutive_failures.remove(&account_index);
+                        generator.skip_account(account_index);
+                    } else {
+                        debug!(
+                            "TxSender {}: tx rejected for account {} ({}/{}): {}",
+                            self.id, account_index, count, MAX_CONSECUTIVE_FAILURES, reason
+                        );
+                        if let Err(e) = generator.refresh_nonce(account_index).await {
                             debug!(
-                                "TxSender {}: transient error for account {}, backing off: {}",
-                                self.id, account_index, reason
+                                "TxSender {}: failed to refresh nonce for account {}: {}",
+                                self.id, account_index, e
                             );
-                            tokio::time::sleep(TRANSIENT_BACKOFF).await;
-                        }
-                        SendOutcome::Rejected(reason) => {
-                            let count = consecutive_failures.entry(account_index).or_default();
-                            *count += 1;
-                            if *count >= MAX_CONSECUTIVE_FAILURES {
-                                warn!(
-                                    "TxSender {}: account {} failed {} times consecutively, skipping (last error: {})",
-                                    self.id, account_index, count, reason
-                                );
-                                consecutive_failures.remove(&account_index);
-                                generator.skip_account(account_index);
-                            } else {
-                                debug!(
-                                    "TxSender {}: tx rejected for account {} ({}/{}): {}",
-                                    self.id, account_index, count, MAX_CONSECUTIVE_FAILURES, reason
-                                );
-                                if let Err(e) = generator.refresh_nonce(account_index).await {
-                                    debug!(
-                                        "TxSender {}: failed to refresh nonce for account {}: {}",
-                                        self.id, account_index, e
-                                    );
-                                }
-                            }
                         }
                     }
-                }
-                Some(false) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
-                }
-                None => {
-                    break;
                 }
             }
 

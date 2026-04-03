@@ -129,9 +129,7 @@ describe('Memo', () => {
     const balances = await balancesSnapshot(client, { sender, receiver })
 
     const callData = encodeMemo(USDC.address, transferData, memoId, memo)
-    const receipt = await sender
-      .sendTransaction({ to: memoAddress, data: callData })
-      .then(ReceiptVerifier.waitSuccess)
+    const receipt = await sender.sendTransaction({ to: memoAddress, data: callData }).then(ReceiptVerifier.waitSuccess)
 
     receipt.verifyEvents((ev) => {
       ev.expectBeforeMemo({ memoIndex })
@@ -232,9 +230,7 @@ describe('Memo', () => {
 
     // outer: memo(Memo, middleData, memoId1, "outer")
     const outerData = encodeMemo(memoAddress, middleData, memoIdR1, toHex('outer'))
-    const receipt = await sender
-      .sendTransaction({ to: memoAddress, data: outerData })
-      .then(ReceiptVerifier.waitSuccess)
+    const receipt = await sender.sendTransaction({ to: memoAddress, data: outerData }).then(ReceiptVerifier.waitSuccess)
 
     receipt.verifyEvents((ev) => {
       ev.expectBeforeMemo({ memoIndex: startMemoIndex })
@@ -290,9 +286,7 @@ describe('Memo', () => {
     const balances = await balancesSnapshot(client, { sender, receiver })
 
     const callData = encodeMemo(receiver.account.address, '0x', memoId, memo)
-    const receipt = await sender
-      .sendTransaction({ to: memoAddress, data: callData })
-      .then(ReceiptVerifier.waitSuccess)
+    const receipt = await sender.sendTransaction({ to: memoAddress, data: callData }).then(ReceiptVerifier.waitSuccess)
 
     receipt.verifyEvents((ev) => {
       ev.expectBeforeMemo({ memoIndex })
@@ -322,12 +316,7 @@ describe('Memo', () => {
       functionName: 'revertWithString',
       args: ['intentional revert'],
     })
-    const memoData = encodeMemo(
-      callHelper.address,
-      revertData,
-      keccak256(toHex('revert-test')),
-      toHex('will revert'),
-    )
+    const memoData = encodeMemo(callHelper.address, revertData, keccak256(toHex('revert-test')), toHex('will revert'))
 
     const balances = await balancesSnapshot(client, { sender, receiver })
 
@@ -361,12 +350,7 @@ describe('Memo', () => {
       functionName: 'revertWithError',
       args: ['custom error message'],
     })
-    const memoData = encodeMemo(
-      callHelper.address,
-      revertData,
-      keccak256(toHex('error-prop')),
-      toHex('error test'),
-    )
+    const memoData = encodeMemo(callHelper.address, revertData, keccak256(toHex('error-prop')), toHex('error test'))
 
     const receipt = await CallHelper.attach({ wallet: sender, public: client }, callHelper.address)
       .write.execute([memoAddress, memoData, 0n])
@@ -451,12 +435,7 @@ describe('Memo', () => {
     const { client, sender, receiver } = await clients()
     const amount = USDC.parseUnits('0.001')
     const transferData = encodeUSDCTransfer(receiver.account.address, amount)
-    const memoData = encodeMemo(
-      USDC.address,
-      transferData,
-      keccak256(toHex('delegate-memo')),
-      toHex('delegate'),
-    )
+    const memoData = encodeMemo(USDC.address, transferData, keccak256(toHex('delegate-memo')), toHex('delegate'))
 
     const receipt = await CallHelper.attach({ wallet: sender, public: client }, callHelper.address)
       .write.delegateCall([memoAddress, memoData])
@@ -606,9 +585,7 @@ describe('Memo + Multicall3From', () => {
 
     const callData = encodeMemo(multicall3FromAddress, batchCallData, memoId1, memo1)
 
-    const receipt = await sender
-      .sendTransaction({ to: memoAddress, data: callData })
-      .then(ReceiptVerifier.waitSuccess)
+    const receipt = await sender.sendTransaction({ to: memoAddress, data: callData }).then(ReceiptVerifier.waitSuccess)
 
     receipt.verifyEvents((ev) => {
       ev.expectBeforeMemo({ memoIndex: startIdx })

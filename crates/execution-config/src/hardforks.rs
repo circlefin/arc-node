@@ -245,8 +245,14 @@ pub static ARC_DEVNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
         ArcHardfork::Zero4.boxed(),
         ForkCondition::Block(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET),
     );
-    // TODO: When Zero5 is activated on devnet, add Osaka at the same activation point:
-    // forks.insert(EthereumHardfork::Osaka.boxed(), ForkCondition::Timestamp(<zero5_timestamp>));
+    forks.insert(
+        EthereumHardfork::Osaka.boxed(),
+        ForkCondition::Timestamp(ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET),
+    );
+    forks.insert(
+        ArcHardfork::Zero5.boxed(),
+        ForkCondition::Block(ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET),
+    );
     forks
 });
 
@@ -273,6 +279,10 @@ pub const ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_TESTNET: u64 = 11172019;
 /// Zero4
 pub const ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET: u64 = 19491165;
 pub const ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET: u64 = 26148086;
+/// Zero5
+pub const ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET: u64 = 32371192;
+/// Osaka (paired with Zero5)
+pub const ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET: u64 = 1775483400;
 
 #[cfg(test)]
 mod tests {
@@ -442,7 +452,7 @@ mod tests {
     fn test_arc_devnet_forks() {
         let forks = ARC_DEVNET_HARDFORKS.clone();
         assert_base_hardforks(&forks);
-        assert_eq!(forks.len(), 19);
+        assert_eq!(forks.len(), 21);
 
         // verify hardfork zero3 block
         assert_eq!(
@@ -474,6 +484,38 @@ mod tests {
         assert!(forks.is_fork_active_at_block(
             ArcHardfork::Zero4,
             ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET
+        ));
+
+        // verify hardfork zero5 block
+        assert_eq!(
+            forks.get(ArcHardfork::Zero5),
+            Some(ForkCondition::Block(
+                ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET
+            ))
+        );
+        assert!(!forks.is_fork_active_at_block(
+            ArcHardfork::Zero5,
+            ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1
+        ));
+        assert!(forks.is_fork_active_at_block(
+            ArcHardfork::Zero5,
+            ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET
+        ));
+
+        // verify osaka timestamp
+        assert_eq!(
+            forks.get(EthereumHardfork::Osaka),
+            Some(ForkCondition::Timestamp(
+                ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET
+            ))
+        );
+        assert!(!forks.is_fork_active_at_timestamp(
+            EthereumHardfork::Osaka,
+            ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET - 1
+        ));
+        assert!(forks.is_fork_active_at_timestamp(
+            EthereumHardfork::Osaka,
+            ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET
         ));
     }
 

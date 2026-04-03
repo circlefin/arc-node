@@ -60,6 +60,7 @@ ractor.workspace = true
 rand.workspace = true
 redb.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+schnellru.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_with = { workspace = true, features = ["macros", "base64"] }

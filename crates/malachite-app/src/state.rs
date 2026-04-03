@@ -25,6 +25,8 @@ use eyre::Context as _;
 use malachitebft_app_channel::app::streaming::StreamId;
 use malachitebft_app_channel::app::types::core::Round;
 
+use crate::streaming;
+
 use arc_consensus_types::{
     Address, AlloyAddress, ArcContext, BlockHash, Config, ConsensusParams, Height, ValidatorSet,
 };
@@ -451,18 +453,9 @@ impl State {
     }
 
     pub fn next_stream_id(&mut self) -> StreamId {
-        let mut bytes = Vec::with_capacity(size_of::<u64>() + size_of::<u32>());
-        bytes.extend_from_slice(&self.current_height.as_u64().to_be_bytes());
-        bytes.extend_from_slice(
-            &self
-                .current_round
-                .as_u32()
-                .expect("round is always Some in active consensus")
-                .to_be_bytes(),
-        );
-        bytes.extend_from_slice(&self.stream_nonce.to_be_bytes());
+        let nonce = self.stream_nonce;
         self.stream_nonce += 1;
-        StreamId::new(bytes.into())
+        streaming::new_stream_id(self.current_height, self.current_round, nonce)
     }
 
     pub async fn restart_height(
