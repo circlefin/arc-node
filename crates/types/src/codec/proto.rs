@@ -271,6 +271,9 @@ impl Codec<StreamMessage<ProposalPart>> for ProtobufCodec {
     type Error = ProtoError;
 
     fn decode(&self, bytes: Bytes) -> Result<StreamMessage<ProposalPart>, Self::Error> {
+        // NOTE: stream_id length is not validated here — overall message size is already
+        // bounded by libp2p gossipsub's max_transmit_size, and the exact stream_id format
+        // (== 16 bytes) is enforced in PartStreamsMap::insert.
         let proto = proto::StreamMessage::decode(bytes.as_ref())?;
 
         let proto_content = proto

@@ -179,7 +179,7 @@ fn validate_beneficiary_not_blocklisted<DB: Database>(
                 error = %reason,
                 header_beneficiary = %header_beneficiary,
                 block_number = block_number,
-                "Failed to read blocklist status for proposer-selected beneficiary"
+                "Blocklist status read failed for block beneficiary"
             );
             BlockValidationError::msg(ERR_BLOCKLIST_READ_FAILED)
         })?;
@@ -188,7 +188,7 @@ fn validate_beneficiary_not_blocklisted<DB: Database>(
         tracing::warn!(
             header_beneficiary = %header_beneficiary,
             block_number = block_number,
-            "Proposer selected a blocklisted beneficiary"
+            "Block beneficiary is blocklisted"
         );
         return Err(BlockValidationError::msg(ERR_BLOCKED_ADDRESS).into());
     }
@@ -372,6 +372,7 @@ where
             self.system_caller
                 .apply_blockhashes_contract_call(self.ctx.parent_hash, &mut self.evm)?;
 
+            let header_beneficiary = self.evm.block().beneficiary();
             if let Ok(expected_beneficiary) = protocol_config::retrieve_reward_beneficiary(&mut self.evm)
                 .inspect_err(|error| {
                     // Log and continue to avoid halting the chain (e.g. if ProtocolConfig is deprecated).
@@ -382,24 +383,18 @@ where
                     );
                 })
             {
-                let header_beneficiary = self.evm.block().beneficiary();
-
                 validate_expected_beneficiary(
                     header_beneficiary,
                     expected_beneficiary,
                     block_number,
                 )?;
-
-                // If expected beneficiary is zero address, proposer is allowed to set the beneficiary,
-                // but the selected address must not be blocklisted.
-                if expected_beneficiary.is_zero() {
-                    validate_beneficiary_not_blocklisted(
-                        self.evm.db_mut(),
-                        header_beneficiary,
-                        block_number,
-                    )?;
-                }
             }
+
+            validate_beneficiary_not_blocklisted(
+                self.evm.db_mut(),
+                header_beneficiary,
+                block_number,
+            )?;
 
             // ADR-0003: Stateful gas limit validation against ProtocolConfig (Zero5+)
             let block_gas_limit = self.evm.block().gas_limit();
@@ -1406,6 +1401,64 @@ mod tests {
         let mut block_env = get_mock_block_env();
         block_env.number = U256::from(10);
         block_env.beneficiary = blocklisted_beneficiary;
+
+        let cfg_env = CfgEnv::new()
+            .with_chain_id(chain_spec.chain_id())
+            .with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
+        let evm_env = EvmEnv { cfg_env, block_env };
+
+        let mut state = State::builder().with_database(db).build();
+        let evm = evm_config.evm_with_env(&mut state, evm_env);
+        let ctx = get_mock_execution_ctx();
+        let mut executor = ArcBlockExecutor::new(
+            evm,
+            ctx,
+            chain_spec.as_ref(),
+            evm_config.inner.executor_factory.receipt_builder(),
+        );
+
+        let result = executor.apply_pre_execution_changes();
+        match result {
+            Err(BlockExecutionError::Validation(err)) => {
+                let err_msg = err.to_string();
+                assert!(
+                    err_msg.contains(ERR_BLOCKED_ADDRESS),
+                    "Expected validation error containing '{}', got: {}",
+                    ERR_BLOCKED_ADDRESS,
+                    err_msg
+                );
+            }
+            other => panic!(
+                "Expected BlockExecutionError::Validation containing '{}', got: {:?}",
+                ERR_BLOCKED_ADDRESS, other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_beneficiary_validation_fails_when_matching_but_blocklisted() {
+        // Beneficiary matches ProtocolConfig.rewardBeneficiary() (non-zero) but is blocklisted.
+        // The blocklist check is unconditional — even a correctly-set beneficiary must not be blocklisted.
+        let chain_spec = LOCAL_DEV.clone();
+
+        let mut db = InMemoryDB::default();
+        insert_alloc_into_db(&mut db, chain_spec.genesis());
+
+        let block_number = 10;
+        let expected_beneficiary =
+            query_expected_beneficiary(chain_spec.clone(), &mut db, block_number);
+        assert!(
+            !expected_beneficiary.is_zero(),
+            "LOCAL_DEV rewardBeneficiary should be non-zero for this test"
+        );
+
+        mark_address_as_blocklisted(&mut db, expected_beneficiary);
+
+        let evm_config = create_evm_config(chain_spec.clone());
+
+        let mut block_env = get_mock_block_env();
+        block_env.number = U256::from(block_number);
+        block_env.beneficiary = expected_beneficiary;
 
         let cfg_env = CfgEnv::new()
             .with_chain_id(chain_spec.chain_id())

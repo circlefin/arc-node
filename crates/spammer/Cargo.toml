@@ -24,6 +24,7 @@ clap = { workspace = true, features = ["derive"] }
 clap-verbosity-flag = { workspace = true, features = ["tracing"] }
 color-eyre = { workspace = true }
 futures-util = { workspace = true }
+governor = "0.8"
 hex = { workspace = true }
 humantime = "2.1"
 k256 = { workspace = true }

@@ -367,11 +367,31 @@ where
     }
 
     // Inject --datadir=~/.arc/execution unless the user already supplied --datadir.
+    // Only inject for subcommands that accept --datadir; skip the ones that don't.
+    const SUBCOMMANDS_WITH_DATADIR: &[&str] = &[
+        // Keep in sync with Reth subcommands that accept --datadir (as of Reth v1.11.3).
+        // When upgrading Reth, check for new subcommands and update this list.
+        "node",
+        "init",
+        "init-state",
+        "import",
+        "import-era",
+        "export-era",
+        "db",
+        "download",
+        "stage",
+        "prune",
+        "re-execute",
+    ];
+    let has_datadir_subcommand = args.iter().any(|a| {
+        a.to_str()
+            .is_some_and(|s| SUBCOMMANDS_WITH_DATADIR.contains(&s))
+    });
     let has_explicit_datadir = args.iter().any(|a| {
         a.to_str()
             .is_some_and(|s| s == FLAG_DATADIR || s.starts_with("--datadir="))
     });
-    if !has_explicit_datadir {
+    if has_datadir_subcommand && !has_explicit_datadir {
         if let Some(home) = BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
             let datadir = home.join(".arc").join("execution");
             args.push(std::ffi::OsString::from(format!(
@@ -1024,6 +1044,46 @@ mod tests {
                 .count(),
             1,
             "must not inject a second --datadir"
+        );
+    }
+
+    /// Subcommands that don't accept --datadir must not receive the injected flag.
+    #[test]
+    fn test_arc_pruning_no_datadir_for_p2p() {
+        let argv = init_arc_pruning(["arc-node", "p2p"]);
+        let translated: Vec<_> = argv
+            .iter()
+            .map(|s| s.to_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            !translated.iter().any(|s| s.starts_with("--datadir")),
+            "p2p must not receive --datadir"
+        );
+    }
+
+    #[test]
+    fn test_arc_pruning_no_datadir_for_config() {
+        let argv = init_arc_pruning(["arc-node", "config"]);
+        let translated: Vec<_> = argv
+            .iter()
+            .map(|s| s.to_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            !translated.iter().any(|s| s.starts_with("--datadir")),
+            "config must not receive --datadir"
+        );
+    }
+
+    #[test]
+    fn test_arc_pruning_no_datadir_for_dump_genesis() {
+        let argv = init_arc_pruning(["arc-node", "dump-genesis"]);
+        let translated: Vec<_> = argv
+            .iter()
+            .map(|s| s.to_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            !translated.iter().any(|s| s.starts_with("--datadir")),
+            "dump-genesis must not receive --datadir"
         );
     }
 }

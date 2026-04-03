@@ -15,13 +15,17 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::mem::size_of;
 use std::time::{Duration, Instant};
 
-use arc_consensus_types::{Height, ProposalPart, ProposalParts};
+use bytes::Bytes;
+
+use arc_consensus_types::{Height, ProposalPart, ProposalParts, Round};
 
 use malachitebft_app_channel::app::streaming::{Sequence, StreamId, StreamMessage};
 use malachitebft_app_channel::app::types::PeerId;
+use schnellru::{ByLength, LruMap};
 use tracing::{error, warn};
 
 /// Maximum number of messages allowed per stream
@@ -50,6 +54,57 @@ pub(crate) const CHUNK_SIZE: usize = 128 * 1024;
 
 /// Maximum age for a stream before it's evicted
 const MAX_STREAM_AGE: Duration = Duration::from_secs(60);
+
+/// Maximum number of evicted streams tracked in the LRU cache.
+const MAX_EVICTED_STREAMS: usize = 10_000;
+
+/// Stream IDs are exactly 16 bytes: u64 height + u32 round + u32 nonce.
+pub(crate) const STREAM_ID_LEN: usize = size_of::<u64>() + size_of::<u32>() + size_of::<u32>();
+
+/// Outcome of [`PartStreamsMap::insert`].
+#[derive(Debug)]
+pub enum InsertResult {
+    /// The stream is complete; contains the assembled proposal parts.
+    Complete(ProposalParts),
+    /// The message was accepted (or silently dropped) but the stream is not yet complete.
+    Pending,
+    /// The message was rejected due to peer misbehaviour.
+    Invalid(InsertError),
+}
+
+/// Reason a stream message was rejected by [`PartStreamsMap::insert`].
+#[derive(Debug)]
+pub enum InsertError {
+    /// The stream_id is not exactly [`STREAM_ID_LEN`] bytes.
+    InvalidStreamIdLength { actual: usize, expected: usize },
+}
+
+impl std::fmt::Display for InsertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InsertError::InvalidStreamIdLength { actual, expected } => {
+                write!(
+                    f,
+                    "invalid stream_id length: {actual} bytes (expected {expected})"
+                )
+            }
+        }
+    }
+}
+
+/// Build a new stream ID for the given height, round, and nonce.
+pub(crate) fn new_stream_id(height: Height, round: Round, nonce: u32) -> StreamId {
+    let mut bytes = [0u8; STREAM_ID_LEN];
+    bytes[..8].copy_from_slice(&height.as_u64().to_be_bytes());
+    bytes[8..12].copy_from_slice(
+        &round
+            .as_u32()
+            .expect("expected non-Nil round")
+            .to_be_bytes(),
+    );
+    bytes[12..16].copy_from_slice(&nonce.to_be_bytes());
+    StreamId::new(Bytes::copy_from_slice(&bytes))
+}
 
 struct MinSeq<T>(StreamMessage<T>);
 
@@ -118,7 +173,7 @@ impl Default for StreamState {
     }
 }
 
-enum InsertResult {
+enum StreamInsertResult {
     Duplicate,
     Incomplete(Option<Height>),
     ExceededMaxMessages,
@@ -140,22 +195,22 @@ impl StreamState {
         }
     }
 
-    fn insert(&mut self, msg: StreamMessage<ProposalPart>) -> InsertResult {
+    fn insert(&mut self, msg: StreamMessage<ProposalPart>) -> StreamInsertResult {
         // Reject oversized Data chunks before recording the sequence as seen
         if let Some(ProposalPart::Data(data)) = msg.content.as_data() {
             if data.bytes.len() > CHUNK_SIZE {
-                return InsertResult::ExceededMaxChunkSize(data.bytes.len());
+                return StreamInsertResult::ExceededMaxChunkSize(data.bytes.len());
             }
         }
 
         if !self.seen_sequences.insert(msg.sequence) {
             // We have already seen a message with this sequence number, ignore it.
-            return InsertResult::Duplicate;
+            return StreamInsertResult::Duplicate;
         }
 
         // Check if we've exceeded the maximum number of messages per stream
         if self.message_count >= MAX_MESSAGES_PER_STREAM {
-            return InsertResult::ExceededMaxMessages;
+            return StreamInsertResult::ExceededMaxMessages;
         }
 
         // Increment message count
@@ -186,14 +241,14 @@ impl StreamState {
 
         // Otherwise, abort early.
         if !self.is_complete {
-            return InsertResult::Incomplete(self.height);
+            return StreamInsertResult::Incomplete(self.height);
         }
 
         // We are complete, drain the buffer and assemble the proposal parts.
         let parts = self.buffer.drain();
 
         // NOTE: The order of the parts is guaranteed by the MinHeap
-        InsertResult::Complete(parts)
+        StreamInsertResult::Complete(parts)
     }
 }
 
@@ -210,7 +265,7 @@ impl StreamState {
 pub struct PartStreamsMap {
     current_height: Height,
     streams: BTreeMap<(PeerId, StreamId), StreamState>,
-    evicted: BTreeSet<(PeerId, StreamId)>, // TODO: Change to HashSet when StreamId is Hashable
+    evicted: LruMap<(PeerId, StreamId), ()>,
     last_eviction: Instant,
 }
 
@@ -220,7 +275,7 @@ impl PartStreamsMap {
         Self {
             streams: BTreeMap::new(),
             last_eviction: Instant::now(),
-            evicted: BTreeSet::new(),
+            evicted: LruMap::new(ByLength::new(MAX_EVICTED_STREAMS as u32)),
             current_height,
         }
     }
@@ -237,22 +292,26 @@ impl PartStreamsMap {
     /// - `msg`: The stream message containing the proposal part
     ///
     /// ## Returns
-    /// Returns `Some(ProposalParts)` if the stream is complete after insertion,
-    /// otherwise returns `None`.
-    pub fn insert(
-        &mut self,
-        peer_id: PeerId,
-        msg: StreamMessage<ProposalPart>,
-    ) -> Option<ProposalParts> {
+    /// - [`InsertResult::Complete`] if the stream is complete after insertion
+    /// - [`InsertResult::Pending`] if the message was accepted but the stream is not
+    ///   yet complete, or was silently rejected (duplicate, evicted, limit exceeded)
+    /// - [`InsertResult::Invalid`] if the message was rejected due to misbehaviour
+    pub fn insert(&mut self, peer_id: PeerId, msg: StreamMessage<ProposalPart>) -> InsertResult {
+        let actual = msg.stream_id.to_bytes().len();
+        if actual != STREAM_ID_LEN {
+            return InsertResult::Invalid(InsertError::InvalidStreamIdLength {
+                actual,
+                expected: STREAM_ID_LEN,
+            });
+        }
+
         // First, evict any streams that have exceeded MAX_STREAM_AGE
         self.evict_old_streams();
 
         let stream_id = msg.stream_id.clone();
         let key = (peer_id, stream_id.clone());
-
-        if self.evicted.contains(&key) {
-            // This stream has been evicted before, ignore further messages.
-            return None;
+        if self.evicted.peek(&(peer_id, stream_id.clone())).is_some() {
+            return InsertResult::Pending;
         }
 
         // Check if this is a new stream
@@ -269,12 +328,11 @@ impl PartStreamsMap {
                     "Peer exceeded maximum number of concurrent streams, rejecting new stream"
                 );
 
-                return None;
+                return InsertResult::Pending;
             }
 
             // Check if we've exceeded the total streams limit
             if self.streams.len() >= MAX_TOTAL_STREAMS {
-                // Evict the oldest stream to make room
                 self.evict_oldest_stream();
             }
         }
@@ -285,27 +343,18 @@ impl PartStreamsMap {
         let result = state.insert(msg);
 
         let parts = match result {
-            InsertResult::Duplicate => {
-                // Duplicate message, ignore
-                None
-            }
+            StreamInsertResult::Duplicate => return InsertResult::Pending,
 
-            InsertResult::Incomplete(None) => {
-                // Stream is not yet complete and height is unknown
-                None
-            }
+            StreamInsertResult::Incomplete(None) => return InsertResult::Pending,
 
-            InsertResult::Incomplete(Some(height)) => {
-                // Stream is not yet complete but the height is known
+            StreamInsertResult::Incomplete(Some(height)) => {
                 if height < self.current_height {
-                    // Stream is stale
                     self.evict(&key);
                 }
-
-                None
+                return InsertResult::Pending;
             }
 
-            InsertResult::ExceededMaxMessages => {
+            StreamInsertResult::ExceededMaxMessages => {
                 warn!(
                     %peer_id,
                     %stream_id,
@@ -314,12 +363,11 @@ impl PartStreamsMap {
                     "Stream exceeded maximum message count, message rejected"
                 );
 
-                // Stream exceeded max messages
                 self.evict(&key);
-                None
+                return InsertResult::Pending;
             }
 
-            InsertResult::ExceededMaxChunkSize(actual) => {
+            StreamInsertResult::ExceededMaxChunkSize(actual) => {
                 warn!(
                     %peer_id,
                     %stream_id,
@@ -329,22 +377,23 @@ impl PartStreamsMap {
                 );
 
                 self.evict(&key);
-                None
+                return InsertResult::Pending;
             }
 
-            InsertResult::Complete(parts) => {
-                // Stream is complete, stop tracking
+            StreamInsertResult::Complete(parts) => {
                 self.streams.remove(&key);
-                Some(parts)
+                parts
             }
-        }?;
+        };
 
-        // Assemble and return the ProposalParts if complete.
+        // StreamState guarantees Init and Fin are present and no duplicates exist,
+        // so ProposalParts::new should never fail on a complete stream.
         match ProposalParts::new(parts) {
-            Ok(proposal_parts) => Some(proposal_parts),
+            Ok(proposal_parts) => InsertResult::Complete(proposal_parts),
             Err(e) => {
-                error!("Failed to assemble proposal parts: {e}");
-                None
+                debug_assert!(false, "unreachable: complete stream failed assembly: {e}");
+                error!(%peer_id, %stream_id, "Failed to assemble proposal parts: {e}");
+                InsertResult::Pending
             }
         }
     }
@@ -357,10 +406,12 @@ impl PartStreamsMap {
             .count()
     }
 
-    /// Evict a stream from the map and mark it as evicted
+    /// Evict a stream from the map and mark it as evicted.
+    /// The evicted LRU map is bounded by [`MAX_EVICTED_STREAMS`]; the oldest
+    /// entry is automatically dropped when capacity is exceeded.
     fn evict(&mut self, key: &(PeerId, StreamId)) {
         self.streams.remove(key);
-        self.evicted.insert(key.clone());
+        self.evicted.insert((key.0, key.1.clone()), ());
     }
 
     /// Evict streams that have exceeded MAX_STREAM_AGE
@@ -375,9 +426,6 @@ impl PartStreamsMap {
 
         // Update last eviction time
         self.last_eviction = now;
-
-        // Clear the evicted set to avoid unbounded growth
-        self.evicted.clear();
 
         // Identify streams to evict, ie. those older than MAX_STREAM_AGE
         let keys_to_remove: Vec<_> = self
@@ -417,6 +465,22 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    impl PartStreamsMap {
+        /// Test-only wrapper that panics on [`InsertResult::Invalid`].
+        /// Returns `Some(parts)` on [`InsertResult::Complete`], `None` on [`InsertResult::Pending`].
+        fn must_insert(
+            &mut self,
+            peer_id: PeerId,
+            msg: StreamMessage<ProposalPart>,
+        ) -> Option<ProposalParts> {
+            match self.insert(peer_id, msg) {
+                InsertResult::Complete(parts) => Some(parts),
+                InsertResult::Pending => None,
+                InsertResult::Invalid(e) => panic!("unexpected InsertError: {e}"),
+            }
+        }
+    }
 
     // Helper functions to easily create test messages
     fn make_message(
@@ -460,6 +524,24 @@ mod tests {
         })
     }
 
+    fn make_stream_id(id: u8) -> StreamId {
+        let mut bytes = vec![0u8; STREAM_ID_LEN];
+        bytes[STREAM_ID_LEN - 1] = id;
+        StreamId::new(bytes.into())
+    }
+
+    fn make_stream_id_u16(id: u16) -> StreamId {
+        let mut bytes = vec![0u8; STREAM_ID_LEN];
+        bytes[STREAM_ID_LEN - 2..].copy_from_slice(&id.to_be_bytes());
+        StreamId::new(bytes.into())
+    }
+
+    fn make_stream_id_u64(id: u64) -> StreamId {
+        let mut bytes = vec![0u8; STREAM_ID_LEN];
+        bytes[8..16].copy_from_slice(&id.to_be_bytes());
+        StreamId::new(bytes.into())
+    }
+
     fn make_fin_part() -> ProposalPart {
         ProposalPart::Fin(ProposalFin {
             signature: Signature::test(),
@@ -471,12 +553,12 @@ mod tests {
     #[test]
     fn test_insert_single_message_stream_not_complete() {
         let peer_1 = PeerId::random();
-        let stream_1 = StreamId::new(vec![101].into());
+        let stream_1 = make_stream_id(101);
 
         let mut map = PartStreamsMap::new(Height::new(1));
         let msg = make_message(&stream_1, 0, make_init_part());
 
-        let result = map.insert(peer_1, msg);
+        let result = map.must_insert(peer_1, msg);
 
         assert!(
             result.is_none(),
@@ -488,7 +570,7 @@ mod tests {
     #[test]
     fn test_insert_in_order_completes_and_removes_stream() {
         let peer_1 = PeerId::random();
-        let stream_1 = StreamId::new(vec![101].into());
+        let stream_1 = make_stream_id(101);
 
         let mut map = PartStreamsMap::new(Height::new(1));
         let init_msg = make_message(&stream_1, 0, make_init_part());
@@ -497,15 +579,15 @@ mod tests {
         let fin_msg = make_fin_message(&stream_1, 3);
 
         // Insert Init and Data parts
-        assert!(map.insert(peer_1, init_msg).is_none());
+        assert!(map.must_insert(peer_1, init_msg).is_none());
         assert_eq!(map.streams.len(), 1);
-        assert!(map.insert(peer_1, data_msg).is_none());
+        assert!(map.must_insert(peer_1, data_msg).is_none());
         assert_eq!(map.streams.len(), 1);
-        assert!(map.insert(peer_1, data_fin_msg).is_none());
+        assert!(map.must_insert(peer_1, data_fin_msg).is_none());
         assert_eq!(map.streams.len(), 1);
 
         // Insert final part
-        let result = map.insert(peer_1, fin_msg);
+        let result = map.must_insert(peer_1, fin_msg);
 
         assert!(
             result.is_some(),
@@ -520,7 +602,7 @@ mod tests {
     #[test]
     fn test_insert_out_of_order_completes_and_removes_stream() {
         let peer_1 = PeerId::random();
-        let stream_1 = StreamId::new(vec![101].into());
+        let stream_1 = make_stream_id(101);
 
         let init_msg = make_message(&stream_1, 0, make_init_part());
         let data_msg = make_message(&stream_1, 1, make_data_part(42));
@@ -542,12 +624,12 @@ mod tests {
 
             // Insert all but the last message
             for msg in &perm[..3] {
-                assert!(map.insert(peer_1, (*msg).clone()).is_none());
+                assert!(map.must_insert(peer_1, (*msg).clone()).is_none());
                 assert_eq!(map.streams.len(), 1);
             }
 
             // Insert the last message, which should complete the stream
-            let result = map.insert(peer_1, perm[3].clone());
+            let result = map.must_insert(peer_1, perm[3].clone());
 
             assert!(
                 result.is_some(),
@@ -563,7 +645,7 @@ mod tests {
     #[test]
     fn test_insert_duplicate_sequence_is_ignored() {
         let peer_1 = PeerId::random();
-        let stream_1 = StreamId::new(vec![101].into());
+        let stream_1 = make_stream_id(101);
 
         let mut map = PartStreamsMap::new(Height::new(1));
         let init_msg = make_message(&stream_1, 0, make_init_part());
@@ -572,19 +654,19 @@ mod tests {
         let data_fin_msg = make_message(&stream_1, 2, make_fin_part());
         let fin_msg = make_fin_message(&stream_1, 3);
 
-        map.insert(peer_1, init_msg);
-        map.insert(peer_1, data_msg);
-        map.insert(peer_1, data_fin_msg);
+        map.must_insert(peer_1, init_msg);
+        map.must_insert(peer_1, data_msg);
+        map.must_insert(peer_1, data_fin_msg);
 
         // Insert duplicate message
-        let result_duplicate = map.insert(peer_1, data_msg_duplicate);
+        let result_duplicate = map.must_insert(peer_1, data_msg_duplicate);
         assert!(
             result_duplicate.is_none(),
             "Duplicate message should be ignored and return None"
         );
 
         // The stream state should not be corrupted and should complete normally
-        let result_final = map.insert(peer_1, fin_msg);
+        let result_final = map.must_insert(peer_1, fin_msg);
         assert!(
             result_final.is_some(),
             "Stream should complete successfully after ignoring a duplicate"
@@ -595,15 +677,15 @@ mod tests {
     #[test]
     fn test_stream_with_missing_part_is_not_completed() {
         let peer_1 = PeerId::random();
-        let stream_1 = StreamId::new(vec![101].into());
+        let stream_1 = make_stream_id(101);
 
         let mut map = PartStreamsMap::new(Height::new(1));
         let init_msg = make_message(&stream_1, 0, make_init_part());
         // Sequence 1 is missing
         let fin_msg = make_message(&stream_1, 2, make_fin_part());
 
-        map.insert(peer_1, init_msg);
-        let result = map.insert(peer_1, fin_msg);
+        map.must_insert(peer_1, init_msg);
+        let result = map.must_insert(peer_1, fin_msg);
 
         assert!(
             result.is_none(),
@@ -619,8 +701,8 @@ mod tests {
     #[test]
     fn test_multiple_interleaved_streams() {
         let peer_1 = PeerId::random();
-        let stream_1 = StreamId::new(vec![101].into());
-        let stream_2 = StreamId::new(vec![202].into());
+        let stream_1 = make_stream_id(101);
+        let stream_2 = make_stream_id(202);
 
         let mut map = PartStreamsMap::new(Height::new(1));
 
@@ -634,22 +716,22 @@ mod tests {
         let s2_fin = make_fin_message(&stream_2, 3);
 
         // Interleave inserts
-        map.insert(peer_1, s1_init);
+        map.must_insert(peer_1, s1_init);
         assert_eq!(map.streams.len(), 1);
-        map.insert(peer_1, s2_init);
+        map.must_insert(peer_1, s2_init);
         assert_eq!(
             map.streams.len(),
             2,
             "Map should track two separate streams"
         );
 
-        map.insert(peer_1, s1_data_fin);
+        map.must_insert(peer_1, s1_data_fin);
         assert_eq!(map.streams.len(), 2);
-        map.insert(peer_1, s2_data_fin);
+        map.must_insert(peer_1, s2_data_fin);
         assert_eq!(map.streams.len(), 2);
 
         // Complete stream 1
-        let s1_result = map.insert(peer_1, s1_fin);
+        let s1_result = map.must_insert(peer_1, s1_fin);
         assert!(s1_result.is_some(), "Stream 1 should complete");
         assert_eq!(
             map.streams.len(),
@@ -658,8 +740,8 @@ mod tests {
         );
 
         // Continue and complete stream 2
-        map.insert(peer_1, s2_data);
-        let s2_result = map.insert(peer_1, s2_fin);
+        map.must_insert(peer_1, s2_data);
+        let s2_result = map.must_insert(peer_1, s2_fin);
         assert!(s2_result.is_some(), "Stream 2 should complete");
         assert!(
             map.streams.is_empty(),
@@ -674,10 +756,10 @@ mod tests {
 
         // Create MAX_STREAMS_PER_PEER streams
         for i in 0..MAX_STREAMS_PER_PEER {
-            let stream = StreamId::new(vec![i as u8].into());
+            let stream = make_stream_id(i as u8);
             let msg = make_message(&stream, 0, make_init_part());
             assert!(
-                map.insert(peer_1, msg).is_none(),
+                map.must_insert(peer_1, msg).is_none(),
                 "Should accept stream {i}"
             );
         }
@@ -689,9 +771,9 @@ mod tests {
         );
 
         // Try to create one more stream - should be rejected
-        let overflow_stream = StreamId::new(vec![255].into());
+        let overflow_stream = make_stream_id(255);
         let overflow_msg = make_message(&overflow_stream, 0, make_init_part());
-        let result = map.insert(peer_1, overflow_msg);
+        let result = map.must_insert(peer_1, overflow_msg);
 
         assert!(
             result.is_none(),
@@ -704,11 +786,11 @@ mod tests {
         );
 
         // Complete one stream to free up a slot
-        let stream_0 = StreamId::new(vec![0].into());
+        let stream_0 = make_stream_id(0);
         let fin_msg = make_message(&stream_0, 1, make_fin_part());
-        map.insert(peer_1, fin_msg);
+        map.must_insert(peer_1, fin_msg);
         let fin = make_fin_message(&stream_0, 2);
-        map.insert(peer_1, fin);
+        map.must_insert(peer_1, fin);
 
         assert_eq!(
             map.streams.len(),
@@ -717,10 +799,10 @@ mod tests {
         );
 
         // Now we should be able to add a new stream
-        let new_stream = StreamId::new(vec![100].into());
+        let new_stream = make_stream_id(100);
         let new_msg = make_message(&new_stream, 0, make_init_part());
         assert!(
-            map.insert(peer_1, new_msg).is_none(),
+            map.must_insert(peer_1, new_msg).is_none(),
             "Should accept new stream after one completes"
         );
         assert_eq!(map.streams.len(), MAX_STREAMS_PER_PEER);
@@ -729,17 +811,17 @@ mod tests {
     #[test]
     fn test_per_stream_message_limit() {
         let peer_1 = PeerId::random();
-        let stream_1 = StreamId::new(vec![101].into());
+        let stream_1 = make_stream_id(101);
         let mut map = PartStreamsMap::new(Height::new(1));
 
         // Send Init
         let init_msg = make_message(&stream_1, 0, make_init_part());
-        assert!(map.insert(peer_1, init_msg).is_none());
+        assert!(map.must_insert(peer_1, init_msg).is_none());
 
         // Send MAX_MESSAGES_PER_STREAM - 1 data messages (accounting for init already sent)
         for i in 1..MAX_MESSAGES_PER_STREAM {
             let msg = make_message(&stream_1, i as u64, make_data_part(i as u8));
-            let result = map.insert(peer_1, msg);
+            let result = map.must_insert(peer_1, msg);
             assert!(
                 result.is_none(),
                 "Should accept message {i} of {MAX_MESSAGES_PER_STREAM}"
@@ -754,7 +836,7 @@ mod tests {
             MAX_MESSAGES_PER_STREAM as u64,
             make_data_part(MAX_MESSAGES_PER_STREAM as u8),
         );
-        let result = map.insert(peer_1, overflow_msg);
+        let result = map.must_insert(peer_1, overflow_msg);
 
         assert!(
             result.is_none(),
@@ -772,16 +854,16 @@ mod tests {
 
         // Peer 1 creates MAX_STREAMS_PER_PEER streams
         for i in 0..MAX_STREAMS_PER_PEER {
-            let stream = StreamId::new(vec![i as u8].into());
+            let stream = make_stream_id(i as u8);
             let msg = make_message(&stream, 0, make_init_part());
-            map.insert(peer_1, msg);
+            map.must_insert(peer_1, msg);
         }
 
         // Peer 2 should also be able to create MAX_STREAMS_PER_PEER streams
         for i in 0..MAX_STREAMS_PER_PEER {
-            let stream = StreamId::new(vec![i as u8].into());
+            let stream = make_stream_id(i as u8);
             let msg = make_message(&stream, 0, make_init_part());
-            let result = map.insert(peer_2, msg);
+            let result = map.must_insert(peer_2, msg);
             assert!(
                 result.is_none(),
                 "Peer 2 should be able to create stream {i}"
@@ -805,16 +887,16 @@ mod tests {
         }
 
         // Both peers should now be at their limit
-        let overflow_stream = StreamId::new(vec![255].into());
+        let overflow_stream = make_stream_id(255);
         let overflow_msg_p1 = make_message(&overflow_stream, 0, make_init_part());
         assert!(
-            map.insert(peer_1, overflow_msg_p1).is_none(),
+            map.must_insert(peer_1, overflow_msg_p1).is_none(),
             "Peer 1 should be rejected"
         );
 
         let overflow_msg_p2 = make_message(&overflow_stream, 0, make_init_part());
         assert!(
-            map.insert(peer_2, overflow_msg_p2).is_none(),
+            map.must_insert(peer_2, overflow_msg_p2).is_none(),
             "Peer 2 should be rejected"
         );
     }
@@ -822,15 +904,15 @@ mod tests {
     #[test]
     fn test_stream_age_eviction() {
         let peer_1 = PeerId::random();
-        let stream_1 = StreamId::new(vec![101].into());
-        let stream_2 = StreamId::new(vec![102].into());
-        let stream_3 = StreamId::new(vec![103].into());
+        let stream_1 = make_stream_id(101);
+        let stream_2 = make_stream_id(102);
+        let stream_3 = make_stream_id(103);
 
         let mut map = PartStreamsMap::new(Height::new(1));
 
         // Create first stream
         let msg1 = make_message(&stream_1, 0, make_init_part());
-        map.insert(peer_1, msg1);
+        map.must_insert(peer_1, msg1);
         assert_eq!(map.streams.len(), 1);
 
         // Manually set the created_at time to be older than MAX_STREAM_AGE
@@ -840,7 +922,7 @@ mod tests {
 
         // Create a second stream (this will not trigger eviction of the old one yet)
         let msg2 = make_message(&stream_2, 0, make_init_part());
-        map.insert(peer_1, msg2);
+        map.must_insert(peer_1, msg2);
 
         // The old stream should not have been evicted
         assert!(
@@ -857,7 +939,7 @@ mod tests {
 
         // Create a third stream to trigger eviction of the old one
         let msg3 = make_message(&stream_3, 0, make_init_part());
-        map.insert(peer_1, msg3);
+        map.must_insert(peer_1, msg3);
 
         // The old stream should have been evicted
         assert!(
@@ -883,9 +965,9 @@ mod tests {
         for _ in 0..MAX_TOTAL_STREAMS {
             let peer = PeerId::random();
             peers.push(peer);
-            let stream = StreamId::new(vec![0].into());
+            let stream = make_stream_id(0);
             let msg = make_message(&stream, 0, make_init_part());
-            map.insert(peer, msg);
+            map.must_insert(peer, msg);
         }
 
         assert_eq!(
@@ -896,7 +978,7 @@ mod tests {
 
         // Get the oldest stream's creation time to verify it gets evicted
         let oldest_peer = peers[0];
-        let oldest_stream = StreamId::new(vec![0].into());
+        let oldest_stream = make_stream_id(0);
         let oldest_key = (oldest_peer, oldest_stream.clone());
 
         // Manually set the first stream to be the oldest
@@ -906,9 +988,9 @@ mod tests {
 
         // Try to create one more stream from a new peer
         let new_peer = PeerId::random();
-        let new_stream = StreamId::new(vec![0].into());
+        let new_stream = make_stream_id(0);
         let new_msg = make_message(&new_stream, 0, make_init_part());
-        map.insert(new_peer, new_msg);
+        map.must_insert(new_peer, new_msg);
 
         // Should still have MAX_TOTAL_STREAMS (oldest evicted, new one added)
         assert_eq!(
@@ -937,16 +1019,16 @@ mod tests {
 
         // Create and complete MAX_STREAMS_PER_PEER streams
         for i in 0..MAX_STREAMS_PER_PEER {
-            let stream = StreamId::new(vec![i as u8].into());
+            let stream = make_stream_id(i as u8);
 
             // Send complete stream
             let init = make_message(&stream, 0, make_init_part());
             let fin_part = make_message(&stream, 1, make_fin_part());
             let fin = make_fin_message(&stream, 2);
 
-            map.insert(peer_1, init);
-            map.insert(peer_1, fin_part);
-            map.insert(peer_1, fin);
+            map.must_insert(peer_1, init);
+            map.must_insert(peer_1, fin_part);
+            map.must_insert(peer_1, fin);
         }
 
         // All streams should be completed and removed
@@ -958,10 +1040,10 @@ mod tests {
 
         // Should be able to create MAX_STREAMS_PER_PEER new streams
         for i in 0..MAX_STREAMS_PER_PEER {
-            let stream = StreamId::new(vec![(i + 100) as u8].into());
+            let stream = make_stream_id((i + 100) as u8);
             let msg = make_message(&stream, 0, make_init_part());
             assert!(
-                map.insert(peer_1, msg).is_none(),
+                map.must_insert(peer_1, msg).is_none(),
                 "Should accept new stream {i} after previous ones completed"
             );
         }
@@ -980,14 +1062,14 @@ mod tests {
 
         // Create 3 streams, 2 old and 1 new
         for i in 0..3 {
-            let stream = StreamId::new(vec![i].into());
+            let stream = make_stream_id(i);
             let msg = make_message(&stream, 0, make_init_part());
-            map.insert(peer, msg);
+            map.must_insert(peer, msg);
         }
 
         // Age first two streams
         for i in 0..2 {
-            let stream = StreamId::new(vec![i].into());
+            let stream = make_stream_id(i);
             if let Some(state) = map.streams.get_mut(&(peer, stream)) {
                 state.created_at = Instant::now() - MAX_STREAM_AGE - Duration::from_secs(1);
             }
@@ -996,9 +1078,9 @@ mod tests {
         // No eviction yet because `last_eviction` is recent
         map.last_eviction = Instant::now();
 
-        let stream_2 = StreamId::new(vec![2].into());
+        let stream_2 = make_stream_id(2);
         let msg = make_message(&stream_2, 1, make_data_part(1));
-        map.insert(peer, msg);
+        map.must_insert(peer, msg);
 
         // Should still have all 3 streams
         assert_eq!(map.streams.len(), 3);
@@ -1008,7 +1090,7 @@ mod tests {
 
         // Trigger eviction by inserting new message into remaining stream
         let msg = make_message(&stream_2, 1, make_data_part(2));
-        map.insert(peer, msg);
+        map.must_insert(peer, msg);
 
         // Should only have 1 stream left
         assert_eq!(map.streams.len(), 1);
@@ -1021,17 +1103,17 @@ mod tests {
         let mut map = PartStreamsMap::new(Height::new(1));
 
         // Fill first stream to capacity
-        let stream_1 = StreamId::new(vec![1].into());
+        let stream_1 = make_stream_id(1);
         for i in 0..MAX_MESSAGES_PER_STREAM {
             let msg = make_message(&stream_1, i as u64, make_data_part(i as u8));
-            map.insert(peer, msg);
+            map.must_insert(peer, msg);
         }
 
         // Second stream should still accept messages
-        let stream_2 = StreamId::new(vec![2].into());
+        let stream_2 = make_stream_id(2);
         let msg = make_message(&stream_2, 0, make_init_part());
         assert!(
-            map.insert(peer, msg).is_none(),
+            map.must_insert(peer, msg).is_none(),
             "Second stream should accept messages despite first being at limit"
         );
     }
@@ -1039,17 +1121,17 @@ mod tests {
     #[test]
     fn test_evicted_stream_rejects_new_messages() {
         let peer_1 = PeerId::random();
-        let stream_1 = StreamId::new(vec![101].into());
+        let stream_1 = make_stream_id(101);
         let mut map = PartStreamsMap::new(Height::new(1));
 
         // Send Init
         let init_msg = make_message(&stream_1, 0, make_init_part());
-        map.insert(peer_1, init_msg);
+        map.must_insert(peer_1, init_msg);
 
         // Exceed message limit to trigger eviction
         for i in 1..=MAX_MESSAGES_PER_STREAM {
             let msg = make_message(&stream_1, i as u64, make_data_part(i as u8));
-            map.insert(peer_1, msg);
+            map.must_insert(peer_1, msg);
         }
 
         // Verify stream was evicted
@@ -1061,7 +1143,7 @@ mod tests {
             (MAX_MESSAGES_PER_STREAM + 1) as u64,
             make_data_part(99),
         );
-        let result = map.insert(peer_1, new_msg);
+        let result = map.must_insert(peer_1, new_msg);
 
         assert!(
             result.is_none(),
@@ -1077,7 +1159,7 @@ mod tests {
     #[test]
     fn test_stale_height_streams_evicted() {
         let peer_1 = PeerId::random();
-        let stream_1 = StreamId::new(vec![101].into());
+        let stream_1 = make_stream_id(101);
         let mut map = PartStreamsMap::new(Height::new(5));
 
         // Send Init message for old height (height 3)
@@ -1086,30 +1168,30 @@ mod tests {
             init.height = Height::new(3);
         }
         let init_msg = make_message(&stream_1, 0, init_part);
-        map.insert(peer_1, init_msg);
+        map.must_insert(peer_1, init_msg);
 
         // Send a data message
         let data_msg = make_message(&stream_1, 1, make_data_part(42));
-        map.insert(peer_1, data_msg);
+        map.must_insert(peer_1, data_msg);
 
         // Verify stream was evicted
         assert_eq!(map.streams.len(), 0, "Stale stream should be evicted");
         assert!(
-            map.evicted.contains(&(peer_1, stream_1)),
+            map.evicted.peek(&(peer_1, stream_1)).is_some(),
             "Stream should be marked as evicted"
         );
     }
 
     #[test]
-    fn test_evicted_set_cleared_periodically() {
+    fn test_evicted_set_retained_across_eviction_cycles() {
         let mut map = PartStreamsMap::new(Height::new(1));
         let peer = PeerId::random();
 
-        // Create and evict a stream
-        let stream = StreamId::new(vec![1].into());
+        // Create and evict a stream by exceeding message limit
+        let stream = make_stream_id(1);
         for i in 0..=MAX_MESSAGES_PER_STREAM {
             let msg = make_message(&stream, i as u64, make_data_part(i as u8));
-            map.insert(peer, msg);
+            map.must_insert(peer, msg);
         }
 
         assert!(
@@ -1117,22 +1199,21 @@ mod tests {
             "Evicted set should contain entries"
         );
 
-        // Simulate time passing beyond MAX_STREAM_AGE
+        // Simulate time passing beyond MAX_STREAM_AGE and trigger eviction cycle
         map.last_eviction = Instant::now() - MAX_STREAM_AGE - Duration::from_secs(1);
-
-        // Trigger eviction cycle
         map.evict_old_streams();
 
+        // Evicted entries should be retained — the LRU is self-bounding
         assert!(
-            map.evicted.is_empty(),
-            "Evicted set should be cleared after eviction cycle"
+            !map.evicted.is_empty(),
+            "Evicted set should be retained across eviction cycles"
         );
     }
 
     #[test]
     fn test_oversized_chunk_rejected() {
         let peer = PeerId::random();
-        let stream = StreamId::new(vec![1].into());
+        let stream = make_stream_id(1);
         let mut map = PartStreamsMap::new(Height::new(1));
 
         let init_msg = make_message(&stream, 0, make_init_part());
@@ -1143,13 +1224,16 @@ mod tests {
         let msg = make_message(&stream, 1, oversized);
         let result = map.insert(peer, msg);
 
-        assert!(result.is_none(), "Oversized chunk should be rejected");
+        assert!(
+            matches!(result, InsertResult::Pending),
+            "Oversized chunk should be rejected"
+        );
         assert!(
             map.streams.is_empty(),
             "Stream should be evicted after oversized chunk"
         );
         assert!(
-            map.evicted.contains(&(peer, stream)),
+            map.evicted.peek(&(peer, stream)).is_some(),
             "Stream should be marked as evicted"
         );
     }
@@ -1157,7 +1241,7 @@ mod tests {
     #[test]
     fn test_normal_chunk_accepted() {
         let peer = PeerId::random();
-        let stream = StreamId::new(vec![1].into());
+        let stream = make_stream_id(1);
         let mut map = PartStreamsMap::new(Height::new(1));
 
         let init_msg = make_message(&stream, 0, make_init_part());
@@ -1174,14 +1258,17 @@ mod tests {
         let msg = make_message(&stream, 2, at_limit);
         let result = map.insert(peer, msg);
 
-        assert!(result.is_none(), "Stream should not be complete yet");
+        assert!(
+            matches!(result, InsertResult::Pending),
+            "Stream should not be complete yet"
+        );
         assert_eq!(map.streams.len(), 1, "Stream should still be active");
     }
 
     #[test]
     fn test_non_data_parts_not_subject_to_size_check() {
         let peer = PeerId::random();
-        let stream = StreamId::new(vec![1].into());
+        let stream = make_stream_id(1);
         let mut map = PartStreamsMap::new(Height::new(1));
 
         // Init and Fin are not Data variants, so they bypass the byte limit
@@ -1197,8 +1284,108 @@ mod tests {
         let result = map.insert(peer, fin_msg);
 
         assert!(
-            result.is_some(),
+            matches!(result, InsertResult::Complete(_)),
             "Stream should complete — Init/Fin are not subject to chunk size limit"
+        );
+    }
+
+    #[test]
+    fn test_invalid_stream_id_length_rejected() {
+        let peer = PeerId::random();
+        let mut map = PartStreamsMap::new(Height::new(1));
+
+        // Too short
+        let short = StreamId::new(vec![0x01; 8].into());
+        let msg = make_message(&short, 0, make_init_part());
+        assert!(matches!(
+            map.insert(peer, msg),
+            InsertResult::Invalid(InsertError::InvalidStreamIdLength {
+                actual: 8,
+                expected: 16
+            })
+        ));
+        assert!(map.streams.is_empty(), "short stream_id should be rejected");
+
+        // Too long
+        let long = StreamId::new(vec![0x01; 1024].into());
+        let msg = make_message(&long, 0, make_init_part());
+        assert!(matches!(
+            map.insert(peer, msg),
+            InsertResult::Invalid(InsertError::InvalidStreamIdLength {
+                actual: 1024,
+                expected: 16
+            })
+        ));
+        assert!(map.streams.is_empty(), "long stream_id should be rejected");
+
+        // Empty
+        let empty = StreamId::new(vec![].into());
+        let msg = make_message(&empty, 0, make_init_part());
+        assert!(matches!(
+            map.insert(peer, msg),
+            InsertResult::Invalid(InsertError::InvalidStreamIdLength {
+                actual: 0,
+                expected: 16
+            })
+        ));
+        assert!(map.streams.is_empty(), "empty stream_id should be rejected");
+
+        // Exactly 16 bytes — accepted
+        let valid = StreamId::new(vec![0x01; STREAM_ID_LEN].into());
+        let msg = make_message(&valid, 0, make_init_part());
+        assert!(map.must_insert(peer, msg).is_none()); // not complete, but accepted
+        assert_eq!(map.streams.len(), 1, "valid stream_id should be accepted");
+    }
+
+    #[test]
+    fn test_evicted_set_capped() {
+        let peer = PeerId::random();
+        let mut map = PartStreamsMap::new(Height::new(100));
+
+        // Send many Init messages for stale height with distinct stream IDs.
+        // Each gets immediately evicted because height 1 < current height 100.
+        let count = MAX_EVICTED_STREAMS + 500;
+        for i in 0..count as u64 {
+            let mut init = make_init_part();
+            if let ProposalPart::Init(ref mut part) = init {
+                part.height = Height::new(1);
+            }
+
+            let stream = make_stream_id_u64(i);
+            let msg = make_message(&stream, 0, init);
+            map.must_insert(peer, msg);
+
+            assert!(
+                map.evicted.len() <= MAX_EVICTED_STREAMS,
+                "Evicted set should never exceed MAX_EVICTED_STREAMS, got {}",
+                map.evicted.len()
+            );
+        }
+
+        // After the loop, evicted should have been cleared at least once
+        assert!(
+            map.evicted.len() <= MAX_EVICTED_STREAMS,
+            "Evicted set should be bounded, got {}",
+            map.evicted.len()
+        );
+
+        // Map should still function correctly after clearing.
+        // Use a new peer and a current-height init so the stream isn't stale-evicted.
+        let peer2 = PeerId::random();
+        let stream = make_stream_id(0xFF);
+        let mut init_part = make_init_part();
+        if let ProposalPart::Init(ref mut part) = init_part {
+            part.height = Height::new(100);
+        }
+        let init = make_message(&stream, 0, init_part);
+        let data = make_message(&stream, 1, make_fin_part());
+        let fin = make_fin_message(&stream, 2);
+
+        assert!(map.must_insert(peer2, init).is_none());
+        assert!(map.must_insert(peer2, data).is_none());
+        assert!(
+            map.must_insert(peer2, fin).is_some(),
+            "Map should still complete streams after evicted set clearing"
         );
     }
 
@@ -1214,9 +1401,9 @@ mod tests {
 
             // Try to create streams using different IDs
             for stream_id_byte in stream_attempts {
-                let stream = StreamId::new(vec![stream_id_byte].into());
+                let stream = make_stream_id(stream_id_byte);
                 let msg = make_message(&stream, 0, make_init_part());
-                map.insert(peer, msg);
+                map.must_insert(peer, msg);
 
                 // Count how many streams this peer has
                 let peer_stream_count = map.peer_streams_count(peer);
@@ -1236,13 +1423,13 @@ mod tests {
             message_count in 1..500usize
         ) {
             let peer = PeerId::random();
-            let stream = StreamId::new(vec![1].into());
+            let stream = make_stream_id(1);
             let mut map = PartStreamsMap::new(Height::new(1));
 
             // Try to send many messages to the same stream
             for i in 0..message_count {
                 let msg = make_message(&stream, i as u64, make_data_part((i % 256) as u8));
-                map.insert(peer, msg);
+                map.must_insert(peer, msg);
 
                 // Check the stream state if it still exists
                 if let Some(state) = map.streams.get(&(peer, stream.clone())) {
@@ -1272,9 +1459,9 @@ mod tests {
             // Try to create multiple streams for each peer
             for peer in &peers {
                 for stream_idx in 0..streams_per_peer {
-                    let stream = StreamId::new(vec![(stream_idx % 256) as u8, (stream_idx / 256) as u8].into());
+                    let stream = make_stream_id_u16(stream_idx as u16);
                     let msg = make_message(&stream, 0, make_init_part());
-                    map.insert(*peer, msg);
+                    map.must_insert(*peer, msg);
 
                     // Total streams should never exceed the limit
                     prop_assert!(
@@ -1296,9 +1483,9 @@ mod tests {
 
             // Create streams
             for i in 0..stream_count {
-                let stream = StreamId::new(vec![i as u8].into());
+                let stream = make_stream_id(i as u8);
                 let msg = make_message(&stream, 0, make_init_part());
-                map.insert(peer, msg);
+                map.must_insert(peer, msg);
             }
 
             let initial_count = map.streams.len();
@@ -1312,9 +1499,9 @@ mod tests {
             map.last_eviction = Instant::now() - MAX_STREAM_AGE - Duration::from_secs(1);
 
             // Trigger eviction by inserting a new stream
-            let new_stream = StreamId::new(vec![255].into());
+            let new_stream = make_stream_id(255);
             let msg = make_message(&new_stream, 0, make_init_part());
-            map.insert(peer, msg);
+            map.must_insert(peer, msg);
 
             // All old streams should be evicted, only the new one should remain
             prop_assert!(
@@ -1334,7 +1521,7 @@ mod tests {
 
             // Complete multiple streams
             for i in 0..completion_count {
-                let stream = StreamId::new(vec![i as u8].into());
+                let stream = make_stream_id(i as u8);
 
                 // Send complete stream: init, data, fin_part, fin
                 let init = make_message(&stream, 0, make_init_part());
@@ -1342,10 +1529,10 @@ mod tests {
                 let fin_part = make_message(&stream, 2, make_fin_part());
                 let fin = make_fin_message(&stream, 3);
 
-                map.insert(peer, init);
-                map.insert(peer, data);
-                map.insert(peer, fin_part);
-                map.insert(peer, fin);
+                map.must_insert(peer, init);
+                map.must_insert(peer, data);
+                map.must_insert(peer, fin_part);
+                map.must_insert(peer, fin);
             }
 
             // All completed streams should be removed
@@ -1372,9 +1559,9 @@ mod tests {
             // Each peer creates streams up to their limit
             for peer in &peers {
                 for i in 0..MAX_STREAMS_PER_PEER {
-                    let stream = StreamId::new(vec![i as u8].into());
+                    let stream = make_stream_id(i as u8);
                     let msg = make_message(&stream, 0, make_init_part());
-                    map.insert(*peer, msg);
+                    map.must_insert(*peer, msg);
                 }
             }
 
@@ -1405,13 +1592,13 @@ mod tests {
             message_count in 1..10usize
         ) {
             let peer = PeerId::random();
-            let stream = StreamId::new(vec![1].into());
+            let stream = make_stream_id(1);
             let mut map = PartStreamsMap::new(Height::new(1));
 
             // Send incomplete stream (no Fin message)
             for i in 0..message_count {
                 let msg = make_message(&stream, i as u64, make_data_part(i as u8));
-                let result = map.insert(peer, msg);
+                let result = map.must_insert(peer, msg);
 
                 // Should never complete without Fin
                 prop_assert!(
@@ -1436,7 +1623,7 @@ mod tests {
             use rand::rngs::StdRng;
 
             let peer = PeerId::random();
-            let stream = StreamId::new(vec![1].into());
+            let stream = make_stream_id(1);
             let mut map = PartStreamsMap::new(Height::new(1));
 
             // Create messages in order
@@ -1453,7 +1640,7 @@ mod tests {
 
             // Insert all but the last message
             for msg in &messages[..3] {
-                let result = map.insert(peer, msg.clone());
+                let result = map.must_insert(peer, msg.clone());
                 prop_assert!(
                     result.is_none(),
                     "Stream should not complete until all messages received"
@@ -1461,7 +1648,7 @@ mod tests {
             }
 
             // Insert the last message, should complete
-            let result = map.insert(peer, messages[3].clone());
+            let result = map.must_insert(peer, messages[3].clone());
             prop_assert!(
                 result.is_some(),
                 "Stream should complete when all messages received, regardless of order"
@@ -1480,13 +1667,13 @@ mod tests {
             duplicate_indices in prop::collection::vec(0..20usize, 1..10)
         ) {
             let peer = PeerId::random();
-            let stream = StreamId::new(vec![1].into());
+            let stream = make_stream_id(1);
             let mut map = PartStreamsMap::new(Height::new(1));
 
             // Send initial messages
             for i in 0..message_count {
                 let msg = make_message(&stream, i as u64, make_data_part(i as u8));
-                map.insert(peer, msg);
+                map.must_insert(peer, msg);
             }
 
             let state_before = map.streams.get(&(peer, stream.clone()))
@@ -1496,7 +1683,7 @@ mod tests {
             for &idx in &duplicate_indices {
                 if idx < message_count {
                     let duplicate = make_message(&stream, idx as u64, make_data_part(99));
-                    map.insert(peer, duplicate);
+                    map.must_insert(peer, duplicate);
                 }
             }
 
@@ -1515,7 +1702,7 @@ mod tests {
             total_parts in 5..15usize, // Need at least 5 parts: init, data1, data2, fin_part, fin
         ) {
             let peer = PeerId::random();
-            let stream = StreamId::new(vec![1].into());
+            let stream = make_stream_id(1);
             let mut map = PartStreamsMap::new(Height::new(1));
 
             // Choose a missing index in the middle of data parts (not init, not fin_part, not fin)
@@ -1524,14 +1711,14 @@ mod tests {
             let missing_index = 1 + (total_parts % 2); // Will be 1 or 2
 
             // Send init
-            map.insert(peer, make_message(&stream, 0, make_init_part()));
+            map.must_insert(peer, make_message(&stream, 0, make_init_part()));
 
             // Send data parts, skipping the missing one
             // Data parts go from seq 1 to seq (total_parts - 3)
             for i in 1..total_parts - 2 {
                 if i != missing_index {
                     let msg = make_message(&stream, i as u64, make_data_part(i as u8));
-                    map.insert(peer, msg);
+                    map.must_insert(peer, msg);
                 }
             }
 
@@ -1539,8 +1726,8 @@ mod tests {
             let fin_part = make_message(&stream, (total_parts - 2) as u64, make_fin_part());
             let fin = make_fin_message(&stream, (total_parts - 1) as u64);
 
-            map.insert(peer, fin_part);
-            let result = map.insert(peer, fin);
+            map.must_insert(peer, fin_part);
+            let result = map.must_insert(peer, fin);
 
             // Should not complete with missing part
             prop_assert!(
@@ -1573,7 +1760,7 @@ mod tests {
             let mut all_messages = Vec::new();
 
             for stream_idx in 0..stream_count {
-                let stream = StreamId::new(vec![stream_idx as u8].into());
+                let stream = make_stream_id(stream_idx as u8);
 
                 // Init
                 all_messages.push((stream_idx, make_message(&stream, 0, make_init_part())));
@@ -1606,7 +1793,7 @@ mod tests {
 
             // Insert all messages
             for (stream_idx, msg) in all_messages {
-                let result = map.insert(peer, msg);
+                let result = map.must_insert(peer, msg);
 
                 // Mark stream as completed if it returns a result
                 if result.is_some() {
@@ -1636,28 +1823,28 @@ mod tests {
             data_count in 1..10usize
         ) {
             let peer = PeerId::random();
-            let stream = StreamId::new(vec![1].into());
+            let stream = make_stream_id(1);
             let mut map = PartStreamsMap::new(Height::new(1));
 
             let mut seq = 0u64;
 
             // Conditionally send init
             if has_init {
-                map.insert(peer, make_message(&stream, seq, make_init_part()));
+                map.must_insert(peer, make_message(&stream, seq, make_init_part()));
                 seq += 1;
             }
 
             // Send data parts
             for i in 0..data_count {
-                map.insert(peer, make_message(&stream, seq, make_data_part(i as u8)));
+                map.must_insert(peer, make_message(&stream, seq, make_data_part(i as u8)));
                 seq += 1;
             }
 
             // Conditionally send fin_part and fin
             let result = if has_fin {
-                map.insert(peer, make_message(&stream, seq, make_fin_part()));
+                map.must_insert(peer, make_message(&stream, seq, make_fin_part()));
                 seq += 1;
-                map.insert(peer, make_fin_message(&stream, seq))
+                map.must_insert(peer, make_fin_message(&stream, seq))
             } else {
                 None
             };
@@ -1687,10 +1874,10 @@ mod tests {
             let mut map = PartStreamsMap::new(Height::new(1));
 
             // Fill first stream up to its message count
-            let stream_1 = StreamId::new(vec![1].into());
+            let stream_1 = make_stream_id(1);
             for i in 0..stream1_message_count {
                 let msg = make_message(&stream_1, i as u64, make_data_part(i as u8));
-                map.insert(peer, msg);
+                map.must_insert(peer, msg);
             }
 
             // Verify first stream exists and has the expected message count
@@ -1706,10 +1893,10 @@ mod tests {
             );
 
             // Second stream should still accept messages independently
-            let stream_2 = StreamId::new(vec![2].into());
+            let stream_2 = make_stream_id(2);
             for i in 0..stream2_message_count {
                 let msg = make_message(&stream_2, i as u64, make_data_part(i as u8));
-                let result = map.insert(peer, msg);
+                let result = map.must_insert(peer, msg);
 
                 prop_assert!(
                     result.is_none(),

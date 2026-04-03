@@ -34,12 +34,12 @@ contract Memo is IMemo {
     ICallFrom public constant CALL_FROM = ICallFrom(Addresses.CALL_FROM);
 
     /// @inheritdoc IMemo
-    function memo(address target, bytes calldata data, bytes32 memoId, bytes calldata memo) external {
+    function memo(address target, bytes calldata data, bytes32 memoId, bytes calldata memoData) external {
         // Pre-increment ensures unique indices under reentrancy; each call captures its own local index.
         uint256 currentMemoIndex = memoIndex++;
         emit BeforeMemo(currentMemoIndex);
         (bool success, bytes memory returnData) = CALL_FROM.callFrom(msg.sender, target, data);
         if (!success) revert MemoFailed(returnData);
-        emit Memo(msg.sender, target, keccak256(data), memoId, memo, currentMemoIndex);
+        emit Memo(msg.sender, target, keccak256(data), memoId, memoData, currentMemoIndex);
     }
 }

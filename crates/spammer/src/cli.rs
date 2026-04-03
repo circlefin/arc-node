@@ -66,7 +66,7 @@ pub struct SpammerArgs {
     #[clap(short = 'n', long, default_value = "0", global = true)]
     pub num_txs: u64,
     /// Number of transactions to send per second (all generators combined)
-    #[clap(short = 'r', long, default_value = "1000", global = true)]
+    #[clap(short = 'r', long, default_value = "1000", global = true, value_parser = clap::value_parser!(u64).range(1..))]
     pub rate: u64,
     /// Maximum time in seconds to send transactions (applies to all generators) (0 for no limit)
     #[clap(short = 't', long, default_value = "0", global = true)]

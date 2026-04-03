@@ -33,12 +33,7 @@ import { buildProtocolConfigGenesisAllocs, schemaProtocolConfig } from './Protoc
 import { BuilderContext } from './context'
 import { Address, fromHex, Hex, toHex } from 'viem'
 import { buildValidatorManagerGenesisAllocs, schemaValidatorManager } from './ValidatorManager'
-import {
-  memoAddress,
-  multicall3FromAddress,
-  nativeCoinAutorityAddress,
-  nativeCoinControlAddress,
-} from './addresses'
+import { memoAddress, multicall3FromAddress, nativeCoinAutorityAddress, nativeCoinControlAddress } from './addresses'
 
 const emptyPrecompileStart = 0x1800000000000000000000000000000000000002n
 const emptyPrecompileEnd = 0x18000000000000000000000000000000000000ffn

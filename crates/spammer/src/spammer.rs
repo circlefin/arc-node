@@ -17,7 +17,6 @@
 use std::fs::create_dir_all;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use color_eyre::eyre::{self, Result};
@@ -31,6 +30,7 @@ use alloy_consensus::{Signed, TxEip1559};
 use crate::accounts::AccountBuilder;
 use crate::generator::TxGenerator;
 use crate::latency::{LatencyTracker, TxSubmitted};
+use crate::rate_limiter::RateLimiter;
 use crate::result_tracker::ResultTracker;
 use crate::sender::TxSender;
 use crate::ws::WsClientBuilder;
@@ -52,9 +52,6 @@ pub struct Spammer {
     /// Transaction senders that fan out transactions to target nodes in round-robin
     /// fashion.
     tx_senders: Vec<TxSender>,
-    /// Shared rate limiter for all senders, enforcing TPS and total transaction
-    /// limits.
-    rate_limiter: Arc<RateLimiter>,
     /// Tracks transaction results and reports statistics on them.
     result_tracker: ResultTracker,
     /// Optional tracker for submit-to-finalized latency measurement.
@@ -130,7 +127,11 @@ impl Spammer {
         };
 
         // Shared rate limiter for all senders
-        let rate_limiter = Arc::new(RateLimiter::new(config.max_rate, config.max_num_txs));
+        let rate_limiter = Arc::new(RateLimiter::new(
+            config.max_rate,
+            config.max_num_txs,
+            config.num_generators,
+        ));
 
         // Create transaction generators and senders
         let (tx_generators, tx_senders) = if config.fire_and_forget {
@@ -166,7 +167,6 @@ impl Spammer {
         Ok(Self {
             tx_generators,
             tx_senders,
-            rate_limiter,
             result_tracker,
             latency_tracker,
             finish_sender,
@@ -381,13 +381,11 @@ impl Spammer {
             tx_sender_handles.push(tokio::spawn(async move { tx_sender.run().await }));
         }
 
-        let rate_limiter_handle = tokio::spawn(async move { self.rate_limiter.run().await });
         let tracker_handle = tokio::spawn(async move { self.result_tracker.run().await });
 
         for handle in tx_sender_handles {
             handle.await??;
         }
-        rate_limiter_handle.abort();
 
         for handle in tx_gen_handles {
             handle.await??;
@@ -401,65 +399,5 @@ impl Spammer {
         }
 
         Ok(())
-    }
-}
-
-/// Rate limiter for transaction sending.
-///
-/// Enforces a maximum transactions-per-second rate and an optional total
-/// transaction count limit. Shared across all senders via `Arc`.
-pub(crate) struct RateLimiter {
-    /// Maximum transactions per second.
-    tps: u64,
-    /// Maximum total transactions (0 means unlimited).
-    max_num_txs: u64,
-    /// Counter for transactions in the current second.
-    tps_counter: AtomicU64,
-    /// Counter for total transactions sent.
-    total_counter: AtomicU64,
-}
-
-impl RateLimiter {
-    /// Create a new rate limiter with the given TPS and total transaction limits.
-    pub fn new(tps: u64, max_num_txs: u64) -> Self {
-        Self {
-            tps,
-            max_num_txs,
-            tps_counter: AtomicU64::new(0),
-            total_counter: AtomicU64::new(0),
-        }
-    }
-
-    /// Run the rate limiter's background task.
-    ///
-    /// Resets the per-second counter every second to allow the next batch of
-    /// transactions. This task runs indefinitely until aborted.
-    pub async fn run(&self) -> Result<()> {
-        let mut interval = time::interval(Duration::from_secs(1));
-        let _ = interval.tick().await; // consume the first tick at 0 seconds
-        loop {
-            let _ = interval.tick().await;
-            self.tps_counter.store(0, Ordering::SeqCst);
-        }
-    }
-
-    /// Increment counters and determine whether to send, wait, or abort.
-    ///
-    /// Returns:
-    /// - `Some(true)`: Send a transaction now.
-    /// - `Some(false)`: TPS limit reached, wait until next second.
-    /// - `None`: Total transaction limit reached, abort the load.
-    pub fn inc(&self) -> Option<bool> {
-        let current_tps = self.tps_counter.fetch_add(1, Ordering::SeqCst);
-        if current_tps >= self.tps {
-            return Some(false); // wait until next second
-        }
-
-        let current_total = self.total_counter.fetch_add(1, Ordering::SeqCst);
-        if self.max_num_txs > 0 && current_total >= self.max_num_txs {
-            return None; // abort the load
-        }
-
-        Some(true) // send transaction
     }
 }
