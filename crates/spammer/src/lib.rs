@@ -22,6 +22,7 @@ mod config;
 mod erc20;
 mod generator;
 mod latency;
+mod rate_limiter;
 mod result_tracker;
 mod sender;
 mod spammer;

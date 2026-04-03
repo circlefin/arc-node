@@ -42,6 +42,6 @@ interface IMemo {
     /// @param target The address to call via the precompile.
     /// @param data The calldata to forward to the target.
     /// @param memoId A caller-supplied identifier for the memo.
-    /// @param memo Arbitrary memo bytes attached to the subcall.
-    function memo(address target, bytes calldata data, bytes32 memoId, bytes calldata memo) external;
+    /// @param memoData Arbitrary memo bytes attached to the subcall.
+    function memo(address target, bytes calldata data, bytes32 memoId, bytes calldata memoData) external;
 }

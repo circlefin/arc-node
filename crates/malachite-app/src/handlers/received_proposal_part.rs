@@ -34,7 +34,7 @@ use crate::payload::{validate_consensus_block, EnginePayloadValidator};
 use crate::proposal_parts::{assemble_block_from_parts, validate_proposal_parts};
 use crate::state::State;
 use crate::store::Store;
-use crate::streaming::PartStreamsMap;
+use crate::streaming::{InsertResult, PartStreamsMap};
 use arc_consensus_db::invalid_payloads::InvalidPayload;
 
 /// Handles the `ReceivedProposalPart` message from the consensus engine.
@@ -158,8 +158,13 @@ async fn on_received_proposal_part(
     );
 
     // Check if we have a full proposal
-    let Some(parts) = context.streams_map.insert(from, part) else {
-        return Ok(None);
+    let parts = match context.streams_map.insert(from, part) {
+        InsertResult::Complete(parts) => parts,
+        InsertResult::Pending => return Ok(None),
+        InsertResult::Invalid(e) => {
+            warn!(%from, error = %e, "Rejecting stream message");
+            return Ok(None);
+        }
     };
 
     // Process complete proposal parts, validate and assemble them into a block.

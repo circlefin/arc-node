@@ -804,8 +804,9 @@ mod tests {
 
     use crate::chain_ids::{DEVNET_CHAIN_ID, LOCALDEV_CHAIN_ID, TESTNET_CHAIN_ID};
     use crate::hardforks::{
-        ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_DEVNET, ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_TESTNET,
-        ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET, ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET,
+        ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET, ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_DEVNET,
+        ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_TESTNET, ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET,
+        ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET, ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET,
     };
 
     fn assert_arc_chainspec_evm_hardforks(spec: &ArcChainSpec) {
@@ -1022,9 +1023,10 @@ Post-merge hard forks (timestamp based):
             "0x41c417868fee948f58602b01a84ce0ddb5ffe2184f7e9ab43b9c8d7e5eb47067",
             "the genesis hash of assets/devnet/genesis.json changed unexpectedly"
         );
-        assert_eq!(spec.forks_iter().count(), 19);
+        assert_eq!(spec.forks_iter().count(), 21);
         assert_arc_chainspec_evm_hardforks(&spec);
         assert!(!spec.is_osaka_active_at_timestamp(0));
+        assert!(spec.is_osaka_active_at_timestamp(ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET));
 
         let flags_before = spec.get_hardfork_flags(ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1);
         assert!(!flags_before.is_active(ArcHardfork::Zero3));
@@ -1042,6 +1044,18 @@ Post-merge hard forks (timestamp based):
         let flags_at_zero4 = spec.get_hardfork_flags(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET);
         assert!(flags_at_zero4.is_active(ArcHardfork::Zero3));
         assert!(flags_at_zero4.is_active(ArcHardfork::Zero4));
+        assert!(!flags_at_zero4.is_active(ArcHardfork::Zero5));
+
+        let flags_before_zero5 =
+            spec.get_hardfork_flags(ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1);
+        assert!(flags_before_zero5.is_active(ArcHardfork::Zero3));
+        assert!(flags_before_zero5.is_active(ArcHardfork::Zero4));
+        assert!(!flags_before_zero5.is_active(ArcHardfork::Zero5));
+
+        let flags_at_zero5 = spec.get_hardfork_flags(ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET);
+        assert!(flags_at_zero5.is_active(ArcHardfork::Zero3));
+        assert!(flags_at_zero5.is_active(ArcHardfork::Zero4));
+        assert!(flags_at_zero5.is_active(ArcHardfork::Zero5));
 
         assert_eq!(
             spec.display_hardforks().to_string(),
@@ -1061,12 +1075,14 @@ Post-merge hard forks (timestamp based):
 - GrayGlacier                      @0
 - Zero3                            @7437594
 - Zero4                            @19491165
+- Zero5                            @32371192
 Merge hard forks:
 - Paris                            @0 (network is known to be merged)
 Post-merge hard forks (timestamp based):
 - Shanghai                         @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Cancun                           @0          blob: (target: 6, max: 9, fraction: 5007716)
-- Prague                           @0          blob: (target: 6, max: 9, fraction: 5007716)"#
+- Prague                           @0          blob: (target: 6, max: 9, fraction: 5007716)
+- Osaka                            @1775483400          blob: (target: 6, max: 9, fraction: 5007716)"#
         );
         assert_eq!(
             spec.fork(ArcHardfork::Zero3),
@@ -1075,6 +1091,10 @@ Post-merge hard forks (timestamp based):
         assert_eq!(
             spec.fork(ArcHardfork::Zero4),
             ForkCondition::Block(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET)
+        );
+        assert_eq!(
+            spec.fork(ArcHardfork::Zero5),
+            ForkCondition::Block(ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET)
         );
     }
 

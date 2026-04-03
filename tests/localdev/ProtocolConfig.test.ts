@@ -339,10 +339,7 @@ describe('ProtocolConfig Smoke Tests', function () {
 
       // Arc: Beneficiary gets FULL effective gas price * gas used
       const arcExpectedFee = effectiveGasPrice * gasUsed
-      expect(totalFee).to.equal(
-        arcExpectedFee,
-        'Arc: Beneficiary should receive full effective gas price * gas used',
-      )
+      expect(totalFee).to.equal(arcExpectedFee, 'Arc: Beneficiary should receive full effective gas price * gas used')
 
       // Standard Ethereum: Beneficiary would only get (effective_gas_price - base_fee) * gas used
       const standardEthereumFee = (effectiveGasPrice - actualBaseFee) * gasUsed
