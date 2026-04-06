@@ -14,6 +14,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Transaction sending with two operating modes.
+//!
+//! ## Backpressure mode (default)
+//!
+//! The sender owns a [`TxGenerator`] directly and drives it in a tight loop:
+//! generate a transaction, submit it via JSON-RPC, wait for the response, then
+//! advance the nonce only on acceptance. On rejection the sender re-queries the
+//! node for the correct nonce and retries. After three consecutive rejections
+//! for the same account it skips that account to avoid an infinite retry loop.
+//!
+//! Use backpressure mode for correctness-sensitive workloads where every
+//! transaction must land on-chain (e.g., contract deployments, nonce-dependent
+//! sequences, reproducible load tests).
+//!
+//! ## Fire-and-forget mode
+//!
+//! A separate generator task pushes signed transactions into a buffered channel
+//! (capacity 10,000). The sender reads from the channel and dispatches each
+//! transaction without waiting for the JSON-RPC response (unless
+//! `--wait-response` is set). Nonces are incremented optimistically at
+//! generation time, so nonce gaps can occur on rejection.
+//!
+//! Use fire-and-forget mode for peak-throughput stress tests where some
+//! transaction loss is acceptable.
+//!
+//! Both modes share the same rate limiter, round-robin node selection, and
+//! optional latency tracking.
+
 use alloy_consensus::{Signed, TxEip1559};
 use color_eyre::eyre::{self, Result, WrapErr};
 use serde_json::json;
@@ -57,9 +85,19 @@ pub(crate) enum TxSource {
     Backpressure(Box<TxGenerator>),
 }
 
-/// Transaction sender for one tx generator.
-/// Receive transactions from one tx generator and send them to multiple nodes in round-robin fashion.
-/// Report the result of each transaction to the result tracker.
+/// Dispatches signed transactions to one or more nodes over WebSocket JSON-RPC.
+///
+/// Each sender is paired with exactly one transaction source (a generator or a
+/// channel) and fans out transactions across the target nodes in round-robin
+/// order. Results are reported to a shared [`ResultTracker`] for aggregate
+/// statistics, and optionally to a [`LatencyTracker`] for submit-to-finalized
+/// latency measurement.
+///
+/// The sender's operating mode is determined by [`TxSource`]:
+/// - **Backpressure** ([`TxSource::Backpressure`]): owns the generator, waits
+///   for every JSON-RPC response, retries on rejection with nonce refresh.
+/// - **Fire-and-forget** ([`TxSource::Channel`]): reads from a buffered
+///   channel, sends without waiting (unless `wait_response` is set).
 pub(crate) struct TxSender {
     id: usize,
     /// WebSocket clients used to dispatch transactions to nodes in round-robin.

@@ -38,3 +38,6 @@ If a decision affects multiple components or has lasting implications, it likely
 | ADR | Title | Status | Date       |
 |-----|-------|--------|------------|
 | [0001](0001-adr-process.md) | ADR Process | Proposed | 2025-12-11 |
+| [0002](0002-block-dissemination-protocol.md) | Block Dissemination Protocol | Draft | 2026-01-13 |
+| [0003](0003-governance-configuration-and-validation.md) | Dynamic Block Gas Limit Configuration Validation | Draft | 2026-02-20 |
+| [0004](0004-base-fee-validation.md) | Base Fee Parameter Validation | Draft | 2026-03-03 |
