@@ -52,6 +52,7 @@ source $HOME/.cargo/env
 ```sh
 git clone https://github.com/circlefin/arc-node.git
 cd arc-node
+git checkout v0.6.0
 ```
 
 **3. Build and install:**
