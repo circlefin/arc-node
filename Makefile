@@ -7,6 +7,10 @@ QUAKE_MANIFEST ?= crates/quake/scenarios/localdev.toml
 NUM_VALIDATORS := $(shell grep -c '^\[nodes\.validator' $(QUAKE_MANIFEST) 2>/dev/null || echo 5)
 QUAKE := cargo run --bin quake --
 LOAD_PREDEFINED_ARC_REMOTE_SIGNER_KEYS := true
+DEFAULT_BRANCH ?= $(shell git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+ifeq ($(DEFAULT_BRANCH),)
+DEFAULT_BRANCH = master
+endif
 
 ##@ Help
 .PHONY: help
@@ -51,7 +55,7 @@ buf-format: ## Format protobuf files using buf
 
 .PHONY: buf-breaking
 buf-breaking: ## Check for breaking changes in protobuf files
-	buf breaking --against '.git#branch=master'
+	buf breaking --against '.git#branch=$(DEFAULT_BRANCH)'
 
 .PHONY: lint
 lint: fmt buf-format build-contract ## Run formatting and linting
