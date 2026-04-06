@@ -39,7 +39,25 @@ use crate::erc20::TEST_TOKEN_ADDRESS;
 pub(crate) const TESTNET_CHAIN_ID: u64 = 1337;
 const GUZZLER_ADDRESS: Address = address!("1be052abb35D7f41609Bfec8F2fC2A684CB9984f");
 
-/// Generate transactions signed by a given account and send them to the Reth RPC endpoints in round-robin fashion.
+/// Generates and signs transactions from a pool of pre-funded genesis accounts.
+///
+/// Each generator is assigned a non-overlapping slice of the account space and
+/// cycles through its accounts in round-robin order. It supports three
+/// transaction types, selected per-transaction according to configurable
+/// weights ([`TxTypeMix`]):
+///
+/// - **Native transfers** -- simple value transfers between accounts.
+/// - **ERC-20 calls** -- `transfer`, `approve`, and `transferFrom` against
+///   a deployed `TestToken` contract, with function mix controlled by
+///   [`Erc20FnWeights`].
+/// - **GasGuzzler calls** -- gas-intensive operations (`hashLoop`,
+///   `storageWrite`, `storageRead`, `guzzle`, `guzzle2`) against a deployed
+///   `GasGuzzler` contract, with function mix controlled by
+///   [`GuzzlerFnWeights`].
+///
+/// In fire-and-forget mode the generator pushes signed transactions into a
+/// channel for a separate [`TxSender`](crate::sender::TxSender) task; in backpressure mode the sender
+/// owns the generator directly and calls [`next_tx`](Self::next_tx).
 pub(crate) struct TxGenerator {
     id: usize,
     signers: Vec<Option<LocalSigner<SigningKey>>>,

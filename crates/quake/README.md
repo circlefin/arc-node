@@ -28,6 +28,7 @@ __Table of contents__
     - [Quick start (local deployment)](#quick-start-local-deployment)
     - [Command workflow](#command-workflow)
     - [Basic commands](#basic-commands)
+    - [The `load` and `spam` commands](#the-load-and-spam-commands)
     - [The `perturb` command](#the-perturb-command)
       - [Disconnect](#disconnect)
       - [Kill](#kill)
@@ -327,6 +328,86 @@ flags as both commands, e.g. `--all` (from `clean`) and `--remote` (from `start`
 ./quake restart validator1 validator2
 ```
 If you want to restart just some nodes leaving the others running, use `quake perturb restart <nodes>`.
+
+### The `load` and `spam` commands
+
+Both commands send transaction load to a running testnet using the [spammer](../spammer/README.md).
+Transactions are dispatched over WebSocket JSON-RPC. They
+accept the same flags as the spammer and differ only in the adopted send mode:
+
+| Command | Send mode | Nonce handling | Error recovery | Best for |
+|---------|-----------|---------------|----------------|----------|
+| `load` | Backpressure | Advances only on acceptance | Re-queries nonce on rejection, skips after 3 consecutive failures | Correctness-sensitive workloads, reproducible tests |
+| `spam` | Fire-and-forget | Incremented optimistically | None (transactions may be lost) | Peak-throughput stress tests |
+
+**Backpressure mode** (`load`) waits for each JSON-RPC response for a transaction before submitting
+the next one. If a transaction is rejected the sender re-queries the
+node for the correct nonce and retries. This is slower but guarantees that every
+submitted transaction has a valid nonce and is accepted by RPC endpoint.
+
+**Fire-and-forget mode** (`spam`) pushes transactions into a 10,000-item
+buffered channel and dispatches them without waiting for responses. Nonces are
+incremented at generation time, so nonce gaps can occur when transactions are
+rejected. Use `--wait-response` (`-w`) to optionally wait for each response
+while still using optimistic nonces; expect multiple `nonce too low` errors to be produced.
+
+Both commands support blending transaction types with `--mix`:
+```bash
+# 1000 TPS of native transfers for 30 seconds (backpressure)
+./quake load -t 30 -r 1000 validator1
+
+# Same workload in fire-and-forget mode
+./quake spam -t 30 -r 1000 validator1
+
+# Mixed workload: 70% native transfers, 30% ERC-20
+./quake load -t 60 -r 500 --mix transfer=70,erc20=30 validator1
+
+# Gas-intensive workload with diverse guzzler functions
+./quake load -t 60 -r 200 --mix guzzler=100 \
+  --guzzler-fn-weights hash-loop=70@2000,storage-write=30@600 validator1
+
+# Fire-and-forget at high throughput, targeting all nodes
+./quake spam -t 120 -r 5000
+```
+
+Common flags (see `./quake load --help` for the full list):
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--rate` | `-r` | `1000` | Target TPS across all generators |
+| `--time` | `-t` | `0` | Max duration in seconds (0 = unlimited) |
+| `--num-txs` | `-n` | `0` | Max total transactions (0 = unlimited) |
+| `--num-generators` | `-g` | `1` | Parallel generators, each with its own account slice |
+| `--mix` | | `transfer=100` | Transaction type blend: `transfer`, `erc20`, `guzzler` |
+| `--tx-latency` | | `false` | Record submit-to-finalized latency to CSV |
+
+If no target nodes are specified, transactions are sent to all nodes.
+
+#### Latency tracking (`--tx-latency`)
+
+The `--tx-latency` flag measures end-to-end transaction latency: the wall-clock
+time between `eth_sendRawTransaction` submission and finalized block inclusion.
+See the [spammer README](../spammer/README.md#transaction-latency-tracking) for
+full details on the tracking architecture, CSV output format, and analysis tools.
+
+```bash
+./quake load -t 30 -r 1000 --tx-latency validator1
+./quake load -t 30 -r 1000 --tx-latency --csv-dir .quake/results validator1
+```
+
+**Recording behavior by mode:**
+
+- **Backpressure** (`load`): only transactions accepted by the node are tracked.
+  Rejected and transient errors are skipped.
+- **Fire-and-forget with `--wait-response`** (`spam -w`): same, only accepted
+  transactions.
+- **Fire-and-forget without `--wait-response`** (`spam`): all dispatched
+  transactions are tracked, including those later rejected by the node. These
+  unmatched entries remain in memory and are evicted after 5 minutes without
+  appearing in the CSV.
+
+Transactions that are never included in a block (dropped from mempool, rejected
+after submission) do not appear in the CSV.
 
 ### The `perturb` command
 Quake offers a number of perturbations that can be applied to nodes in the testnet.
@@ -791,9 +872,9 @@ The following flags are applied to all nodes by default. They are defined in
 | Flag | Default Value | Description |
 |------|---------------|-------------|
 | `http.enable` | `true` | Enable the HTTP-RPC server |
-| `http.api` | `["admin", "net", "eth", "web3", "debug", "txpool", "trace"]` | APIs exposed over HTTP |
+| `http.api` | `["admin", "net", "eth", "web3", "debug", "txpool", "trace", "reth"]` | APIs exposed over HTTP |
 | `ws.enable` | `true` | Enable the WebSocket-RPC server |
-| `ws.api` | `["admin", "net", "eth", "web3", "debug", "txpool", "trace"]` | APIs exposed over WebSocket |
+| `ws.api` | `["admin", "net", "eth", "web3", "debug", "txpool", "trace", "reth"]` | APIs exposed over WebSocket |
 | `engine.persistence-threshold` | `0` | Persistence threshold for engine payloads |
 | `engine.memory-block-buffer-target` | `0` | Memory block buffer target |
 | `enable-arc-rpc` | `true` | Enable Arc-specific RPC methods |

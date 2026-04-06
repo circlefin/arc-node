@@ -18,6 +18,7 @@ pub mod capabilities;
 pub mod engine;
 pub mod ipc;
 pub mod json_structures;
+pub mod persistence_meter;
 pub mod retry;
 pub mod rpc;
 
@@ -29,4 +30,5 @@ pub use constants::INITIAL_RETRY_DELAY;
 #[cfg(any(test, feature = "mocks"))]
 pub mod mocks {
     pub use crate::engine::{MockEngineAPI, MockEthereumAPI};
+    pub use crate::persistence_meter::MockPersistenceMeter;
 }

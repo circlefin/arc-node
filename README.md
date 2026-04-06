@@ -1,6 +1,9 @@
 # Arc Node
 
-> The Economic OS for the internet
+> [!IMPORTANT]
+> Arc is currently in testnet, and this is alpha software currently undergoing audits.
+
+The Economic OS for the internet
 
 [![Website](https://img.shields.io/badge/Website-arc.network-blue)](https://www.arc.network/)
 

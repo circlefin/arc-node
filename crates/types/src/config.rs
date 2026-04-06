@@ -65,6 +65,9 @@ pub struct Config {
     /// RPC config
     pub rpc: RpcConfig,
 
+    /// Execution-layer config
+    pub execution: ExecutionConfig,
+
     /// Signing config
     pub signing: SigningConfig,
 }
@@ -163,6 +166,35 @@ impl Default for RpcConfig {
             listen_addr: format!("127.0.0.1:{RPC_BASE_PORT}")
                 .parse()
                 .expect("valid socket address"),
+        }
+    }
+}
+
+/// Execution-layer tuning parameters.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionConfig {
+    /// Whether persistence backpressure is enabled.
+    #[serde(default)]
+    pub persistence_backpressure: bool,
+
+    /// Number of blocks the EL is allowed to lag behind the CL before
+    /// persistence backpressure is applied during startup replay.
+    /// Only takes effect when `persistence_backpressure` is true.
+    #[serde(default = "ExecutionConfig::default_persistence_backpressure_threshold")]
+    pub persistence_backpressure_threshold: u64,
+}
+
+impl ExecutionConfig {
+    const fn default_persistence_backpressure_threshold() -> u64 {
+        100
+    }
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            persistence_backpressure: false,
+            persistence_backpressure_threshold: Self::default_persistence_backpressure_threshold(),
         }
     }
 }

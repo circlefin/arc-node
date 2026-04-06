@@ -18,6 +18,12 @@ Versions across networks may not be compatible. Consult the table below to confi
 curl -L https://raw.githubusercontent.com/circlefin/arc-node/main/arcup/install | bash
 ```
 
+After installing, restart your shell or run:
+
+```sh
+source ~/.arc/env
+```
+
 Verify the installation:
 
 ```sh

@@ -5,9 +5,12 @@ This document provides a comprehensive overview of the Arc Network node architec
 ## Table of Contents
 
 - [Overview](#overview)
-- [Core Crates](#core-crates)
-- [Node Crate Deep Dive](#node-crate-deep-dive)
-- [Extension Points](#extension-points)
+- [Architectural Layers](#architectural-layers)
+- [Transaction Lifecycle](#transaction-lifecycle)
+- [Block Production Flow](#block-production-flow)
+- [Synchronization Modes](#synchronization-modes)
+- [Execution Layer Deep Dive](#execution-layer-deep-dive)
+- [Data Flow](#data-flow)
 
 ## Overview
 
@@ -91,7 +94,7 @@ sequenceDiagram
 
     User->>RPC: eth_sendRawTransaction
     RPC->>TxPool: Add transaction
-    Note over TxPool: Validation, gas checks,<br/>denylist filtering
+    Note over TxPool: Validation, gas checks
 
     Consensus->>Engine: Request payload<br/>(getPayload)
     Engine->>TxPool: Select transactions
@@ -112,9 +115,8 @@ sequenceDiagram
 
 ### Key Stages
 
-1. **Transaction Submission** ([crates/node/src/txpool/pool.rs](../crates/node/src/txpool/pool.rs))
+1. **Transaction Submission** ([crates/execution-txpool/src/pool.rs](../crates/execution-txpool/src/pool.rs))
    - Validates transaction format and signature
-   - Checks denylist for blocked addresses
    - Adds to mempool if valid
 
 2. **Block Proposal** ([crates/malachite-app/src/app.rs](../crates/malachite-app/src/app.rs))
@@ -127,7 +129,7 @@ sequenceDiagram
    - Once ⅔+ votes collected, block is decided
    - Certificate generated with validator signatures
 
-4. **Execution** ([crates/node/src/executor.rs](../crates/node/src/executor.rs))
+4. **Execution** ([crates/evm/src/executor.rs](../crates/evm/src/executor.rs))
    - Consensus sends `engine_newPayload` + `engine_forkchoiceUpdated`
    - Block executor runs transactions through EVM
    - State trie updated with new balances, storage
@@ -177,7 +179,7 @@ Traditional gossip-based synchronization where nodes:
 - Participate in consensus as validators or full nodes
 - Maintain peer connections for liveness
 
-**Implementation**: [crates/malachite-app/src/node.rs](../crates/malachite-app/src/node.rs) (lines 340-380)
+**Implementation**: [crates/malachite-app/src/node.rs](../crates/malachite-app/src/node.rs)
 
 ### RPC Sync Mode
 Alternative for lightweight full nodes that:
@@ -210,49 +212,43 @@ graph TB
     style N3 fill:#e1f5ff
 ```
 
-## Node Crate Deep Dive
+## Execution Layer Deep Dive
 
-The `node/` crate is the heart of the execution layer. Here's a detailed breakdown:
+The execution layer is split across several dedicated crates. Here's a breakdown:
 
 ### EVM Customization
 
-The EVM layer (`src/evm.rs`) allows for:
+The EVM layer ([crates/evm/src/evm.rs](../crates/evm/src/evm.rs)) allows for:
 
 - Custom base fee calculation logic
 - Integration of custom precompiles
 - EVM configuration overrides
 
-See [Configuration Guide](CONFIGURATION.md#custom-base-fee-calculation) for customization details.
-
 ### Precompiles
 
-Custom precompiles are defined in `src/precompiles/`:
+Custom precompiles are defined in [crates/precompiles/src/](../crates/precompiles/src/):
 
-- **Native Coin Authority** (`0x80`) - Authority operations for native coin
-- **Native Coin Control** (`0x81`) - Control operations for native coin
-- **System Accounting** (`0x82`) - System-level accounting operations
-- **PQ Signature Verify** (`0x83`) - Post-quantum signature verification
-
-See [Configuration Guide](CONFIGURATION.md#adding-more-precompiles) for details on adding new precompiles.
+- **Native Coin Authority** (`0x1800..0000`) - Mint, burn, transfer operations for native coin
+- **Native Coin Control** (`0x1800..0001`) - Address blocklist
+- **System Accounting** (`0x1800..0002`) - Gas fee ring buffer
+- **Call From** (`0x1800..0003`) - Plumbing to support native batch and memo txns.
+- **PQ Signature Verify** (`0x1800..0004`) - Post-quantum SLH-DSA-SHA2-128s verification
 
 ### Transaction Pool
 
-The custom transaction pool (`src/txpool/`) provides:
+The custom transaction pool ([crates/execution-txpool/src/](../crates/execution-txpool/src/)) provides:
 
 - Configurable pool parameters
 - Custom validation logic
-- Transaction denylist support
-
-See [Configuration Guide](CONFIGURATION.md#transaction-denylist-configuration) for details.
 
 ### Payload Building
 
-The payload builder (`src/payload.rs`) handles:
+The payload builder ([crates/execution-payload/src/payload.rs](../crates/execution-payload/src/payload.rs)) handles:
 
 - Block construction
 - Transaction selection and ordering
 - Gas limit management
-- Emergency denylist on panic
+- Adds to the InvalidTxList during execution panics
 
 ## Data Flow
 
@@ -261,15 +257,13 @@ graph LR
     TxSubmit[Transaction Submitted]
     TxPool[Transaction Pool]
     Validator[Pool Validator]
-    Denylist[Denylist Check]
     Payload[Payload Builder]
     Executor[Block Executor]
     EVM[EVM Execution]
     State[State Update]
 
     TxSubmit --> Validator
-    Validator --> Denylist
-    Denylist --> TxPool
+    Validator --> TxPool
     TxPool --> Payload
     Payload --> Executor
     Executor --> EVM
@@ -278,6 +272,5 @@ graph LR
 
 ## Further Reading
 
-- [Configuration Guide](CONFIGURATION.md) - Detailed configuration options
 - [Contributing Guide](../CONTRIBUTING.md) - Development workflow and guidelines
 - [ADRs](adr/README.md) - Architecture Decision Records

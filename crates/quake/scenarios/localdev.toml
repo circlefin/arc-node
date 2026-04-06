@@ -1,3 +1,7 @@
+# Enable persistence backpressure in CI to exercise the feature until it is
+# enabled by default.
+cl.config.execution.persistence_backpressure = true
+
 [nodes.validator1]
 [nodes.validator2]
 [nodes.validator3]

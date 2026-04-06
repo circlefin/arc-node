@@ -109,6 +109,7 @@ services:
       {{#if rpc}}
       - "--eth-rpc-endpoint=http://{{el_container_name}}:8545"
       - "--execution-endpoint=http://{{el_container_name}}:8551"
+      - "--execution-ws-endpoint=ws://{{el_container_name}}:8546"
       - "--execution-jwt=/assets/jwtsecret"
       {{else}}
       - "--eth-socket=/sockets/reth.ipc"

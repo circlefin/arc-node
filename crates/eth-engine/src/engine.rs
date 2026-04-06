@@ -39,6 +39,16 @@ use crate::ipc::{engine_ipc::EngineIPC, ethereum_ipc::EthereumIPC};
 use crate::json_structures::ExecutionBlock;
 use crate::rpc::{engine_rpc::EngineRpc, ethereum_rpc::EthereumRPC};
 
+/// A subscription-capable transport endpoint for the execution layer.
+///
+/// Exposed so that callers (e.g. startup replay, RPC sync) can establish
+/// auxiliary subscriptions without Engine needing to know about those concerns.
+#[derive(Clone, Debug)]
+pub enum SubscriptionEndpoint {
+    Ipc { socket_path: String },
+    Ws { url: Url },
+}
+
 #[cfg_attr(any(test, feature = "mocks"), mockall::automock)]
 #[async_trait]
 pub trait EngineAPI: Send + Sync {
@@ -105,7 +115,10 @@ impl Engine {
     pub async fn new_ipc(execution_socket: &str, eth_socket: &str) -> eyre::Result<Self> {
         let api = Box::new(EngineIPC::new(execution_socket).await?);
         let eth = Box::new(EthereumIPC::new(eth_socket).await?);
-        Ok(Self::new(api, eth))
+        let sub_endpoint = SubscriptionEndpoint::Ipc {
+            socket_path: eth_socket.to_owned(),
+        };
+        Ok(Self(Arc::new(Inner::new(api, eth, Some(sub_endpoint)))))
     }
 
     /// Create a new engine using RPC.
@@ -115,6 +128,7 @@ impl Engine {
     pub async fn new_rpc(
         execution_endpoint: Url,
         eth_endpoint: Url,
+        ws_endpoint: Option<Url>,
         execution_jwt: &str,
     ) -> eyre::Result<Self> {
         let api = Box::new(EngineRpc::new(
@@ -126,12 +140,13 @@ impl Engine {
         // Probe the RPC server to confirm it is reachable.
         eth.check_connectivity().await?;
 
-        Ok(Self::new(api, eth))
+        let sub_endpoint = ws_endpoint.map(|url| SubscriptionEndpoint::Ws { url });
+        Ok(Self(Arc::new(Inner::new(api, eth, sub_endpoint))))
     }
 
     /// Create a new engine with custom API implementations.
     pub fn new(api: Box<dyn EngineAPI>, eth: Box<dyn EthereumAPI>) -> Self {
-        Self(Arc::new(Inner::new(api, eth)))
+        Self(Arc::new(Inner::new(api, eth, None)))
     }
 
     /// Set the function that determines whether Osaka is active at a given timestamp.
@@ -209,6 +224,13 @@ impl Engine {
             .expect("Clock is before UNIX epoch!")
             .as_secs()
     }
+
+    /// Returns the subscription-capable endpoint for the execution layer,
+    /// if one was configured. `None` for test/mock engines or RPC without
+    /// `--execution-ws-endpoint`.
+    pub fn subscription_endpoint(&self) -> Option<&SubscriptionEndpoint> {
+        self.0.subscription_endpoint.as_ref()
+    }
 }
 
 impl Deref for Engine {
@@ -224,6 +246,8 @@ pub struct Inner {
     pub api: Box<dyn EngineAPI>,
     /// Client for Ethereum API.
     pub eth: Box<dyn EthereumAPI>,
+    /// Subscription-capable endpoint for the execution layer.
+    subscription_endpoint: Option<SubscriptionEndpoint>,
     /// Optional function to check if Osaka is active at a given timestamp.
     /// Set after construction via [`Engine::set_is_osaka_active`].
     /// When `None`, defaults to `false` (use V4).
@@ -231,11 +255,15 @@ pub struct Inner {
 }
 
 impl Inner {
-    /// Create a new engine with custom API implementations.
-    fn new(api: Box<dyn EngineAPI>, eth: Box<dyn EthereumAPI>) -> Self {
+    fn new(
+        api: Box<dyn EngineAPI>,
+        eth: Box<dyn EthereumAPI>,
+        subscription_endpoint: Option<SubscriptionEndpoint>,
+    ) -> Self {
         Self {
             api,
             eth,
+            subscription_endpoint,
             is_osaka_active: OnceLock::new(),
         }
     }

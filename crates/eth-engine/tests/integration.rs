@@ -231,6 +231,7 @@ async fn test_engine() {
         let engine = Engine::new_rpc(
             Url::parse("http://localhost:8551").unwrap(),
             Url::parse("http://localhost:8545").unwrap(),
+            None,
             jwt_path.to_str().unwrap(),
         )
         .await

@@ -18,10 +18,14 @@ use eyre::{eyre, Context};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+/// Timeout when blocked waiting for EL persistence to catch up.
+const REPLAY_PERSISTENCE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 use arc_consensus_types::{ArcContext, ConsensusParams, Height, ValidatorSet, ValueSyncConfig};
 use arc_eth_engine::capabilities::check_capabilities;
 use arc_eth_engine::engine::{Engine, EngineAPI, EthereumAPI};
 use arc_eth_engine::json_structures::ExecutionBlock;
+use arc_eth_engine::persistence_meter::{self, PersistenceMeter};
 use malachitebft_app_channel::Reply;
 use malachitebft_core_types::HeightParams;
 
@@ -49,6 +53,19 @@ pub async fn handle(
     let payload_validator = EnginePayloadValidator::new(engine, metrics);
     let block_finalizer = EngineBlockFinalizer::new(engine, stats, metrics);
 
+    let execution_config = &state.config().execution;
+    let persistence_meter = persistence_meter::create_with_fallback(
+        execution_config.persistence_backpressure,
+        engine.subscription_endpoint(),
+        execution_config.persistence_backpressure_threshold,
+    )
+    .await;
+
+    // Seed with the current EL height. Safe at startup since all blocks are
+    // persisted before the node begins replaying.
+    persistence_meter::seed_from_latest_block(persistence_meter.as_ref(), engine.eth.as_ref())
+        .await;
+
     let (next_height, next_validator_set, next_consensus_params, previous_block) =
         on_consensus_ready(
             metrics,
@@ -59,6 +76,7 @@ pub async fn handle(
             block_finalizer,
             engine.api.as_ref(),
             engine.eth.as_ref(),
+            persistence_meter.as_ref(),
             max_pending_proposals,
         )
         .await?;
@@ -90,6 +108,7 @@ async fn on_consensus_ready(
     block_finalizer: impl BlockFinalizer,
     engine_api: impl EngineAPI,
     ethereum_api: impl EthereumAPI,
+    persistence_meter: impl PersistenceMeter,
     max_pending_proposals: usize,
 ) -> eyre::Result<(Height, ValidatorSet, ConsensusParams, ExecutionBlock)> {
     // Perform handshake and replay any missing blocks
@@ -104,6 +123,7 @@ async fn on_consensus_ready(
         &ethereum_api,
         &certificates_repository,
         &payloads_repository,
+        persistence_meter,
         metrics,
     )
     .await?;
@@ -294,6 +314,7 @@ struct HandshakeResult {
     next_height: Height,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handshake_and_replay(
     payload_validator: impl PayloadValidator,
     block_finalizer: impl BlockFinalizer,
@@ -301,6 +322,7 @@ async fn handshake_and_replay(
     ethereum_api: impl EthereumAPI,
     certificates_repository: impl CertificatesRepository,
     payloads_repository: impl PayloadsRepository,
+    persistence_meter: impl PersistenceMeter,
     metrics: &AppMetrics,
 ) -> eyre::Result<HandshakeResult> {
     // Node start-up: https://hackmd.io/@danielrachi/engine_api#Node-startup
@@ -366,7 +388,22 @@ async fn handshake_and_replay(
         )
         .await
         {
-            Ok(block) => latest_block = block,
+            Ok(block) => {
+                latest_block = block;
+                if let Err(e) = persistence_meter
+                    .wait_for_persisted_block(
+                        latest_block.block_number,
+                        REPLAY_PERSISTENCE_WAIT_TIMEOUT,
+                    )
+                    .await
+                {
+                    error!(
+                        block_number = latest_block.block_number,
+                        %e,
+                        "🔄 Replay: persistence backpressure timed out, proceeding"
+                    );
+                }
+            }
             Err(ReplayBlockError::PayloadMissing(h)) => {
                 warn!(height = %h, latest_height_cons = %latest_height_cons, "🔄 Handshake: payload missing, triggering checkpoint sync");
 
@@ -468,7 +505,8 @@ mod tests {
     use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3};
     use arc_consensus_types::{ValidatorSet, B256};
     use arc_eth_engine::capabilities::EngineCapabilities;
-    use arc_eth_engine::mocks::{MockEngineAPI, MockEthereumAPI};
+    use arc_eth_engine::mocks::{MockEngineAPI, MockEthereumAPI, MockPersistenceMeter};
+    use arc_eth_engine::persistence_meter::NoopPersistenceMeter;
     use eyre::eyre;
     use mockall::predicate::*;
 
@@ -601,6 +639,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -675,6 +714,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -689,6 +729,200 @@ mod tests {
         assert_eq!(latest_height, cl_height);
         assert_eq!(next_height, cl_height.increment());
         assert_eq!(metrics.get_handshake_replay_blocks(), expected_replayed);
+    }
+
+    #[tokio::test]
+    async fn test_replay_checks_persistence_after_each_replayed_block_for_small_gap() {
+        let el_height = 3u64;
+        let cl_height = Height::new(5);
+        let latest_block_el = test_execution_block(el_height, 1000);
+
+        let mut payload_validator = MockPayloadValidator::new();
+        payload_validator
+            .expect_validate_payload()
+            .times(2)
+            .returning(|_| Ok(PayloadValidationResult::Valid));
+
+        let mut block_finalizer = MockBlockFinalizer::new();
+        block_finalizer
+            .expect_finalize_decided_block()
+            .times(2)
+            .returning(|height, _| {
+                let h = height.as_u64();
+                let block = test_execution_block(h, 1000 + h);
+                Ok((block, block.block_hash))
+            });
+
+        let engine_api = setup_mock_engine_api_success();
+        let ethereum_api = setup_mock_ethereum_api_with_block(latest_block_el, cl_height.as_u64());
+
+        let mut certificates_repo = MockCertificatesRepository::new();
+        certificates_repo
+            .expect_max_height()
+            .return_once(move || Ok(Some(cl_height)));
+
+        let mut payloads_repo = MockPayloadsRepository::new();
+        payloads_repo
+            .expect_get()
+            .times(2)
+            .returning(|height| Ok(Some(test_payload(height.as_u64(), 1000 + height.as_u64()))));
+
+        let mut persistence_meter = MockPersistenceMeter::new();
+        let mut sequence = mockall::Sequence::new();
+        persistence_meter
+            .expect_wait_for_persisted_block()
+            .withf(|&block, _| block == 4)
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(|_, _| Ok(()));
+        persistence_meter
+            .expect_wait_for_persisted_block()
+            .withf(|&block, _| block == 5)
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(|_, _| Ok(()));
+
+        let metrics = test_metrics();
+
+        let result = handshake_and_replay(
+            &payload_validator,
+            &block_finalizer,
+            &engine_api,
+            &ethereum_api,
+            &certificates_repo,
+            &payloads_repo,
+            &persistence_meter,
+            &metrics,
+        )
+        .await;
+
+        let HandshakeResult { previous_block, .. } = result.unwrap();
+        assert_eq!(previous_block.block_number, cl_height.as_u64());
+    }
+
+    #[tokio::test]
+    async fn test_replay_checks_persistence_after_each_replayed_block() {
+        let el_height = 3u64;
+        let cl_height = Height::new(13);
+        let latest_block_el = test_execution_block(el_height, 1000);
+
+        let mut payload_validator = MockPayloadValidator::new();
+        payload_validator
+            .expect_validate_payload()
+            .times(10)
+            .returning(|_| Ok(PayloadValidationResult::Valid));
+
+        let mut block_finalizer = MockBlockFinalizer::new();
+        block_finalizer
+            .expect_finalize_decided_block()
+            .times(10)
+            .returning(|height, _| {
+                let h = height.as_u64();
+                let block = test_execution_block(h, 1000 + h);
+                Ok((block, block.block_hash))
+            });
+
+        let engine_api = setup_mock_engine_api_success();
+        let ethereum_api = setup_mock_ethereum_api_with_block(latest_block_el, cl_height.as_u64());
+
+        let mut certificates_repo = MockCertificatesRepository::new();
+        certificates_repo
+            .expect_max_height()
+            .return_once(move || Ok(Some(cl_height)));
+
+        let mut payloads_repo = MockPayloadsRepository::new();
+        payloads_repo
+            .expect_get()
+            .times(10)
+            .returning(|height| Ok(Some(test_payload(height.as_u64(), 1000 + height.as_u64()))));
+
+        let mut persistence_meter = MockPersistenceMeter::new();
+        let mut sequence = mockall::Sequence::new();
+        for height in 4u64..=13 {
+            persistence_meter
+                .expect_wait_for_persisted_block()
+                .withf(move |&block, _| block == height)
+                .times(1)
+                .in_sequence(&mut sequence)
+                .return_once(|_, _| Ok(()));
+        }
+
+        let metrics = test_metrics();
+
+        let result = handshake_and_replay(
+            &payload_validator,
+            &block_finalizer,
+            &engine_api,
+            &ethereum_api,
+            &certificates_repo,
+            &payloads_repo,
+            &persistence_meter,
+            &metrics,
+        )
+        .await;
+
+        let HandshakeResult { previous_block, .. } = result.unwrap();
+        assert_eq!(previous_block.block_number, cl_height.as_u64());
+    }
+
+    #[tokio::test]
+    async fn test_replay_proceeds_when_persistence_meter_fails() {
+        let el_height = 4u64;
+        let cl_height = Height::new(5);
+        let latest_block_el = test_execution_block(el_height, 1000);
+        let payload_to_replay = test_payload(5, 1100);
+
+        let mut payload_validator = MockPayloadValidator::new();
+        payload_validator
+            .expect_validate_payload()
+            .return_once(|_| Ok(PayloadValidationResult::Valid));
+
+        let mut block_finalizer = MockBlockFinalizer::new();
+        block_finalizer
+            .expect_finalize_decided_block()
+            .return_once(|height, _| {
+                let h = height.as_u64();
+                let block = test_execution_block(h, 1000 + h);
+                Ok((block, block.block_hash))
+            });
+
+        let engine_api = setup_mock_engine_api_success();
+        let ethereum_api = setup_mock_ethereum_api_with_block(latest_block_el, cl_height.as_u64());
+
+        let mut certificates_repo = MockCertificatesRepository::new();
+        certificates_repo
+            .expect_max_height()
+            .return_once(move || Ok(Some(cl_height)));
+
+        let mut payloads_repo = MockPayloadsRepository::new();
+        payloads_repo
+            .expect_get()
+            .return_once(move |_| Ok(Some(payload_to_replay)));
+
+        let mut persistence_meter = MockPersistenceMeter::new();
+        persistence_meter
+            .expect_wait_for_persisted_block()
+            .withf(|&block, _| block == 5)
+            .times(1)
+            .return_once(|_, _| Err(eyre!("persistence meter failed")));
+
+        let metrics = test_metrics();
+
+        let result = handshake_and_replay(
+            &payload_validator,
+            &block_finalizer,
+            &engine_api,
+            &ethereum_api,
+            &certificates_repo,
+            &payloads_repo,
+            &persistence_meter,
+            &metrics,
+        )
+        .await;
+
+        // Meter error is logged but replay proceeds
+        let HandshakeResult { previous_block, .. } = result.unwrap();
+        assert_eq!(previous_block.block_number, cl_height.as_u64());
     }
 
     async fn do_multiple_block_replay(num_blocks: usize) {
@@ -736,6 +970,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -794,6 +1029,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -836,6 +1072,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -867,6 +1104,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -912,6 +1150,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -960,6 +1199,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -1008,6 +1248,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -1039,6 +1280,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -1079,6 +1321,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -1140,6 +1383,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -1178,6 +1422,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -1216,6 +1461,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;
@@ -1273,6 +1519,7 @@ mod tests {
             block_finalizer,
             &engine_api,
             &ethereum_api,
+            NoopPersistenceMeter,
             10,
         )
         .await
@@ -1395,6 +1642,7 @@ mod tests {
             &ethereum_api,
             &certificates_repo,
             &payloads_repo,
+            NoopPersistenceMeter,
             &metrics,
         )
         .await;

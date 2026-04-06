@@ -198,7 +198,7 @@ The execution layer is built on top of [Reth][reth], extending it with Arc-speci
 
 - **Custom Precompiles** - Native implementations for Arc-specific operations (native coin control, post-quantum signatures, system accounting)
 - **Custom EVM Configuration** - Specialized gas calculations and execution logic
-- **Transaction Pool Enhancements** - Denylist support and custom validation
+- **Transaction Pool Enhancements** - Custom validation
 - **Block Executor** - Optimized block execution with Arc-specific features
 
 For architectural details, see the [Architecture Guide](../../docs/ARCHITECTURE.md).

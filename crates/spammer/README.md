@@ -5,6 +5,7 @@ Transaction load generator: create, sign, and send transactions to multiple node
 **Table of contents**
 
 - [Architecture overview](#architecture-overview)
+- [Operating modes](#operating-modes)
 - [CLI usage](#cli-usage)
   - [`spammer ws`](#spammer-ws)
   - [`spammer nodes`](#spammer-nodes)
@@ -174,6 +175,20 @@ graph LR
 **Result Tracker**:
 - Monitors RPC request outcomes and provides real-time statistics on successful
   and failed transactions, with updates printed every second.
+
+## Operating modes
+
+The spammer supports two send modes:
+
+| Mode | Nonce handling | Error recovery | Best for |
+|------|---------------|----------------|----------|
+| Backpressure (default) | Advances only on acceptance | Re-queries nonce on rejection, skips after 3 consecutive failures | Correctness-sensitive workloads |
+| Fire-and-forget | Incremented optimistically | None (transactions may be lost) | Peak-throughput stress tests |
+
+When invoked via Quake, these modes map to the `load` and `spam` commands
+respectively. See the [Quake README](../quake/README.md#the-load-and-spam-commands)
+for CLI usage.
+When the `spammer` is executed directly, the `--fire-and-forget` flag enables the Fire-and-forget mode.
 
 ## CLI usage
 
