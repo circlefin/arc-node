@@ -19,6 +19,10 @@ Arc is an open EVM-compatible layer 1 built on [Malachite](https://github.com/ci
 - 🗳️ **[Consensus](crates/malachite-app/README.md)** - Consensus binary and configuration
 - More: see Arc [developer docs](https://docs.arc.network/arc/concepts/welcome-to-arc) for guides, APIs, and specs
 
+## Run a Node
+
+See [Installation — Build from Source](docs/installation.md#build-from-source) for how to build and install arc-node binaries, and [Running an Arc Node](docs/running-an-arc-node.md) for configuration and startup.
+
 ## Development
 
 ### Repository setup
