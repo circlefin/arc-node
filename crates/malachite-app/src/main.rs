@@ -25,7 +25,8 @@ use eyre::{eyre, Result};
 use tracing::{info, trace};
 
 use arc_consensus_types::{
-    Config, Height, MetricsConfig, PruningConfig, RpcConfig, RuntimeConfig, SigningConfig,
+    Config, ExecutionConfig, Height, MetricsConfig, PruningConfig, RpcConfig, RuntimeConfig,
+    SigningConfig,
 };
 use arc_node_consensus::hardcoded_config;
 use arc_node_consensus::node::{App, StartConfig};
@@ -174,6 +175,11 @@ fn build_config_from_cli(cmd: &StartCmd, logging: config::LoggingConfig) -> Resu
         certificates_before: Height::new(cmd.prune_certificates_before),
     };
 
+    let execution = ExecutionConfig {
+        persistence_backpressure: cmd.execution_persistence_backpressure,
+        persistence_backpressure_threshold: cmd.execution_persistence_backpressure_threshold,
+    };
+
     Ok(Config {
         moniker: cmd.get_moniker(),
         logging,
@@ -183,6 +189,7 @@ fn build_config_from_cli(cmd: &StartCmd, logging: config::LoggingConfig) -> Resu
         runtime,
         prune,
         rpc,
+        execution,
         signing: build_signing_config(cmd)?,
     })
 }
@@ -222,6 +229,7 @@ fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<
         execution_socket: cmd.execution_socket.clone(),
         eth_rpc_endpoint: cmd.eth_rpc_endpoint.clone(),
         execution_endpoint: cmd.execution_endpoint.clone(),
+        execution_ws_endpoint: cmd.execution_ws_endpoint.clone(),
         execution_jwt: cmd.execution_jwt.clone(),
         pprof_bind_address: Some(cmd.pprof_addr.parse()?),
         suggested_fee_recipient: cmd.suggested_fee_recipient,

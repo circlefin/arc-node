@@ -87,7 +87,9 @@ const EL_DEFAULT_HTTP_ENABLE: bool = true;
 const EL_DEFAULT_LOG_LEVEL: &str = "debug";
 const EL_DEFAULT_RPC_TXFEECAP: u64 = 1000;
 const EL_DEFAULT_WS_ENABLE: bool = true;
-const EL_DEFAULT_RPC_API: &[&str] = &["admin", "net", "eth", "web3", "debug", "txpool", "trace"];
+const EL_DEFAULT_RPC_API: &[&str] = &[
+    "admin", "net", "eth", "web3", "debug", "txpool", "trace", "reth",
+];
 const EL_DEFAULT_ENABLE_ARC_RPC: bool = true;
 const EL_DEFAULT_ARC_DENYLIST_ENABLED: bool = true;
 
@@ -1593,7 +1595,7 @@ mod tests {
             .contains(&"--http.api=admin,debug".to_string()));
         // Default array is overridden
         // the default array is
-        // http.api = ["admin", "net", "eth", "web3", "debug", "txpool", "trace"]
+        // http.api = ["admin", "net", "eth", "web3", "debug", "txpool", "trace", "reth"]
         // so this check confirms that no flag contains both "eth" and "http.api".
         assert!(!manifest.nodes["validator1"]
             .el_cli_flags()

@@ -562,6 +562,7 @@ fn generate_consensus_config(
         // Use single-threaded runtime for lower resource usage when running local devnet
         runtime: RuntimeConfig::SingleThreaded,
         prune: PruningConfig::default(),
+        execution: Default::default(),
         rpc: RpcConfig {
             enabled: true,
             // IPADDR_ANY because we need external access to it for testing.
@@ -795,6 +796,15 @@ pub(crate) fn generate_node_cli_flags(
                 "--signing.remote=http://{name}-signer-proxy:{REMOTE_SIGNER_PROXY_PORT}"
             ));
         }
+
+        // Add persistence backpressure flags.
+        if node.cl_config.execution.persistence_backpressure {
+            flags.push("--execution-persistence-backpressure".to_string());
+        }
+        flags.push(format!(
+            "--execution-persistence-backpressure-threshold={}",
+            node.cl_config.execution.persistence_backpressure_threshold
+        ));
 
         // Add pruning flags from explicit cl_config.prune values.
         let prune = &node.cl_config.prune;

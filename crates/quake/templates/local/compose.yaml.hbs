@@ -138,6 +138,7 @@ services:
       {{#if ../rpc}}
       - "--eth-rpc-endpoint=http://{{execution.inner.name}}:8545"
       - "--execution-endpoint=http://{{execution.inner.name}}:8551"
+      - "--execution-ws-endpoint=ws://{{execution.inner.name}}:8546"
       - "--execution-jwt=/app/assets/jwtsecret"
       {{else}}
       - "--eth-socket=/sockets/reth.ipc"
@@ -279,6 +280,7 @@ services:
       {{#if ../rpc}}
       - "--eth-rpc-endpoint=http://{{execution.inner.name}}_u:8545"
       - "--execution-endpoint=http://{{execution.inner.name}}_u:8551"
+      - "--execution-ws-endpoint=ws://{{execution.inner.name}}_u:8546"
       - "--execution-jwt=/app/assets/jwtsecret"
       {{else}}
       - "--eth-socket=/sockets/reth.ipc"

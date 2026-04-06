@@ -872,9 +872,9 @@ The following flags are applied to all nodes by default. They are defined in
 | Flag | Default Value | Description |
 |------|---------------|-------------|
 | `http.enable` | `true` | Enable the HTTP-RPC server |
-| `http.api` | `["admin", "net", "eth", "web3", "debug", "txpool", "trace"]` | APIs exposed over HTTP |
+| `http.api` | `["admin", "net", "eth", "web3", "debug", "txpool", "trace", "reth"]` | APIs exposed over HTTP |
 | `ws.enable` | `true` | Enable the WebSocket-RPC server |
-| `ws.api` | `["admin", "net", "eth", "web3", "debug", "txpool", "trace"]` | APIs exposed over WebSocket |
+| `ws.api` | `["admin", "net", "eth", "web3", "debug", "txpool", "trace", "reth"]` | APIs exposed over WebSocket |
 | `engine.persistence-threshold` | `0` | Persistence threshold for engine payloads |
 | `engine.memory-block-buffer-target` | `0` | Memory block buffer target |
 | `enable-arc-rpc` | `true` | Enable Arc-specific RPC methods |

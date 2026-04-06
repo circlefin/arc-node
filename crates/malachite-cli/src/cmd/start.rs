@@ -160,6 +160,37 @@ pub struct StartCmd {
     #[clap(long, value_name = "URL")]
     pub execution_endpoint: Option<Url>,
 
+    /// The WebSocket URL of the execution engine. Used for subscribing to
+    /// real-time execution layer events (e.g. persisted block notifications).
+    ///
+    /// If omitted, derived from --eth-rpc-endpoint using the convention
+    /// (scheme http→ws / https→wss, port + 1).
+    ///
+    /// Example: ws://localhost:8546
+    #[clap(long, value_name = "URL")]
+    pub execution_ws_endpoint: Option<Url>,
+
+    /// Enable persistence backpressure during startup replay. When enabled,
+    /// the consensus layer waits for the execution layer to persist blocks
+    /// before replaying further.
+    ///
+    /// Requires --execution-ws-endpoint (RPC mode) or IPC mode.
+    #[clap(long = "execution-persistence-backpressure")]
+    pub execution_persistence_backpressure: bool,
+
+    /// Number of blocks the execution layer is allowed to lag behind the
+    /// consensus layer before persistence backpressure is applied.
+    ///
+    /// Only takes effect when --execution-persistence-backpressure is enabled.
+    /// Large values weaken backpressure and may allow the execution layer
+    /// to accumulate a significant unpersisted block buffer.
+    #[clap(
+        long = "execution-persistence-backpressure-threshold",
+        value_name = "BLOCKS",
+        default_value = "100"
+    )]
+    pub execution_persistence_backpressure_threshold: u64,
+
     /// The path to the JWT secret file shared by Malachite and the execution
     /// engine. This is a mandatory form of authentication which ensures that
     /// Malachite has the authority to control the execution engine.
@@ -368,6 +399,9 @@ impl Default for StartCmd {
             execution_socket: None,
             eth_rpc_endpoint: None,
             execution_endpoint: None,
+            execution_ws_endpoint: None,
+            execution_persistence_backpressure: false,
+            execution_persistence_backpressure_threshold: 100,
             execution_jwt: None,
             metrics: None,
             rpc_addr: None,

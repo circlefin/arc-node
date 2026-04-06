@@ -21,9 +21,11 @@ mkdir -p ~/.arc/execution ~/.arc/consensus
 sudo install -d -o $USER /run/arc
 ```
 
+> **macOS:** `/run` does not exist on macOS. Use a user-local directory instead (e.g. `mkdir -p ~/.arc/run`) and adjust the `--ipcpath`, `--auth-ipc.path`, `--eth-socket`, and `--execution-socket` flags in the commands below accordingly.
+
 When running as a systemd service, `RuntimeDirectory=arc` creates `/run/arc` automatically — skip the second command.
 
-**1. Download snapshots** (recommended for faster initial sync). This lets your node start from a recent block height rather than syncing from genesis.
+**1. Download snapshots** (required). Syncing from genesis is not currently supported -- a snapshot is needed to bootstrap the node.
 
 ```sh
 arc-snapshots download --chain=arc-testnet
@@ -83,6 +85,20 @@ arc-node-consensus start \
 
 > **Note:** Start the Execution Layer first. The Consensus Layer connects to it on startup and will fail if the EL is not running.
 
+> **Note:** The Blockdaemon endpoint does not currently support WebSocket connections. The node will log retry warnings for this endpoint but still syncs correctly via the other two endpoints. HTTP block fetching from Blockdaemon works normally.
+
+**5. Verify the node is syncing:**
+
+Wait about 30 seconds, then check the block height:
+
+```sh
+curl -s -X POST http://localhost:8545 \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+```
+
+The `result` field should be a hex block number that increases over time. If it stays at `0x0`, check the Consensus Layer logs for connection errors.
+
 ### EL ↔ CL Communication
 
 The Quick Start above uses IPC sockets, which require EL and CL to run on the same host. If they are on separate hosts, use RPC instead.
@@ -138,6 +154,8 @@ Check out [reth system requirements](https://reth.rs/run/system-requirements/) f
 ### Production Deployment
 
 For production, run both processes as systemd services.
+
+> **Note:** The service files below use `$USER` and `$HOME`, which the shell expands to your current username and home directory before writing the file. Review the generated file with `sudo cat /etc/systemd/system/arc-execution.service` after creation to confirm the paths are correct.
 
 #### Execution Layer Service
 

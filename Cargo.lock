@@ -1099,6 +1099,7 @@ name = "arc-eth-engine"
 version = "0.0.1"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rpc-types",

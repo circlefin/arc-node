@@ -59,12 +59,15 @@ impl<'a> EngineConfig<'a> {
             EngineConfig::Rpc(EthRpcConfig {
                 eth_rpc_endpoint,
                 execution_endpoint,
+                execution_ws_endpoint,
                 execution_jwt,
             }) => {
-                (|| {
+                let ws_endpoint = execution_ws_endpoint;
+                (move || {
                     Engine::new_rpc(
                         execution_endpoint.clone(),
                         eth_rpc_endpoint.clone(),
+                        ws_endpoint.clone(),
                         execution_jwt,
                     )
                 })
@@ -86,6 +89,7 @@ pub struct EthIpcConfig<'a> {
 pub struct EthRpcConfig<'a> {
     pub eth_rpc_endpoint: &'a Url,
     pub execution_endpoint: &'a Url,
+    pub execution_ws_endpoint: Option<Url>,
     pub execution_jwt: &'a str,
 }
 
@@ -110,6 +114,8 @@ pub struct StartConfig {
     pub eth_rpc_endpoint: Option<Url>,
     /// The execution endpoint
     pub execution_endpoint: Option<Url>,
+    /// The execution WebSocket endpoint
+    pub execution_ws_endpoint: Option<Url>,
     /// The execution JWT
     pub execution_jwt: Option<String>,
     /// The bind address for the pprof server
@@ -148,9 +154,15 @@ impl StartConfig {
             self.execution_endpoint.as_ref(),
             self.execution_jwt.as_ref(),
         ) {
+            let ws_endpoint = self
+                .execution_ws_endpoint
+                .clone()
+                .or_else(|| derive_ws_url(eth_rpc_endpoint));
+
             Some(EngineConfig::Rpc(EthRpcConfig {
                 eth_rpc_endpoint,
                 execution_endpoint,
+                execution_ws_endpoint: ws_endpoint,
                 execution_jwt,
             }))
         } else {
@@ -165,4 +177,21 @@ impl StartConfig {
             DbUpgrade::Perform
         }
     }
+}
+
+/// Derive a WebSocket URL from an HTTP RPC URL using the reth convention:
+/// `http(s)://host:port` → `ws(s)://host:(port+1)`.
+///
+/// Same convention used by `--follow.endpoint` (see [`SyncEndpointUrl::websocket`]).
+/// Returns `None` if the URL has no explicit port or an unsupported scheme.
+fn derive_ws_url(http_url: &Url) -> Option<Url> {
+    let mut ws_url = http_url.clone();
+    match http_url.scheme() {
+        "http" => ws_url.set_scheme("ws").ok()?,
+        "https" => ws_url.set_scheme("wss").ok()?,
+        _ => return None,
+    }
+    let port = http_url.port()?;
+    ws_url.set_port(Some(port + 1)).ok()?;
+    Some(ws_url)
 }
