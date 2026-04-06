@@ -800,11 +800,11 @@ pub(crate) fn generate_node_cli_flags(
         // Add persistence backpressure flags.
         if node.cl_config.execution.persistence_backpressure {
             flags.push("--execution-persistence-backpressure".to_string());
+            flags.push(format!(
+                "--execution-persistence-backpressure-threshold={}",
+                node.cl_config.execution.persistence_backpressure_threshold
+            ));
         }
-        flags.push(format!(
-            "--execution-persistence-backpressure-threshold={}",
-            node.cl_config.execution.persistence_backpressure_threshold
-        ));
 
         // Add pruning flags from explicit cl_config.prune values.
         let prune = &node.cl_config.prune;

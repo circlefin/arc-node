@@ -191,7 +191,44 @@ fn derive_ws_url(http_url: &Url) -> Option<Url> {
         "https" => ws_url.set_scheme("wss").ok()?,
         _ => return None,
     }
-    let port = http_url.port()?;
-    ws_url.set_port(Some(port + 1)).ok()?;
+    let port = http_url.port()?.checked_add(1)?;
+    ws_url.set_port(Some(port)).ok()?;
     Some(ws_url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_ws_url_increments_port() {
+        let http = Url::parse("http://localhost:8545").unwrap();
+        let ws = derive_ws_url(&http).unwrap();
+        assert_eq!(ws.as_str(), "ws://localhost:8546/");
+    }
+
+    #[test]
+    fn derive_ws_url_https_to_wss() {
+        let https = Url::parse("https://localhost:8545").unwrap();
+        let wss = derive_ws_url(&https).unwrap();
+        assert_eq!(wss.as_str(), "wss://localhost:8546/");
+    }
+
+    #[test]
+    fn derive_ws_url_returns_none_on_port_overflow() {
+        let http = Url::parse("http://localhost:65535").unwrap();
+        assert!(derive_ws_url(&http).is_none());
+    }
+
+    #[test]
+    fn derive_ws_url_returns_none_without_port() {
+        let http = Url::parse("http://localhost").unwrap();
+        assert!(derive_ws_url(&http).is_none());
+    }
+
+    #[test]
+    fn derive_ws_url_returns_none_for_unsupported_scheme() {
+        let ftp = Url::parse("ftp://localhost:8545").unwrap();
+        assert!(derive_ws_url(&ftp).is_none());
+    }
 }
