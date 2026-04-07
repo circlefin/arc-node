@@ -69,9 +69,9 @@ where
         let tx_kind = tx.kind();
         let tx_value = tx.value();
 
-        if !self.can_load_account(evm, NATIVE_COIN_CONTROL_ADDRESS) {
-            return self.mainnet.pre_execution(evm);
-        }
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)?;
         self.check_blocklist(evm, caller, &tx_kind, tx_value)?;
 
         self.mainnet.pre_execution(evm)
@@ -174,10 +174,6 @@ where
     >,
     ERROR: EvmTrError<EVM>,
 {
-    fn can_load_account(&self, evm: &mut EVM, address: Address) -> bool {
-        evm.ctx_mut().journal_mut().load_account(address).is_ok()
-    }
-
     fn check_blocklist(
         &self,
         evm: &mut EVM,
