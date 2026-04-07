@@ -16,7 +16,7 @@ concurrency:
 
 env:
   REGISTRY: docker.cloudsmith.io
-  REGISTRY_NAMESPACE: circle/arc
+  REGISTRY_NAMESPACE: circle/arc-network
 
 jobs:
   build:
