@@ -57,10 +57,12 @@ git checkout v0.6.0
 
 **3. Build and install:**
 
+By default, `cargo install` places binaries in `~/.cargo/bin`, which is added to `PATH` by the Rust installer. Pass `--root <dir>` to install into `<dir>/bin` instead (e.g. `--root /usr/local`).
+
 ```sh
-cargo install --path crates/node --root /usr/local
-cargo install --path crates/malachite-app --root /usr/local
-cargo install --path crates/snapshots --root /usr/local
+cargo install --path crates/node
+cargo install --path crates/malachite-app
+cargo install --path crates/snapshots
 ```
 
 Verify:

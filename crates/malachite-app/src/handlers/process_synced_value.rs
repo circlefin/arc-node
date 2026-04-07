@@ -52,7 +52,7 @@ pub async fn handle(
     value_bytes: Bytes,
     reply: Reply<Option<ProposedValue<ArcContext>>>,
 ) -> Result<(), eyre::Error> {
-    let proposal = on_process_synced_value(
+    let proposal = match on_process_synced_value(
         EnginePayloadValidator::new(engine, state.metrics()),
         state.store(),
         state.store(),
@@ -61,7 +61,17 @@ pub async fn handle(
         proposer,
         value_bytes,
     )
-    .await?;
+    .await
+    {
+        Ok(proposal) => proposal,
+        Err(e) => {
+            error!(%height, %round, %proposer, "ProcessSyncedValue failed: {e:#}");
+            if let Err(send_err) = reply.send(None) {
+                error!("🔴 ProcessSyncedValue: Failed to send error reply: {send_err:?}");
+            }
+            return Err(e);
+        }
+    };
 
     // Mark this height as synced for proposal monitoring
     if let Some(p) = &proposal
@@ -276,6 +286,79 @@ mod tests {
         .expect("Failed to process synced value");
 
         assert!(proposal.is_none());
+    }
+
+    // These two tests cover error paths in `on_process_synced_value` that were
+    // previously untested. They do NOT directly test the CCHAIN-1498 fix in
+    // `handle()`, which requires `State` and `Engine` — concrete types with no
+    // test builder. A `State` test harness would benefit all handler tests but
+    // is out of scope here.
+    #[tokio::test]
+    async fn on_process_synced_value_engine_validation_error() {
+        let mut u = Unstructured::new(&[0u8; 512]);
+
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let proposer = Address::new([0u8; 20]);
+        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+        let value_bytes = Bytes::from(payload.as_ssz_bytes());
+
+        let mut engine = MockPayloadValidator::new();
+        engine
+            .expect_validate_payload()
+            .returning(|_| Err(io::Error::other("Simulated engine error").into()));
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided.expect_store().times(0);
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(0);
+
+        let result = on_process_synced_value(
+            engine,
+            undecided,
+            invalid,
+            height,
+            round,
+            proposer,
+            value_bytes,
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn on_process_synced_value_invalid_payload_store_fails() {
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let proposer = Address::new([0u8; 20]);
+        let value_bytes = Bytes::from(vec![0u8; 10]); // garbage bytes trigger SSZ decode failure
+
+        let mut engine = MockPayloadValidator::new();
+        engine.expect_validate_payload().times(0);
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided.expect_store().times(0);
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid
+            .expect_append()
+            .times(1)
+            .returning(|_| Err(io::Error::other("Simulated invalid payload store error")));
+
+        let result = on_process_synced_value(
+            engine,
+            undecided,
+            invalid,
+            height,
+            round,
+            proposer,
+            value_bytes,
+        )
+        .await;
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]

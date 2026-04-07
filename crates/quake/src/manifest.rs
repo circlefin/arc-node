@@ -157,6 +157,16 @@ pub struct ElEngineConfig {
     pub cross_block_cache_size: Option<u64>,
     pub persistence_threshold: u64,
     pub memory_block_buffer_target: u64,
+    pub legacy_state_root: Option<bool>,
+}
+
+/// Execution layer (Reth) storage configuration overrides.
+///
+/// Fields mirror reth's storage CLI flags and correspond to `--storage.*` flags.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct ElStorageConfig {
+    pub v2: Option<bool>,
 }
 
 /// Execution layer (Reth) gas price oracle configuration overrides.
@@ -383,6 +393,7 @@ pub struct ElConfigOverride {
     pub tx_propagation_policy: Option<String>,
     pub arc: ElArcConfig,
     pub prune: ElPruneConfig,
+    pub storage: ElStorageConfig,
 }
 
 impl Default for ElConfigOverride {
@@ -403,6 +414,7 @@ impl Default for ElConfigOverride {
             tx_propagation_policy: Option::default(),
             arc: ElArcConfig::default(),
             prune: ElPruneConfig::default(),
+            storage: ElStorageConfig::default(),
         }
     }
 }

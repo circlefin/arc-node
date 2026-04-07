@@ -347,6 +347,7 @@ impl Manifest {
             engine: ElEngineConfig {
                 disable_state_cache: Some(rng.gen_bool(0.1)),
                 cross_block_cache_size: Some(rng.gen_range(2048..=8192)),
+                legacy_state_root: Some(rng.gen_bool(0.1)),
                 ..ElEngineConfig::default()
             },
             ..ElConfigOverride::default()
@@ -959,6 +960,7 @@ mod tests {
                 (2048..=8192).contains(&cache),
                 "cross-block-cache-size = {cache}"
             );
+            assert!(g.engine.legacy_state_root.is_some());
         }
     }
 
