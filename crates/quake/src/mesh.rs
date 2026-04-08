@@ -14,7 +14,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use indexmap::IndexMap;
+
 pub(crate) use arc_mesh_analysis::{
     analyze, classify_all, fetch_all_metrics, format_report, parse_all_metrics, MeshDisplayOptions,
-    MeshTier,
+    MeshTier, NodeType as MeshNodeType,
 };
+
+use crate::manifest::Node;
+
+/// Parse raw Prometheus metrics and assign manifest-aware node types in one step.
+///
+/// Combines `parse_all_metrics` with `assign_mesh_node_types` so callers don't
+/// need to remember both steps.
+pub(crate) fn parse_and_classify_metrics(
+    raw_metrics: &[(String, String)],
+    manifest_nodes: &IndexMap<String, Node>,
+) -> Vec<arc_mesh_analysis::NodeMetricsData> {
+    let mut nodes_data = parse_all_metrics(raw_metrics);
+    if !nodes_data.is_empty() {
+        crate::util::assign_mesh_node_types(&mut nodes_data, manifest_nodes);
+    }
+    nodes_data
+}

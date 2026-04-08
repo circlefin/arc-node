@@ -24,7 +24,7 @@ use crate::generator::{TxGenerator, TESTNET_CHAIN_ID};
 use crate::ws::WsClient;
 
 /// TestToken ERC-20 contract address (deterministic deployment in genesis).
-pub(crate) const TEST_TOKEN_ADDRESS: Address = address!("c35bA063F507CCf914FeEb69c8651ec695872587");
+pub(crate) const TEST_TOKEN_ADDRESS: Address = address!("e8e7F64D3d4eA1D5b9722A0769c3e7aC380b1423");
 
 fn encode_transfer(to: Address, amount: U256) -> Bytes {
     sol! {

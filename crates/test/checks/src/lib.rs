@@ -23,6 +23,7 @@ pub mod mesh;
 pub mod mev;
 pub mod perf;
 pub mod store;
+pub mod sync_speed;
 pub mod types;
 
 pub use fetch::fetch_all_metrics;
@@ -35,6 +36,9 @@ pub use mesh::check_mesh;
 pub use mev::check_pending_state;
 pub use perf::{check_block_time, check_block_time_delta, format_perf_report, parse_perf_metrics};
 pub use store::{check_store_pruning, collect_store_info, StoreInfo};
+pub use sync_speed::{
+    check_sync_speed, collect_sync_speed, poll_height, SyncSpeedConfig, SyncSpeedResult,
+};
 pub use types::{
     CheckResult, HistogramStats, NodeHealthData, NodeHealthDelta, NodePerfData, PerfDisplayOptions,
     Report,

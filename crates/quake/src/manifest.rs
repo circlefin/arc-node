@@ -347,6 +347,24 @@ impl std::fmt::Display for ElPruningPreset {
     }
 }
 
+/// CL pruning preset — emitted as `--full` or `--minimal` on the CL binary.
+/// Mutually exclusive with explicit `cl.config.prune.*` values.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClPruningPreset {
+    Full,
+    Minimal,
+}
+
+impl std::fmt::Display for ClPruningPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => write!(f, "--full"),
+            Self::Minimal => write!(f, "--minimal"),
+        }
+    }
+}
+
 /// Execution layer (Reth) pruning configuration overrides.
 ///
 /// Fields correspond to `--prune.*` CLI flags. Segment names use kebab-case
@@ -536,6 +554,11 @@ pub struct Node {
     /// Voting power for this validator in the genesis validator set.
     /// Only meaningful for validator nodes. When set, all validators must specify it.
     pub cl_voting_power: Option<u64>,
+
+    /// CL pruning preset — emitted as `--full` or `--minimal` on the CL binary.
+    /// Mutually exclusive with explicit `cl.config.prune.*` values.
+    #[serde(default)]
+    pub cl_prune_preset: Option<ClPruningPreset>,
 
     /// Mark this node as external (operated by a third party).
     /// External validators are expected to be multi-hop in mesh health checks
@@ -748,6 +771,25 @@ impl Manifest {
             }
         }
 
+        // Follow mode pulls blocks over RPC to follow_endpoints. Quake remote resolves those
+        // URLs from shared subnets only — no shared subnet means RPC cannot be reached on
+        // the private network.
+        if !self.subnets.is_empty() {
+            for (node_name, node) in self.nodes.iter() {
+                if !node.follow {
+                    continue;
+                }
+                for ep in &node.follow_endpoints {
+                    if self.subnets.shared_subnets(node_name, ep).is_empty() {
+                        warn!(
+                            "Node '{node_name}' follows '{ep}' over RPC but they share no subnet — \
+                             Quake remote cannot route RPC between them on private networks"
+                        );
+                    }
+                }
+            }
+        }
+
         // Check that all persistent peers reference valid node names
         for (node_name, node) in self.nodes.iter() {
             if let Some(peers) = &node.cl_persistent_peers {
@@ -771,6 +813,27 @@ impl Manifest {
                             "Node '{node_name}' has invalid el_trusted_peers entry '{peer}': \
                             no node with that name exists in the manifest"
                         );
+                    }
+                }
+            }
+        }
+
+        // Warn about persistent peers that don't share a subnet (CL P2P via Quake private IPs).
+        // Skip follow-mode nodes: they do not use CL persistent peers for P2P; RPC to
+        // `follow_endpoints` is checked above.
+        if !self.subnets.is_empty() {
+            for (node_name, node) in self.nodes.iter() {
+                if node.follow {
+                    continue;
+                }
+                if let Some(peers) = &node.cl_persistent_peers {
+                    for peer in peers {
+                        if self.subnets.shared_subnets(node_name, peer).is_empty() {
+                            warn!(
+                                "Node '{node_name}' has persistent peer '{peer}' but they share \
+                                 no subnet — CL P2P connections will fail at the network level"
+                            );
+                        }
                     }
                 }
             }
@@ -1025,6 +1088,7 @@ mod tests {
         let str = r#"
         name = "testnet"
         description = "test"
+        image_cl = "arc_consensus:v0.4.0"
         cl.config.logging.log_level = "warn"
         [nodes.validator1]
         cl.config.logging.log_level = "info"
@@ -1072,6 +1136,7 @@ mod tests {
     #[test]
     fn test_load_invalid_global_cl_config() {
         let str = r#"
+        image_cl = "arc_consensus:v0.4.0"
         cl.config.foo = 1
         [nodes.validator1]
         "#;
@@ -1082,6 +1147,7 @@ mod tests {
     #[test]
     fn test_load_invalid_node_config() {
         let str = r#"
+        image_cl = "arc_consensus:v0.4.0"
         [nodes.validator1]
         cl.config.foo = 1
         "#;
@@ -1171,6 +1237,7 @@ mod tests {
     #[test]
     fn test_node_with_empty_config_uses_global() {
         let str = r#"
+        image_cl = "arc_consensus:v0.4.0"
         [cl.config]
         consensus.enabled = false
 
@@ -1701,6 +1768,7 @@ mod tests {
     #[test]
     fn test_el_pruning_preset_roundtrip() {
         let toml_str = r#"
+        image_cl = "arc_consensus:v0.4.0"
         el.config.prune.preset = "minimal"
         el.config.prune.bodies.distance = 100
 
@@ -2103,6 +2171,7 @@ mod tests {
     #[test]
     fn test_voting_power_roundtrip() {
         let str = r#"
+        image_cl = "arc_consensus:v0.4.0"
         [nodes.validator1]
         cl_voting_power = 2000
         [nodes.validator2]

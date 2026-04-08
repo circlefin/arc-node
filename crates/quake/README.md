@@ -135,6 +135,9 @@ modify the generated configuration files before starting the nodes.
 # Send 1000 transactions per second during 30 seconds to one validator node
 ./quake load -t 30 -r 1000 validator1
 
+# Mixed EIP-1559 and legacy transfer load (70/30 split)
+./quake load -t 30 -r 1000 --mix transfer=70,legacy=30 validator1
+
 # Mixed ERC-20 and native transfer load (70/30 split)
 ./quake load -t 30 -r 1000 --mix transfer=70,erc20=30 validator1
 

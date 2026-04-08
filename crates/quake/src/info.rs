@@ -368,6 +368,36 @@ pub(crate) fn print_store_info(store_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Measure sync speed of `node` until it catches up with `reference`,
+/// printing live progress to stdout.
+pub(crate) async fn measure_sync_speed(
+    nodes: &NodesMetadata,
+    node: &str,
+    reference: &str,
+) -> Result<()> {
+    let node_url = nodes
+        .execution_http_url(node)
+        .ok_or_else(|| eyre::eyre!("Unknown node '{node}'"))?;
+    let ref_url = nodes
+        .execution_http_url(reference)
+        .ok_or_else(|| eyre::eyre!("Unknown reference node '{reference}'"))?;
+
+    let config = arc_checks::SyncSpeedConfig {
+        node_name: node.to_string(),
+        node_url,
+        reference_name: reference.to_string(),
+        reference_url: ref_url,
+        max_duration: Duration::from_secs(300),
+    };
+
+    let result = arc_checks::collect_sync_speed(config).await?;
+
+    println!();
+    println!("{result}");
+
+    Ok(())
+}
+
 /// Compact a known error message to a short string to make the output more readable
 fn error_to_short_string(error: Report) -> String {
     let err = error.root_cause().to_string().replace("\n", "  ");

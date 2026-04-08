@@ -289,10 +289,9 @@ mod tests {
     }
 
     // These two tests cover error paths in `on_process_synced_value` that were
-    // previously untested. They do NOT directly test the CCHAIN-1498 fix in
-    // `handle()`, which requires `State` and `Engine` — concrete types with no
-    // test builder. A `State` test harness would benefit all handler tests but
-    // is out of scope here.
+    // previously untested. They do NOT directly test the error-reply-before-propagation
+    // fix in `handle()`, which requires `State` and `Engine` -- concrete types
+    // with no test builder.
     #[tokio::test]
     async fn on_process_synced_value_engine_validation_error() {
         let mut u = Unstructured::new(&[0u8; 512]);

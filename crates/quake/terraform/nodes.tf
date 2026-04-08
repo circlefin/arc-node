@@ -17,15 +17,16 @@ resource "aws_instance" "node" {
   }
 
   user_data = templatefile("nodes-data.yaml", {
-    id              = var.node_names[count.index]
-    username        = local.username
-    region          = var.region
-    ssh_public_key  = tls_private_key.ssh.public_key_openssh
-    arch            = local.arch,
-    consensus_image = var.image_cl
-    execution_image = var.image_el
-    github_user     = var.github_user
-    github_token    = var.github_token
+    id                     = var.node_names[count.index]
+    username               = local.username
+    region                 = var.region
+    ssh_public_key         = tls_private_key.ssh.public_key_openssh
+    arch                   = local.arch,
+    consensus_image        = var.image_cl
+    execution_image        = var.image_el
+    github_user            = var.github_user
+    github_token           = var.github_token
+    expected_secondary_enis = length(local.node_secondary_networks[var.node_names[count.index]])
   })
 
   tags = merge(

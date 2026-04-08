@@ -2,6 +2,8 @@
 
 Arc node can be installed in two ways: a pre-built binary via `arcup` or building from source.
 
+> **Docker:** Container images and Docker Compose instructions are coming soon.
+
 ## Versions
 
 Versions across networks may not be compatible. Consult the table below to confirm which version to run for each network.
@@ -53,6 +55,7 @@ source $HOME/.cargo/env
 git clone https://github.com/circlefin/arc-node.git
 cd arc-node
 git checkout v0.6.0
+git submodule update --init --recursive
 ```
 
 **3. Build and install:**

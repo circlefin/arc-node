@@ -22,10 +22,11 @@ use tracing::warn;
 
 use crate::manifest::subnets::Subnets;
 use crate::manifest::{
-    default_subnet_singleton, ClGossipSubConfig, DockerImages, ElConfigOverride,
+    default_subnet_singleton, ClGossipSubConfig, ClPruningPreset, DockerImages, ElConfigOverride,
     EngineApiConnection, Manifest, Node, NodeType, RemoteKeyId,
 };
 use crate::node::SubnetName;
+use crate::setup::supports_cli_flags;
 use crate::util::merge_toml_values;
 
 /// Node name prefix that indicates a validator node.
@@ -123,6 +124,9 @@ pub struct RawNode {
     #[serde(default, skip_serializing_if = "is_default")]
     cl_gossipsub: ClGossipSubConfig,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cl_prune_preset: Option<ClPruningPreset>,
+
     #[serde(
         default = "default_subnet_singleton",
         skip_serializing_if = "is_default_subnet"
@@ -215,6 +219,100 @@ impl Default for RawManifest {
     }
 }
 
+/// Collect all leaf keys from a TOML table as dot-separated paths.
+fn collect_toml_keys(table: &toml::Table, prefix: &str, out: &mut Vec<String>) {
+    for (key, value) in table {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match value {
+            toml::Value::Table(sub) => collect_toml_keys(sub, &path, out),
+            _ => out.push(path),
+        }
+    }
+}
+
+/// cl.config.* TOML paths that Quake can translate to CL CLI flags.
+/// For v0.5.0+ images, any cl.config path NOT in this list will be rejected
+/// to prevent silent ignores (config.toml is not read by v0.5.0+).
+///
+/// TODO: Derive this list dynamically.
+const CL_CONFIG_TRANSLATABLE: &[&str] = &[
+    "logging.log_level",
+    "consensus.enabled",
+    "consensus.p2p.discovery.enabled",
+    "consensus.p2p.discovery.num_inbound_peers",
+    "consensus.p2p.discovery.num_outbound_peers",
+    "prune.certificates_distance",
+    "prune.certificates_before",
+    "execution.persistence_backpressure",
+    "execution.persistence_backpressure_threshold",
+];
+
+/// For v0.5.0+ CL images, reject any cl.config.* paths that cannot be translated
+/// to CLI flags. Pre-v0.5.0 images read config.toml directly so all paths are fine.
+fn validate_cl_config(raw: &RawManifest) -> Result<()> {
+    if !supports_cli_flags(raw.image_cl.as_deref()) {
+        return Ok(());
+    }
+
+    reject_untranslatable_cl_config(&raw.cl.config, "global")?;
+    for (node_name, raw_node) in &raw.nodes {
+        reject_untranslatable_cl_config(&raw_node.cl.config, node_name)?;
+    }
+    Ok(())
+}
+
+/// Walk all leaf keys in a cl.config table and bail if any are not in `CL_CONFIG_TRANSLATABLE`.
+fn reject_untranslatable_cl_config(table: &toml::Table, scope: &str) -> Result<()> {
+    let mut keys = Vec::new();
+    collect_toml_keys(table, "", &mut keys);
+
+    let untranslatable: Vec<&String> = keys
+        .iter()
+        .filter(|k| !CL_CONFIG_TRANSLATABLE.contains(&k.as_str()))
+        .collect();
+
+    if !untranslatable.is_empty() {
+        bail!(
+            "{scope}: cl.config.* settings have no CLI flag equivalent and will be \
+             silently ignored by CL v0.5.0+: [{}]. \
+             Remove these settings or request CLI flag support from the CL team.",
+            untranslatable
+                .iter()
+                .map(|k| format!("cl.config.{k}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Reject manifests where a node sets both `cl_prune_preset` and `cl.config.prune.*`.
+/// These are mutually exclusive: the preset is a named shortcut while explicit prune
+/// config overrides individual knobs. Allowing both would make precedence ambiguous.
+fn validate_prune_exclusivity(raw: &RawManifest) -> Result<()> {
+    let global_has_prune = has_prune_keys(&raw.cl.config);
+    for (node_name, raw_node) in &raw.nodes {
+        let node_has_prune = has_prune_keys(&raw_node.cl.config) || global_has_prune;
+        if raw_node.cl_prune_preset.is_some() && node_has_prune {
+            bail!(
+                "{node_name}: cl_prune_preset and cl.config.prune.* are mutually exclusive. \
+                 Use either a preset (full/minimal) or explicit prune settings, not both."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn has_prune_keys(table: &toml::Table) -> bool {
+    let mut keys = Vec::new();
+    collect_toml_keys(table, "", &mut keys);
+    keys.iter().any(|k| k.starts_with("prune."))
+}
+
 impl TryFrom<RawManifest> for Manifest {
     type Error = color_eyre::eyre::Error;
 
@@ -222,6 +320,10 @@ impl TryFrom<RawManifest> for Manifest {
         if raw.arc_image_tag.is_some() || raw.arc_image_registry.is_some() {
             warn!("arc_image_tag and arc_image_registry are deprecated; use image_cl/image_el with full image references instead");
         }
+
+        // Validate CL config consistency before converting
+        validate_cl_config(&raw)?;
+        validate_prune_exclusivity(&raw)?;
 
         let node_names = raw.nodes.keys().cloned().collect::<Vec<_>>();
 
@@ -341,6 +443,7 @@ impl TryFrom<RawManifest> for Manifest {
                     follow: raw_node.follow,
                     follow_endpoints: raw_node.follow_endpoints,
                     cl_voting_power: raw_node.cl_voting_power,
+                    cl_prune_preset: raw_node.cl_prune_preset,
                     external: raw_node.external,
                 },
             );
@@ -439,6 +542,7 @@ impl RawNode {
             cl_persistent_peers: node.cl_persistent_peers,
             cl_persistent_peers_only: node.cl_persistent_peers_only,
             cl_gossipsub: node.cl_gossipsub.clone(),
+            cl_prune_preset: node.cl_prune_preset,
             subnets: subnets.to_vec(),
             remote_signer: node.remote_signer,
             follow: node.follow,
@@ -515,6 +619,7 @@ mod tests {
     #[test]
     fn test_el_trusted_peers_roundtrip() {
         let toml = r#"
+        image_cl = "arc_consensus:v0.4.0"
         [nodes.val1.el.config]
         trusted_peers = ["val2"]
         [nodes.val2]
@@ -553,6 +658,7 @@ mod tests {
     #[test]
     fn test_el_trusted_peers_global_roundtrip() {
         let toml = r#"
+        image_cl = "arc_consensus:v0.4.0"
         [el.config]
         trusted_peers = ["val2"]
         [nodes.val1]
@@ -601,6 +707,182 @@ mod tests {
             msg.contains("Failed to merge toml values: array and string"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn test_validate_cl_config_allows_translatable_key_with_new_image() {
+        let toml_str = r#"
+            image_cl = "ghcr.io/org/arc-consensus:latest"
+            cl.config.logging.log_level = "debug"
+            [nodes.val1]
+        "#;
+        let raw: RawManifest = toml::from_str(toml_str).unwrap();
+        let result = Manifest::try_from(raw);
+        assert!(
+            result.is_ok(),
+            "translatable cl.config path should be allowed for v0.5.0+: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_validate_cl_config_rejects_untranslatable_key_with_new_image() {
+        let toml_str = r#"
+            image_cl = "ghcr.io/org/arc-consensus:v0.5.0"
+            cl.config.consensus.p2p.rpc_max_size = "42 Mib"
+            [nodes.val1]
+        "#;
+        let raw: RawManifest = toml::from_str(toml_str).unwrap();
+        let result = Manifest::try_from(raw);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no CLI flag equivalent"),
+            "should mention no CLI equivalent: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_cl_config_allows_old_image_with_any_cl_config() {
+        let toml_str = r#"
+            image_cl = "ghcr.io/org/arc-consensus:v0.4.0"
+            cl.config.logging.log_level = "debug"
+            cl.config.consensus.p2p.rpc_max_size = "42 Mib"
+            [nodes.val1]
+        "#;
+        let raw: RawManifest = toml::from_str(toml_str).unwrap();
+        let result = Manifest::try_from(raw);
+        assert!(
+            result.is_ok(),
+            "old image should allow all cl.config.*: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_validate_cl_config_rejects_untranslatable_when_no_image() {
+        let toml_str = r#"
+            cl.config.value_sync.max_request_size = "10 Mib"
+            [nodes.val1]
+        "#;
+        let raw: RawManifest = toml::from_str(toml_str).unwrap();
+        let result = Manifest::try_from(raw);
+        assert!(
+            result.is_err(),
+            "no image_cl should assume v0.5.0+ and reject untranslatable cl.config"
+        );
+    }
+
+    #[test]
+    fn test_validate_cl_config_rejects_per_node_untranslatable_key() {
+        let toml_str = r#"
+            image_cl = "ghcr.io/org/arc-consensus:latest"
+            [nodes.val1]
+            cl.config.consensus.p2p.rpc_max_size = "42 Mib"
+            [nodes.val2]
+        "#;
+        let raw: RawManifest = toml::from_str(toml_str).unwrap();
+        let result = Manifest::try_from(raw);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("val1"), "error should name the node: {msg}");
+    }
+
+    #[test]
+    fn test_validate_cl_config_allows_per_node_translatable_key() {
+        let toml_str = r#"
+            image_cl = "ghcr.io/org/arc-consensus:latest"
+            [nodes.val1]
+            cl.config.execution.persistence_backpressure = true
+            [nodes.val2]
+        "#;
+        let raw: RawManifest = toml::from_str(toml_str).unwrap();
+        let result = Manifest::try_from(raw);
+        assert!(
+            result.is_ok(),
+            "translatable per-node cl.config should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_prune_preset_and_cl_config_prune_are_mutually_exclusive() {
+        let toml_str = r#"
+            image_cl = "ghcr.io/org/arc-consensus:latest"
+            [nodes.val1]
+            cl_prune_preset = "minimal"
+            cl.config.prune.certificates_distance = 500
+        "#;
+        let raw: RawManifest = toml::from_str(toml_str).unwrap();
+        let result = Manifest::try_from(raw);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("mutually exclusive"),
+            "should mention mutual exclusivity: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_prune_preset_and_global_cl_config_prune_are_mutually_exclusive() {
+        let toml_str = r#"
+            image_cl = "ghcr.io/org/arc-consensus:latest"
+            cl.config.prune.certificates_distance = 500
+            [nodes.val1]
+            cl_prune_preset = "minimal"
+        "#;
+        let raw: RawManifest = toml::from_str(toml_str).unwrap();
+        let result = Manifest::try_from(raw);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("mutually exclusive"),
+            "global prune + per-node preset should conflict: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_prune_preset_without_cl_config_prune_is_allowed() {
+        let toml_str = r#"
+            image_cl = "ghcr.io/org/arc-consensus:latest"
+            [nodes.val1]
+            cl_prune_preset = "full"
+            [nodes.val2]
+        "#;
+        let raw: RawManifest = toml::from_str(toml_str).unwrap();
+        let result = Manifest::try_from(raw);
+        assert!(
+            result.is_ok(),
+            "cl_prune_preset alone should be allowed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_collect_toml_keys() {
+        let table: toml::Table = toml::from_str(
+            r#"[logging]
+log_level = "info"
+[consensus.p2p]
+rpc_max_size = "42 Mib"
+"#,
+        )
+        .unwrap();
+
+        let mut keys = Vec::new();
+        collect_toml_keys(&table, "", &mut keys);
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["consensus.p2p.rpc_max_size", "logging.log_level",]
+        );
+    }
+
+    #[test]
+    fn test_collect_toml_keys_empty_table() {
+        let mut keys = Vec::new();
+        collect_toml_keys(&toml::Table::new(), "", &mut keys);
+        assert!(keys.is_empty());
     }
 
     /// Manifest serialization should not include empty/default fields.

@@ -130,6 +130,7 @@ mod net;
 mod perf;
 mod probe;
 mod sanity;
+mod sync;
 mod tx;
 
 /// List matched tests in a formatted way

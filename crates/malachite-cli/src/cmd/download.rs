@@ -21,7 +21,10 @@
 
 use std::path::Path;
 
-use arc_snapshots::download::{fetch_latest_snapshot_urls, stream_and_extract, Chain};
+use arc_snapshots::download::{
+    consensus_snapshot_exists, fetch_latest_snapshot_urls, should_download, stream_and_extract,
+    write_snapshot_version, Chain,
+};
 use clap::Args;
 use eyre::Result;
 use tracing::info;
@@ -39,6 +42,10 @@ pub struct DownloadCmd {
     /// [possible values: arc-testnet, arc-devnet]
     #[arg(long, default_value = "arc-testnet")]
     pub chain: String,
+
+    /// Force re-download even if snapshot data already exists.
+    #[arg(long = "force")]
+    pub force_redownload: bool,
 }
 
 impl DownloadCmd {
@@ -54,6 +61,16 @@ impl DownloadCmd {
             }
         };
 
+        if !should_download(
+            "Consensus layer",
+            home_dir,
+            &url,
+            consensus_snapshot_exists(home_dir),
+            self.force_redownload,
+        ) {
+            return Ok(());
+        }
+
         let tmp_dir = home_dir.join(".snapshot-tmp");
 
         info!(
@@ -62,7 +79,8 @@ impl DownloadCmd {
             "Starting CL snapshot download"
         );
 
-        stream_and_extract(url, home_dir.to_path_buf(), tmp_dir).await?;
+        stream_and_extract(url.clone(), home_dir.to_path_buf(), tmp_dir).await?;
+        write_snapshot_version(home_dir, &url)?;
 
         info!("CL snapshot downloaded and extracted successfully");
         Ok(())
@@ -131,11 +149,68 @@ mod tests {
         let cmd = DownloadCmd {
             url: Some(format!("{}/cl.tar.lz4", server.uri())),
             chain: "arc-devnet".into(),
+            force_redownload: false,
         };
 
+        let url = format!("{}/cl.tar.lz4", server.uri());
         cmd.run(dir.path()).await?;
 
         assert!(dir.path().join("store.db").exists());
+        // Version marker should be written
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".snapshot-url"))?,
+            url
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_skips_when_url_matches() -> eyre::Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let buf = Vec::new();
+        let encoder = lz4::EncoderBuilder::new().build(buf)?;
+        let mut builder = tar::Builder::new(encoder);
+        let content = b"consensus-store";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, "store.db", content.as_ref())?;
+        let (data, result) = builder.into_inner()?.finish();
+        result?;
+
+        let server = MockServer::start().await;
+        let mock = Mock::given(method("GET"))
+            .and(path("/cl.tar.lz4"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(data.clone())
+                    .append_header("Content-Length", data.len().to_string().as_str()),
+            )
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let dir = tempfile::tempdir()?;
+        let url = format!("{}/cl.tar.lz4", server.uri());
+
+        // Pre-populate data and matching marker
+        std::fs::write(dir.path().join("store.db"), b"existing")?;
+        std::fs::write(dir.path().join(".snapshot-url"), &url)?;
+
+        let cmd = DownloadCmd {
+            url: Some(url),
+            chain: "arc-devnet".into(),
+            force_redownload: false,
+        };
+        cmd.run(dir.path()).await?;
+
+        // Data should be untouched
+        assert_eq!(std::fs::read(dir.path().join("store.db"))?, b"existing");
+
+        drop(mock);
         Ok(())
     }
 
@@ -145,6 +220,7 @@ mod tests {
         let cmd = DownloadCmd {
             url: Some("http://example.com/cl.tar.lz4".into()),
             chain: "not-a-chain".into(),
+            force_redownload: false,
         };
         assert!(cmd.run(dir.path()).await.is_err());
     }

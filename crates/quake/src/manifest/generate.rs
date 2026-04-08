@@ -624,6 +624,11 @@ mod tests {
                         region_strategy,
                     };
                     let mut manifest = Manifest::generate_random(42, &config).unwrap();
+                    // Manifest→RawManifest serialization emits cl_config as cl.config.* TOML.
+                    // Set a pre-v0.5.0 image so the safeguard allows cl.config.* on re-parse.
+                    // TODO: refactor RawManifest::try_from(Manifest) to emit explicit fields
+                    // instead of cl.config.*, then this workaround can be removed.
+                    manifest.images.cl = Some("arc_consensus:v0.4.0".to_string());
 
                     // TODO: ByteSize v1.3 has an issue - the serializer produces lossy output.
                     //       This is fixed in a newer version; the dependency should be upgraded upstream first.

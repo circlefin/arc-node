@@ -42,7 +42,8 @@
 //! Both modes share the same rate limiter, round-robin node selection, and
 //! optional latency tracking.
 
-use alloy_consensus::{Signed, TxEip1559};
+use alloy_consensus::TxEnvelope;
+use alloy_eips::eip2718::Encodable2718;
 use color_eyre::eyre::{self, Result, WrapErr};
 use serde_json::json;
 use std::collections::HashMap;
@@ -78,7 +79,7 @@ pub(crate) struct TxSenderConfig {
 pub(crate) enum TxSource {
     /// Fire-and-forget: receives txs from a separate generator task via channel.
     Channel {
-        rx: Receiver<Signed<TxEip1559>>,
+        rx: Receiver<TxEnvelope>,
         wait_response: bool,
     },
     /// Backpressure: owns the generator directly, waits for each response.
@@ -128,7 +129,7 @@ impl TxSender {
     pub async fn new_channel(
         id: usize,
         ws_client_builders: Vec<WsClientBuilder>,
-        tx_receiver: Receiver<Signed<TxEip1559>>,
+        tx_receiver: Receiver<TxEnvelope>,
         result_sender: Sender<Result<u64>>,
         rate_limiter: Arc<RateLimiter>,
         config: TxSenderConfig,
@@ -299,12 +300,12 @@ impl TxSender {
     /// A `request_id` of 0 means the error was already reported to the tracker.
     async fn dispatch_raw_tx(
         &mut self,
-        tx: Signed<TxEip1559>,
+        tx: TxEnvelope,
     ) -> Result<(u64, usize, u64, alloy_primitives::B256)> {
-        let tx_len = tx.eip2718_encoded_length();
+        let tx_len = tx.encode_2718_len();
 
         let mut buf = Vec::with_capacity(tx_len);
-        tx.eip2718_encode(&mut buf);
+        tx.encode_2718(&mut buf);
 
         let tx_hash = compute_tx_hash(&buf);
         let payload = hex::encode(buf);
@@ -335,7 +336,7 @@ impl TxSender {
     /// result is successful. With `wait_response` enabled, this means only
     /// transactions accepted by the node are tracked. Without it, the node's
     /// response is not checked, so rejected transactions may still be tracked.
-    async fn send(&mut self, tx: Signed<TxEip1559>, wait_response: bool) -> Result<()> {
+    async fn send(&mut self, tx: TxEnvelope, wait_response: bool) -> Result<()> {
         // Capture timestamp before sending for accurate latency measurement
         let submitted_time = timestamp_now();
         let (request_id, node_idx, tx_len, tx_hash) = self.dispatch_raw_tx(tx).await?;
@@ -380,7 +381,7 @@ impl TxSender {
     /// Reports to result tracker in all cases. When latency tracking is
     /// enabled, records a [`TxSubmitted`] event on acceptance so the
     /// tracker can correlate submit time with finalized inclusion.
-    async fn send_and_wait(&mut self, tx: Signed<TxEip1559>) -> Result<SendOutcome> {
+    async fn send_and_wait(&mut self, tx: TxEnvelope) -> Result<SendOutcome> {
         let submitted_time = timestamp_now();
         let (request_id, node_idx, tx_len, tx_hash) = self.dispatch_raw_tx(tx).await?;
 

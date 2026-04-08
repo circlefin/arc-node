@@ -435,6 +435,15 @@ pub(crate) enum InfoSubcommand {
     },
     /// Show consensus health: round breakdown, height restarts, sync-fell-behind counts
     Health,
+    /// Measure sync speed: wait for a node to start, then track blocks/s until it
+    /// catches up with validator1
+    SyncSpeed {
+        /// Name of the node to measure
+        node: String,
+        /// Reference node to sync against (default: validator1)
+        #[clap(long, default_value = "validator1")]
+        reference: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

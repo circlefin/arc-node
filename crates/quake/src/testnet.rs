@@ -31,7 +31,7 @@ use crate::infra::{self, local, remote, BuildProfile, InfraData, InfraProvider, 
 use crate::infra::{local::LocalInfra, remote::RemoteInfra};
 use crate::infra::{COMPOSE_PROJECT_NAME, PPROF_PROXY_SSM_PORT, RPC_PROXY_SSM_PORT};
 use crate::manifest::Manifest;
-use crate::node::{NodeMetadata, NodeName};
+use crate::node::{NodeMetadata, NodeName, EXECUTION_SUFFIX, RETH_HTTP_BASE_PORT};
 use crate::nodes::{NodeOrContainerName, NodesMetadata};
 use crate::perturb::{self, Perturbation};
 use crate::rpc::RpcClient;
@@ -374,9 +374,17 @@ impl Testnet {
                 // Generate a compose file per node with node-specific EL and CL
                 // configuration
                 for (node_name, node) in self.manifest.nodes.iter() {
-                    let el_cli_flags = node
+                    let mut el_cli_flags = node
                         .el_cli_flags()
                         .context("Failed to generate EL CLI flags")?;
+
+                    // Rewrite Docker-style --rpc.forwarder=http://{peer}_el:port to VPC IPs.
+                    setup::rewrite_rpc_forwarder_for_remote(
+                        &mut el_cli_flags,
+                        node_name,
+                        &self.nodes_metadata,
+                        &self.manifest.subnets,
+                    );
 
                     let peers_ips: Vec<String> = if let Some(peers) = &node.cl_persistent_peers {
                         NodesMetadata::peer_consensus_ips(
@@ -392,6 +400,30 @@ impl Testnet {
                             .collect()
                     };
 
+                    // Resolve follow endpoints to container-accessible EL RPC URLs.
+                    // Use subnet-aware resolution: pick the target's IP on a subnet
+                    // shared with this node so cross-subnet relay nodes are reachable.
+                    let follow_endpoint_urls: Vec<String> = node
+                        .follow_endpoints
+                        .iter()
+                        .filter_map(|ep_name| {
+                            let Some(md) = self.nodes_metadata.get(ep_name) else {
+                                warn!(
+                                    node = %node_name,
+                                    endpoint = %ep_name,
+                                    "follow endpoint not found in nodes metadata; skipping"
+                                );
+                                return None;
+                            };
+                            let shared = self.manifest.subnets.shared_subnets(node_name, ep_name);
+                            let ip = shared
+                                .first()
+                                .and_then(|s| md.execution.private_ip_address_for(s))
+                                .unwrap_or_else(|| md.execution.first_private_ip().clone());
+                            Some(format!("http://{ip}:{RETH_HTTP_BASE_PORT}"))
+                        })
+                        .collect();
+
                     // Generate CL CLI flags including persistent peers
                     let cl_cli_flags = setup::generate_node_cli_flags(
                         node_name,
@@ -399,6 +431,7 @@ impl Testnet {
                         "0.0.0.0", // Remote nodes listen on all interfaces
                         &peers_ips,
                         Some(self.images.cl.as_str()),
+                        &follow_endpoint_urls,
                     );
 
                     let compose_data = setup::ComposeTemplateDataRemote {
@@ -814,7 +847,8 @@ impl Testnet {
                     // Fetch CL mesh peer counts in parallel with latest data
                     let metrics_urls = self.nodes_metadata.all_consensus_metrics_urls();
                     let raw_metrics = crate::mesh::fetch_all_metrics(&metrics_urls).await;
-                    let nodes_data = crate::mesh::parse_all_metrics(&raw_metrics);
+                    let nodes_data =
+                        crate::mesh::parse_and_classify_metrics(&raw_metrics, &self.manifest.nodes);
                     let cl_mesh_peers: std::collections::HashMap<String, i64> = nodes_data
                         .iter()
                         .map(|n| {
@@ -857,15 +891,20 @@ impl Testnet {
             }) => {
                 let metrics_urls = self.nodes_metadata.all_consensus_metrics_urls();
                 let raw_metrics = crate::mesh::fetch_all_metrics(&metrics_urls).await;
-                let nodes_data = crate::mesh::parse_all_metrics(&raw_metrics);
-                let analysis = crate::mesh::analyze(&nodes_data);
-                let options = crate::mesh::MeshDisplayOptions {
-                    show_counts: !mesh_only,
-                    show_mesh: true,
-                    show_peers: peers || peers_full,
-                    show_peers_full: peers_full,
-                };
-                print!("{}", crate::mesh::format_report(&analysis, &options));
+                let nodes_data =
+                    crate::mesh::parse_and_classify_metrics(&raw_metrics, &self.manifest.nodes);
+                if nodes_data.is_empty() {
+                    println!("No nodes responded to metrics requests. Is the testnet running?");
+                } else {
+                    let analysis = crate::mesh::analyze(&nodes_data);
+                    let options = crate::mesh::MeshDisplayOptions {
+                        show_counts: !mesh_only,
+                        show_mesh: true,
+                        show_peers: peers || peers_full,
+                        show_peers_full: peers_full,
+                    };
+                    print!("{}", crate::mesh::format_report(&analysis, &options));
+                }
             }
             Some(InfoSubcommand::Perf {
                 latency_only,
@@ -910,6 +949,9 @@ impl Testnet {
                         println!();
                     }
                 }
+            }
+            Some(InfoSubcommand::SyncSpeed { node, reference }) => {
+                info_mod::measure_sync_speed(&self.nodes_metadata, &node, &reference).await?;
             }
             Some(InfoSubcommand::Health) => {
                 let metrics_urls = self.nodes_metadata.all_consensus_metrics_urls();
@@ -1212,6 +1254,16 @@ impl Testnet {
 
             let listen_ip = "0.0.0.0".to_string();
 
+            // Resolve follow endpoints to Docker-internal EL RPC URLs
+            let follow_endpoint_urls: Vec<String> = node_config
+                .map(|nc| {
+                    nc.follow_endpoints
+                        .iter()
+                        .map(|ep| format!("http://{ep}_{EXECUTION_SUFFIX}:{RETH_HTTP_BASE_PORT}"))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             // Generate CLI flags for the consensus layer
             let cli_flags = setup::generate_node_cli_flags(
                 name,
@@ -1219,6 +1271,7 @@ impl Testnet {
                 &listen_ip,
                 &peers_ips,
                 Some(self.images.cl.as_str()),
+                &follow_endpoint_urls,
             );
             node_metadata.consensus.set_cli_flags(cli_flags);
 
@@ -1229,6 +1282,7 @@ impl Testnet {
                 &listen_ip,
                 &peers_ips,
                 self.images.cl_upgrade.as_deref(),
+                &follow_endpoint_urls,
             );
             node_metadata.consensus.set_cli_flags_upgraded(cli_flags);
         }

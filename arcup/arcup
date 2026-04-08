@@ -15,6 +15,10 @@ GPG_KEYSERVER="keyserver.ubuntu.com"
 BIN_DIR="${ARC_BIN_DIR:-$HOME/.arc/bin}"
 ARCUP_BIN_URL="https://raw.githubusercontent.com/circlefin/arc-node/main/arcup/arcup"
 ARCUP_BIN_PATH="$BIN_DIR/arcup"
+CURL_HEADERS=()
+if [ "${CURL_HEADER:-}" ]; then
+    CURL_HEADERS=(-H "$CURL_HEADER")
+fi
 
 # Binaries included in each release archive
 BINARIES=("arc-node-execution" "arc-node-consensus" "arc-snapshots")
@@ -24,6 +28,15 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
+
+# Temp paths populated by update_arcup() and main(); cleaned up on EXIT.
+_ARCUP_TMP_FILE=""
+TMP_DIR=$(mktemp -d)
+_arcup_cleanup() {
+    [[ -n "$_ARCUP_TMP_FILE" ]] && rm -f "$_ARCUP_TMP_FILE"
+    [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+trap _arcup_cleanup EXIT
 
 info() {
     echo -e "${GREEN}info${NC}: $1" >&2
@@ -79,8 +92,12 @@ download_file() {
     local url="https://github.com/${REPO}/releases/download/${tag}/${filename}"
     local output_path="$output_dir/$filename"
 
+    if ! command -v curl >/dev/null 2>&1; then
+        error "curl not found. Please install curl."
+    fi
+
     info "Downloading $filename..."
-    if ! curl -#fLo "$output_path" "$url"; then
+    if ! curl -#fL "${CURL_HEADERS[@]}" -o "$output_path" "$url"; then
         error "Failed to download $filename from $url"
     fi
 }
@@ -97,11 +114,11 @@ compute_sha256() {
 # Check if arcup installer is up to date
 check_installer_up_to_date() {
     if ! command -v curl >/dev/null 2>&1; then
-        return
+        error "curl not found. Please install curl."
     fi
 
     local remote_version
-    remote_version=$(curl -fsSL "$ARCUP_BIN_URL" 2>/dev/null | \
+    remote_version=$(curl -fsSL "${CURL_HEADERS[@]}" "$ARCUP_BIN_URL" 2>/dev/null | \
         grep '^ARCUP_INSTALLER_VERSION=' | sed -E 's/ARCUP_INSTALLER_VERSION="(.+)"/\1/')
 
     if [[ -z "$remote_version" ]]; then
@@ -125,17 +142,15 @@ update_arcup() {
         error "curl not found. Please install curl."
     fi
 
-    local tmp_file
-    tmp_file=$(mktemp)
-    trap "rm -f $tmp_file" EXIT
+    _ARCUP_TMP_FILE=$(mktemp)
 
     info "Downloading latest arcup..."
-    if ! curl -fsSL "$ARCUP_BIN_URL" -o "$tmp_file"; then
+    if ! curl -fsSL "${CURL_HEADERS[@]}" -o "$_ARCUP_TMP_FILE" "$ARCUP_BIN_URL"; then
         error "Failed to download arcup update"
     fi
 
     local remote_version
-    remote_version=$(grep '^ARCUP_INSTALLER_VERSION=' "$tmp_file" | sed -E 's/ARCUP_INSTALLER_VERSION="(.+)"/\1/')
+    remote_version=$(grep '^ARCUP_INSTALLER_VERSION=' "$_ARCUP_TMP_FILE" | sed -E 's/ARCUP_INSTALLER_VERSION="(.+)"/\1/')
 
     if [[ -z "$remote_version" ]]; then
         error "Failed to determine remote version"
@@ -147,12 +162,10 @@ update_arcup() {
     fi
 
     info "Updating from $ARCUP_INSTALLER_VERSION to $remote_version..."
-    if cp "$tmp_file" "$ARCUP_BIN_PATH" 2>/dev/null; then
+    if cp "$_ARCUP_TMP_FILE" "$ARCUP_BIN_PATH" 2>/dev/null; then
         chmod 755 "$ARCUP_BIN_PATH"
-    elif sudo cp "$tmp_file" "$ARCUP_BIN_PATH" 2>/dev/null; then
-        sudo chmod 755 "$ARCUP_BIN_PATH"
     else
-        error "Failed to update arcup at $ARCUP_BIN_PATH. Try running with sudo."
+        error "Failed to update arcup at '$ARCUP_BIN_PATH' — ensure it is writable"
     fi
 
     echo ""
@@ -195,6 +208,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -n "$VERSION" ]] && [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+    error "Invalid version format: '$VERSION' (expected e.g. v1.2.3)"
+fi
 
 # Detect platform
 detect_platform() {
@@ -272,8 +289,8 @@ get_latest_version() {
 
     local api_url="https://api.github.com/repos/$REPO/releases/latest"
     local response
-    if ! response=$(curl -fsSL "$api_url" 2>&1); then
-        error "Failed to fetch latest version from GitHub: $response"
+    if ! response=$(curl -fsSL "${CURL_HEADERS[@]}" "$api_url" 2>&1); then
+        error "Failed to fetch latest version from '$api_url': $response"
     fi
 
     local version
@@ -302,11 +319,9 @@ install_binary() {
     mv -f "$dst" "$old" 2>/dev/null || true
     if cp "$src" "$dst" 2>/dev/null; then
         chmod 755 "$dst"
-    elif sudo cp "$src" "$dst" 2>/dev/null; then
-        sudo chmod 755 "$dst"
     else
         mv -f "$old" "$dst" 2>/dev/null || true
-        error "Failed to install $name to $BIN_DIR. Try running with sudo."
+        error "Failed to install $name to '$BIN_DIR' — ensure it is writable"
     fi
     rm -f "$old" 2>/dev/null || true
 
@@ -339,9 +354,6 @@ main() {
     info "Installing arc-node $VERSION_TAG"
 
     ARCHIVE_NAME="arc-node-${VERSION_TAG}-${TARGET}.tar.gz"
-
-    TMP_DIR=$(mktemp -d)
-    trap "rm -rf $TMP_DIR" EXIT
 
     # Download archive
     download_file "$VERSION_TAG" "$ARCHIVE_NAME" "$TMP_DIR"
@@ -389,6 +401,14 @@ main() {
             warn "Install gpg to enable signature verification of releases."
         fi
     fi
+
+    # Validate archive contents before extracting (guard against path traversal)
+    while IFS= read -r entry; do
+        case "$entry" in
+            /* | .. | ../* | */../* | */.. )
+                error "Archive contains unsafe path: $entry" ;;
+        esac
+    done < <(tar -tzf "$ARCHIVE_PATH")
 
     # Extract archive
     info "Extracting archive..."

@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloy_consensus::{SignableTransaction, Signed, TxEip1559};
+use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
 use alloy_primitives::{address, Address, Bytes, U256};
 use alloy_signer::Signer;
 use alloy_signer_local::LocalSigner;
@@ -67,7 +67,7 @@ pub(crate) struct TxGenerator {
     ws_client_builders: Vec<WsClientBuilder>,
     /// Channel to send signed txs to a separate `TxSender` task (fire-and-forget mode).
     /// `None` in backpressure mode, where the sender owns the generator directly.
-    tx_sender: Option<Sender<Signed<TxEip1559>>>,
+    tx_sender: Option<Sender<TxEnvelope>>,
     max_txs_per_account: u64,
     query_latest_nonce: bool,
     tx_input_size: usize,
@@ -97,7 +97,7 @@ impl TxGenerator {
         signers_range: Range<usize>,
         account_builder: AccountBuilder,
         ws_client_builders: Vec<WsClientBuilder>,
-        tx_sender: Option<Sender<Signed<TxEip1559>>>,
+        tx_sender: Option<Sender<TxEnvelope>>,
         max_txs_per_account: u64,
         query_latest_nonce: bool,
         tx_input_size: usize,
@@ -315,7 +315,7 @@ impl TxGenerator {
     /// have hit `max_txs_per_account`. The nonce is NOT incremented; the
     /// caller must call `ack_nonce(account_index)` after the transaction is
     /// accepted.
-    pub async fn next_tx(&mut self) -> Result<Option<(Signed<TxEip1559>, usize)>> {
+    pub async fn next_tx(&mut self) -> Result<Option<(TxEnvelope, usize)>> {
         self.init().await?;
 
         let num_accounts = self.signers.len();
@@ -388,26 +388,38 @@ impl TxGenerator {
                 }
             };
 
-            // Generate tx based on selected type
-            let tx = match tx_type {
-                TxType::Transfer => self.make_eip1559_tx(next_nonce),
+            // Build, sign, wrap
+            let signer = self.signers[i].as_ref().expect("signer initialized above");
+            let envelope = match tx_type {
+                TxType::Legacy => {
+                    let tx = self.make_legacy_tx(next_nonce);
+                    let sig = signer.sign_hash(&tx.signature_hash()).await?;
+                    TxEnvelope::Legacy(tx.into_signed(sig))
+                }
+                TxType::Transfer => {
+                    let tx = self.make_eip1559_tx(next_nonce);
+                    let sig = signer.sign_hash(&tx.signature_hash()).await?;
+                    TxEnvelope::Eip1559(tx.into_signed(sig))
+                }
                 TxType::Erc20 => {
                     let recipient = erc20_recipient.expect("resolved above for TxType::Erc20");
                     let function =
                         erc20_function.expect("erc20_function resolved above for TxType::Erc20");
-                    crate::erc20::prepare_erc20_tx(
+                    let tx = crate::erc20::prepare_erc20_tx(
                         ws_clients,
                         signer_addr,
                         recipient,
                         next_nonce,
                         function,
                     )
-                    .await?
+                    .await?;
+                    let sig = signer.sign_hash(&tx.signature_hash()).await?;
+                    TxEnvelope::Eip1559(tx.into_signed(sig))
                 }
                 TxType::Guzzler => {
                     let (guzzler_function, base_arg) =
                         guzzler_selection.expect("guzzler_selection set for TxType::Guzzler");
-                    Self::prepare_guzzler_call_tx(
+                    let tx = Self::prepare_guzzler_call_tx(
                         ws_clients,
                         signer_addr,
                         GUZZLER_ADDRESS,
@@ -415,18 +427,16 @@ impl TxGenerator {
                         base_arg,
                         guzzler_function,
                     )
-                    .await?
+                    .await?;
+                    let sig = signer.sign_hash(&tx.signature_hash()).await?;
+                    TxEnvelope::Eip1559(tx.into_signed(sig))
                 }
             };
-            let tx_sign_hash = tx.signature_hash();
-            let signer = self.signers[i].as_ref().expect("signer initialized above");
-            let signature = signer.sign_hash(&tx_sign_hash).await?;
-            let signed_tx = tx.into_signed(signature);
 
             // Store nonce so that a repeated call without ack retries the same nonce
             self.next_nonces[i] = Some(next_nonce);
 
-            return Ok(Some((signed_tx, i)));
+            return Ok(Some((envelope, i)));
         }
 
         // All accounts exhausted
@@ -659,6 +669,22 @@ impl TxGenerator {
         }
     }
 
+    /// Create a legacy (Type 0) value transfer.
+    fn make_legacy_tx(&self, nonce: u64) -> TxLegacy {
+        let input = Bytes::from(vec![0u8; self.tx_input_size]);
+        let input_gas = input.len() as u64 * 16;
+
+        TxLegacy {
+            chain_id: Some(TESTNET_CHAIN_ID),
+            nonce,
+            gas_price: 2_000_000_000, // 2 gwei
+            gas_limit: 30_000 + input_gas,
+            to: Address::left_padding_from(&(nonce.wrapping_add(0x1000)).to_be_bytes()).into(),
+            value: U256::from(1e16), // 0.01 ETH
+            input,
+        }
+    }
+
     /// Create an EIP-1559 tx that calls the selected GasGuzzler function.
     fn make_guzzler_call_tx(
         nonce: u64,
@@ -686,13 +712,14 @@ impl TxGenerator {
 mod tests {
     use super::*;
     use crate::spammer::TEST_MNEMONIC;
+    use alloy_consensus::{transaction::SignerRecoverable, Transaction};
     use std::{collections::HashMap, time::Duration};
     use tokio::sync::mpsc;
 
     fn make_generator(
         start: usize,
         end: usize,
-        tx_sender: Option<Sender<Signed<TxEip1559>>>,
+        tx_sender: Option<Sender<TxEnvelope>>,
         max_txs_per_account: u64,
     ) -> TxGenerator {
         let account_builder = AccountBuilder::new(TEST_MNEMONIC.to_string());
@@ -731,7 +758,7 @@ mod tests {
             (900, 1000, 1000),
         ];
         for (start, end, channel_capacity) in test_cases {
-            let (tx_sender, mut tx_receiver) = mpsc::channel::<Signed<TxEip1559>>(channel_capacity);
+            let (tx_sender, mut tx_receiver) = mpsc::channel::<TxEnvelope>(channel_capacity);
             let mut generator = make_generator(start, end, Some(tx_sender), 0);
 
             // When we run the generator briefly to fill up the channel
@@ -743,14 +770,8 @@ mod tests {
             // Drain generated txs from channel and count txs per signer (by recovered sender address)
             let mut per_sender_counts: HashMap<Address, usize> = HashMap::new();
             let mut counter = 0usize;
-            while let Ok(signed) = tx_receiver.try_recv() {
-                // Recover sender address from signed transaction
-                let sighash = signed.signature_hash();
-                let sender = signed
-                    .signature()
-                    .recover_address_from_prehash(&sighash)
-                    .expect("recover signer");
-
+            while let Ok(envelope) = tx_receiver.try_recv() {
+                let sender = envelope.recover_signer().expect("recover signer");
                 *per_sender_counts.entry(sender).or_default() += 1;
                 counter += 1;
             }
@@ -792,8 +813,8 @@ mod tests {
         assert_eq!(idx1, 0);
         assert_eq!(idx2, 0);
         assert_eq!(
-            tx1.tx().nonce,
-            tx2.tx().nonce,
+            tx1.nonce(),
+            tx2.nonce(),
             "nonce should be unchanged without ack"
         );
         Ok(())
@@ -808,9 +829,38 @@ mod tests {
         let (tx2, _) = generator.next_tx().await?.expect("second tx");
 
         assert_eq!(
-            tx2.tx().nonce,
-            tx1.tx().nonce + 1,
+            tx2.nonce(),
+            tx1.nonce() + 1,
             "nonce should increment after ack"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_tx_legacy_produces_legacy_envelope() -> Result<()> {
+        let account_builder = AccountBuilder::new(TEST_MNEMONIC.to_string());
+        let mut generator = TxGenerator::new(
+            0,
+            0..1,
+            account_builder,
+            vec![],
+            None,
+            0,
+            false,
+            0,
+            GuzzlerFnWeights::default(),
+            Erc20FnWeights::default(),
+            TxTypeMix {
+                legacy: 100,
+                ..Default::default()
+            },
+        );
+
+        let (envelope, _) = generator.next_tx().await?.expect("legacy tx");
+        assert!(
+            matches!(envelope, TxEnvelope::Legacy(_)),
+            "expected Legacy envelope, got {:?}",
+            envelope
         );
         Ok(())
     }

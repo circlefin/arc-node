@@ -144,15 +144,6 @@ services:
       - "--eth-socket=/sockets/reth.ipc"
       - "--execution-socket=/sockets/auth.ipc"
       {{/if}}
-      {{#if follow}}
-      - "--follow"
-      {{#each follow_endpoints}}
-      - "--follow.endpoint={{this}}"
-      {{/each}}
-      {{/if}}
-      {{#unless consensus_enabled}}
-      - "--no-consensus"
-      {{/unless}}
 
   {{#if ../images.el_upgrade}}
 
@@ -286,15 +277,6 @@ services:
       - "--eth-socket=/sockets/reth.ipc"
       - "--execution-socket=/sockets/auth.ipc"
       {{/if}}
-      {{#if follow}}
-      - "--follow"
-      {{#each follow_endpoints}}
-      - "--follow.endpoint={{this}}"
-      {{/each}}
-      {{/if}}
-      {{#unless consensus_enabled}}
-      - "--no-consensus"
-      {{/unless}}
   {{/if}}
 
   {{! Copied and modified from deployments/remote-signer.yaml }}

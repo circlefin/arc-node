@@ -307,7 +307,7 @@ Use `--mix` to blend transaction types with relative weights:
 ```
       --mix <MIX>
           Weighted transaction type mix.
-          Format: transfer=70,erc20=20,guzzler=10
+          Format: transfer=50,legacy=20,erc20=20,guzzler=10
           Omitted types default to weight 0 (disabled).
           When --mix is omitted, behavior depends on --guzzler-fn-weights:
             if guzzler functions are enabled: 100% guzzler;
@@ -316,7 +316,8 @@ Use `--mix` to blend transaction types with relative weights:
 
 Available transaction types:
 
-- `transfer` — native USDC value transfer (EIP-1559)
+- `transfer` — native USDC value transfer (EIP-1559, Type 2)
+- `legacy` — native USDC value transfer (legacy, Type 0)
 - `erc20` — ERC-20 call on the TestToken contract (function selected by `--erc20-fn-weights`, defaults to `transfer`)
 - `guzzler` — GasGuzzler contract call (function selected by `--guzzler-fn-weights`)
 
@@ -330,6 +331,9 @@ Examples:
 ```bash
 # 100% ERC-20 transfers (default function)
 spammer ws ws://127.0.0.1:8546 --mix erc20=100 -r 100 -t 30
+
+# 70% EIP-1559 transfers, 30% legacy transfers
+spammer ws ws://127.0.0.1:8546 --mix transfer=70,legacy=30 -r 100 -t 30
 
 # 70% native transfers, 30% ERC-20
 spammer ws ws://127.0.0.1:8546 --mix transfer=70,erc20=30 -r 100 -t 30
