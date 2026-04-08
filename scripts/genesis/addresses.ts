@@ -41,4 +41,4 @@ export const multicall3FromAddress = '0xEb7cc06E3D3b5F9F9a5fA2B31B477ff72bB9c8b6
 export const denylistAddress = '0x36082bA812806eB06C2758c412522669b5E2ac7b' as const
 export const memoAddress = '0x9702466268ccF55eAB64cdf484d272Ac08d3b75b' as const
 export const gasGuzzlerAddress = '0x1be052abb35D7f41609Bfec8F2fC2A684CB9984f' as const
-export const testTokenAddress = '0xc35bA063F507CCf914FeEb69c8651ec695872587' as const
+export const testTokenAddress = '0xe8e7F64D3d4eA1D5b9722A0769c3e7aC380b1423' as const

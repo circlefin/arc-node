@@ -86,6 +86,11 @@ impl Subnets {
         }
     }
 
+    /// Whether any subnets are defined.
+    pub fn is_empty(&self) -> bool {
+        self.subnets_meta.is_empty()
+    }
+
     /// CIDR map for the compose template (subnet name -> CIDR block).
     pub fn cidr_map(&self) -> IndexMap<SubnetName, CidrBlock> {
         self.subnets_meta

@@ -26,13 +26,13 @@ write_files:
       docker run --rm --network host -u 0 -v $PWD:/work -w /work spammer:latest $@
   # SSH private key for CC to SSH to nodes (same key used by all instances)
   - path: /home/${username}/.ssh/id_rsa
-    owner: ${username}:${username}
+    owner: root:root
     permissions: "0600"
     content: |
       ${indent(6, ssh_private_key)}
   # Parallel SSH script: executes the same command on multiple nodes in parallel
   - path: /home/${username}/pssh.sh
-    owner: ${username}:${username}
+    owner: root:root
     permissions: "0755"
     content: |
       #!/bin/bash

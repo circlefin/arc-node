@@ -433,18 +433,81 @@ pub async fn stream_and_extract(url: String, dest_dir: PathBuf, tmp_dir: PathBuf
     task::spawn_blocking(move || download_and_extract(&url, &dest_dir, &tmp_dir)).await?
 }
 
+fn execution_snapshot_exists(dir: &Path) -> bool {
+    dir.join("db/mdbx.dat").exists()
+}
+
+pub fn consensus_snapshot_exists(dir: &Path) -> bool {
+    dir.join("store.db").exists()
+}
+
+const SNAPSHOT_VERSION_FILE: &str = ".snapshot-url";
+
+pub fn write_snapshot_version(dir: &Path, url: &str) -> Result<()> {
+    std::fs::write(dir.join(SNAPSHOT_VERSION_FILE), url)?;
+    Ok(())
+}
+
+/// Returns `true` if the layer should be downloaded, `false` if it should be skipped.
+pub fn should_download(layer: &str, dir: &Path, url: &str, exists: bool, force: bool) -> bool {
+    if force {
+        return true;
+    }
+    if !exists {
+        return true;
+    }
+    match std::fs::read_to_string(dir.join(SNAPSHOT_VERSION_FILE)) {
+        Ok(saved) if saved.trim() == url => {
+            info!(dir = %dir.display(), "{layer} data already exists and is up to date, skipping download");
+            false
+        }
+        Ok(_) => {
+            info!(dir = %dir.display(), "Newer {layer} snapshot available, re-downloading");
+            true
+        }
+        Err(_) => {
+            // No marker file — data from an older tool version or manual placement. Don't clobber.
+            info!(dir = %dir.display(), "{layer} data already exists but version is unknown, skipping download (use --force to re-download)");
+            false
+        }
+    }
+}
+
 /// Downloads and extracts both EL and CL archives sequentially.
 /// EL is extracted into `execution_dir`, CL into `consensus_dir`.
 /// Uses `tmp_dir/el` and `tmp_dir/cl` as staging areas.
+/// Skips a layer if its destination already contains up-to-date snapshot data,
+/// unless `force_redownload` is true.
 pub fn download_and_extract_both(
     el_url: &str,
     cl_url: &str,
     execution_dir: &Path,
     consensus_dir: &Path,
     tmp_dir: &Path,
+    force_redownload: bool,
 ) -> Result<()> {
-    download_and_extract(el_url, execution_dir, &tmp_dir.join("el"))?;
-    download_and_extract(cl_url, consensus_dir, &tmp_dir.join("cl"))?;
+    if should_download(
+        "Execution layer",
+        execution_dir,
+        el_url,
+        execution_snapshot_exists(execution_dir),
+        force_redownload,
+    ) {
+        download_and_extract(el_url, execution_dir, &tmp_dir.join("el"))?;
+        write_snapshot_version(execution_dir, el_url)?;
+    }
+
+    if should_download(
+        "Consensus layer",
+        consensus_dir,
+        cl_url,
+        consensus_snapshot_exists(consensus_dir),
+        force_redownload,
+    ) {
+        download_and_extract(cl_url, consensus_dir, &tmp_dir.join("cl"))?;
+        write_snapshot_version(consensus_dir, cl_url)?;
+    }
+
     // Both subdirs are cleaned up by download_and_extract; remove the parent if empty.
     let _ = std::fs::remove_dir(tmp_dir);
     Ok(())
@@ -457,9 +520,17 @@ pub async fn stream_and_extract_both(
     execution_dir: PathBuf,
     consensus_dir: PathBuf,
     tmp_dir: PathBuf,
+    force_redownload: bool,
 ) -> Result<()> {
     task::spawn_blocking(move || {
-        download_and_extract_both(&el_url, &cl_url, &execution_dir, &consensus_dir, &tmp_dir)
+        download_and_extract_both(
+            &el_url,
+            &cl_url,
+            &execution_dir,
+            &consensus_dir,
+            &tmp_dir,
+            force_redownload,
+        )
     })
     .await?
 }
@@ -745,15 +816,302 @@ mod tests {
         let tmp = dir.path().join("tmp");
         let el_url = format!("{}/el.tar.lz4", server.uri());
         let cl_url = format!("{}/cl.tar.lz4", server.uri());
+        let el_url_clone = el_url.clone();
+        let cl_url_clone = cl_url.clone();
 
         tokio::task::spawn_blocking(move || {
-            download_and_extract_both(&el_url, &cl_url, &el_dest, &cl_dest, &tmp)
+            download_and_extract_both(&el_url, &cl_url, &el_dest, &cl_dest, &tmp, false)
         })
         .await??;
 
         assert!(dir.path().join("el/db/mdbx.dat").exists());
         assert!(dir.path().join("cl/store.db").exists());
         assert!(!dir.path().join("tmp").exists());
+        // Version markers should be written
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("el/.snapshot-url"))?,
+            el_url_clone
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cl/.snapshot-url"))?,
+            cl_url_clone
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_and_extract_both_skips_existing() -> Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let el_data = build_tar_lz4(&[("db/mdbx.dat", b"el-data")])?;
+        let cl_data = build_tar_lz4(&[("store.db", b"cl-data")])?;
+
+        let server = MockServer::start().await;
+        let el_mock = Mock::given(method("GET"))
+            .and(path("/el.tar.lz4"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(el_data.clone())
+                    .append_header("Content-Length", el_data.len().to_string().as_str()),
+            )
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+        let cl_mock = Mock::given(method("GET"))
+            .and(path("/cl.tar.lz4"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(cl_data.clone())
+                    .append_header("Content-Length", cl_data.len().to_string().as_str()),
+            )
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let dir = tempfile::tempdir()?;
+        let el_dest = dir.path().join("el");
+        let cl_dest = dir.path().join("cl");
+        let tmp = dir.path().join("tmp");
+        let el_url = format!("{}/el.tar.lz4", server.uri());
+        let cl_url = format!("{}/cl.tar.lz4", server.uri());
+
+        // Pre-populate dest dirs with data and matching version markers
+        std::fs::create_dir_all(el_dest.join("db"))?;
+        std::fs::write(el_dest.join("db/mdbx.dat"), b"existing-el")?;
+        std::fs::write(el_dest.join(SNAPSHOT_VERSION_FILE), &el_url)?;
+        std::fs::create_dir_all(&cl_dest)?;
+        std::fs::write(cl_dest.join("store.db"), b"existing-cl")?;
+        std::fs::write(cl_dest.join(SNAPSHOT_VERSION_FILE), &cl_url)?;
+
+        tokio::task::spawn_blocking(move || {
+            download_and_extract_both(&el_url, &cl_url, &el_dest, &cl_dest, &tmp, false)
+        })
+        .await??;
+
+        // Data should be untouched
+        assert_eq!(
+            std::fs::read(dir.path().join("el/db/mdbx.dat"))?,
+            b"existing-el"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("cl/store.db"))?,
+            b"existing-cl"
+        );
+
+        // Explicitly verify mocks received 0 requests
+        drop(el_mock);
+        drop(cl_mock);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_and_extract_both_force_overrides_skip() -> Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let el_data = build_tar_lz4(&[("db/mdbx.dat", b"new-el")])?;
+        let cl_data = build_tar_lz4(&[("store.db", b"new-cl")])?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/el.tar.lz4"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(el_data.clone())
+                    .append_header("Content-Length", el_data.len().to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/cl.tar.lz4"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(cl_data.clone())
+                    .append_header("Content-Length", cl_data.len().to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir()?;
+        let el_dest = dir.path().join("el");
+        let cl_dest = dir.path().join("cl");
+        let tmp = dir.path().join("tmp");
+        let el_url = format!("{}/el.tar.lz4", server.uri());
+        let cl_url = format!("{}/cl.tar.lz4", server.uri());
+
+        // Pre-populate dest dirs with old data and old markers
+        std::fs::create_dir_all(el_dest.join("db"))?;
+        std::fs::write(el_dest.join("db/mdbx.dat"), b"old-el")?;
+        std::fs::write(el_dest.join(SNAPSHOT_VERSION_FILE), "http://old/el.tar.lz4")?;
+        std::fs::create_dir_all(&cl_dest)?;
+        std::fs::write(cl_dest.join("store.db"), b"old-cl")?;
+        std::fs::write(cl_dest.join(SNAPSHOT_VERSION_FILE), "http://old/cl.tar.lz4")?;
+
+        let el_url_clone = el_url.clone();
+        let cl_url_clone = cl_url.clone();
+
+        tokio::task::spawn_blocking(move || {
+            download_and_extract_both(&el_url, &cl_url, &el_dest, &cl_dest, &tmp, true)
+        })
+        .await??;
+
+        // Data should be overwritten
+        assert_eq!(std::fs::read(dir.path().join("el/db/mdbx.dat"))?, b"new-el");
+        assert_eq!(std::fs::read(dir.path().join("cl/store.db"))?, b"new-cl");
+        // Markers should be updated
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("el/.snapshot-url"))?,
+            el_url_clone
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cl/.snapshot-url"))?,
+            cl_url_clone
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_and_extract_both_redownloads_when_url_differs() -> Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let el_data = build_tar_lz4(&[("db/mdbx.dat", b"new-el")])?;
+        let cl_data = build_tar_lz4(&[("store.db", b"new-cl")])?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/el-v2.tar.lz4"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(el_data.clone())
+                    .append_header("Content-Length", el_data.len().to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/cl-v2.tar.lz4"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(cl_data.clone())
+                    .append_header("Content-Length", cl_data.len().to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir()?;
+        let el_dest = dir.path().join("el");
+        let cl_dest = dir.path().join("cl");
+        let tmp = dir.path().join("tmp");
+
+        // Pre-populate with old data and old version markers
+        std::fs::create_dir_all(el_dest.join("db"))?;
+        std::fs::write(el_dest.join("db/mdbx.dat"), b"old-el")?;
+        std::fs::write(
+            el_dest.join(SNAPSHOT_VERSION_FILE),
+            "http://old/el-v1.tar.lz4",
+        )?;
+        std::fs::create_dir_all(&cl_dest)?;
+        std::fs::write(cl_dest.join("store.db"), b"old-cl")?;
+        std::fs::write(
+            cl_dest.join(SNAPSHOT_VERSION_FILE),
+            "http://old/cl-v1.tar.lz4",
+        )?;
+
+        // New URLs differ from markers
+        let el_url = format!("{}/el-v2.tar.lz4", server.uri());
+        let cl_url = format!("{}/cl-v2.tar.lz4", server.uri());
+        let el_url_clone = el_url.clone();
+        let cl_url_clone = cl_url.clone();
+
+        tokio::task::spawn_blocking(move || {
+            download_and_extract_both(&el_url, &cl_url, &el_dest, &cl_dest, &tmp, false)
+        })
+        .await??;
+
+        // Data should be overwritten with new snapshot
+        assert_eq!(std::fs::read(dir.path().join("el/db/mdbx.dat"))?, b"new-el");
+        assert_eq!(std::fs::read(dir.path().join("cl/store.db"))?, b"new-cl");
+        // Markers should reflect new URLs
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("el/.snapshot-url"))?,
+            el_url_clone
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cl/.snapshot-url"))?,
+            cl_url_clone
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_and_extract_both_skips_when_marker_missing() -> Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let el_data = build_tar_lz4(&[("db/mdbx.dat", b"el-data")])?;
+        let cl_data = build_tar_lz4(&[("store.db", b"cl-data")])?;
+
+        let server = MockServer::start().await;
+        let el_mock = Mock::given(method("GET"))
+            .and(path("/el.tar.lz4"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(el_data.clone())
+                    .append_header("Content-Length", el_data.len().to_string().as_str()),
+            )
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+        let cl_mock = Mock::given(method("GET"))
+            .and(path("/cl.tar.lz4"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(cl_data.clone())
+                    .append_header("Content-Length", cl_data.len().to_string().as_str()),
+            )
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let dir = tempfile::tempdir()?;
+        let el_dest = dir.path().join("el");
+        let cl_dest = dir.path().join("cl");
+        let tmp = dir.path().join("tmp");
+        let el_url = format!("{}/el.tar.lz4", server.uri());
+        let cl_url = format!("{}/cl.tar.lz4", server.uri());
+
+        // Pre-populate data WITHOUT version markers (simulates old tool or manual placement)
+        std::fs::create_dir_all(el_dest.join("db"))?;
+        std::fs::write(el_dest.join("db/mdbx.dat"), b"existing-el")?;
+        std::fs::create_dir_all(&cl_dest)?;
+        std::fs::write(cl_dest.join("store.db"), b"existing-cl")?;
+
+        tokio::task::spawn_blocking(move || {
+            download_and_extract_both(&el_url, &cl_url, &el_dest, &cl_dest, &tmp, false)
+        })
+        .await??;
+
+        // Data should be untouched
+        assert_eq!(
+            std::fs::read(dir.path().join("el/db/mdbx.dat"))?,
+            b"existing-el"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("cl/store.db"))?,
+            b"existing-cl"
+        );
+        // No marker file should have been written (no download happened)
+        assert!(!dir.path().join("el/.snapshot-url").exists());
+        assert!(!dir.path().join("cl/.snapshot-url").exists());
+
+        // Verify mocks received 0 requests
+        drop(el_mock);
+        drop(cl_mock);
         Ok(())
     }
 

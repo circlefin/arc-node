@@ -216,9 +216,11 @@ impl FromStr for Erc20FnWeights {
 /// Transaction type the spammer can generate.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum TxType {
-    /// Native USDC value transfer between prefunded accounts.
+    /// Native USDC value transfer between prefunded accounts (EIP-1559, Type 2).
     #[default]
     Transfer,
+    /// Legacy (Type 0) value transfer between prefunded accounts.
+    Legacy,
     /// ERC-20 `transfer()` call on the TestToken contract.
     Erc20,
     /// Call to the GasGuzzler contract (function selected by `--guzzler-fn-weights`).
@@ -233,21 +235,23 @@ pub enum TxType {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TxTypeMix {
     pub transfer: u32,
+    pub legacy: u32,
     pub erc20: u32,
     pub guzzler: u32,
 }
 
 impl TxTypeMix {
-    pub fn buckets(&self) -> [(TxType, u32); 3] {
+    pub fn buckets(&self) -> [(TxType, u32); 4] {
         [
             (TxType::Transfer, self.transfer),
+            (TxType::Legacy, self.legacy),
             (TxType::Erc20, self.erc20),
             (TxType::Guzzler, self.guzzler),
         ]
     }
 
     pub fn total_weight(&self) -> u32 {
-        self.transfer + self.erc20 + self.guzzler
+        self.transfer + self.legacy + self.erc20 + self.guzzler
     }
 }
 
@@ -271,11 +275,12 @@ impl FromStr for TxTypeMix {
 
             match key.as_str() {
                 "transfer" => out.transfer = weight,
+                "legacy" => out.legacy = weight,
                 "erc20" => out.erc20 = weight,
                 "guzzler" => out.guzzler = weight,
                 _ => {
                     return Err(format!(
-                        "Unknown tx type '{raw_key}'. Valid keys: transfer, erc20, guzzler"
+                        "Unknown tx type '{raw_key}'. Valid keys: transfer, legacy, erc20, guzzler"
                     ))
                 }
             }
@@ -439,6 +444,16 @@ mod tests {
     }
 
     #[test]
+    fn tx_type_mix_parses_legacy() {
+        let mix = TxTypeMix::from_str("transfer=60,legacy=40").expect("should parse");
+        assert_eq!(mix.total_weight(), 100);
+        assert_eq!(mix.transfer, 60);
+        assert_eq!(mix.legacy, 40);
+        assert_eq!(mix.erc20, 0);
+        assert_eq!(mix.guzzler, 0);
+    }
+
+    #[test]
     fn tx_type_mix_rejects_unknown_key() {
         let err = TxTypeMix::from_str("swap=50").expect_err("unknown key should fail");
         assert!(err.contains("Unknown tx type"));
@@ -466,6 +481,7 @@ mod tests {
         let config = Config {
             tx_type_mix: TxTypeMix {
                 transfer: 0,
+                legacy: 0,
                 erc20: 0,
                 guzzler: 0,
             },

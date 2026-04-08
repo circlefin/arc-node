@@ -100,7 +100,6 @@ services:
       ARC_GENESIS_FILE_PATH: /assets/genesis.json
     command:
       # - "--log-format=json"
-      - "--log-level=debug"
       - "start"
       - "--home=/data/malachite"
       {{#each cl_cli_flags}}

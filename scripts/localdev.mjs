@@ -94,6 +94,7 @@ const localdevManager = new ProcessManager({
     const blockTime = options.blockTime ?? '200ms'
     const launchArgs = [
       'run',
+      '--release',
       ...(options.frozen ? ['--frozen'] : []),
       ...(options.offline ? ['--offline'] : []),
       '--package',

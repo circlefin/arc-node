@@ -76,6 +76,10 @@ struct DownloadArgs {
     /// Defaults to ~/.arc/consensus.
     #[arg(long)]
     consensus_path: Option<PathBuf>,
+
+    /// Force re-download even if snapshot data already exists in the target directories.
+    #[arg(long = "force")]
+    force_redownload: bool,
 }
 
 #[tokio::main]
@@ -137,10 +141,11 @@ pub(crate) async fn run_download(args: DownloadArgs) -> Result<()> {
         execution_dir,
         consensus_dir,
         tmp_dir,
+        args.force_redownload,
     )
     .await?;
 
-    info!("Snapshot downloaded and extracted successfully");
+    info!("Snapshot operation complete");
     Ok(())
 }
 
@@ -240,6 +245,20 @@ mod tests {
         assert!(parse(&["arc-snapshots"]).is_err());
     }
 
+    #[test]
+    fn parse_download_with_force_flag() {
+        let cli = parse(&["arc-snapshots", "download", "--force"]).unwrap();
+        let Commands::Download(args) = cli.command;
+        assert!(args.force_redownload);
+    }
+
+    #[test]
+    fn parse_download_without_force_defaults_to_false() {
+        let cli = parse(&["arc-snapshots", "download"]).unwrap();
+        let Commands::Download(args) = cli.command;
+        assert!(!args.force_redownload);
+    }
+
     #[tokio::test]
     async fn run_download_errors_with_only_one_url() {
         let args = DownloadArgs {
@@ -248,6 +267,7 @@ mod tests {
             chain: Chain::Devnet,
             execution_path: Some("/tmp/el".into()),
             consensus_path: Some("/tmp/cl".into()),
+            force_redownload: false,
         };
         let err = run_download(args).await.unwrap_err();
         assert!(err.to_string().contains("both"));
@@ -258,6 +278,7 @@ mod tests {
             chain: Chain::Devnet,
             execution_path: Some("/tmp/el".into()),
             consensus_path: Some("/tmp/cl".into()),
+            force_redownload: false,
         };
         let err = run_download(args).await.unwrap_err();
         assert!(err.to_string().contains("both"));

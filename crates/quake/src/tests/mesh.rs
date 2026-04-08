@@ -65,8 +65,7 @@ use tracing::debug;
 use super::{quake_test, CheckResult, RpcClientFactory, TestOutcome, TestParams, TestResult};
 use crate::manifest::{self, Node};
 use crate::mesh::{
-    analyze, classify_all, fetch_all_metrics, format_report, parse_all_metrics, MeshDisplayOptions,
-    MeshTier,
+    analyze, classify_all, fetch_all_metrics, format_report, MeshDisplayOptions, MeshTier,
 };
 use crate::testnet::Testnet;
 
@@ -188,8 +187,7 @@ pub(super) async fn run_mesh_checks(
 ) -> color_eyre::eyre::Result<Vec<CheckResult>> {
     let metrics_urls = testnet.nodes_metadata.all_consensus_metrics_urls();
     let raw_metrics = fetch_all_metrics(&metrics_urls).await;
-    let nodes_data = parse_all_metrics(&raw_metrics);
-
+    let nodes_data = crate::mesh::parse_and_classify_metrics(&raw_metrics, &testnet.manifest.nodes);
     if nodes_data.is_empty() {
         bail!("No mesh metrics collected from any node ({label})");
     }

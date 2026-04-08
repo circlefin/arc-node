@@ -21,6 +21,15 @@ use super::types::{
     ValidatorConnectivity, TOPICS,
 };
 
+const COL_TYPE: usize = 12;
+const COL_SMALL: usize = 5;
+const COL_PEERS: usize = 6;
+const COL_IN_PEERS: usize = 8;
+const COL_OUT_PEERS: usize = 9;
+const COL_CONNS: usize = 6;
+const COL_IN_CONNS: usize = 8;
+const COL_OUT_CONNS: usize = 8;
+
 pub fn format_report(analysis: &MeshAnalysis, options: &MeshDisplayOptions) -> String {
     let mut out = String::new();
 
@@ -67,13 +76,38 @@ pub fn format_report(analysis: &MeshAnalysis, options: &MeshDisplayOptions) -> S
 
     // -- Counts table --------------------------------------------------------
     if options.show_counts {
-        let _ = writeln!(out, "{}", "=".repeat(125));
+        let name_w = analysis
+            .nodes
+            .iter()
+            .map(|n| n.moniker.len())
+            .max()
+            .unwrap_or(7)
+            .max(7); // at least "Moniker"
+        let col_widths = [
+            name_w,
+            COL_TYPE,
+            COL_SMALL,
+            COL_SMALL,
+            COL_SMALL,
+            COL_SMALL,
+            COL_PEERS,
+            COL_IN_PEERS,
+            COL_OUT_PEERS,
+            COL_CONNS,
+            COL_IN_CONNS,
+            COL_OUT_CONNS,
+        ];
+        let total_w = col_widths.iter().sum::<usize>() + col_widths.len() - 1;
+
+        let _ = writeln!(out, "{}", "=".repeat(total_w));
         let _ = writeln!(out, "Status - mesh peers, connected peers, connections");
         let _ = write!(out, "{network_line}");
-        let _ = write!(out, "{}\n\n", "=".repeat(125));
+        let _ = write!(out, "{}\n\n", "=".repeat(total_w));
         let _ = writeln!(
             out,
-            "{:<15} {:<12} {:<5} {:<5} {:<5} {:<5} {:<6} {:<8} {:<9} {:<6} {:<8} {:<8}",
+            "{:<name_w$} {:<COL_TYPE$} {:<COL_SMALL$} {:<COL_SMALL$} {:<COL_SMALL$} {:<COL_SMALL$} \
+             {:<COL_PEERS$} {:<COL_IN_PEERS$} {:<COL_OUT_PEERS$} \
+             {:<COL_CONNS$} {:<COL_IN_CONNS$} {:<COL_OUT_CONNS$}",
             "Moniker",
             "Type",
             "Cons",
@@ -87,7 +121,7 @@ pub fn format_report(analysis: &MeshAnalysis, options: &MeshDisplayOptions) -> S
             "InConns",
             "OutConns"
         );
-        let _ = writeln!(out, "{}", "-".repeat(125));
+        let _ = writeln!(out, "{}", "-".repeat(total_w));
 
         let mut sorted_nodes: Vec<&NodeMetricsData> = analysis.nodes.iter().collect();
         sorted_nodes.sort_by(|a, b| {
@@ -101,7 +135,7 @@ pub fn format_report(analysis: &MeshAnalysis, options: &MeshDisplayOptions) -> S
         for node in &sorted_nodes {
             if let Some(pt) = prev_type {
                 if pt != node.node_type {
-                    let _ = writeln!(out, "{}", "-".repeat(125));
+                    let _ = writeln!(out, "{}", "-".repeat(total_w));
                 }
             }
             prev_type = Some(node.node_type);
@@ -117,7 +151,9 @@ pub fn format_report(analysis: &MeshAnalysis, options: &MeshDisplayOptions) -> S
 
             let _ = writeln!(
                 out,
-                "{:<15} {:<12} {:<5} {:<5} {:<5} {:<5} {:<6} {:<8} {:<9} {:<6} {:<8} {:<8}",
+                "{:<name_w$} {:<COL_TYPE$} {:<COL_SMALL$} {:<COL_SMALL$} {:<COL_SMALL$} {:<COL_SMALL$} \
+                 {:<COL_PEERS$} {:<COL_IN_PEERS$} {:<COL_OUT_PEERS$} \
+                 {:<COL_CONNS$} {:<COL_IN_CONNS$} {:<COL_OUT_CONNS$}",
                 node.moniker,
                 node.node_type,
                 c,

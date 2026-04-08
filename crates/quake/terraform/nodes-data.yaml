@@ -11,6 +11,119 @@ users:
     shell: /bin/bash
     ssh_authorized_keys:
       - ${ssh_public_key}
+write_files:
+  # Systemd service + script to configure secondary ENIs for bridge nodes that
+  # span multiple subnets. Bridge nodes need an interface per subnet so Docker
+  # containers can route CL P2P traffic across subnet boundaries
+  # (see validate_topology in subnets.rs). Terraform attaches the ENIs but
+  # AL2023 does not auto-configure hot-plugged interfaces — this service
+  # discovers them via IMDS and sets up policy routing per-interface.
+  - path: /etc/systemd/system/configure-secondary-enis.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Configure secondary ENIs for multi-subnet bridge nodes
+      After=network-online.target
+      Wants=network-online.target
+      Before=docker.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      Environment=EXPECTED_SECONDARY_ENIS=${expected_secondary_enis}
+      ExecStart=/usr/local/bin/configure-secondary-enis.sh
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /usr/local/bin/configure-secondary-enis.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # Discovers secondary ENIs via EC2 IMDS and sets up IP addresses with
+      # per-interface policy routing so each ENI handles its own subnet traffic.
+      set -euo pipefail
+
+      EXPECTED=$${EXPECTED_SECONDARY_ENIS:-0}
+      if [ "$EXPECTED" -le 0 ]; then
+        echo "No secondary ENIs expected, nothing to configure."
+        exit 0
+      fi
+
+      echo "Configuring $EXPECTED secondary ENI(s)..."
+
+      IMDS="http://169.254.169.254/latest"
+      imds_get() {
+        curl -sf --retry 10 --retry-delay 2 --retry-connrefused \
+          -H "X-aws-ec2-metadata-token: $TOKEN" "$IMDS/$1"
+      }
+
+      # IMDS may not be reachable immediately at boot — retry with backoff.
+      TOKEN=$(curl -sf --retry 10 --retry-delay 2 --retry-connrefused \
+        -X PUT "$IMDS/api/token" \
+        -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+
+      # Detect primary interface from default route (portable across instance types).
+      PRIMARY_IFACE=$(ip -o route show default | awk '{print $5; exit}')
+      if [ -z "$PRIMARY_IFACE" ]; then
+        echo "ERROR: No default route — cannot detect primary interface."
+        exit 1
+      fi
+      PRIMARY_MAC=$(cat "/sys/class/net/$PRIMARY_IFACE/address")
+      echo "Primary interface: $PRIMARY_IFACE (MAC=$PRIMARY_MAC)"
+
+      # Wait for all secondary ENIs to appear (Terraform attachment may lag behind boot)
+      ATTEMPTS=0
+      MAX_ATTEMPTS=60
+      while true; do
+        ALL_MACS=$(imds_get "meta-data/network/interfaces/macs/")
+        SECONDARY_COUNT=$(echo "$ALL_MACS" | grep -cv "^$PRIMARY_MAC" || true)
+        if [ "$SECONDARY_COUNT" -ge "$EXPECTED" ]; then
+          echo "All $EXPECTED secondary ENI(s) detected."
+          break
+        fi
+        ATTEMPTS=$((ATTEMPTS + 1))
+        if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
+          echo "WARNING: Only $SECONDARY_COUNT of $EXPECTED secondary ENIs detected after $${MAX_ATTEMPTS}s. Proceeding anyway."
+          break
+        fi
+        sleep 1
+      done
+
+      RT_TABLE=1000
+      for MAC_ENTRY in $ALL_MACS; do
+        MAC=$(echo "$MAC_ENTRY" | tr -d '/')
+        [ "$MAC" = "$PRIMARY_MAC" ] && continue
+
+        IFACE=$(ip -o link | grep -i "$MAC" | awk -F': ' '{print $2}')
+        if [ -z "$IFACE" ]; then
+          echo "WARNING: No interface found for MAC $MAC, skipping."
+          continue
+        fi
+
+        IP=$(imds_get "meta-data/network/interfaces/macs/$MAC/local-ipv4s")
+        CIDR=$(imds_get "meta-data/network/interfaces/macs/$MAC/subnet-ipv4-cidr-block")
+        if [ -z "$IP" ] || [ -z "$CIDR" ]; then
+          echo "WARNING: IMDS returned empty IP or CIDR for $MAC, skipping."
+          continue
+        fi
+        PREFIX=$(echo "$CIDR" | cut -d'/' -f2)
+        SUBNET=$(echo "$CIDR" | cut -d'/' -f1)
+        GW=$(echo "$SUBNET" | awk -F. '{print $1"."$2"."$3".1"}')
+
+        echo "Configuring $IFACE: IP=$IP/$PREFIX GW=$GW (MAC=$MAC)"
+        ip link set "$IFACE" up
+        ip addr add "$IP/$PREFIX" dev "$IFACE" 2>/dev/null || true
+
+        # Policy routing: traffic from this IP exits via this interface
+        ip rule add from "$IP" table "$RT_TABLE" priority $((RT_TABLE + 100)) 2>/dev/null || true
+        ip route add default via "$GW" dev "$IFACE" table "$RT_TABLE" 2>/dev/null || true
+        ip route add "$CIDR" dev "$IFACE" scope link table "$RT_TABLE" 2>/dev/null || true
+
+        RT_TABLE=$((RT_TABLE + 1))
+        echo "Secondary ENI $IFACE configured successfully."
+      done
 runcmd:
 # Set up 4 GiB swap to prevent hard OOM kills (dd instead of fallocate for XFS compatibility)
   - dd if=/dev/zero of=/swapfile bs=1M count=4096
@@ -24,6 +137,10 @@ runcmd:
 # Install packages via dnf (Amazon Linux 2023)
 # Note: curl-minimal, jq, nfs-utils are pre-installed
   - dnf install -y docker tmux iproute-tc
+# Activate the secondary ENI service. For bridge nodes (EXPECTED > 0), the
+# oneshot start blocks until ENIs are fully configured — before Docker starts.
+  - systemctl daemon-reload
+  - systemctl enable --now configure-secondary-enis.service
 # Install Docker Compose v2 plugin (not available in AL2023 repos)
   - mkdir -p /usr/local/lib/docker/cli-plugins
   - curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" -o /usr/local/lib/docker/cli-plugins/docker-compose
@@ -32,8 +149,6 @@ runcmd:
   - systemctl start docker
   - systemctl enable docker
 # Pull Docker images from GHCR
-# TODO: instead of docker login, use the EC2_Pull_Access instance profile, which has permission to pull images from GHCR 
-#   https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/roles/details/EC2_Pull_Access?section=permissions
   - echo ${github_token} | docker login ghcr.io -u ${github_user} --password-stdin
   - docker pull ${consensus_image}
   - docker pull ${execution_image}

@@ -21,6 +21,7 @@ use std::future::Future;
 use toml::Value;
 
 use crate::manifest::{Node, NodeType};
+use crate::mesh::MeshNodeType;
 
 /// Merges two toml values into a single one.
 /// First value is the base value, second value will overwrite the first value when
@@ -62,6 +63,29 @@ pub fn assign_node_groups<'a>(
                 NodeType::Validator => "Validators".to_string(),
                 NodeType::NonValidator => "Non-Validators".to_string(),
             });
+        }
+    }
+}
+
+/// Override mesh-analysis node types using the manifest's authoritative NodeType.
+///
+/// The mesh-analysis crate infers node types from Prometheus `peer_type` labels,
+/// but external validators behind dedicated sentries get misclassified as
+/// "persistent" because only their sentry discovers them. This function
+/// corrects the type for validators, matching the `assign_node_groups` pattern
+/// used by perf and health reports.
+pub fn assign_mesh_node_types(
+    nodes: &mut [arc_mesh_analysis::NodeMetricsData],
+    manifest_nodes: &IndexMap<String, Node>,
+) {
+    for node in nodes.iter_mut() {
+        if let Some((_, manifest_node)) = manifest_nodes
+            .iter()
+            .find(|(name, _)| node.moniker == name.as_str())
+        {
+            if manifest_node.node_type == NodeType::Validator {
+                node.node_type = MeshNodeType::Validator;
+            }
         }
     }
 }

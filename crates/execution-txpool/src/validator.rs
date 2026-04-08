@@ -224,39 +224,30 @@ where
 
         match self.inner.client().latest() {
             Ok(state_provider) => {
-                let sender = transaction.sender();
-                if self.is_address_blocklisted(sender, &state_provider) {
-                    info!(
-                        "Rejecting {:?} transaction {} - blocklisted sender: {}",
-                        origin,
-                        transaction.hash(),
-                        sender
-                    );
-                    return TransactionValidationOutcome::Invalid(
-                        transaction,
-                        InvalidPoolTransactionError::other(
-                            ArcTransactionValidatorError::BlocklistedError,
-                        ),
-                    );
-                }
-
-                // Check recipient address if this transaction with value > 0
-                if let Some(to) = transaction.to() {
-                    if !transaction.value().is_zero()
-                        && self.is_address_blocklisted(to, &state_provider)
-                    {
+                match self.check_for_blocklisted_addresses(&transaction, &state_provider) {
+                    Ok(Some(address)) => {
                         info!(
-                            "Rejecting {:?} transaction {} - blocklisted recipient: {} (sender: {})",
+                            "Rejecting {:?} transaction {} - blocklisted address: {}",
                             origin,
                             transaction.hash(),
-                            to,
-                            sender
+                            address
                         );
                         return TransactionValidationOutcome::Invalid(
                             transaction,
                             InvalidPoolTransactionError::other(
                                 ArcTransactionValidatorError::BlocklistedError,
                             ),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(
+                            %err,
+                            "blocklist storage read failed — rejecting transaction"
+                        );
+                        return TransactionValidationOutcome::Error(
+                            *transaction.hash(),
+                            Box::new(err),
                         );
                     }
                 }
@@ -324,19 +315,47 @@ where
         Ok(None)
     }
 
-    /// Check if an address is blocklisted by reading from the native coin control precompile storage.
+    /// Returns Ok(Some(address)) if any checked address is blocklisted, Ok(None) if all clear.
+    /// Checks the sender unconditionally and the recipient only for value-bearing transactions.
+    fn check_for_blocklisted_addresses(
+        &self,
+        transaction: &Tx,
+        state_provider: &dyn StateProvider,
+    ) -> ProviderResult<Option<Address>> {
+        let has_value = !transaction.value().is_zero();
+        let addresses =
+            std::iter::once(transaction.sender()).chain(transaction.to().filter(|_| has_value));
+
+        for address in addresses {
+            if self.is_address_blocklisted(address, state_provider)? {
+                return Ok(Some(address));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn is_address_blocklisted(
         &self,
-        address: alloy_primitives::Address,
+        address: Address,
         state: &dyn StateProvider,
-    ) -> bool {
-        let storage_slot = compute_is_blocklisted_storage_slot(address);
-        state
-            .storage(NATIVE_COIN_CONTROL_ADDRESS, storage_slot)
-            .ok()
-            .flatten()
-            .is_some_and(|value| value != UNBLOCKLISTED_STATUS)
+    ) -> ProviderResult<bool> {
+        is_address_blocklisted(address, |addr, slot| state.storage(addr, slot))
     }
+}
+
+/// Core blocklist check: reads the blocklist storage slot and fails closed on errors.
+/// Extracted as a free function taking a storage reader closure for testability.
+fn is_address_blocklisted(
+    address: Address,
+    read_storage: impl Fn(
+        Address,
+        alloy_primitives::StorageKey,
+    ) -> ProviderResult<Option<alloy_primitives::StorageValue>>,
+) -> ProviderResult<bool> {
+    let storage_slot = compute_is_blocklisted_storage_slot(address);
+    let value = read_storage(NATIVE_COIN_CONTROL_ADDRESS, storage_slot)?;
+    Ok(value.is_some_and(|v| v != UNBLOCKLISTED_STATUS))
 }
 
 impl<Client, Tx, Evm> TransactionValidator for ArcTransactionValidator<Client, Tx, Evm>
@@ -370,8 +389,10 @@ mod tests {
     use arc_execution_config::addresses_denylist::{
         AddressesDenylistConfig, DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
     };
+    use arc_precompiles::native_coin_control::BLOCKLISTED_STATUS;
     use reth_evm_ethereum::EthEvmConfig;
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_storage_api::errors::provider::ProviderError;
     use reth_transaction_pool::blobstore::InMemoryBlobStore;
     use reth_transaction_pool::{
         test_utils::MockTransaction, validate::EthTransactionValidatorBuilder, PoolTransaction,
@@ -1143,5 +1164,50 @@ mod tests {
         }
 
         assert_eq!(load(&HITS), 5, "only the last five are present");
+    }
+
+    #[test]
+    fn blocklist_storage_error_propagates() {
+        let result = is_address_blocklisted(Address::from([0xABu8; 20]), |_, _| {
+            Err(ProviderError::BlockHashNotFound(B256::ZERO))
+        });
+        assert!(result.is_err(), "storage error must propagate");
+    }
+
+    #[test]
+    fn blocklist_returns_false_when_storage_returns_none() {
+        let result = is_address_blocklisted(Address::from([0xABu8; 20]), |_, _| Ok(None));
+        assert!(!result.unwrap(), "Ok(None) means not blocklisted");
+    }
+
+    #[test]
+    fn blocklist_returns_false_for_unblocklisted_status() {
+        let result = is_address_blocklisted(Address::from([0xABu8; 20]), |_, _| {
+            Ok(Some(UNBLOCKLISTED_STATUS))
+        });
+        assert!(
+            !result.unwrap(),
+            "UNBLOCKLISTED_STATUS means not blocklisted"
+        );
+    }
+
+    #[test]
+    fn blocklist_returns_true_for_blocklisted_status() {
+        let result = is_address_blocklisted(Address::from([0xABu8; 20]), |_, _| {
+            Ok(Some(BLOCKLISTED_STATUS))
+        });
+        assert!(result.unwrap(), "BLOCKLISTED_STATUS means blocklisted");
+    }
+
+    #[test]
+    fn blocklist_returns_true_for_other_nonzero_values() {
+        for status in [U256::from(2), U256::from(42), U256::MAX] {
+            let result =
+                is_address_blocklisted(Address::from([0xABu8; 20]), |_, _| Ok(Some(status)));
+            assert!(
+                result.unwrap(),
+                "non-zero value {status} should be treated as blocklisted"
+            );
+        }
     }
 }

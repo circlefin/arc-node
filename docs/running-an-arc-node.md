@@ -10,6 +10,8 @@ Arc is an open, EVM-compatible Layer-1 blockchain. Anyone can run an Arc node â€
 
 ## Quick Start
 
+> **Docker:** Container images and Docker Compose instructions are coming soon.
+
 An Arc node runs two processes: the Execution Layer (EL) and the Consensus Layer (CL). The EL executes transactions and maintains blockchain state. The CL fetches blocks from the network, verifies their cryptographic signatures, and passes them to the EL for execution.
 
 See [installation](installation.md) for instructions on how to install the binaries on your machine.

@@ -25,7 +25,7 @@ use tokio::time::{self, Duration};
 use tracing::{debug, info};
 use url::Url;
 
-use alloy_consensus::{Signed, TxEip1559};
+use alloy_consensus::TxEnvelope;
 
 use crate::accounts::AccountBuilder;
 use crate::generator::TxGenerator;
@@ -232,7 +232,7 @@ impl Spammer {
         config: &Config,
     ) -> Result<(TxGenerator, TxSender)> {
         // Buffered channel to send transactions from generator to sender
-        let (tx_sender, tx_receiver) = mpsc::channel::<Signed<TxEip1559>>(10000);
+        let (tx_sender, tx_receiver) = mpsc::channel::<TxEnvelope>(10000);
 
         debug!("TxGenerator {i}: creating with signers in range {range:?}...");
         let mut tx_gen = TxGenerator::new(

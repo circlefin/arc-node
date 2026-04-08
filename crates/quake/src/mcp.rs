@@ -316,8 +316,8 @@ impl QuakeMcpServer {
         let testnet = self.testnet.read().await;
         let metrics_urls = testnet.nodes_metadata.all_consensus_metrics_urls();
         let raw_metrics = crate::mesh::fetch_all_metrics(&metrics_urls).await;
-        let nodes_data = crate::mesh::parse_all_metrics(&raw_metrics);
-
+        let nodes_data =
+            crate::mesh::parse_and_classify_metrics(&raw_metrics, &testnet.manifest.nodes);
         if nodes_data.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
                 "No nodes responded to metrics requests. Is the testnet running?",

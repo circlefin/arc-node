@@ -133,7 +133,7 @@ pub struct SpammerArgs {
     pub reconnect_period: std::time::Duration,
     /// Weighted transaction type mix.
     ///
-    /// Format: transfer=70,erc20=20,guzzler=10
+    /// Format: transfer=50,legacy=20,erc20=20,guzzler=10
     /// Omitted types default to weight 0 (disabled).
     /// When omitted, defaults based on --guzzler-fn-weights:
     ///   if guzzler functions enabled: 100% guzzler;
