@@ -187,7 +187,7 @@ pub struct StartCmd {
     #[clap(
         long = "execution-persistence-backpressure-threshold",
         value_name = "BLOCKS",
-        default_value = "100"
+        default_value = "16"
     )]
     pub execution_persistence_backpressure_threshold: u64,
 
@@ -401,7 +401,7 @@ impl Default for StartCmd {
             execution_endpoint: None,
             execution_ws_endpoint: None,
             execution_persistence_backpressure: false,
-            execution_persistence_backpressure_threshold: 100,
+            execution_persistence_backpressure_threshold: 16,
             execution_jwt: None,
             metrics: None,
             rpc_addr: None,

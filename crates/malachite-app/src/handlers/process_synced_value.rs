@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use eyre::Context;
 use ssz::Decode;
@@ -26,6 +28,7 @@ use malachitebft_app_channel::Reply;
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use arc_consensus_types::{Address, ArcContext, Height};
 use arc_eth_engine::engine::Engine;
+use arc_eth_engine::persistence_meter::PersistenceMeter;
 
 use malachitebft_app_channel::app::types::core::Validity;
 
@@ -34,6 +37,9 @@ use crate::payload::{validate_consensus_block, EnginePayloadValidator, PayloadVa
 use crate::state::State;
 use crate::store::repositories::{InvalidPayloadsRepository, UndecidedBlocksRepository};
 use arc_consensus_db::invalid_payloads::InvalidPayload;
+
+/// Timeout when blocked waiting for EL persistence to catch up during sync.
+const SYNC_PERSISTENCE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Handles the `ProcessSyncedValue` message from the consensus engine.
 ///
@@ -56,6 +62,7 @@ pub async fn handle(
         EnginePayloadValidator::new(engine, state.metrics()),
         state.store(),
         state.store(),
+        state.persistence_meter(),
         height,
         round,
         proposer,
@@ -98,10 +105,12 @@ pub async fn handle(
 ///
 /// Returns `Ok(None)` when the raw bytes cannot be SSZ-decoded (the error is logged
 /// but not propagated).
+#[allow(clippy::too_many_arguments)]
 async fn on_process_synced_value(
     engine: impl PayloadValidator,
     undecided_blocks_repo: impl UndecidedBlocksRepository,
     invalid_payloads_repo: impl InvalidPayloadsRepository,
+    persistence_meter: impl PersistenceMeter,
     height: Height,
     round: Round,
     proposer: Address,
@@ -169,6 +178,19 @@ async fn on_process_synced_value(
         )
     })?;
 
+    if validity.is_valid() {
+        if let Err(e) = persistence_meter
+            .wait_for_persisted_block(height.as_u64(), SYNC_PERSISTENCE_WAIT_TIMEOUT)
+            .await
+        {
+            error!(
+                block_number = height.as_u64(),
+                %e,
+                "ProcessSyncedValue: persistence backpressure timed out, proceeding"
+            );
+        }
+    }
+
     Ok(Some(proposal))
 }
 
@@ -182,6 +204,8 @@ mod tests {
     };
 
     use arbitrary::{Arbitrary, Unstructured};
+    use arc_eth_engine::mocks::MockPersistenceMeter;
+    use arc_eth_engine::persistence_meter::NoopPersistenceMeter;
     use bytes::Bytes;
     use malachitebft_core_types::Validity;
     use mockall::predicate::*;
@@ -226,6 +250,7 @@ mod tests {
             engine,
             undecided,
             invalid,
+            NoopPersistenceMeter,
             height,
             round,
             proposer,
@@ -277,6 +302,7 @@ mod tests {
             engine,
             undecided,
             invalid,
+            NoopPersistenceMeter,
             height,
             round,
             proposer,
@@ -317,6 +343,7 @@ mod tests {
             engine,
             undecided,
             invalid,
+            NoopPersistenceMeter,
             height,
             round,
             proposer,
@@ -350,6 +377,7 @@ mod tests {
             engine,
             undecided,
             invalid,
+            NoopPersistenceMeter,
             height,
             round,
             proposer,
@@ -388,6 +416,7 @@ mod tests {
             engine,
             undecided,
             invalid,
+            NoopPersistenceMeter,
             height,
             round,
             proposer,
@@ -397,5 +426,138 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().downcast_ref::<io::Error>().is_some());
+    }
+
+    #[tokio::test]
+    async fn on_process_synced_value_calls_persistence_meter_for_valid_payload() {
+        let mut u = Unstructured::new(&[0u8; 512]);
+
+        let height = Height::new(42);
+        let round = Round::new(0);
+        let proposer = Address::new([0u8; 20]);
+        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+        let value_bytes = Bytes::from(payload.as_ssz_bytes());
+
+        let mut engine = MockPayloadValidator::new();
+        engine
+            .expect_validate_payload()
+            .returning(|_| Ok(PayloadValidationResult::Valid));
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided.expect_store().times(1).returning(|_| Ok(()));
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(0);
+
+        let mut persistence_meter = MockPersistenceMeter::new();
+        persistence_meter
+            .expect_wait_for_persisted_block()
+            .withf(|&block, _| block == 42)
+            .times(1)
+            .return_once(|_, _| Ok(()));
+
+        let proposal = on_process_synced_value(
+            engine,
+            undecided,
+            invalid,
+            persistence_meter,
+            height,
+            round,
+            proposer,
+            value_bytes,
+        )
+        .await
+        .expect("should succeed");
+
+        assert!(proposal.is_some());
+        assert_eq!(proposal.unwrap().validity, Validity::Valid);
+    }
+
+    #[tokio::test]
+    async fn on_process_synced_value_skips_persistence_meter_for_invalid_payload() {
+        let mut u = Unstructured::new(&[0u8; 512]);
+
+        let height = Height::new(42);
+        let round = Round::new(0);
+        let proposer = Address::new([0u8; 20]);
+        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+        let value_bytes = Bytes::from(payload.as_ssz_bytes());
+
+        let mut engine = MockPayloadValidator::new();
+        engine.expect_validate_payload().returning(|_| {
+            Ok(PayloadValidationResult::Invalid {
+                reason: "bad".into(),
+            })
+        });
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided.expect_store().times(1).returning(|_| Ok(()));
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(1).returning(|_| Ok(()));
+
+        let mut persistence_meter = MockPersistenceMeter::new();
+        persistence_meter.expect_wait_for_persisted_block().times(0);
+
+        let proposal = on_process_synced_value(
+            engine,
+            undecided,
+            invalid,
+            persistence_meter,
+            height,
+            round,
+            proposer,
+            value_bytes,
+        )
+        .await
+        .expect("should succeed");
+
+        assert!(proposal.is_some());
+        assert_eq!(proposal.unwrap().validity, Validity::Invalid);
+    }
+
+    #[tokio::test]
+    async fn on_process_synced_value_proceeds_when_persistence_meter_fails() {
+        let mut u = Unstructured::new(&[0u8; 512]);
+
+        let height = Height::new(7);
+        let round = Round::new(0);
+        let proposer = Address::new([0u8; 20]);
+        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+        let value_bytes = Bytes::from(payload.as_ssz_bytes());
+
+        let mut engine = MockPayloadValidator::new();
+        engine
+            .expect_validate_payload()
+            .returning(|_| Ok(PayloadValidationResult::Valid));
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided.expect_store().times(1).returning(|_| Ok(()));
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(0);
+
+        let mut persistence_meter = MockPersistenceMeter::new();
+        persistence_meter
+            .expect_wait_for_persisted_block()
+            .withf(|&block, _| block == 7)
+            .times(1)
+            .return_once(|_, _| Err(eyre::eyre!("persistence meter timeout")));
+
+        let proposal = on_process_synced_value(
+            engine,
+            undecided,
+            invalid,
+            persistence_meter,
+            height,
+            round,
+            proposer,
+            value_bytes,
+        )
+        .await
+        .expect("should succeed even when meter fails");
+
+        assert!(proposal.is_some());
+        assert_eq!(proposal.unwrap().validity, Validity::Valid);
     }
 }

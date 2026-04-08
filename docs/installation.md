@@ -1,32 +1,46 @@
-# Installation
+# Install
 
-Arc node can be installed in two ways: a pre-built binary via `arcup` or building from source.
+The Arc node binaries can be installed in two ways:
+downloading pre-built binaries via [`arcup`](#pre-built-binary),
+or by building them from [source](#build-from-source).
+
+After the installation, refer to [Running an Arc Node](./running-an-arc-node.md)
+for how to run an Arc node.
 
 > **Docker:** Container images and Docker Compose instructions are coming soon.
 
 ## Versions
 
-Versions across networks may not be compatible. Consult the table below to confirm which version to run for each network.
+Versions of the Arc node across networks may not be compatible.
+Consult the table below to confirm which version to run for each network.
 
-| Network | Version |
-|---------|---------|
-| Arc Testnet | v0.6.0 |
+| Network     | Version |
+|-------------|---------|
+| Arc Testnet | v0.6.0  |
 
 ## Pre-built Binary
 
-`arcup` installs `arc-node-execution`, `arc-node-consensus`, and `arc-snapshots` to `~/.arc/bin`.
+This repository includes `arcup`, a script that installs Arc node binaries
+into `$ARC_BIN_DIR` directory, defaulting to `~/.arc/bin`:
 
 ```sh
 curl -L https://raw.githubusercontent.com/circlefin/arc-node/main/arcup/install | bash
 ```
 
-After installing, restart your shell or run:
+More precisely, the [configured paths](./running-an-arc-node.md#configure-paths)
+for Arc nodes are based on the `$ARC_HOME` variable, with `~/.arc` as default value.
+If `$ARC_BIN_DIR` is not set, its default value is `$ARC_HOME/bin`, defaulting
+to `~/.arc/bin`.
+`$ARC_BIN_DIR` must be part of the system `PATH`.
+
+To be sure that the binaries installed under `$ARC_BIN_DIR` are available in
+the `PATH`, load the produced environment file:
 
 ```sh
-source ~/.arc/env
+source $ARC_HOME/env
 ```
 
-Verify the installation:
+Next, verify that the three Arc binaries are installed:
 
 ```sh
 arc-snapshots --version
@@ -34,7 +48,8 @@ arc-node-execution --version
 arc-node-consensus --version
 ```
 
-To update in the future, run:
+The `arcup` script should also be in the `PATH`
+and can be used to update Arc binaries:
 
 ```sh
 arcup
@@ -42,25 +57,35 @@ arcup
 
 ## Build from Source
 
-**1. Install Rust:**
+The Arc node source code is available in the
+https://github.com/circlefin/arc-node repository:
 
-```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-```
-
-**2. Clone the repository:**
+**1. Clone `arc-node`**
 
 ```sh
 git clone https://github.com/circlefin/arc-node.git
 cd arc-node
-git checkout v0.6.0
+git checkout $VERSION
 git submodule update --init --recursive
+```
+
+`$VERSION` is a tag for a released version.
+Refer to the [Versions](#versions) section to find out which one to use.
+
+**2. Install Rust:**
+
+Make sure that you have [rust](https://rust-lang.org/tools/install/) installed.
+If not, it can be installed with the following commands:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
 ```
 
 **3. Build and install:**
 
-By default, `cargo install` places binaries in `~/.cargo/bin`, which is added to `PATH` by the Rust installer. Pass `--root <dir>` to install into `<dir>/bin` instead (e.g. `--root /usr/local`).
+The following commands produce three Arc node binaries: 
+`arc-node-execution`, `arc-node-consensus`, and `arc-snapshots`:
 
 ```sh
 cargo install --path crates/node
@@ -68,7 +93,13 @@ cargo install --path crates/malachite-app
 cargo install --path crates/snapshots
 ```
 
-Verify:
+`cargo install` places compiled binaries into `~/.cargo/bin`, which is added
+to `PATH` by loading `~/.cargo/env`.
+Include the parameter `--root $BASE_DIR` to install the compiled binaries into
+`$BASE_DIR/bin` instead (for instance, `--root /usr/local`).
+
+In either case, Arc node binaries should be in the `PATH`.
+Verify by calling them:
 
 ```sh
 arc-snapshots --version
@@ -76,4 +107,3 @@ arc-node-execution --version
 arc-node-consensus --version
 ```
 
-See [Running an Arc Node](./running-an-arc-node.md) for how to run the node after installation.

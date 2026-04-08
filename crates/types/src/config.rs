@@ -186,7 +186,7 @@ pub struct ExecutionConfig {
 
 impl ExecutionConfig {
     const fn default_persistence_backpressure_threshold() -> u64 {
-        100
+        16
     }
 }
 
