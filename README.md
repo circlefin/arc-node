@@ -1,9 +1,8 @@
 <p align="center">
   <a href="https://www.arc.network/">
     <picture>
-      <source media="(prefers-color-scheme: light)" srcset="docs/assets/arc-logo-dark.svg">
       <source media="(prefers-color-scheme: dark)" srcset="docs/assets/arc-logo-light.svg">
-      <img alt="Arc" src="docs/assets/arc-logo-light.svg" width="auto" height="120">
+      <img alt="Arc" src="docs/assets/arc-logo-dark.svg" width="auto" height="120">
     </picture>
   </a>
 </p>
