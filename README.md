@@ -1,11 +1,21 @@
-# Arc Node
+<p align="center">
+  <a href="https://www.arc.network/">
+    <picture>
+      <source media="(prefers-color-scheme: light)" srcset="docs/assets/arc-logo-dark.svg">
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/arc-logo-light.svg">
+      <img alt="Arc" src="docs/assets/arc-logo-light.svg" width="auto" height="120">
+    </picture>
+  </a>
+</p>
+
+<p align="center">The Economic OS for the internet</p>
+
+<p align="center">
+  <a href="https://www.arc.network/"><img src="https://img.shields.io/badge/Website-arc.network-blue" alt="Website"></a>
+</p>
 
 > [!IMPORTANT]
 > Arc is currently in testnet, and this is alpha software currently undergoing audits.
-
-The Economic OS for the internet
-
-[![Website](https://img.shields.io/badge/Website-arc.network-blue)](https://www.arc.network/)
 
 Arc is an open EVM-compatible layer 1 built on [Malachite](https://github.com/circlefin/malachite) consensus, delivering the performance and reliability needed to meet the new demands of the global internet economy. 
 
@@ -173,3 +183,25 @@ For more details, see our [Contributing Guide](CONTRIBUTING.md).
 - [Reth](https://github.com/paradigmxyz/reth) - The underlying execution layer framework
 - [Malachite](https://github.com/circlefin/malachite) - BFT consensus engine
 - [Local Documentation](docs/) - Implementation guides and references
+
+## Acknowledgements
+
+arc-node is open-source software, licensed under Apache 2.0, built from a number of open source libraries, and inspired by others. We would like to highlight several of them in particular and credit the teams that develop and maintain them.
+
+[Malachite](https://github.com/circlefin/malachite) -  Malachite, a flexible BFT consensus engine written in Rust, was originally developed at [Informal Systems](https://github.com/informalsystems) and [is now maintained by Circle](https://www.circle.com/blog/introducing-arc-an-open-layer-1-blockchain-purpose-built-for-stablecoin-finance) as part of Arc. We thank Informal Systems for originating and stewarding Malachite, and their continued contributions to the project.  
+
+[Reth / Paradigm](https://github.com/paradigmxyz/reth) - Reth is an EVM execution client that is used in Arc's execution layer via Reth SDK. We thank the Paradigm team for continuing to push the envelope with Reth and their continued emphasis on performance, extensibility, and customization, as well as their commitment to open source. Additionally, we're big fans of the Foundry toolchain as well! 
+
+[libp2p](https://github.com/libp2p/rust-libp2p) - libp2p is used extensively through the arc-node consensus layer, and we thank the team for their development of it.
+
+[Tokio](https://github.com/tokio-rs/tokio) - Tokio is used extensively throughout the consensus and execution layers, and we are grateful to  the team for their continued development and maintenance of it.
+
+[Celo](https://celo.org/) -  USDC is the native token on Arc and supports interacting with it through an ERC-20 interface; this "linked interface" design was first (as far as we know) pioneered on Celo, and we'd like to credit the team for devising it.
+
+[Alloy-rs](https://github.com/alloy-rs/alloy) - Alloy is used throughout the consensus and execution layers, and we are very thankful  to the team for this excellent library.
+
+[Revm](https://github.com/bluealloy/revm) - Revm is used via the Reth SDK in the execution layer as the core EVM implementation. We thank the team for their continued development and maintenance of it.
+
+[Hardhat / Nomic Foundation](https://github.com/NomicFoundation/hardhat) - we thank the team for their continued development of the Hardhat toolchain. 
+
+[Viem](https://github.com/wevm/viem) - we thank the team for their continued development of Viem and other libraries.
