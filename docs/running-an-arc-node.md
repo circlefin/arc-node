@@ -4,80 +4,148 @@ Arc is an open, EVM-compatible Layer-1 blockchain. Anyone can run an Arc node �
 
 ## What Your Node Does
 
-- **Verifies every block** — Every block is cryptographically verified against the signatures of the validator set before it is accepted. Your node independently confirms that validators finalized each block
-- **Executes every transaction** — Every transaction is re-executed locally through the EVM. Your node maintains its own copy of the complete blockchain state
-- **Exposes a local RPC endpoint** — Your node provides a standard Ethereum JSON-RPC API (`http://localhost:8545`) for querying blocks, balances, and transactions, and for submitting calls directly against your own verified state
+- **Verifies every block** — Every block is cryptographically verified against the signatures of the validator set before it is accepted. Your node independently confirms that validators finalized each block;
+- **Executes every transaction** — Every transaction is re-executed locally through the EVM. Your node maintains its own copy of the complete blockchain state;
+- **Exposes a local RPC endpoint** — Your node provides a standard Ethereum JSON-RPC API (`http://localhost:8545`) for querying blocks, balances, and transactions, and for submitting calls directly against your own verified state.
 
 ## Quick Start
 
+An Arc node is composed of two processes:
+
+- **Execution Layer (EL)**: executes finalized transactions and maintains the state of the blockchain;
+- **Consensus Layer (CL)**: fetches finalized blocks, verifies their cryptographic signatures, and passes them to the EL for execution.
+
+Refer to the [installation](installation.md) instructions to install
+`arc-node-execution` (EL) and `arc-node-consensus` (CL).
+
 > **Docker:** Container images and Docker Compose instructions are coming soon.
 
-An Arc node runs two processes: the Execution Layer (EL) and the Consensus Layer (CL). The EL executes transactions and maintains blockchain state. The CL fetches blocks from the network, verifies their cryptographic signatures, and passes them to the EL for execution.
+### Configure paths
 
-See [installation](installation.md) for instructions on how to install the binaries on your machine.
+This guide adopts the following variables to define paths of Arc components:
 
-**0. Create data directories** (one-time setup):
+| Variable        | Meaning                                                                    | Default               |
+|-----------------|----------------------------------------------------------------------------|-----------------------|
+| `ARC_HOME`      | Base directory of installation. Base location of data directories.         | `~/.arc`              |
+| `ARC_EXECUTION` | Data directory for the Execution layer (EL)                                | `$ARC_HOME/execution` |
+| `ARC_CONSENSUS` | Data directory for the Consensus layer (CL)                                | `$ARC_HOME/consensus` |
+| `ARC_BIN_DIR`   | Directory where Arc binaries are installed. Must be included in the `PATH` | `$ARC_HOME/bin`       |
+| `ARC_RUN`       | Runtime directory for both Execution (EL) and Consensus (CL) layers.       | `/run/arc`            |
 
-```sh
-mkdir -p ~/.arc/execution ~/.arc/consensus
-sudo install -d -o $USER /run/arc
-```
-
-> **macOS:** `/run` does not exist on macOS. Use a user-local directory instead (e.g. `mkdir -p ~/.arc/run`) and adjust the `--ipcpath`, `--auth-ipc.path`, `--eth-socket`, and `--execution-socket` flags in the commands below accordingly.
-
-When running as a systemd service, `RuntimeDirectory=arc` creates `/run/arc` automatically — skip the second command.
-
-**1. Download snapshots** (required). Syncing from genesis is not currently supported -- a snapshot is needed to bootstrap the node.
+In a simplified version, define `$ARC_HOME` and `$ARC_RUN` variables once,
+then use the derived variables in the remaining of this guide:
 
 ```sh
-arc-snapshots download --chain=arc-testnet
+# Base directory for Arc node data (default: ~/.arc)
+ARC_HOME="${ARC_HOME:-$HOME/.arc}"
+
+# Linux runtime directory:
+ARC_RUN="/run/arc"
+# Mac OS runtime directory:
+#ARC_RUN="$ARC_HOME/run"
+
+ARC_EXECUTION=$ARC_HOME/execution
+ARC_CONSENSUS=$ARC_HOME/consensus
 ```
 
-This command fetches the latest snapshot URLs from https://snapshots.arc.network, downloads the snapshots, and extracts them into `~/.arc/execution` and `~/.arc/consensus` respectively.
+### Setup directories
 
-**2. Start the Execution Layer:**
+The standard installation sets up `$ARC_HOME=~/.arc` as base directory.
+Create the **data directories** for the execution and consensus layers:
+
+```sh
+mkdir -p $ARC_EXECUTION $ARC_CONSENSUS
+```
+
+To set up the **runtime directory** in a **Linux** environment:
+
+```sh
+sudo install -d -o $USER "$ARC_RUN"
+```
+
+> When running Arc as a systemd service, `RuntimeDirectory=arc`
+> sets up `/run/arc` automatically — the last command is not needed.
+
+To set up the **runtime directory** in a **MacOS** environment,
+uncomment the `ARC_RUN="$ARC_HOME/run"` line above and run:
+
+```sh
+mkdir -p "$ARC_RUN"
+```
+
+### Download snapshots
+
+Syncing a new Arc node from genesis is currently not supported.
+A **snapshot** is needed to bootstrap the node:
+
+```sh
+arc-snapshots download \
+  --chain=arc-testnet \
+  --execution-path "$ARC_EXECUTION" \
+  --consensus-path "$ARC_CONSENSUS"
+```
+
+The `arc-snapshots` binary is part of the Arc node installation.
+The command above fetches the latest snapshots for `arc-testnet` chain from
+https://snapshots.arc.network and extracts them into the
+`$ARC_CONSENSUS` and `$ARC_EXECUTION` data directories.
+
+> **Download sizes:** At the time of writing, the most recent snapshot sizes
+> (tagged `20260408`) are: **~68 GB** for EL and **~16 GB** for CL.
+> These are the sizes of the downloaded compressed snapshots; when extracted,
+> the sizes are ~103 GB for EL and ~36 GB for CL.
+>
+> On a fast connection (~100 Mbps) the download takes roughly 10-15 minutes;
+> on slower or metered connections it can take hours.
+
+### Initialize consensus layer
+
+This is a one-time setup, producing the private key file used as network identity:
+
+```sh
+arc-node-consensus init --home $ARC_CONSENSUS
+```
+
+### Start execution layer
+
+The Execution Layer (EL) is deployed by the `arc-node-execution` binary and started as follows:
 
 ```sh
 arc-node-execution node \
   --chain arc-testnet \
-  --datadir ~/.arc/execution \
-  --disable-discovery \
-  --ipcpath /run/arc/reth.ipc \
-  --auth-ipc \
-  --auth-ipc.path /run/arc/auth.ipc \
-  --http \
-  --http.addr 127.0.0.1 \
-  --http.port 8545 \
+  --datadir $ARC_EXECUTION \
+  --ipcpath $ARC_RUN/reth.ipc \
+  --auth-ipc --auth-ipc.path $ARC_RUN/auth.ipc \
+  --http --http.addr 127.0.0.1 --http.port 8545 \
   --http.api eth,net,web3,txpool,trace,debug \
+  --rpc.forwarder https://rpc.quicknode.testnet.arc.network/ \
   --metrics 127.0.0.1:9001 \
-  --full \
-  --enable-arc-rpc \
-  --rpc.forwarder https://rpc.quicknode.testnet.arc.network/
+  --disable-discovery \
+  --enable-arc-rpc
 ```
 
-> `--chain arc-testnet` uses the genesis configuration bundled in the binary. Replace with `--chain /path/to/genesis.json` if you have a custom genesis file.
+The `--chain` parameter configures the genesis file.
+By using `--chain arc-testnet`, the genesis configuration bundled in the binary is adopted.
+Replace with `--chain /path/to/genesis.json` if you have a custom genesis file.
 
-> `--http` / `--http.port` expose the JSON-RPC API on localhost. `--rpc.forwarder` routes transactions to an RPC node.
+The `--http`, `--http.addr`, and `--http.port` parameters expose a standard Ethereum
+[JSON-RPC API](https://reth.rs/jsonrpc/intro).
+The `--http.api` parameter defines the available RPC endpoints.
+The `--rpc.forwarder` parameter routes requests not served locally to an existing RPC node.
 
-See [reth node](https://reth.rs/cli/reth/node/) for additional flags.
+The `arc-node-execution` binary accepts all parameters of a `reth` node.
+Refer to its [documentation](https://reth.rs/cli/reth/node/) for details.
 
-**3. Initialize the Consensus Layer** (one-time setup):
+### Start consensus layer
 
-```sh
-arc-node-consensus init --home ~/.arc/consensus
-```
-
-This generates a private key file used for P2P network identity.
-
-**4. Start the Consensus Layer** (in a separate terminal):
+After starting the [execution layer](#start-execution-layer), in a different terminal, start the consensus layer:
 
 ```sh
 arc-node-consensus start \
-  --home ~/.arc/consensus \
-  --eth-socket /run/arc/reth.ipc \
-  --execution-socket /run/arc/auth.ipc \
+  --home $ARC_CONSENSUS \
+  --eth-socket $ARC_RUN/reth.ipc \
+  --execution-socket $ARC_RUN/auth.ipc \
   --rpc.addr 127.0.0.1:31000 \
-  --full \
   --follow \
   --follow.endpoint https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network \
   --follow.endpoint https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network \
@@ -85,57 +153,101 @@ arc-node-consensus start \
   --metrics 127.0.0.1:29000
 ```
 
-> **Note:** Start the Execution Layer first. The Consensus Layer connects to it on startup and will fail if the EL is not running.
+The consensus layer attempts to connect to the execution layer via the provided
+`--eth-socket`.
+For this reason, always start the execution layer first.
+Otherwise, the consensus layer may fail to start, if it fails to connect to the
+companion execution layer.
 
-> **Note:** The Blockdaemon endpoint does not currently support WebSocket connections. The node will log retry warnings for this endpoint but still syncs correctly via the other two endpoints. HTTP block fetching from Blockdaemon works normally.
+The consensus layer operates in the **follow** mode.
+We provide three endpoints from which the node retrieves finalized blocks.
 
-**5. Verify the node is syncing:**
+> **Note:** The Blockdaemon endpoint currently does not support WebSocket
+> connections. The node will log retry warnings for this endpoint but still
+> syncs correctly via the other two endpoints. HTTP block fetching from
+> Blockdaemon works normally.
 
-Wait about 30 seconds, then check the block height:
+### Verify operation
+
+After starting both the consensus and execution layer, wait about 30 seconds.
+Then, check the latest block height:
 
 ```sh
 curl -s -X POST http://localhost:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+  -d '{ "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}'
 ```
 
-The `result` field should be a hex block number that increases over time. If it stays at `0x0`, check the Consensus Layer logs for connection errors.
+The produced output is in JSON format.
+The `result` field represents the next block height, in hexadecimal
+(you can use `printf "%0d"` to translate it into decimal).
+It should increase over time.
+If it remains `0x0`, check the logs of the consensus layer for errors.
 
-### EL ↔ CL Communication
+> Notice that this command queries the execution layer's HTTP server offering
+> a local JSON-RPC API.
+> If the address and port of the HTTP endpoint are configured differently than
+> the above example, adapt the command accordingly.
 
-The Quick Start above uses IPC sockets, which require EL and CL to run on the same host. If they are on separate hosts, use RPC instead.
+## Separated hosts
 
-**Generate a JWT secret** (one-time setup). The EL and CL use this to authenticate with each other:
+The [Quick Start](#quick-start) section describes the setup of the execution
+(EL) and consensus (CL) layers running in the same host.
+The two processes interact via Inter-Process Communication (IPC),
+namely using local sockets to which both processes have read and write access.
+
+To run EL and CL in separated hosts, the two processes must instead interact
+using the Remote Procedure Call (RPC) protocol.
+
+### Authentication
+
+To authenticate the connection between EL and CL, a JSON Web Token (JWT) is employed:
 
 ```sh
-openssl rand -hex 32 | tr -d "\n" > ~/.arc/jwtsecret
-chmod 600 ~/.arc/jwtsecret
+openssl rand -hex 32 | tr -d "\n" > "$ARC_HOME/jwtsecret"
+chmod 600 "$ARC_HOME/jwtsecret"
 ```
 
+Notice that both hosts must have access to this random token file.
+Generate it in one host and securely copy it into the other host.
 
-**EL flags (RPC):**
+### Execution layer
 
-Remove the IPC flags and add:
+From the [Start execution layer](#start-execution-layer) instructions, two changes are required:
 
+1. Remove all flags related to IPC communication: `--ipcpath`, `--auth-ipc`, `--auth-ipc.path`;
+2. Add the following parameters to configure the RPC interaction:
 ```sh
---authrpc.addr 0.0.0.0 \
---authrpc.port 8551 \
---authrpc.jwtsecret ~/.arc/jwtsecret
+  --authrpc.addr 0.0.0.0 \
+  --authrpc.port 8551 \
+  --authrpc.jwtsecret "$ARC_HOME/jwtsecret"
 ```
 
-> **Security:** When using `--authrpc.addr 0.0.0.0`, restrict access to the Engine API port (8551) using firewall rules or a private network. The Engine API controls block production — do not expose it to the public internet.
+**Important:** with this setup, port 8551 is exposed via all network
+interfaces (`0.0.0.0`).
+Make sure to configure the firewall to restrict the access to this port to the
+consensus layer's host.
+The Engine API controls block production — do not expose it to the public internet.
 
-**CL flags (RPC):**
+### Consensus layer
 
-Remove `--eth-socket` and `--execution-socket`, and add:
+From the [Start consensus layer](#start-consensus-layer) instructions, two changes are required:
 
+1. Remove all flags related to IPC communication: `--eth-socket` and `--execution-socket`;
+2. Add the following parameters to configure the RPC interaction:
 ```sh
---eth-rpc-endpoint http://<EL_HOST>:8545 \
---execution-endpoint http://<EL_HOST>:8551 \
---execution-jwt ~/.arc/jwtsecret
+  --eth-rpc-endpoint http://$EL_ADDR:8545 \
+  --execution-endpoint http://$EL_ADDR:8551 \
+  --execution-jwt "$ARC_HOME/jwtsecret"
 ```
 
-> IPC and RPC are mutually exclusive. Both processes must have read/write access to the IPC socket directory when using IPC.
+Where `EL_ADDR` is the network address (IP or hostname) of the host running the execution layer.
+
+The `--eth-rpc-endpoint` parameter refers to the EL's HTTP server exposing a
+standard and open Ethereum [JSON-RPC API](https://reth.rs/jsonrpc/intro).
+
+The `--execution-endpoint` parameter should match the EL's `--authrpc`
+address and port, exposing the _protected_ RPC endpoint.
 
 ---
 
@@ -152,6 +264,23 @@ Remove `--eth-socket` and `--execution-socket`, and add:
 
 
 Check out [reth system requirements](https://reth.rs/run/system-requirements/) for more info on EL configuration.
+
+**Note**: during periods of sustained high load, such as during startup or extended sync if the node is far behind, the execution layer memory may surge on some hardware. This should not be an issue if running with the suggested System Requirements. However, if you do observe this, you can enable backpressure to throttle the pace of execution according to the speed of disk writes, which will constrain memory growth. 
+
+To enable this, the `reth_` namespace should enabled on the **execution layer**: 
+
+```sh
+--http.api eth,net,web3,txpool,trace,debug,reth
+```
+
+And on the **consensus layer** backpressure must be activated: 
+
+```sh
+--execution-persistence-backpressure \
+--execution-persistence-backpressure-threshold=10
+```
+
+Note: arc-node is alpha software and this performance issue is actively being worked on.
 
 ### Production Deployment
 
@@ -187,7 +316,6 @@ ExecStart=/usr/local/bin/arc-node-execution node \
   --http.port 8545 \
   --http.api eth,net,web3,txpool,trace,debug \
   --metrics 127.0.0.1:9001 \
-  --full \
   --enable-arc-rpc \
   --rpc.forwarder https://rpc.quicknode.testnet.arc.network/
 
@@ -225,7 +353,6 @@ ExecStart=/usr/local/bin/arc-node-consensus start \
   --eth-socket /run/arc/reth.ipc \
   --execution-socket /run/arc/auth.ipc \
   --rpc.addr 127.0.0.1:31000 \
-  --full \
   --follow \
   --follow.endpoint https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network \
   --follow.endpoint https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network \
@@ -280,3 +407,7 @@ For production monitoring, scrape the Prometheus metrics endpoints with Grafana:
 |----------|-------------|
 | `localhost:9001/metrics` | Execution Layer metrics |
 | `localhost:29000/metrics` | Consensus Layer metrics |
+
+### Pruning
+
+The `--full` flag is accepted by both the CL and EL and will enable pruning. However, EL pruning is currently considered unstable and is not recommended at this time.

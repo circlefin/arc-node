@@ -31,6 +31,7 @@ use arc_consensus_types::{
     Address, AlloyAddress, ArcContext, BlockHash, Config, ConsensusParams, Height, ValidatorSet,
 };
 use arc_eth_engine::json_structures::ExecutionBlock;
+use arc_eth_engine::persistence_meter::{NoopPersistenceMeter, PersistenceMeter};
 use arc_signer::ArcSigningProvider;
 use malachitebft_core_types::HeightParams;
 
@@ -135,6 +136,9 @@ pub struct State {
     /// Timestamps of heights that received a synced value via ProcessSyncedValue.
     synced_heights: HashMap<Height, SystemTime>,
 
+    /// Meters EL block persistence to apply backpressure during sync catch-up.
+    persistence_meter: Box<dyn PersistenceMeter>,
+
     /// Consensus-layer chain spec (fork activation by height/time).
     #[allow(dead_code)]
     pub spec: ConsensusSpec,
@@ -199,6 +203,7 @@ impl State {
             consensus_params: ConsensusParams::default(),
             proposal_monitor: None,
             synced_heights: HashMap::new(),
+            persistence_meter: Box::new(NoopPersistenceMeter),
             spec,
             metrics,
         }
@@ -271,6 +276,14 @@ impl State {
     pub fn set_consensus_params(&mut self, consensus_params: ConsensusParams) {
         self.metrics.update_consensus_params(&consensus_params);
         self.consensus_params = consensus_params;
+    }
+
+    pub fn persistence_meter(&self) -> &dyn PersistenceMeter {
+        self.persistence_meter.as_ref()
+    }
+
+    pub fn set_persistence_meter(&mut self, meter: Box<dyn PersistenceMeter>) {
+        self.persistence_meter = meter;
     }
 
     /// Get mutable reference to the streams map

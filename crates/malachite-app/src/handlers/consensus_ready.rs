@@ -47,24 +47,27 @@ pub async fn handle(
     engine: &Engine,
     reply: Reply<(Height, HeightParams<ArcContext>)>,
 ) -> eyre::Result<()> {
+    // Create and attach the persistence meter before borrowing state fields,
+    // since set_persistence_meter requires &mut self.
+    {
+        let execution_config = &state.config().execution;
+        let meter = persistence_meter::create_with_fallback(
+            execution_config.persistence_backpressure,
+            engine.subscription_endpoint(),
+            execution_config.persistence_backpressure_threshold,
+        )
+        .await;
+
+        persistence_meter::seed_from_latest_block(meter.as_ref(), engine.eth.as_ref()).await;
+
+        state.set_persistence_meter(meter);
+    }
+
     let (store, stats, metrics) = (state.store(), state.stats(), state.metrics());
     let max_pending_proposals = max_pending_proposals(&state.config().value_sync);
 
     let payload_validator = EnginePayloadValidator::new(engine, metrics);
     let block_finalizer = EngineBlockFinalizer::new(engine, stats, metrics);
-
-    let execution_config = &state.config().execution;
-    let persistence_meter = persistence_meter::create_with_fallback(
-        execution_config.persistence_backpressure,
-        engine.subscription_endpoint(),
-        execution_config.persistence_backpressure_threshold,
-    )
-    .await;
-
-    // Seed with the current EL height. Safe at startup since all blocks are
-    // persisted before the node begins replaying.
-    persistence_meter::seed_from_latest_block(persistence_meter.as_ref(), engine.eth.as_ref())
-        .await;
 
     let (next_height, next_validator_set, next_consensus_params, previous_block) =
         on_consensus_ready(
@@ -76,7 +79,7 @@ pub async fn handle(
             block_finalizer,
             engine.api.as_ref(),
             engine.eth.as_ref(),
-            persistence_meter.as_ref(),
+            state.persistence_meter(),
             max_pending_proposals,
         )
         .await?;
