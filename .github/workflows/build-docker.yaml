@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [labeled, synchronize]
     branches:
-      - master
+      - main
       - release/*
   push:
     tags:
