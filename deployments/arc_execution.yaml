@@ -27,6 +27,7 @@ services:
     volumes:
       - ../assets/localdev:/app/assets
       - ./entrypoint_arc_execution.sh:/usr/local/bin/entrypoint.sh
+      - ./sockets:/sockets
     extra_hosts:
       - host.docker.internal:host-gateway
     ports:
