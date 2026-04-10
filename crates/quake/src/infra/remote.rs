@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
+use crate::clean::{MALACHITE_DATA_SUBDIRS, RETH_DATA_SUBDIRS};
 use crate::infra::export::SSH_KEY_FILENAME;
 use crate::infra::terraform::Terraform;
 use crate::infra::{ssm, BuildProfile, InfraData, InfraProvider};
@@ -217,6 +218,22 @@ impl RemoteInfra {
 
         let pssh_cmd = format!("./pssh.sh '{cmd}' {}", node_ips.join(" "));
         self.ssh_cc(&pssh_cmd, false)
+            .wrap_err_with(|| format!("Failed to run '{cmd}' on {nodes:?}"))
+    }
+
+    /// Run the same command on the given nodes in parallel by calling pssh.sh in CC and return its stdout.
+    fn pssh_single_cmd_with_output(&self, nodes: &[&NodeName], cmd: &str) -> Result<String> {
+        if nodes.is_empty() {
+            return Ok("".to_string());
+        }
+
+        let node_ips = nodes
+            .iter()
+            .map(|node| self.node_private_ip(node).map(String::as_str))
+            .collect::<Result<Vec<_>>>()?;
+
+        let pssh_cmd = format!("./pssh.sh '{cmd}' {}", node_ips.join(" "));
+        self.ssh_cc_with_output(&pssh_cmd)
             .wrap_err_with(|| format!("Failed to run '{cmd}' on {nodes:?}"))
     }
 
@@ -454,6 +471,62 @@ impl RemoteInfra {
 
         info!("✅ Provisioning for remote infrastructure completed");
         Ok(())
+    }
+
+    /// Clean Reth data on all remote nodes.
+    pub fn clean_reth_data(&self) {
+        let paths = RETH_DATA_SUBDIRS
+            .map(|s| format!("~/data/reth/{s}"))
+            .join(" ");
+        let cmd = format!("sudo rm -rf {paths}");
+        info!("Removing Reth data on remote nodes...");
+        match self.pssh_single_cmd_with_output(&self.infra_data.node_names(), cmd.as_str()) {
+            Ok(output) => {
+                info!(%output, "✅ Reth data removed on remote nodes.");
+            }
+            Err(err) => {
+                warn!("⚠️ Failed to remove Reth data on remote nodes: {err:#}");
+            }
+        }
+    }
+
+    /// Clean Malachite data on all remote nodes.
+    pub fn clean_malachite_data(&self) {
+        let paths = MALACHITE_DATA_SUBDIRS
+            .map(|s| format!("~/data/malachite/{s}"))
+            .join(" ");
+        let cmd = format!("sudo rm -rf {paths}");
+        info!("Removing Malachite data on remote nodes...");
+        match self.pssh_single_cmd_with_output(&self.infra_data.node_names(), cmd.as_str()) {
+            Ok(output) => {
+                info!(%output, "✅ Malachite data removed on remote nodes.");
+            }
+            Err(err) => {
+                warn!("⚠️ Failed to remove Malachite data on remote nodes: {err:#}");
+            }
+        }
+    }
+
+    /// Start monitoring services on the CC server.
+    pub fn start_monitoring(&self) -> Result<String> {
+        self.ssh_cc_with_output("docker compose -f ~/monitoring/compose.yaml up -d")
+            .wrap_err("Failed to start monitoring services on CC")
+    }
+
+    /// Stop monitoring services on the CC server.
+    pub fn stop_monitoring(&self) -> Result<String> {
+        self.ssh_cc_with_output(
+            "docker compose -f ~/monitoring/compose.yaml down --volumes --timeout 5",
+        )
+        .wrap_err("Failed to stop monitoring services on CC")
+    }
+
+    /// Remove monitoring data directories on the CC server.
+    pub fn clean_monitoring_data(&self) -> Result<String> {
+        self.ssh_cc_with_output(
+            "sudo rm -rf ~/monitoring/data-prometheus ~/monitoring/data-grafana ~/monitoring/blockscout/db ~/monitoring/blockscout/logs ~/monitoring/blockscout/dets",
+        )
+        .wrap_err("Failed to remove monitoring data on CC")
     }
 }
 

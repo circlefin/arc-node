@@ -9,7 +9,7 @@ QUAKE := cargo run --bin quake --
 LOAD_PREDEFINED_ARC_REMOTE_SIGNER_KEYS := true
 DEFAULT_BRANCH ?= $(shell git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
 ifeq ($(DEFAULT_BRANCH),)
-DEFAULT_BRANCH = main
+DEFAULT_BRANCH = master
 endif
 
 ##@ Help
