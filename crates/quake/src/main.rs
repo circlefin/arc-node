@@ -26,6 +26,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use clean::{clean_scope, CleanScope};
 use perturb::Perturbation;
 use testnet::{Testnet, TestnetError};
 
@@ -36,6 +37,7 @@ use crate::perturb::{PERTURB_MAX_TIME_OFF, PERTURB_MIN_TIME_OFF};
 use crate::valset::ValidatorPowerUpdate;
 
 mod build;
+mod clean;
 mod genesis;
 mod info;
 mod infra;
@@ -346,9 +348,35 @@ pub(crate) struct InfraArgs {
 
 #[derive(Args)]
 struct CleanArgs {
-    /// Also stop monitoring services and remove their data
+    /// Remove all data, including the testnet directory and monitoring services
     #[clap(short = 'a', long, default_value = "false")]
+    #[clap(conflicts_with_all = ["data", "execution_data", "consensus_data", "monitoring"])]
     all: bool,
+
+    /// Stop monitoring services and remove their data
+    #[clap(short = 'm', long, default_value = "false")]
+    monitoring: bool,
+    /// Remove only execution and consensus layer data, preserving configuration
+    #[clap(short = 'd', long, default_value = "false")]
+    #[clap(conflicts_with_all = ["execution_data", "consensus_data"])]
+    data: bool,
+    /// Remove only execution layer data, preserving configuration
+    #[clap(short = 'x', long, default_value = "false")]
+    execution_data: bool,
+    /// Remove only consensus layer data, preserving configuration
+    #[clap(short = 'c', long, default_value = "false")]
+    consensus_data: bool,
+}
+
+impl CleanArgs {
+    fn scope(&self) -> CleanScope {
+        clean_scope(
+            self.data,
+            self.execution_data,
+            self.consensus_data,
+            self.monitoring,
+        )
+    }
 }
 
 #[derive(Debug, Subcommand, PartialEq)]
@@ -658,12 +686,18 @@ async fn main() -> Result<()> {
         Commands::Stop {
             nodes_or_containers,
         } => testnet.stop(nodes_or_containers).await?,
-        Commands::Clean { clean_args } => testnet.clean(clean_args.all).await?,
+        Commands::Clean { clean_args } => {
+            testnet
+                .clean(clean_args.scope(), clean_args.all || clean_args.monitoring)
+                .await?
+        }
         Commands::Restart {
             clean_args,
             start_args,
         } => {
-            testnet.clean(clean_args.all).await?;
+            testnet
+                .clean(clean_args.scope(), clean_args.all || clean_args.monitoring)
+                .await?;
             pre_start(
                 &mut testnet,
                 &start_args,

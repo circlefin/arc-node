@@ -114,6 +114,7 @@ The Execution Layer (EL) is deployed by the `arc-node-execution` binary and star
 arc-node-execution node \
   --chain arc-testnet \
   --datadir $ARC_EXECUTION \
+  --full \
   --ipcpath $ARC_RUN/reth.ipc \
   --auth-ipc --auth-ipc.path $ARC_RUN/auth.ipc \
   --http --http.addr 127.0.0.1 --http.port 8545 \
@@ -123,6 +124,12 @@ arc-node-execution node \
   --disable-discovery \
   --enable-arc-rpc
 ```
+
+> **Note on `--full` and snapshots:** The `--full` flag is required on the
+> first start when bootstrapping from a pruned snapshot. It reconciles internal
+> database tables that would otherwise fail a consistency check. After the
+> initial startup completes, you may restart without `--full` if you prefer to
+> run without pruning.
 
 The `--chain` parameter configures the genesis file.
 By using `--chain arc-testnet`, the genesis configuration bundled in the binary is adopted.
@@ -143,6 +150,7 @@ After starting the [execution layer](#start-execution-layer), in a different ter
 ```sh
 arc-node-consensus start \
   --home $ARC_CONSENSUS \
+  --full \
   --eth-socket $ARC_RUN/reth.ipc \
   --execution-socket $ARC_RUN/auth.ipc \
   --rpc.addr 127.0.0.1:31000 \
@@ -307,6 +315,7 @@ WorkingDirectory=$HOME/.arc
 ExecStart=/usr/local/bin/arc-node-execution node \
   --chain arc-testnet \
   --datadir $HOME/.arc/execution \
+  --full \
   --disable-discovery \
   --ipcpath /run/arc/reth.ipc \
   --auth-ipc \
@@ -350,6 +359,7 @@ Environment=RUST_LOG=info
 WorkingDirectory=$HOME/.arc
 ExecStart=/usr/local/bin/arc-node-consensus start \
   --home $HOME/.arc/consensus \
+  --full \
   --eth-socket /run/arc/reth.ipc \
   --execution-socket /run/arc/auth.ipc \
   --rpc.addr 127.0.0.1:31000 \
@@ -410,4 +420,13 @@ For production monitoring, scrape the Prometheus metrics endpoints with Grafana:
 
 ### Pruning
 
-The `--full` flag is accepted by both the CL and EL and will enable pruning. However, EL pruning is currently considered unstable and is not recommended at this time.
+The `--full` flag is accepted by both the CL and EL and will enable pruning.
+When bootstrapping from a pruned snapshot, `--full` is **required** on the
+first EL start to reconcile the database (see the note in
+[Start execution layer](#start-execution-layer)). After that initial run you
+can restart without `--full`.
+
+> **Caution:** EL pruning increases memory usage and may cause out-of-memory
+> issues on constrained machines. If you encounter memory pressure, enable
+> backpressure (see [System Requirements](#system-requirements) section) and remove
+> `--full` after the first successful start.

@@ -246,6 +246,11 @@ stateful!(run_native_coin_authority, precompile_input, hardfork_flags; {
                 &mut gas_counter,
             )?;
 
+            // Reject minting to zero address (Zero5+)
+            if hardfork_flags.is_active(ArcHardfork::Zero5) && args.to == Address::ZERO {
+                return Err(PrecompileErrorOrRevert::new_reverted(gas_counter, ERR_ZERO_ADDRESS));
+            }
+
             // Check blocklist
             if is_blocklisted(&mut precompile_input.internals, args.to, &mut gas_counter, hardfork_flags)? {
                 return Err(PrecompileErrorOrRevert::new_reverted(gas_counter, ERR_BLOCKED_ADDRESS));
@@ -350,6 +355,11 @@ stateful!(run_native_coin_authority, precompile_input, hardfork_flags; {
                 &precompile_input,
                 &mut gas_counter,
             )?;
+
+            // Reject burning from zero address (Zero5+)
+            if hardfork_flags.is_active(ArcHardfork::Zero5) && args.from == Address::ZERO {
+                return Err(PrecompileErrorOrRevert::new_reverted(gas_counter, ERR_ZERO_ADDRESS));
+            }
 
             // Check blocklist
             if is_blocklisted(&mut precompile_input.internals, args.from, &mut gas_counter, hardfork_flags)? {
@@ -1034,6 +1044,29 @@ mod tests {
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 ..Default::default()
             },
+            // No auth SLOAD, zero-address check precedes blocklist SLOADs
+            NativeCoinAuthorityTest {
+                name: "mint() to zero address reverts (Zero5+)",
+                caller: ALLOWED_CALLER_ADDRESS,
+                calldata: INativeCoinAuthority::mintCall {
+                    to: Address::ZERO,
+                    amount: U256::from(1),
+                }
+                .abi_encode()
+                .into(),
+                gas_limit: MINT_GAS_COST,
+                pre_zero5_gas_limit: None,
+                expected_revert_str: Some(ERR_ZERO_ADDRESS),
+                expected_result: InstructionResult::Revert,
+                return_data: None,
+                blocklisted_addresses: None,
+                gas_used: 0,
+                pre_zero5_gas_used: None,
+                target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+                bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+                eip7708_only: true,
+                ..Default::default()
+            },
             // No auth SLOAD, reverts immediately
             NativeCoinAuthorityTest {
                 name: "burn() with unauthorized caller reverts",
@@ -1210,6 +1243,29 @@ mod tests {
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 ..Default::default()
             },
+            // No auth SLOAD, zero-address check precedes blocklist SLOADs
+            NativeCoinAuthorityTest {
+                name: "burn() from zero address reverts (Zero5+)",
+                caller: ALLOWED_CALLER_ADDRESS,
+                calldata: INativeCoinAuthority::burnCall {
+                    from: Address::ZERO,
+                    amount: U256::from(1),
+                }
+                .abi_encode()
+                .into(),
+                gas_limit: BURN_GAS_COST,
+                pre_zero5_gas_limit: None,
+                expected_revert_str: Some(ERR_ZERO_ADDRESS),
+                expected_result: InstructionResult::Revert,
+                return_data: None,
+                blocklisted_addresses: None,
+                gas_used: 0,
+                pre_zero5_gas_used: None,
+                target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+                bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+                eip7708_only: true,
+                ..Default::default()
+            },
             // No auth SLOAD, reverts immediately
             NativeCoinAuthorityTest {
                 name: "transfer() with unauthorized caller reverts",
@@ -1342,7 +1398,7 @@ mod tests {
                 bytecode_address: ADDRESS_B,
                 ..Default::default()
             },
-            // Zero address checks (Zero5+) happen before blocklist SLOADs, so gas_used = 0
+            // No auth SLOAD, zero-address check precedes blocklist SLOADs
             NativeCoinAuthorityTest {
                 name: "transfer() to zero address reverts (Zero5+)",
                 caller: ALLOWED_CALLER_ADDRESS,
@@ -1360,7 +1416,7 @@ mod tests {
                 return_data: None,
                 blocklisted_addresses: None,
                 gas_used: 0,
-                pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
+                pre_zero5_gas_used: None,
                 target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 eip7708_only: true,
@@ -1383,7 +1439,7 @@ mod tests {
                 return_data: None,
                 blocklisted_addresses: None,
                 gas_used: 0,
-                pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
+                pre_zero5_gas_used: None,
                 target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 eip7708_only: true,
@@ -1406,7 +1462,7 @@ mod tests {
                 return_data: None,
                 blocklisted_addresses: None,
                 gas_used: 0,
-                pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
+                pre_zero5_gas_used: None,
                 target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 eip7708_only: true,

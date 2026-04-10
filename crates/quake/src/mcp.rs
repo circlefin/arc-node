@@ -34,6 +34,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::info;
 
+use crate::clean::{clean_scope, CleanScope};
 use crate::infra::remote;
 use crate::perturb::Perturbation;
 use crate::rpc;
@@ -448,8 +449,12 @@ impl QuakeMcpServer {
 
     /// Cleans up testnet data and infrastructure.
     ///
-    /// Both modes remove testnet data (databases and generated files). If `all` is true,
-    /// monitoring services are also stopped and their data is removed.
+    /// By default (no flags), removes all node data and configuration. Partial flags:
+    /// - `data`: remove both execution and consensus layer data, preserving configuration.
+    /// - `execution_data`: remove only Reth (execution layer) data.
+    /// - `consensus_data`: remove only Malachite (consensus layer) data.
+    /// - `monitoring`: stop monitoring services and remove their data (combinable with data flags).
+    /// - `all`: remove everything including monitoring; cannot be combined with other flags.
     #[tool(
         name = "clean_testnet",
         annotations(read_only_hint = false, open_world_hint = false)
@@ -459,12 +464,28 @@ impl QuakeMcpServer {
         params: Parameters<CleanParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.ensure_ssm_tunnels().await?;
-        let all = params.0.all.unwrap_or(false);
+        let p = &params.0;
+        let all = p.all.unwrap_or(false);
+        let monitoring = p.monitoring.unwrap_or(false);
+        let mode = if all {
+            CleanScope::Full
+        } else {
+            clean_scope(
+                p.data.unwrap_or(false),
+                p.execution_data.unwrap_or(false),
+                p.consensus_data.unwrap_or(false),
+                monitoring,
+            )
+        };
+        let scope = if matches!(mode, CleanScope::Full) {
+            "full"
+        } else {
+            "partial"
+        };
         let testnet = self.testnet.read().await;
-        testnet.clean(all).await.map_err(|e| {
+        testnet.clean(mode, all || monitoring).await.map_err(|e| {
             rmcp::ErrorData::internal_error(format!("Failed to clean testnet: {e}"), None)
         })?;
-        let scope = if all { "full" } else { "partial" };
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Testnet cleaned ({scope})"
         ))]))
@@ -952,9 +973,18 @@ struct NodeNamesParams {
 /// Parameters for the clean_testnet tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CleanParams {
-    /// If true, also stop monitoring services and remove monitoring data.
-    /// Testnet data (including generated files) is removed in both modes.
+    /// If true, remove all data, including the testnet directory and monitoring services.
     all: Option<bool>,
+
+    /// If true, also stop monitoring services and remove monitoring data.
+    monitoring: Option<bool>,
+    /// If true, remove both Reth and Malachite data, preserving testnet configuration.
+    /// The testnet can be restarted immediately without re-running setup.
+    data: Option<bool>,
+    /// If true, remove only Reth (execution layer) data.
+    execution_data: Option<bool>,
+    /// If true, remove only Malachite (consensus layer) data.
+    consensus_data: Option<bool>,
 }
 
 /// Parameters for timed perturbation tools (disconnect, kill, pause).

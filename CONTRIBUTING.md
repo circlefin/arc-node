@@ -10,11 +10,11 @@ This project uses Protocol Buffers for consensus and node communication (except 
 
 - `make buf-lint` - Lint protobuf files to ensure they follow best practices
 - `make buf-format` - Format protobuf files (this is included in `make lint`)
-- `make buf-breaking` - Check for breaking changes against the master branch
+- `make buf-breaking` - Check for breaking changes against the main branch
 
 ### Before Committing Changes
 
-If you modify any `.proto` files, always run `make buf-lint` and `make buf-breaking` to ensure your changes don't introduce linting issues or breaking changes. The `buf-breaking` command compares your changes against the master branch to detect any backwards-incompatible modifications. Breaking changes should be carefully reviewed and documented as they can impact existing deployments.
+If you modify any `.proto` files, always run `make buf-lint` and `make buf-breaking` to ensure your changes don't introduce linting issues or breaking changes. The `buf-breaking` command compares your changes against the main branch to detect any backwards-incompatible modifications. Breaking changes should be carefully reviewed and documented as they can impact existing deployments.
 
 ### CI
 

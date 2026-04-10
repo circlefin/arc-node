@@ -17,10 +17,13 @@
 use color_eyre::eyre::{eyre, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::{debug, warn};
 
+use crate::clean;
 use crate::infra::{docker, BuildProfile, InfraProvider, COMPOSE_PROJECT_NAME};
 use crate::node::{Container, ContainerName, NodeName, SubnetName};
 use crate::nodes::NodeOrContainerName;
+use crate::shell;
 
 pub(crate) const COMPOSE_FILENAME: &str = "compose.yaml";
 pub(crate) const COMPOSE_BUILD_FILENAME: &str = "arc_builders.yaml";
@@ -71,6 +74,7 @@ macro_rules! args {
 /// Local infrastructure provider, with nodes and other services deployed locally as Docker containers.
 pub(crate) struct LocalInfra {
     root_dir: PathBuf,
+    testnet_dir: PathBuf,
     compose_path: PathBuf,
     compose_build_path: PathBuf,
     pub monitoring: MonitoringManager,
@@ -82,10 +86,45 @@ impl LocalInfra {
         let compose_build_path = testnet_dir.join(COMPOSE_BUILD_FILENAME);
         Ok(Self {
             root_dir: root_dir.to_path_buf(),
+            testnet_dir: testnet_dir.to_path_buf(),
             compose_path,
             compose_build_path,
             monitoring,
         })
+    }
+
+    /// Clean Reth data for a node, preserving nodekey and jwt.hex.
+    pub fn clean_reth_data(&self, name: &str) {
+        let reth_dir = self.testnet_dir.join(name).join("reth");
+        let paths: Vec<String> = clean::RETH_DATA_SUBDIRS
+            .iter()
+            .map(|s| reth_dir.join(s).to_string_lossy().into_owned())
+            .collect();
+        let args: Vec<&str> = std::iter::once("-rf")
+            .chain(paths.iter().map(|s| s.as_str()))
+            .collect();
+        if let Err(err) = shell::exec("rm", args, &self.root_dir, None, false) {
+            warn!(%err, "⚠️ Failed to remove Reth data for {name}");
+        } else {
+            debug!("✅ Reth data removed for {name}");
+        }
+    }
+
+    /// Clean Malachite data for a node, preserving config/.
+    pub fn clean_malachite_data(&self, name: &str) {
+        let malachite_dir = self.testnet_dir.join(name).join("malachite");
+        let paths: Vec<String> = clean::MALACHITE_DATA_SUBDIRS
+            .iter()
+            .map(|s| malachite_dir.join(s).to_string_lossy().into_owned())
+            .collect();
+        let args: Vec<&str> = std::iter::once("-rf")
+            .chain(paths.iter().map(|s| s.as_str()))
+            .collect();
+        if let Err(err) = shell::exec("rm", args, &self.root_dir, None, false) {
+            warn!(%err, "⚠️ Failed to remove Malachite data for {name}");
+        } else {
+            debug!("✅ Malachite data removed for {name}");
+        }
     }
 
     fn docker_exec(&self, args: Vec<&str>) -> Result<()> {
@@ -123,7 +162,8 @@ impl InfraProvider for LocalInfra {
     }
 
     fn is_setup(&self, _nodes: &[NodeName]) -> Result<()> {
-        docker::compose_file_exists(&self.compose_path)
+        docker::compose_file_exists(&self.compose_path)?;
+        docker::compose_file_exists(&self.monitoring.compose_path)
     }
 
     fn start(&self, names: &[NodeOrContainerName]) -> Result<()> {

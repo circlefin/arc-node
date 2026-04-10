@@ -44,6 +44,8 @@ use crate::{InfoSubcommand, RemoteSubcommand, SSMSubcommand};
 pub(crate) const QUAKE_DIR: &str = ".quake";
 pub(crate) const LAST_MANIFEST_FILENAME: &str = ".last_manifest";
 
+pub use crate::clean::{clean, CleanScope};
+
 /// Stores the nodes upgraded using the 'quake upgrade' command on the running
 /// testnet, one per line. e.g.,:
 ///
@@ -552,6 +554,13 @@ impl Testnet {
             self.start_from_manifest().await?;
         }
 
+        if let Ok(remote_infra) = self.remote_infra() {
+            match remote_infra.start_monitoring() {
+                Ok(output) => info!(%output, "✅ Monitoring started on CC"),
+                Err(err) => warn!("⚠️ Failed to start monitoring on CC: {err:#}"),
+            }
+        }
+
         info!(dir=%self.dir.display(), "✅ Testnet started");
         println!("📁 Testnet files: {}", self.dir.display());
         self.print_monitoring_info();
@@ -971,60 +980,17 @@ impl Testnet {
         Ok(())
     }
 
-    /// Clean up testnet-related files, directories, infrastructure, and running processes
-    pub async fn clean(&self, all: bool) -> Result<()> {
-        // Take down the testnet infrastructure
-        match self.infra_data.infra_type {
-            InfraType::Local => {
-                if let Err(err) = self.infra.down(&[]) {
-                    warn!(%err, "⚠️ Failed to stop and remove containers");
-                } else {
-                    debug!("✅ Testnet is down");
-                }
-            }
-            InfraType::Remote => {
-                let remote_infra = self.remote_infra()?;
-                if let Err(err) = remote_infra.ssm_tunnels.stop().await {
-                    warn!(%err, "⚠️ Failed to terminate SSM sessions");
-                }
+    /// Clean up testnet-related files, directories, infrastructure, and running processes.
+    ///
+    /// `mode` controls which node data is removed. See [`CleanScope`] for the different strategies.
+    /// `include_monitoring` is orthogonal — any mode can be combined with monitoring cleanup.
+    pub async fn clean(&self, mode: CleanScope, include_monitoring: bool) -> Result<()> {
+        clean(self, mode, include_monitoring).await;
 
-                if remote_infra.terraform.has_state() {
-                    debug!("⬇️ Destroying remote infrastructure...");
-                    if let Err(err) = remote_infra.terraform.destroy(true) {
-                        warn!(%err, "⚠️ Failed to destroy remote infrastructure");
-                    } else {
-                        info!("✅ Remote infrastructure destroyed");
-                    }
-                } else {
-                    info!("No Terraform state found; skipping infrastructure destroy");
-                }
-            }
-        }
-
-        // Remove testnet local data
-        if self.dir.exists() {
-            debug!(dir=%self.dir.display(), "🗑️  Removing testnet data");
-            if let Err(err) = fs::remove_dir_all(&self.dir) {
-                warn!(dir=%self.dir.display(), "Failed to remove testnet data: {err}");
-            } else {
-                debug!(dir=%self.dir.display(), "✅ Testnet data removed");
-            }
-        }
-
-        // Take down local monitoring services and remove their data, if requested
-        if let Ok(local_infra) = self.local_infra() {
-            if all {
-                if local_infra.monitoring.stop().is_ok() {
-                    debug!("✅ Monitoring services stopped");
-                }
-                if local_infra.monitoring.clean().is_ok() {
-                    debug!(dir=%local_infra.monitoring.dir.display(), "✅ Monitoring data removed");
-                }
-            } else {
-                warn!(
-                    "Monitoring services are still running; run `quake clean --all` to stop and clean them"
+        if matches!(mode, CleanScope::Full) && !include_monitoring {
+            warn!(
+                    "Monitoring services are still running; run `quake clean --monitoring` to stop and clean them"
                 );
-            }
         }
 
         let _ = fs::remove_file(self.quake_dir.join(UPGRADED_CONTAINERS_FILENAME));
@@ -1225,7 +1191,7 @@ impl Testnet {
         }
     }
 
-    fn local_infra(&self) -> Result<Arc<LocalInfra>> {
+    pub(crate) fn local_infra(&self) -> Result<Arc<LocalInfra>> {
         if self.is_local() {
             Ok(Arc::downcast::<LocalInfra>(self.infra.clone()).unwrap())
         } else {

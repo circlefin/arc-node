@@ -742,6 +742,34 @@ The workflow runs **10 parallel jobs** (matrix indices 0–9). Each job computes
 
 PRs labeled `test-random` will also trigger this workflow.
 
+### The `clean` command
+
+By default, `clean` removes all node data and configuration. The following flags control what is removed:
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--all` | `-a` | Remove everything, including monitoring services and their data. Cannot be combined with other flags. |
+| `--monitoring` | `-m` | Stop monitoring services and remove their data only. |
+| `--data` | `-d` | Remove only execution and consensus layer data, preserving configuration. Cannot be combined with `--execution-data` or `--consensus-data`. |
+| `--execution-data` | `-x` | Remove only execution layer (Reth) data. Cannot be combined with `--data` or `--consensus-data`. |
+| `--consensus-data` | `-c` | Remove only consensus layer (Malachite) data. Cannot be combined with `--data` or `--execution-data`. |
+
+```bash
+# Remove node data only (keep config, monitoring intact)
+./quake clean --data
+
+# Remove only execution layer data
+./quake clean --execution-data
+
+# Remove only consensus layer data
+./quake clean --consensus-data
+
+# Remove node data and monitoring
+./quake clean --data --monitoring
+
+# Remove everything including monitoring
+./quake clean --all
+```
 
 ## Manifest File Format
 
