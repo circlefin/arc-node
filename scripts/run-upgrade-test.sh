@@ -30,7 +30,7 @@ WORKFLOW="nightly-upgrade.yml"
 FROM_VERSION=""
 TO_VERSION=""
 HARDFORK=""
-BRANCH="master"
+BRANCH="main"
 REMOTE="upstream"
 DRY_RUN=false
 
@@ -49,7 +49,7 @@ Options:
   --from       Starting version for EL and CL images
   --to         Upgrade target version for EL and CL images
   --hardfork   Set el_init_hardfork (e.g. zero4, zero5)
-  --branch     Branch to run the workflow on (default: master)
+  --branch     Branch to run the workflow on (default: main)
   --remote     Git remote to resolve the repository from (default: upstream)
   --dry-run    Print the command without executing it
   --help       Show this help message
