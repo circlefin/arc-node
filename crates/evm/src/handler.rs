@@ -89,10 +89,9 @@ where
         let beneficiary = ctx.block().beneficiary();
         let basefee = ctx.block().basefee() as u128;
         let effective_gas_price = ctx.tx().effective_gas_price(basefee);
-        let gas_used = exec_result.gas().used() as u128;
+        let gas_used = exec_result.gas().used();
 
-        // Calculate total fee (base fee + priority fee) instead of just priority fee
-        let total_fee_amount = U256::from(effective_gas_price * gas_used);
+        let total_fee_amount = U256::from(effective_gas_price) * U256::from(gas_used);
 
         // Transfer the total fee to the beneficiary (both base fee and priority fee)
         evm.ctx_mut()
@@ -502,6 +501,62 @@ mod tests {
             balance2_final - balance2_after,
             expected_fee,
             "Second beneficiary should receive the fee when set as beneficiary"
+        );
+    }
+
+    #[test]
+    fn test_reward_beneficiary_large_values_no_overflow() {
+        let beneficiary = address!("1100000000000000000000000000000000000011");
+        let caller = address!("2200000000000000000000000000000000000022");
+        // Values that would overflow u128 when multiplied: (u128::MAX / 1000) * 2000 > u128::MAX
+        let gas_price = u128::MAX / 1000;
+        let gas_used = 2000u64;
+
+        let db: CacheDB<EmptyDBTyped<Infallible>> = CacheDB::new(EmptyDB::default());
+        let mut evm = Context::mainnet().with_db(db).build_mainnet();
+
+        evm.block.beneficiary = beneficiary;
+        evm.block.basefee = 0;
+        evm.tx.caller = caller;
+        evm.tx.gas_price = gas_price;
+
+        let interpreter_result = InterpreterResult::new(
+            InstructionResult::Return,
+            alloy_primitives::Bytes::new(),
+            Gas::new_spent(gas_used),
+        );
+        let call_outcome = CallOutcome::new(interpreter_result, 0..0);
+        let mut exec_result = FrameResult::Call(call_outcome);
+
+        let initial_balance = evm
+            .journaled_state
+            .load_account(beneficiary)
+            .unwrap()
+            .info
+            .balance;
+
+        let handler: ArcEvmHandler<_, EVMError<Infallible>> =
+            ArcEvmHandler::new(ArcHardforkFlags::default());
+        let result = handler.reward_beneficiary(&mut evm, &mut exec_result);
+
+        assert!(
+            result.is_ok(),
+            "reward_beneficiary should succeed with large values"
+        );
+
+        let expected_fee = U256::from(gas_price) * U256::from(gas_used);
+
+        let final_balance = evm
+            .journaled_state
+            .load_account(beneficiary)
+            .unwrap()
+            .info
+            .balance;
+        let balance_increase = final_balance - initial_balance;
+
+        assert_eq!(
+            balance_increase, expected_fee,
+            "Beneficiary should receive correct fee even with large values that would overflow u128"
         );
     }
 

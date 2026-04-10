@@ -54,6 +54,8 @@ git config fetch.recurseSubmodules on-demand
 
 ### Prerequisites
 
+- [Rust](https://rustup.rs/)
+- [Docker](https://docs.docker.com/get-started/get-docker/)
 - [Node.js](https://nodejs.org/)
 - [Foundry](https://getfoundry.sh/)
 - [Hardhat](https://hardhat.org/)
@@ -178,7 +180,7 @@ For more details, see our [Contributing Guide](CONTRIBUTING.md).
 ## Resources
 
 - [Arc Network](https://www.arc.network/) - Official Arc Network website
-- [Arc Documentation](https://www.arc.network/) - Official Arc developer documentation
+- [Arc Documentation](https://docs.arc.network/) - Official Arc developer documentation
 - [Reth](https://github.com/paradigmxyz/reth) - The underlying execution layer framework
 - [Malachite](https://github.com/circlefin/malachite) - BFT consensus engine
 - [Local Documentation](docs/) - Implementation guides and references
