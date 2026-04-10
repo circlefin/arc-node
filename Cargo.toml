@@ -126,7 +126,7 @@ itertools = "0.14"
 # rpc
 jsonrpsee = "0.26.0"
 jsonrpsee-types = "0.26.0"
-jsonwebtoken = "9.3.1"
+jsonwebtoken = "10.3.0"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 lz4 = "1.28.1"
 
