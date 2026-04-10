@@ -39,23 +39,23 @@ write_files:
       # Usage: pssh.sh "command" ip1 ip2 ip3 ...
       # Executes command on all IPs in parallel, fails if any command fails.
       set -euo pipefail
-      CMD="$$1"
+      CMD="$1"
       shift
       SSH_OPTS="-o StrictHostKeyChecking=no -o LogLevel=ERROR"
       USER="${username}"
-      TMPDIR=$$(mktemp -d)
-      trap "rm -rf $$TMPDIR" EXIT
+      TMPDIR=$(mktemp -d)
+      trap "rm -rf $TMPDIR" EXIT
       i=0
-      for IP in "$$@"; do
-          (ssh $$SSH_OPTS $$USER@$$IP "$$CMD"; echo $$? > "$$TMPDIR/$$i") &
-          ((i++))
+      for IP in "$@"; do
+          (ssh $SSH_OPTS $USER@$IP "$CMD"; echo $? > "$TMPDIR/$i") &
+          i="$((i+1))"
       done
       wait
       FAILED=0
-      for f in "$$TMPDIR"/*; do
-          [ -f "$$f" ] && [ "$$(cat "$$f")" != "0" ] && FAILED=1
+      for f in "$TMPDIR"/*; do
+          [ -f "$f" ] && [ "$(cat "$f")" != "0" ] && FAILED=1
       done
-      exit $$FAILED
+      exit $FAILED
 runcmd:
 # Set up 4 GiB swap to prevent hard OOM kills (dd instead of fallocate for XFS compatibility)
   - dd if=/dev/zero of=/swapfile bs=1M count=4096

@@ -1,0 +1,72 @@
+version: '3.9'
+
+name: blockscout
+
+services:
+  proxy:
+    image: nginx
+    container_name: proxy
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    volumes:
+      - "../deployments/monitoring/config-blockscout/proxy:/etc/nginx/templates:ro"
+    environment:
+      BACK_PROXY_PASS: ${BACK_PROXY_PASS:-http://backend:4000}
+      FRONT_PROXY_PASS: ${FRONT_PROXY_PASS:-http://frontend:3000}
+    ports:
+      - target: 80
+        published: 80
+
+  frontend:
+    image: ghcr.io/blockscout/frontend:${BLOCKSCOUT_FRONTEND_TAG:-latest}
+    pull_policy: always
+    restart: always
+    container_name: 'frontend'
+    volumes:
+      - ../deployments/monitoring/config-blockscout/frontend/.curlrc:/home/nextjs/.curlrc:ro
+    env_file:
+      -  ../deployments/monitoring/config-blockscout/frontend/frontend.env
+
+  backend:
+    image: ghcr.io/blockscout/${BLOCKSCOUT_REPO:-blockscout}:${BLOCKSCOUT_TAG:-latest}
+    pull_policy: always
+    restart: always
+    stop_grace_period: 5m
+    container_name: 'backend'
+    command: sh -c "bin/blockscout eval \"Elixir.Explorer.ReleaseTasks.create_and_migrate()\" && bin/blockscout start"
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    env_file:
+      -  ../deployments/monitoring/config-blockscout/backend.env
+    volumes:
+      - ../deployments/volumes/blockscout/logs/:/app/logs/
+      - ../deployments/volumes/blockscout/dets/:/app/dets/
+
+  db-init:
+    image: postgres:17
+    entrypoint:
+      - sh
+      - -c
+      - |
+        chown -R 2000:2000 /var/lib/postgresql/data
+
+  db:
+    image: postgres:17
+    user: 2000:2000
+    shm_size: 256m
+    restart: always
+    container_name: 'db'
+    command: postgres -c 'max_connections=200' -c 'client_connection_check_interval=60000'
+    environment:
+        POSTGRES_DB: 'blockscout'
+        POSTGRES_USER: 'blockscout'
+        POSTGRES_HOST_AUTH_METHOD: 'trust'
+    ports:
+      - target: 5432
+        published: 7432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockscout -d blockscout"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

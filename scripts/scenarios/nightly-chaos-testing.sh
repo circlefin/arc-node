@@ -60,6 +60,9 @@ echo "  Quake dir:    $QUAKE_DIR"
 echo ""
 echo "To reproduce this run locally:"
 echo "  bash scripts/scenarios/nightly-chaos-testing.sh $SCENARIO $SPAM_DURATION_SECS $SPAM_RATE $SEED"
+echo "  Note: each 'quake perturb chaos' iteration uses its own generated seed;"
+echo "  see $RESULTS_DIR/chaos_loop.log for the exact seeds needed to replay the"
+echo "  chaos loop."
 echo ""
 
 mkdir -p "$RESULTS_DIR"
@@ -96,7 +99,7 @@ current_height() {
   #
   # If some nodes are down it can print "conn refused" in place of numbers; ignore those.
   local line max
-  line="$("$QUAKE" --seed "$SEED" -f "$SCENARIO" info heights -n 1 2>/dev/null | tail -n 1)"
+  line="$("$QUAKE" -f "$SCENARIO" info heights -n 1 2>/dev/null | tail -n 1)"
   max="$(
     printf '%s\n' "$line" |
       tr '|' ' ' |
@@ -211,16 +214,16 @@ chaos_loop() {
     echo "=== Chaos testing iteration #$iter ($(date -u)) ==="
 
     # 1) perturb chaos (runs ~5 minutes)
-    echo "Running: $QUAKE --seed $SEED -f $SCENARIO perturb chaos -d 5m"
+    echo "Running: $QUAKE -f $SCENARIO perturb chaos -d 5m"
 
-    "$QUAKE" --seed "$SEED" -f "$SCENARIO" perturb chaos -d 5m
+    "$QUAKE" -f "$SCENARIO" perturb chaos -d 5m
 
     # 2) wait for a random height a bit in the future
     target_height="$(random_wait_height)"
     echo "Waiting for height $target_height..."
-    echo "Running: $QUAKE --seed $SEED -f $SCENARIO wait height $target_height --timeout 180"
+    echo "Running: $QUAKE -f $SCENARIO wait height $target_height --timeout 180"
 
-    "$QUAKE" --seed "$SEED" -f "$SCENARIO" wait height "$target_height" --timeout 180
+    "$QUAKE" -f "$SCENARIO" wait height "$target_height" --timeout 180
 
     # 3) random validator set update
     updates=()
@@ -233,8 +236,8 @@ chaos_loop() {
     done <<< "$rand_valset"
 
     echo "Valset updates: ${updates[*]}"
-    echo "Running: $QUAKE --seed $SEED -f $SCENARIO valset ${updates[@]}"
-    "$QUAKE" --seed "$SEED" -f "$SCENARIO" valset "${updates[@]}"
+    echo "Running: $QUAKE -f $SCENARIO valset ${updates[@]}"
+    "$QUAKE" -f "$SCENARIO" valset "${updates[@]}"
 
     sleep 5
   done

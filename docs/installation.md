@@ -27,7 +27,6 @@ https://github.com/circlefin/arc-node repository:
 git clone https://github.com/circlefin/arc-node.git
 cd arc-node
 git checkout $VERSION
-git submodule update --init --recursive
 ```
 
 `$VERSION` is a tag for a released version.
@@ -43,9 +42,17 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 ```
 
+With Rust installed, install the dependencies for your operating system:
+
+- **Ubuntu:** `sudo apt-get install libclang-dev pkg-config build-essential`
+- **macOS:** `brew install llvm pkg-config`
+- **Windows:** `choco install llvm` or `winget install LLVM.LLVM`
+
+These are needed to build bindings for Arc node execution's database.
+
 **3. Build and install:**
 
-The following commands produce three Arc node binaries: 
+The following commands produce three Arc node binaries:
 `arc-node-execution`, `arc-node-consensus`, and `arc-snapshots`:
 
 ```sh
@@ -67,4 +74,3 @@ arc-snapshots --version
 arc-node-execution --version
 arc-node-consensus --version
 ```
-
