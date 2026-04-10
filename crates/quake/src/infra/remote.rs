@@ -215,7 +215,7 @@ impl RemoteInfra {
             .map(|node| self.node_private_ip(node).map(String::as_str))
             .collect::<Result<Vec<_>>>()?;
 
-        let pssh_cmd = format!("./pssh.sh \"{cmd}\" {}", node_ips.join(" "));
+        let pssh_cmd = format!("./pssh.sh '{cmd}' {}", node_ips.join(" "));
         self.ssh_cc(&pssh_cmd, false)
             .wrap_err_with(|| format!("Failed to run '{cmd}' on {nodes:?}"))
     }

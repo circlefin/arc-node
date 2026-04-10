@@ -32,9 +32,9 @@ use crate::store::repositories::UndecidedBlocksRepository;
 /// Handles the `RestreamProposal` message from the consensus engine.
 ///
 /// This is called when the consensus engine requests to restream a proposal for a specific height and round.
-/// If a valid round is provided, the application first fetches the block from the valid round,
-/// updates its round to the new round, and stores it. Then, it fetches the
-/// block for the specified height and round, streams the proposal parts, and sends them over the network.
+/// The block is looked up by height and block hash (ignoring round), so it will be found
+/// regardless of which round it was originally stored under. The block's round and valid_round
+/// are updated to match the current proposal context before restreaming.
 ///
 /// ## Errors
 /// - If no block is found for the specified height and round
@@ -107,18 +107,17 @@ async fn get_block_to_restream(
     valid_round: Round,
     block_hash: BlockHash,
 ) -> eyre::Result<Option<ConsensusBlock>> {
-    if valid_round.is_defined()
-        && let Some(mut block) = undecided_blocks
-            .get(height, valid_round, block_hash)
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to fetch block from valid round for restreaming it \
-                    (height={height}, valid_round={valid_round}, block_hash={block_hash})"
-                )
-            })?
-    {
-        // Update the block for the new round and store it
+    let block = undecided_blocks
+        .get_first(height, block_hash)
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "Failed to fetch block for restreaming \
+                 (height={height}, round={round}, block_hash={block_hash})"
+            )
+        })?;
+
+    if let Some(mut block) = block {
         block.round = round;
         block.valid_round = valid_round;
 
@@ -127,24 +126,14 @@ async fn get_block_to_restream(
             .await
             .wrap_err_with(|| {
                 format!(
-                "Failed to store updated undecided block from valid round before restreaming it \
-                (height={height}, valid_round={valid_round}, block_hash={block_hash})"
-            )
-            })?;
-
-        Ok(Some(block))
-    } else {
-        let block_to_restream = undecided_blocks
-            .get(height, round, block_hash)
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to fetch block from round for restreaming it \
+                    "Failed to store updated block before restreaming \
                      (height={height}, round={round}, block_hash={block_hash})"
                 )
             })?;
 
-        Ok(block_to_restream)
+        Ok(Some(block))
+    } else {
+        Ok(None)
     }
 }
 
@@ -179,25 +168,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_block_from_valid_round_and_store_update() {
+    async fn get_block_found_and_updated() {
         let mut mock_repo = MockUndecidedBlocksRepository::new();
 
         let height = Height::new(10);
-        let round = Round::new(5); // The new round we are proposing in
-        let valid_round = Round::new(3); // The previous round where we saw the block
+        let round = Round::new(5);
+        let valid_round = Round::new(3);
         let block_hash = BlockHash::default();
 
-        // Original block proposed in round 3
-        let original_block = create_dummy_block(height, valid_round, Round::Nil);
+        let original_block = create_dummy_block(height, Round::new(0), Round::Nil);
 
-        // Expectation: Fetch from valid_round (3)
         mock_repo
-            .expect_get()
-            .with(eq(height), eq(valid_round), eq(block_hash))
+            .expect_get_first()
+            .with(eq(height), eq(block_hash))
             .times(1)
-            .returning(move |_, _, _| Ok(Some(original_block.clone())));
+            .returning(move |_, _| Ok(Some(original_block.clone())));
 
-        // Expectation: Store the block updated with the NEW round (5) and valid_round (3)
         mock_repo
             .expect_store()
             .withf(move |b| b.round == round && b.valid_round == valid_round)
@@ -207,46 +193,13 @@ mod tests {
         let result =
             get_block_to_restream(&mock_repo, height, round, valid_round, block_hash).await;
 
-        assert!(result.is_ok());
-        let block = result.unwrap();
-        assert!(block.is_some());
-
-        let b = block.unwrap();
-        assert_eq!(b.round, round); // Ensure returned block has updated round
-        assert_eq!(b.valid_round, valid_round);
+        let block = result.unwrap().expect("block should be found");
+        assert_eq!(block.round, round);
+        assert_eq!(block.valid_round, valid_round);
     }
 
     #[tokio::test]
-    async fn get_block_no_valid_round_fetch_current() {
-        let mut mock_repo = MockUndecidedBlocksRepository::new();
-
-        let height = Height::new(10);
-        let round = Round::new(5);
-        let valid_round = Round::Nil; // No valid round
-        let block_hash = BlockHash::default();
-
-        // A block proposed for the first time at round 5, no valid round
-        let current_block = create_dummy_block(height, round, valid_round);
-
-        // Expectation: we are restreaming this block because we received it at round 5.
-        mock_repo
-            .expect_get()
-            .with(eq(height), eq(round), eq(block_hash))
-            .times(1)
-            .returning(move |_, _, _| Ok(Some(current_block.clone())));
-
-        // Expectation: Store should NOT be called
-        mock_repo.expect_store().times(0);
-
-        let result =
-            get_block_to_restream(&mock_repo, height, round, valid_round, block_hash).await;
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().unwrap().round, round);
-    }
-
-    #[tokio::test]
-    async fn fallback_when_valid_round_block_missing() {
+    async fn get_block_not_found() {
         let mut mock_repo = MockUndecidedBlocksRepository::new();
 
         let height = Height::new(10);
@@ -254,32 +207,16 @@ mod tests {
         let valid_round = Round::new(3);
         let block_hash = BlockHash::default();
 
-        let block_at_current = create_dummy_block(height, round, valid_round);
-
-        // 1. First fetch at valid_round returns None
-        // The proposed value can be valid for the proposer but not for us.
         mock_repo
-            .expect_get()
-            .with(eq(height), eq(valid_round), eq(block_hash))
+            .expect_get_first()
+            .with(eq(height), eq(block_hash))
             .times(1)
-            .returning(|_, _, _| Ok(None));
-
-        // 2. Fallback: fetch at current round
-        // Since it was restreamed by the proposer, we have it as current's round value.
-        mock_repo
-            .expect_get()
-            .with(eq(height), eq(round), eq(block_hash))
-            .times(1)
-            .returning(move |_, _, _| Ok(Some(block_at_current.clone())));
-
-        // Store should NOT be called in the fallback path
-        mock_repo.expect_store().times(0);
+            .returning(|_, _| Ok(None));
 
         let result =
             get_block_to_restream(&mock_repo, height, round, valid_round, block_hash).await;
 
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_some());
+        assert!(result.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -290,8 +227,8 @@ mod tests {
         let valid_round = Round::Nil;
 
         mock_repo
-            .expect_get()
-            .returning(|_, _, _| Err(std::io::Error::other("DB connection failed")));
+            .expect_get_first()
+            .returning(|_, _| Err(std::io::Error::other("DB connection failed")));
 
         let result =
             get_block_to_restream(&mock_repo, height, round, valid_round, BlockHash::default())
