@@ -539,7 +539,7 @@ where
     let chain_spec = client.chain_spec();
 
     info!(target: "payload_builder", id=%attributes.id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "(arc) building new payload");
-    let mut cumulative_gas_used = 0;
+    let mut cumulative_gas_used: u64 = 0;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
 
@@ -576,7 +576,7 @@ where
         }
 
         // ensure we still have capacity for this transaction
-        if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
+        if cumulative_gas_used.checked_add(pool_tx.gas_limit()).is_none_or(|total| total > block_gas_limit) {
             // we can't fit this transaction into the block, so we need to mark it as invalid
             // which also removes all dependent transaction from the iterator before we can
             // continue
@@ -657,7 +657,7 @@ where
             .effective_tip_per_gas(base_fee)
             .expect("fee is always valid; execution succeeded");
         total_fees += U256::from(miner_fee) * U256::from(gas_used);
-        cumulative_gas_used += gas_used;
+        cumulative_gas_used = cumulative_gas_used.saturating_add(gas_used);
     }
 
     PayloadBuildMetrics::record_stage_tx_execution(loop_started.elapsed());
