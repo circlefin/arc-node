@@ -575,7 +575,7 @@ where
         }
 
         // ensure we still have capacity for this transaction
-        if cumulative_gas_used.saturating_add(pool_tx.gas_limit()) > block_gas_limit {
+        if cumulative_gas_used.checked_add(pool_tx.gas_limit()).is_none_or(|total| total > block_gas_limit) {
             // we can't fit this transaction into the block, so we need to mark it as invalid
             // which also removes all dependent transaction from the iterator before we can
             // continue
