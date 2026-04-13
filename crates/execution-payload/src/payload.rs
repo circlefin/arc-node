@@ -657,7 +657,13 @@ where
             .effective_tip_per_gas(base_fee)
             .expect("fee is always valid; execution succeeded");
         total_fees += U256::from(miner_fee) * U256::from(gas_used);
-        cumulative_gas_used = cumulative_gas_used.saturating_add(gas_used);
+        cumulative_gas_used = cumulative_gas_used
+            .checked_add(gas_used)
+            .ok_or_else(|| {
+                PayloadBuilderError::other(eyre::eyre!(
+                    "cumulative_gas_used overflow: {cumulative_gas_used} + {gas_used}"
+                ))
+            })?;
     }
 
     PayloadBuildMetrics::record_stage_tx_execution(loop_started.elapsed());
