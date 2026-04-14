@@ -393,6 +393,8 @@ sudo systemctl start arc-execution arc-consensus
 
 ### Monitoring
 
+For a Prometheus + Grafana setup on a single host, see [Monitoring an Arc Node](./monitoring.md).
+
 ```sh
 # Check service status
 sudo systemctl status arc-execution
