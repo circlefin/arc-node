@@ -15,7 +15,7 @@ An Arc node is composed of two processes:
 - **Execution Layer (EL)**: executes finalized transactions and maintains the state of the blockchain;
 - **Consensus Layer (CL)**: fetches finalized blocks, verifies their cryptographic signatures, and passes them to the EL for execution.
 
-Refer to the [installation](installation.md) instructions to install
+Refer to the [installation](./installation.md) instructions to install
 `arc-node-execution` (EL) and `arc-node-consensus` (CL).
 
 > **Docker:** Container images and Docker Compose instructions are coming soon.
