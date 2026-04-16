@@ -54,7 +54,8 @@ git config fetch.recurseSubmodules on-demand
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/)
+- - [Rust](https://rustup.rs/)
+> **Tip:** After installing, run `source ~/.cargo/env` or restart your terminal if the `cargo` command is not found.
 - [Docker](https://docs.docker.com/get-started/get-docker/)
 - [Node.js](https://nodejs.org/)
 - [Foundry](https://getfoundry.sh/)
