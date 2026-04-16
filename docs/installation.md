@@ -40,6 +40,7 @@ If not, it can be installed with the following commands:
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
+# Restart your terminal (or run `source ~/.cargo/env` again) so the `cargo` command is available.
 ```
 
 With Rust installed, install the dependencies for your operating system:
