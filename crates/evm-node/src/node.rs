@@ -21,12 +21,12 @@
 //! - inject our consensus ArcConsensus in ArcConsensusBuilder
 //! - inject ArcEngineValidatorBuilder in ArcEngineValidatorBuilder
 
+use crate::payload::ArcLocalPayloadAttributesBuilder;
 use alloy_network::Ethereum;
 use alloy_rpc_types_engine::ExecutionData;
 use arc_evm::{ArcEvmConfig, ArcEvmFactory};
 use arc_execution_validation::ArcConsensus;
 use reth_chainspec::{EthereumHardforks, Hardforks};
-use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_engine_primitives::EngineTypes;
 use reth_ethereum::{node::EthEngineTypes, node::EthEvmConfig};
 use reth_ethereum_engine_primitives::{
@@ -516,7 +516,7 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for ArcNode {
     fn local_payload_attributes_builder(
         chain_spec: &Self::ChainSpec,
     ) -> impl PayloadAttributesBuilder<<Self::Payload as PayloadTypes>::PayloadAttributes> {
-        LocalPayloadAttributesBuilder::new(Arc::new(chain_spec.clone()))
+        ArcLocalPayloadAttributesBuilder::new(Arc::new(chain_spec.clone()))
     }
 }
 

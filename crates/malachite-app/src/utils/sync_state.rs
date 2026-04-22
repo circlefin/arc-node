@@ -19,7 +19,7 @@ use std::time::Duration;
 use arc_consensus_types::BlockTimestamp;
 
 /// Represents the synchronization state of the node with the network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum SyncState {
     /// The node is still catching up with the network and has not yet reached the latest blocks.
     CatchingUp,

@@ -19,6 +19,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 use std::{fs, path::Path};
 
+use alloy_primitives::Address;
 use arc_consensus_types::{
     Config, LoggingConfig, MetricsConfig, PruningConfig, RemoteSigningConfig, RpcConfig,
     RuntimeConfig, SigningConfig,
@@ -751,6 +752,7 @@ pub(crate) fn generate_node_cli_flags(
     peers_ips: &[String],
     image_tag: Option<&str>,
     follow_endpoint_urls: &[String],
+    suggested_fee_recipient: Option<Address>,
 ) -> Vec<String> {
     // For older versions (< v0.5.0), skip CLI flags as they use config.toml
     if !supports_cli_flags(image_tag) {
@@ -797,7 +799,17 @@ pub(crate) fn generate_node_cli_flags(
     // Enable value sync by default
     flags.push("--value-sync".to_string());
 
+    if let Some(addr) = suggested_fee_recipient {
+        flags.push(format!("--suggested-fee-recipient={addr}"));
+    }
+
     if let Some(node) = node {
+        let cl = &node.cl_config;
+
+        // Always set log level and format to ensure consistent logs for testing, debugging, and log collection.
+        flags.push(format!("--log-level={}", cl.logging.log_level));
+        flags.push(format!("--log-format={}", cl.logging.log_format));
+
         // Add persistent-peers-only if enabled
         if node.cl_persistent_peers_only {
             flags.push("--p2p.persistent-peers-only".to_string());
@@ -817,7 +829,6 @@ pub(crate) fn generate_node_cli_flags(
         // Translate cl.config.* typed fields to CLI flags.
         // Defaults come from the CL CLI itself (StartCmd) so we only emit
         // flags whose values differ from what the binary would use anyway.
-        let cl = &node.cl_config;
         let cli_defaults = StartCmd::default();
 
         let discovery = &cl.consensus.p2p.discovery;
@@ -839,11 +850,8 @@ pub(crate) fn generate_node_cli_flags(
 
         if !cl.consensus.enabled {
             flags.push("--no-consensus".to_string());
-        }
-
-        let default_log_level = arc_consensus_types::LogLevel::default();
-        if cl.logging.log_level != default_log_level {
-            flags.push(format!("--log-level={}", cl.logging.log_level));
+        } else if node.node_type == manifest::NodeType::Validator {
+            flags.push("--validator".to_string());
         }
 
         if node.remote_signer.is_some() {
@@ -883,6 +891,9 @@ pub(crate) fn generate_node_cli_flags(
                 flags.push(format!("--follow.endpoint={url}"));
             }
         }
+    } else {
+        flags.push("--log-level=debug".to_string());
+        flags.push("--log-format=plaintext".to_string());
     }
 
     flags
@@ -1398,7 +1409,8 @@ mod tests {
 
     #[test]
     fn generate_node_cli_flags_includes_required_flags() {
-        let flags = generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[]);
+        let flags =
+            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
 
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--moniker"));
@@ -1410,7 +1422,8 @@ mod tests {
     #[test]
     fn generate_node_cli_flags_with_cl_persistent_peers() {
         let peers = vec!["172.19.0.6".to_string(), "172.19.0.7".to_string()];
-        let flags = generate_node_cli_flags("validator-1", None, "172.19.0.5", &peers, None, &[]);
+        let flags =
+            generate_node_cli_flags("validator-1", None, "172.19.0.5", &peers, None, &[], None);
 
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--p2p.persistent-peers"));
@@ -1420,7 +1433,8 @@ mod tests {
 
     #[test]
     fn generate_node_cli_flags_without_persistent_peers() {
-        let flags = generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[]);
+        let flags =
+            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
 
         let flags_str = flags.join(" ");
         // Should not contain persistent peers flag when empty
@@ -1429,7 +1443,8 @@ mod tests {
 
     #[test]
     fn generate_node_cli_flags_includes_metrics() {
-        let flags = generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[]);
+        let flags =
+            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
 
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--metrics"));
@@ -1438,7 +1453,8 @@ mod tests {
 
     #[test]
     fn generate_node_cli_flags_includes_rpc() {
-        let flags = generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[]);
+        let flags =
+            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
 
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--rpc.addr"));
@@ -1447,10 +1463,69 @@ mod tests {
 
     #[test]
     fn generate_node_cli_flags_includes_value_sync() {
-        let flags = generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[]);
+        let flags =
+            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
 
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--value-sync"));
+    }
+
+    #[test]
+    fn generate_node_cli_flags_logging_defaults_when_no_node() {
+        let flags =
+            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
+
+        let flags_str = flags.join(" ");
+        assert!(flags_str.contains("--log-level=debug"));
+        assert!(flags_str.contains("--log-format=plaintext"));
+    }
+
+    #[test]
+    fn generate_node_cli_flags_logging_from_node_config() {
+        use malachitebft_config::{LogFormat, LogLevel};
+
+        let mut node = manifest::Node::default();
+        node.cl_config.logging.log_level = LogLevel::Info;
+        node.cl_config.logging.log_format = LogFormat::Json;
+
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            None,
+        );
+
+        let flags_str = flags.join(" ");
+        assert!(flags_str.contains("--log-level=info"));
+        assert!(flags_str.contains("--log-format=json"));
+    }
+
+    #[test]
+    fn generate_node_cli_flags_emits_suggested_fee_recipient() {
+        use alloy_primitives::address;
+        let recipient = address!("0x98e503f35D0a019cB0a251aD243a4cCFCF371F46");
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            None,
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            Some(recipient),
+        );
+        let flags_str = flags.join(" ");
+        assert!(flags_str.contains(&format!("--suggested-fee-recipient={recipient}")));
+    }
+
+    #[test]
+    fn generate_node_cli_flags_omits_suggested_fee_recipient_when_none() {
+        let flags =
+            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
+        let flags_str = flags.join(" ");
+        assert!(!flags_str.contains("--suggested-fee-recipient"));
     }
 
     #[test]
@@ -1461,8 +1536,15 @@ mod tests {
             ..Default::default()
         };
 
-        let flags =
-            generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            None,
+        );
 
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--signing.remote"));
@@ -1472,8 +1554,15 @@ mod tests {
     #[test]
     fn generate_node_cli_flags_without_remote_signer() {
         let node = manifest::Node::default();
-        let flags =
-            generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(!flags_str.contains("--signing.remote"));
     }
@@ -1485,8 +1574,15 @@ mod tests {
             ..Default::default()
         };
         let peers = vec!["172.19.0.6".to_string()];
-        let flags =
-            generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &peers, None, &[]);
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &peers,
+            None,
+            &[],
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--p2p.persistent-peers-only"));
     }
@@ -1494,8 +1590,15 @@ mod tests {
     #[test]
     fn generate_node_cli_flags_without_persistent_peers_only() {
         let node = manifest::Node::default();
-        let flags =
-            generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(!flags_str.contains("--p2p.persistent-peers-only"));
     }
@@ -1509,8 +1612,15 @@ mod tests {
             },
             ..Default::default()
         };
-        let flags =
-            generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--gossipsub.explicit-peering"));
     }
@@ -1524,8 +1634,15 @@ mod tests {
             },
             ..Default::default()
         };
-        let flags =
-            generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--gossipsub.mesh-prioritization"));
     }
@@ -1539,8 +1656,15 @@ mod tests {
             },
             ..Default::default()
         };
-        let flags =
-            generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--gossipsub.load=high"));
     }
@@ -1548,8 +1672,15 @@ mod tests {
     #[test]
     fn generate_node_cli_flags_without_gossipsub_overrides() {
         let node = manifest::Node::default();
-        let flags =
-            generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(!flags_str.contains("--gossipsub.explicit-peering"));
         assert!(!flags_str.contains("--gossipsub.mesh-prioritization"));
@@ -1664,8 +1795,15 @@ mod tests {
     fn generate_node_cli_flags_includes_pruning_distance() {
         let mut node = manifest::Node::default();
         node.cl_config.prune.certificates_distance = 500;
-        let flags =
-            generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--prune.certificates.distance=500"),
@@ -1681,8 +1819,15 @@ mod tests {
     fn generate_node_cli_flags_includes_pruning_before() {
         let mut node = manifest::Node::default();
         node.cl_config.prune.certificates_before = arc_consensus_types::Height::new(100);
-        let flags =
-            generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--prune.certificates.before=100"),
@@ -1704,8 +1849,15 @@ mod tests {
                 node_type,
                 ..Default::default()
             };
-            let flags =
-                generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[]);
+            let flags = generate_node_cli_flags(
+                "validator-1",
+                Some(&node),
+                "172.19.0.5",
+                &[],
+                None,
+                &[],
+                None,
+            );
             let flags_str = flags.join(" ");
             assert!(
                 !flags_str.contains("--prune.certificates.distance"),
@@ -1730,8 +1882,15 @@ mod tests {
     fn generate_node_cli_flags_prune_distance_emitted() {
         let mut node = manifest::Node::default();
         node.cl_config.prune.certificates_distance = 500;
-        let flags =
-            generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--prune.certificates.distance=500"),
@@ -1748,6 +1907,7 @@ mod tests {
             &[],
             Some("arc_consensus:v0.4.0"),
             &[],
+            None,
         );
 
         assert!(flags.is_empty());
@@ -1762,6 +1922,7 @@ mod tests {
             &[],
             Some("arc_consensus:v0.5.0"),
             &[],
+            None,
         );
 
         assert!(!flags.is_empty());
@@ -1778,8 +1939,15 @@ mod tests {
             "http://validator-1_el:8545".to_string(),
             "http://validator-2_el:8545".to_string(),
         ];
-        let flags =
-            generate_node_cli_flags("rpc-1", Some(&node), "172.19.0.5", &[], None, &endpoints);
+        let flags = generate_node_cli_flags(
+            "rpc-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &endpoints,
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--follow"),
@@ -1799,8 +1967,15 @@ mod tests {
     fn generate_node_cli_flags_no_follow_when_not_enabled() {
         let node = manifest::Node::default();
         let endpoints = vec!["http://validator-1_el:8545".to_string()];
-        let flags =
-            generate_node_cli_flags("rpc-1", Some(&node), "172.19.0.5", &[], None, &endpoints);
+        let flags = generate_node_cli_flags(
+            "rpc-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &endpoints,
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(
             !flags_str.contains("--follow"),
@@ -1812,11 +1987,42 @@ mod tests {
     fn generate_node_cli_flags_includes_no_consensus() {
         let mut node = manifest::Node::default();
         node.cl_config.consensus.enabled = false;
-        let flags = generate_node_cli_flags("rpc-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags =
+            generate_node_cli_flags("rpc-1", Some(&node), "172.19.0.5", &[], None, &[], None);
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--no-consensus"),
             "missing --no-consensus: {flags_str}"
+        );
+    }
+
+    #[test]
+    fn generate_node_cli_flags_includes_validator_for_validator_nodes() {
+        let node = manifest::Node {
+            node_type: manifest::NodeType::Validator,
+            ..Default::default()
+        };
+        let flags =
+            generate_node_cli_flags("val-1", Some(&node), "172.19.0.5", &[], None, &[], None);
+        let flags_str = flags.join(" ");
+        assert!(
+            flags_str.contains("--validator"),
+            "missing --validator: {flags_str}"
+        );
+    }
+
+    #[test]
+    fn generate_node_cli_flags_omits_validator_for_non_validator_nodes() {
+        let node = manifest::Node {
+            node_type: manifest::NodeType::NonValidator,
+            ..Default::default()
+        };
+        let flags =
+            generate_node_cli_flags("fn-1", Some(&node), "172.19.0.5", &[], None, &[], None);
+        let flags_str = flags.join(" ");
+        assert!(
+            !flags_str.contains("--validator"),
+            "should not contain --validator: {flags_str}"
         );
     }
 
@@ -1826,7 +2032,8 @@ mod tests {
             cl_prune_preset: Some(manifest::ClPruningPreset::Full),
             ..Default::default()
         };
-        let flags = generate_node_cli_flags("val-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags =
+            generate_node_cli_flags("val-1", Some(&node), "172.19.0.5", &[], None, &[], None);
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--full"),
@@ -1841,8 +2048,15 @@ mod tests {
             ..Default::default()
         };
         node.cl_config.prune.certificates_distance = 500;
-        let flags =
-            generate_node_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[]);
+        let flags = generate_node_cli_flags(
+            "validator-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            None,
+            &[],
+            None,
+        );
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--prune.certificates.distance=500"),

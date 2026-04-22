@@ -19,7 +19,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
 use eyre::eyre;
 
 use malachitebft_core_types::{Context, SignedExtension, SignedProposal, SignedVote};
@@ -42,64 +41,14 @@ pub struct RemoteSigningProvider {
     public_key_cache: Arc<RwLock<Option<PublicKey>>>,
 }
 
-/// Validate a signature using a specific public key (synchronous)
-pub fn validate_signature_with_key(
-    message: &[u8],
-    signature: &[u8],
-    public_key: &[u8],
-) -> Result<VerificationResult, SigningError> {
-    // Ensure public key is 32 bytes
-    if public_key.len() != 32 {
-        return Err(SigningError::from_source(eyre!(
-            "Invalid public key length: expected 32 bytes, got {}",
-            public_key.len()
-        )));
-    }
-
-    // Ensure signature is 64 bytes
-    if signature.len() != 64 {
-        return Err(SigningError::from_source(eyre!(
-            "Invalid signature length: expected 64 bytes, got {}",
-            signature.len()
-        )));
-    }
-
-    // Convert to fixed-size arrays
-    let public_key_bytes: [u8; 32] = public_key.try_into().expect("Checked length above");
-    let signature_bytes: [u8; 64] = signature.try_into().expect("Checked length above");
-
-    // Parse the public key
-    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
-        .map_err(|_| SigningError::from_source(eyre!("Invalid public key")))?;
-
-    // Parse the signature
-    let ed25519_signature = Ed25519Signature::from_bytes(&signature_bytes);
-
-    // Verify the signature
-    let result = verifying_key
-        .verify_strict(message, &ed25519_signature)
-        .inspect_err(|e| {
-            tracing::error!(
-                signature = %hex::encode(signature),
-                public_key = %hex::encode(public_key),
-                "Signature verification failed: {e}"
-            );
-        })
-        .is_ok();
-
-    Ok(VerificationResult::from_bool(result))
-}
-
 /// Convert raw signature bytes to Ed25519 consensus signature
-pub fn bytes_to_signature(signature_bytes: &[u8]) -> Result<ConsensusSignature, SigningError>
-where
-{
+pub fn bytes_to_signature(signature_bytes: &[u8]) -> Result<ConsensusSignature, SigningError> {
     if signature_bytes.len() == 64 {
         let mut sig_array = [0u8; 64];
         sig_array.copy_from_slice(signature_bytes);
         Ok(ConsensusSignature::from_bytes(sig_array))
     } else {
-        Err(SigningError::from_source(eyre::eyre!(
+        Err(SigningError::from_source(eyre!(
             "Invalid signature length: expected 64 bytes, got {}",
             signature_bytes.len()
         )))
@@ -196,10 +145,20 @@ impl SigningProvider<ArcContext> for RemoteSigningProvider {
         signature: &ConsensusSignature,
         public_key: &PublicKey,
     ) -> Result<VerificationResult, SigningError> {
-        let signature_bytes = signature.to_bytes();
-        let public_key_bytes = public_key.as_bytes();
-
-        validate_signature_with_key(bytes, &signature_bytes, public_key_bytes)
+        Ok(VerificationResult::from_bool(
+            public_key
+                .verify(bytes, signature)
+                .inspect_err(|e| {
+                    use base64::Engine;
+                    tracing::error!(
+                        signature =
+                            base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+                        public_key = format!("0x{}", hex::encode(public_key.as_bytes())),
+                        "Signature verification failed: {e}"
+                    );
+                })
+                .is_ok(),
+        ))
     }
 
     async fn sign_vote(&self, vote: Vote) -> Result<SignedVote<ArcContext>, SigningError> {
@@ -258,60 +217,11 @@ impl SigningProvider<ArcContext> for RemoteSigningProvider {
 
 #[cfg(test)]
 mod unit_tests {
+    use arc_consensus_types::signing::PrivateKey;
     use arc_consensus_types::{Address, BlockHash, Height, Round, Value, ValueId};
     use malachitebft_core_types::{NilOrVal, VoteType};
 
     use super::*;
-
-    #[test]
-    fn test_validate_signature_with_key_invalid_public_key_length() {
-        let message = b"test message";
-        let signature = [0u8; 64];
-
-        // Test with public key too short
-        let short_key = [0u8; 31];
-        assert!(validate_signature_with_key(message, &signature, &short_key).is_err());
-
-        // Test with public key too long
-        let long_key = [0u8; 33];
-        assert!(validate_signature_with_key(message, &signature, &long_key).is_err());
-
-        // Test with empty public key
-        let empty_key = [];
-        assert!(validate_signature_with_key(message, &signature, &empty_key).is_err());
-    }
-
-    #[test]
-    fn test_validate_signature_with_key_invalid_signature_length() {
-        let message = b"test message";
-        let public_key = [0u8; 32];
-
-        // Test with signature too short
-        let short_sig = [0u8; 63];
-        assert!(validate_signature_with_key(message, &short_sig, &public_key).is_err());
-
-        // Test with signature too long
-        let long_sig = [0u8; 65];
-        assert!(validate_signature_with_key(message, &long_sig, &public_key).is_err());
-
-        // Test with empty signature
-        let empty_sig = [];
-        assert!(validate_signature_with_key(message, &empty_sig, &public_key).is_err());
-    }
-
-    #[test]
-    fn test_validate_signature_with_key_invalid_public_key_parsing() {
-        let message = b"test message";
-        let signature = [0u8; 64];
-
-        // Test with invalid public key bytes (all 0xFF which might be invalid for Ed25519)
-        let invalid_key = [0xFFu8; 32];
-        // This should return false due to invalid public key parsing
-        let result = validate_signature_with_key(message, &signature, &invalid_key);
-        // Note: This test might pass or fail depending on ed25519-dalek's validation
-        // The important thing is that it doesn't panic
-        let _ = result; // Should not panic
-    }
 
     #[test]
     fn test_bytes_to_signature_valid_length() {
@@ -323,32 +233,20 @@ mod unit_tests {
 
     #[test]
     fn test_bytes_to_signature_invalid_length() {
-        // Test with signature too short
         let short_sig = [1u8; 32];
-        let result = bytes_to_signature(&short_sig);
-        assert!(result.is_err()); // Should return error
+        assert!(bytes_to_signature(&short_sig).is_err());
 
-        // Test with signature too long
         let long_sig = [1u8; 128];
-        let result = bytes_to_signature(&long_sig);
-        assert!(result.is_err()); // Should return error
+        assert!(bytes_to_signature(&long_sig).is_err());
 
-        // Test with empty signature
         let empty_sig = [];
-        let result = bytes_to_signature(&empty_sig);
-        assert!(result.is_err()); // Should return error
+        assert!(bytes_to_signature(&empty_sig).is_err());
     }
 
     #[test]
     fn signing_provider_verify_flows() {
-        use ed25519_dalek::Signer;
-        use ed25519_dalek::SigningKey;
-
-        // Deterministic keypair
-        let secret_bytes = [7u8; 32];
-        let signing_key = SigningKey::from_bytes(&secret_bytes);
-        let verifying_key = signing_key.verifying_key();
-        let public_key_bytes = verifying_key.to_bytes();
+        let private_key = PrivateKey::generate(rand::thread_rng());
+        let public_key = private_key.public_key();
 
         // Vote
         let vote = Vote {
@@ -360,11 +258,8 @@ mod unit_tests {
             extension: None,
         };
         let vote_bytes = vote.to_sign_bytes();
-        let vote_sig = signing_key.sign(&vote_bytes).to_bytes();
-        assert!(
-            validate_signature_with_key(&vote_bytes, &vote_sig, &public_key_bytes)
-                .is_ok_and(|r| r.is_valid())
-        );
+        let vote_sig = private_key.sign(&vote_bytes);
+        assert!(public_key.verify(&vote_bytes, &vote_sig).is_ok());
 
         // Proposal
         let proposal = Proposal {
@@ -375,29 +270,14 @@ mod unit_tests {
             validator_address: Address::new([4u8; 20]),
         };
         let proposal_bytes = proposal.to_sign_bytes();
-        let proposal_sig = signing_key.sign(&proposal_bytes).to_bytes();
-        assert!(
-            validate_signature_with_key(&proposal_bytes, &proposal_sig, &public_key_bytes)
-                .is_ok_and(|r| r.is_valid())
-        );
-
-        // Vote extension
-        // NOTE: Disabled due to vote extensions not being supported in Arc at this time
-        // let ext = MockExtension;
-        // let ext_bytes = serialization::extension_to_bytes::<MockContext>(&ext);
-        // let ext_sig = signing_key.sign(&ext_bytes).to_bytes();
-        // assert!(
-        //     validate_signature_with_key(&ext_bytes, &ext_sig, &public_key_bytes)
-        //         .is_ok_and(|r| r.is_valid())
-        // );
+        let proposal_sig = private_key.sign(&proposal_bytes);
+        assert!(public_key.verify(&proposal_bytes, &proposal_sig).is_ok());
 
         // Negative case: flip a byte in the vote signature
-        let mut bad_sig = vote_sig;
-        bad_sig[0] ^= 0x01;
-        assert!(
-            validate_signature_with_key(&vote_bytes, &bad_sig, &public_key_bytes)
-                .is_ok_and(|r| r.is_invalid())
-        );
+        let mut bad_sig_bytes = vote_sig.to_bytes();
+        bad_sig_bytes[0] ^= 0x01;
+        let bad_sig = ConsensusSignature::from_bytes(bad_sig_bytes);
+        assert!(public_key.verify(&vote_bytes, &bad_sig).is_err());
     }
 }
 
@@ -411,31 +291,6 @@ mod integration_tests {
     use crate::RemoteSigningError;
 
     use super::*;
-
-    /// Validate a signature using the public key from the external service
-    /// This is a test helper method that fetches the public key and validates the signature
-    async fn validate_signature(
-        provider: &RemoteSigningProvider,
-        message: &[u8],
-        signature: &[u8],
-    ) -> Result<bool, RemoteSigningError> {
-        // Get the public key for validation
-        let public_key = provider.public_key().await?;
-
-        // Validate signature is 64 bytes
-        if signature.len() != 64 {
-            return Err(RemoteSigningError::InvalidResponse(format!(
-                "Invalid signature length: expected 64 bytes, got {}",
-                signature.len()
-            )));
-        }
-
-        // Use the synchronous validation method with raw bytes
-        let result = validate_signature_with_key(message, signature, public_key.as_bytes())
-            .is_ok_and(|r| r.is_valid());
-
-        Ok(result)
-    }
 
     async fn create_provider() -> Result<RemoteSigningProvider, RemoteSigningError> {
         let config = RemoteSigningConfig::default();
@@ -534,18 +389,20 @@ mod integration_tests {
     #[tokio::test]
     async fn signature_validation_workflow() {
         let provider = create_provider().await.expect("Failed to create provider");
+        let public_key = provider
+            .public_key()
+            .await
+            .expect("Failed to get public key");
 
         let message = b"test message for validation";
 
-        // Sign the message
-        let signature = provider.client.sign_message(message).await.unwrap();
+        let signature_bytes = provider.client.sign_message(message).await.unwrap();
+        let signature = bytes_to_signature(&signature_bytes).expect("Invalid signature");
 
-        // Validate using the async method
-        let is_valid = validate_signature(&provider, message, &signature)
-            .await
-            .unwrap();
-
-        assert!(is_valid, "Self-signed signature should be valid");
+        assert!(
+            public_key.verify(message.as_slice(), &signature).is_ok(),
+            "Self-signed signature should be valid"
+        );
     }
 
     #[tokio::test]
@@ -614,19 +471,21 @@ mod integration_tests {
             .block_on(async { RemoteSigningProvider::new(config).await })
             .expect("Failed to create provider");
 
+        let public_key = rt
+            .block_on(provider.public_key())
+            .expect("Failed to get public key");
+
         let message = b"test message for validation";
 
-        // Sign the message
-        let signature = rt
+        let signature_bytes = rt
             .block_on(async { provider.client.sign_message(message).await })
             .expect("Failed to sign message");
 
-        // Validate the signature using async method
-        let is_valid = rt
-            .block_on(async { validate_signature(&provider, message, &signature).await })
-            .expect("Failed to validate signature");
-
-        assert!(is_valid, "Self-signed signature should be valid");
+        let signature = bytes_to_signature(&signature_bytes).expect("Invalid signature");
+        assert!(
+            public_key.verify(message.as_slice(), &signature).is_ok(),
+            "Self-signed signature should be valid"
+        );
     }
 
     #[test]
@@ -638,26 +497,23 @@ mod integration_tests {
             .block_on(RemoteSigningProvider::new(config))
             .expect("Failed to create provider");
 
-        // Get the public key
         let public_key = rt
             .block_on(provider.public_key())
             .expect("Failed to get public key");
 
         let message = b"test message";
 
-        // Sign the message
-        let signature = rt
+        let signature_bytes = rt
             .block_on(async { provider.client.sign_message(message).await })
             .expect("Failed to sign message");
 
-        // Validate signature is 64 bytes
-        assert_eq!(signature.len(), 64, "Signature should be 64 bytes");
+        assert_eq!(signature_bytes.len(), 64, "Signature should be 64 bytes");
 
-        // Validate using the synchronous method (with raw bytes)
-        let is_valid = validate_signature_with_key(message, &signature, public_key.as_bytes())
-            .is_ok_and(|r| r.is_valid());
-
-        assert!(is_valid, "Signature validation should succeed");
+        let signature = bytes_to_signature(&signature_bytes).expect("Invalid signature");
+        assert!(
+            public_key.verify(message.as_slice(), &signature).is_ok(),
+            "Signature validation should succeed"
+        );
     }
 
     #[test]

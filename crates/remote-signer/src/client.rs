@@ -181,13 +181,17 @@ impl RemoteSignerClient {
             (client, result)
         };
 
-        let mut attempt = 0;
+        let mut attempt = 0u32;
 
         let (_client, result) = task
             .retry(config.retry_config)
             .context(grpc_client)
             .notify(|error, backoff| {
-                attempt += 1;
+                // Bounded by config.retry_config.max_retries
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    attempt += 1;
+                }
                 metrics.inc_sign_request_retries();
 
                 warn!(

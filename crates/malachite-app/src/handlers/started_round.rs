@@ -14,21 +14,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use eyre::{eyre, Context};
+use eyre::Context;
 use tracing::{error, info, warn};
 
 use malachitebft_app_channel::app::consensus::Role;
 use malachitebft_app_channel::app::types::ProposedValue;
 use malachitebft_app_channel::Reply;
 
-use arc_consensus_types::{Address, ArcContext, Height, ProposalParts, Round, Validator};
+use arc_consensus_types::proposer::ProposerSelector;
+use arc_consensus_types::{Address, ArcContext, Height, ProposalParts, Round, ValidatorSet};
 use arc_eth_engine::engine::Engine;
 use arc_signer::ArcSigningProvider;
 
 use crate::block::ConsensusBlock;
 use crate::metrics::AppMetrics;
 use crate::payload::{validate_consensus_block, EnginePayloadValidator};
-use crate::proposal_parts::{assemble_block_from_parts, validate_proposal_parts};
+use crate::proposal_parts::{
+    assemble_block_from_parts, resolve_expected_proposer, validate_proposal_parts,
+};
 use crate::state::State;
 use crate::store::Store;
 use arc_consensus_db::invalid_payloads::InvalidPayload;
@@ -95,20 +98,11 @@ async fn on_started_round(
     state.current_round = round;
     state.current_proposer = Some(proposer);
 
-    let proposer = state
-        .validator_set()
-        .get_by_address(&proposer)
-        .ok_or_else(|| {
-            eyre!(
-                "Current proposer not found in validator set for height {height}, \
-                 cannot process pending proposal parts"
-            )
-        })?;
-
     fetch_and_process_pending_proposals(
         height,
         round,
-        proposer,
+        state.validator_set(),
+        &state.ctx.proposer_selector,
         state.store(),
         engine,
         state.signing_provider(),
@@ -121,7 +115,8 @@ async fn on_started_round(
 async fn fetch_and_process_pending_proposals(
     height: Height,
     round: Round,
-    proposer: &Validator,
+    validator_set: &ValidatorSet,
+    proposer_selector: &dyn ProposerSelector,
     store: &Store,
     engine: &Engine,
     signing_provider: &ArcSigningProvider,
@@ -141,7 +136,8 @@ async fn fetch_and_process_pending_proposals(
         pending_parts,
         height,
         round,
-        proposer,
+        validator_set,
+        proposer_selector,
         signing_provider,
     )
     .await
@@ -159,12 +155,14 @@ async fn fetch_and_process_pending_proposals(
 ///
 /// ## Important
 /// This function assumes that the pending parts are for the current height and round.
+#[allow(clippy::too_many_arguments)]
 async fn process_pending_proposal_parts(
     store: &Store,
     pending_parts: Vec<ProposalParts>,
     current_height: Height,
     current_round: Round,
-    current_proposer: &Validator,
+    validator_set: &ValidatorSet,
+    proposer_selector: &dyn ProposerSelector,
     signing_provider: &ArcSigningProvider,
 ) -> eyre::Result<()> {
     for parts in pending_parts {
@@ -173,9 +171,9 @@ async fn process_pending_proposal_parts(
         debug_assert_eq!(height, current_height, "Pending parts height mismatch");
         debug_assert_eq!(round, current_round, "Pending parts round mismatch");
 
-        // Validate the proposal parts, ensuring they are from the expected proposer
-        // for their height/round, and have a valid signature.
-        if !validate_proposal_parts(&parts, current_proposer, signing_provider).await {
+        let expected_proposer = resolve_expected_proposer(proposer_selector, validator_set, &parts);
+
+        if !validate_proposal_parts(&parts, expected_proposer, signing_provider).await {
             continue;
         }
 

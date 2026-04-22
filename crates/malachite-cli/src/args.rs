@@ -53,13 +53,18 @@ pub struct Args {
     #[arg(long, global = true, value_name = "HOME_DIR")]
     pub home: Option<PathBuf>,
 
-    /// Log level (default: `malachite=debug`)
-    #[arg(long, global = true, value_name = "LOG_LEVEL")]
-    pub log_level: Option<LogLevel>,
+    /// Log level
+    #[arg(long, global = true, value_name = "LOG_LEVEL", default_value = "info")]
+    pub log_level: LogLevel,
 
-    /// Log format (default: `plaintext`)
-    #[arg(long, global = true, value_name = "LOG_FORMAT")]
-    pub log_format: Option<LogFormat>,
+    /// Log format
+    #[arg(
+        long,
+        global = true,
+        value_name = "LOG_FORMAT",
+        default_value = "plaintext"
+    )]
+    pub log_format: LogFormat,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -129,11 +134,6 @@ impl Args {
     /// get_db_path returns the database file path based on the home folder.
     pub fn get_db_path(&self) -> Result<PathBuf, Error> {
         Ok(self.get_home_dir()?.join("store.db"))
-    }
-
-    /// get_log_level_or_default returns the log level from the command-line or the default value.
-    pub fn get_log_level_or_default(&self) -> LogLevel {
-        self.log_level.unwrap_or_default()
     }
 
     /// get_priv_validator_key_file_path returns the private validator key file path based on the

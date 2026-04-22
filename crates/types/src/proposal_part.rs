@@ -110,6 +110,7 @@ impl ProposalInit {
     }
 
     /// Approximate in-memory size, not wire size.
+    #[allow(clippy::arithmetic_side_effects)] // sum of fixed-size fields, cannot overflow
     pub fn size_bytes(&self) -> usize {
         std::mem::size_of_val(&self.height)
             + std::mem::size_of_val(&self.round)

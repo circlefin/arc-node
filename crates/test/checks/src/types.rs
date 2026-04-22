@@ -36,11 +36,21 @@ pub struct CheckResult {
     pub message: String,
 }
 
+/// How to label performance report output (cumulative vs observation window).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PerfReportKind {
+    /// Histograms are cumulative since each node's process start.
+    CumulativeSinceStart,
+    /// Histograms are deltas between two scrapes (observation window).
+    Interval { observation_secs: u64 },
+}
+
 /// Statistics extracted from a Prometheus histogram.
 ///
 /// Percentiles are estimated via linear interpolation between bucket
 /// boundaries (same algorithm as Prometheus `histogram_quantile()`).
-/// Values are cumulative since process start, not windowed.
+/// For cumulative parses, values cover process lifetime; for interval
+/// deltas, they cover only the window between two scrapes.
 #[derive(Debug, Clone, Default)]
 pub struct HistogramStats {
     pub count: u64,

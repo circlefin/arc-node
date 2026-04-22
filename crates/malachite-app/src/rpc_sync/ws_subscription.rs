@@ -109,10 +109,14 @@ async fn run_ws_subscription(
             update_tx,
         })
         .notify(|error, delay| {
-            retry_attempts += 1;
+            // Unbounded retries, but at ~60s backoff, overflow takes ~10^10 years
+            #[allow(clippy::arithmetic_side_effects)]
+            {
+                retry_attempts += 1;
+            }
 
             warn!(
-                %ws_url, %error, attempt = retry_attempts,
+                %ws_url, error = format!("{error:#}"), attempt = retry_attempts,
                 "WebSocket connection failed, retrying in {delay:?}"
             );
         });
@@ -124,7 +128,7 @@ async fn run_ws_subscription(
         }
         Some((_, Err(error))) => {
             // The task failed with an error that was not retried (should not happen since we have no max attempts)
-            error!(%ws_url, %error, "WebSocket subscription failed with unrecoverable error");
+            error!(%ws_url, error = format!("{error:#}"), "WebSocket subscription failed with unrecoverable error");
         }
         None => {
             // The WebSocket subscription task was cancelled

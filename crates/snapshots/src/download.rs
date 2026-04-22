@@ -177,6 +177,7 @@ impl DownloadProgress {
         }
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // f64 division and index bounded by BYTE_UNITS.len()
     fn format_size(size: u64) -> String {
         let mut size = size as f64;
         let mut unit_index = 0;
@@ -187,6 +188,7 @@ impl DownloadProgress {
         format!("{:.2} {}", size, BYTE_UNITS[unit_index])
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // divisors are non-zero constants
     fn format_duration(duration: Duration) -> String {
         let secs = duration.as_secs();
         if secs < 60 {
@@ -198,8 +200,9 @@ impl DownloadProgress {
         }
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // progress display math, total_size > 0 guarded
     fn update(&mut self, chunk_size: u64) -> Result<()> {
-        self.downloaded += chunk_size;
+        self.downloaded = self.downloaded.saturating_add(chunk_size);
         if self.total_size == 0 {
             return Ok(());
         }

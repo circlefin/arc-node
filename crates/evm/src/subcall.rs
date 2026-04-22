@@ -34,7 +34,7 @@ pub struct SubcallContinuation {
     pub(crate) precompile: Arc<dyn SubcallPrecompile>,
     /// The original call's gas limit (budget allocated by the parent frame).
     pub(crate) gas_limit: u64,
-    /// Gas consumed by `init_subcall` (ABI decoding, validation).
+    /// Gas consumed by `init_subcall` (ABI decoding, validation, and EIP-2929 account access).
     pub(crate) init_subcall_gas_overhead: u64,
     /// The original call's return memory offset.
     pub(crate) return_memory_offset: std::ops::Range<usize>,

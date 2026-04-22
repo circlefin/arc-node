@@ -64,14 +64,10 @@ fn main() -> Result<()> {
     // Load command-line arguments and possible configuration file.
     let args = Args::new();
 
-    // Override logging configuration (if exists) with optional command-line parameters.
-    let mut logging = config::LoggingConfig::default();
-    if let Some(log_level) = args.log_level {
-        logging.log_level = log_level;
-    }
-    if let Some(log_format) = args.log_format {
-        logging.log_format = log_format;
-    }
+    let logging = config::LoggingConfig {
+        log_level: args.log_level,
+        log_format: args.log_format,
+    };
 
     // This is a drop guard responsible for flushing any remaining logs when the program terminates.
     // It must be assigned to a binding that is not _, as _ will result in the guard being dropped immediately.
@@ -234,6 +230,7 @@ fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<
         pprof_bind_address: Some(cmd.pprof_addr.parse()?),
         suggested_fee_recipient: cmd.suggested_fee_recipient,
         skip_db_upgrade: cmd.skip_db_upgrade,
+        validator: cmd.validator,
         rpc_sync_enabled: cmd.follow,
         rpc_sync_endpoints: cmd.follow_endpoints.clone(),
     };
@@ -286,7 +283,18 @@ fn db_migrate(args: &Args, cmd: &MigrateCmd) -> Result<()> {
     }
 
     if cmd.dry_run {
-        info!("Dry-run mode: would perform migration but not committing");
+        let stats = coordinator
+            .preview_migrate()
+            .map_err(|e| eyre!("Dry-run migration scan failed: {e}"))?;
+
+        info!(
+            tables = stats.tables_migrated,
+            scanned = stats.records_scanned,
+            would_upgrade = stats.records_upgraded,
+            skipped = stats.records_skipped,
+            duration = ?stats.duration,
+            "Dry-run mode: migration scan complete (no changes committed)"
+        );
         return Ok(());
     }
 

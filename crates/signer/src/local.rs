@@ -59,9 +59,11 @@ impl LocalSigningProvider {
             .inner()
             .verify(signature.inner(), data)
             .inspect_err(|e| {
+                use base64::Engine;
                 tracing::error!(
-                    signature = %hex::encode(signature.to_bytes()),
-                    public_key = %hex::encode(public_key.as_bytes()),
+                    signature =
+                        base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+                    public_key = format!("0x{}", hex::encode(public_key.as_bytes())),
                     "Signature verification failed: {e}"
                 );
             })

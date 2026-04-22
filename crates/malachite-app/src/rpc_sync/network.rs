@@ -337,7 +337,11 @@ fn on_outgoing_request(
     );
 
     let request_id = OutboundRequestId::new(state.next_request_id);
-    state.next_request_id += 1;
+    // Request IDs are sequential and won't reach u64::MAX in practice
+    #[allow(clippy::arithmetic_side_effects)]
+    {
+        state.next_request_id += 1;
+    }
 
     // Send request ID back immediately
     if let Err(e) = reply.send(request_id.clone()) {
@@ -395,7 +399,7 @@ fn on_outgoing_request(
                 output_port.send(event);
             }
             Err(e) => {
-                warn!(%request_id, error = %e, "Fetch failed");
+                warn!(%request_id, error = format!("{e:#}"), "Fetch failed");
                 let event = NetworkEvent::SyncResponse(request_id, peer_id, None);
                 output_port.send(event);
             }

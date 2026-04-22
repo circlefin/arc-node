@@ -190,7 +190,7 @@ impl State {
             validator_set: ValidatorSet::default(), // initially empty, will be updated from reth
             store,
             stream_nonce: 0,
-            streams_map: PartStreamsMap::new(initial_height),
+            streams_map: PartStreamsMap::new(initial_height, 0),
             config,
             env_config,
             stats: Stats::default(),
@@ -269,6 +269,7 @@ impl State {
     /// Sets the current validator set and updates metrics
     pub fn set_validator_set(&mut self, val_set: ValidatorSet) {
         self.metrics.update_validator_set(&val_set);
+        self.streams_map.set_num_validators(val_set.len());
         self.validator_set = val_set;
     }
 
@@ -378,7 +379,12 @@ impl State {
     /// Defined to be equal to the size of the consensus input buffer,
     /// which is itself sized to handle all in-flight sync responses.
     pub fn max_pending_proposals(&self) -> usize {
-        let limit = self.config.value_sync.parallel_requests * self.config.value_sync.batch_size;
+        let limit = self
+            .config
+            .value_sync
+            .parallel_requests
+            .checked_mul(self.config.value_sync.batch_size)
+            .expect("max_pending_proposals overflow");
         assert!(limit > 0, "max_pending_proposals must be greater than 0");
         limit
     }
@@ -406,7 +412,10 @@ impl State {
             height: self.current_height,
             round: self.current_round,
             address: self.address(),
+            public_key: *self.identity.public_key(),
             proposer: self.current_proposer,
+            // elapsed() is always <= time since epoch, so this won't underflow
+            #[allow(clippy::arithmetic_side_effects)]
             height_start_time: SystemTime::now() - self.stats.height_started().elapsed(),
             prev_payload_hash: self.previous_block.map(|b| b.block_hash),
             db_latest_height: self
@@ -424,6 +433,7 @@ impl State {
             undecided_blocks_count,
             pending_proposal_parts,
             validator_set: self.validator_set().to_owned(),
+            sync_state: self.sync_state,
         })
     }
 
@@ -467,7 +477,11 @@ impl State {
 
     pub fn next_stream_id(&mut self) -> StreamId {
         let nonce = self.stream_nonce;
-        self.stream_nonce += 1;
+        // Stream nonce is reset each height; cannot realistically reach u32::MAX
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            self.stream_nonce += 1;
+        }
         streaming::new_stream_id(self.current_height, self.current_round, nonce)
     }
 

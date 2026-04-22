@@ -292,7 +292,9 @@ where
             );
         }
 
-        let base_fee_config = self.chain_spec.base_fee_config(block_number + 1);
+        let base_fee_config = self
+            .chain_spec
+            .base_fee_config(block_number.checked_add(1).expect("block number overflow"));
         let calc = base_fee_config.resolve_calc_params(fee_params.as_ref());
 
         let parent_block_number = block_number.saturating_sub(1);
@@ -429,7 +431,12 @@ where
 
         // The sum of the transaction's gas limit, Tg, and the gas utilized in this block prior,
         // must be no greater than the block's gasLimit.
-        let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
+        let block_available_gas = self
+            .evm
+            .block()
+            .gas_limit()
+            .checked_sub(self.gas_used)
+            .expect("gas_used must not exceed block gas_limit");
 
         if tx.tx().gas_limit() > block_available_gas {
             return Err(
@@ -467,7 +474,10 @@ where
         let gas_used = result.gas_used();
 
         // append gas used
-        self.gas_used += gas_used;
+        self.gas_used = self
+            .gas_used
+            .checked_add(gas_used)
+            .expect("cumulative gas overflow");
 
         // Cancun is always active for arc
         self.blob_gas_used = self.blob_gas_used.saturating_add(blob_gas_used);
@@ -681,8 +691,8 @@ mod tests {
             .expect("Should be able to query reward beneficiary")
     }
 
-    /// Patch ProtocolConfig storage so rewardBeneficiary() returns 0x00.
-    fn set_beneficiary_to_zero_address(db: &mut InMemoryDB) {
+    /// Patch ProtocolConfig storage so rewardBeneficiary() returns the given address.
+    fn set_reward_beneficiary(db: &mut InMemoryDB, beneficiary: Address) {
         // ProtocolConfig ERC-7201 base slot from the contract (see ProtocolConfig.sol).
         const PROTOCOL_CONFIG_STORAGE_LOCATION_HEX: &str =
             "668f09ce856848ead6cb1ddee963f15ef833cea8958030868f867aec84385200";
@@ -693,9 +703,14 @@ mod tests {
         db.insert_account_storage(
             protocol_config::PROTOCOL_CONFIG_ADDRESS,
             reward_beneficiary_slot,
-            StorageValue::from(0u64),
+            StorageValue::from(U256::from_be_slice(beneficiary.as_slice())),
         )
         .expect("Insert storage");
+    }
+
+    /// Patch ProtocolConfig storage so rewardBeneficiary() returns 0x00.
+    fn set_beneficiary_to_zero_address(db: &mut InMemoryDB) {
+        set_reward_beneficiary(db, Address::ZERO);
     }
 
     fn mark_address_as_blocklisted(db: &mut InMemoryDB, beneficiary: Address) {
@@ -1116,9 +1131,13 @@ mod tests {
         let mut db = InMemoryDB::default();
         insert_alloc_into_db(&mut db, chain_spec.genesis());
 
+        // Set a non-zero expected beneficiary so the mismatch check is active.
+        let expected_beneficiary = address!("0000000000000000000000000000000000001234");
+        set_reward_beneficiary(&mut db, expected_beneficiary);
+
         let evm_config = create_evm_config(chain_spec.clone());
 
-        // Use a wrong beneficiary address
+        // Use a wrong beneficiary address (different from expected_beneficiary above)
         let wrong_beneficiary = address!("0000000000000000000000000000000000000bad");
 
         let mut block_env = get_mock_block_env();
@@ -1444,13 +1463,11 @@ mod tests {
         let mut db = InMemoryDB::default();
         insert_alloc_into_db(&mut db, chain_spec.genesis());
 
+        // Set a non-zero expected beneficiary so the mismatch check is active, then blocklist it.
+        let expected_beneficiary = address!("0000000000000000000000000000000000001234");
+        set_reward_beneficiary(&mut db, expected_beneficiary);
+
         let block_number = 10;
-        let expected_beneficiary =
-            query_expected_beneficiary(chain_spec.clone(), &mut db, block_number);
-        assert!(
-            !expected_beneficiary.is_zero(),
-            "LOCAL_DEV rewardBeneficiary should be non-zero for this test"
-        );
 
         mark_address_as_blocklisted(&mut db, expected_beneficiary);
 

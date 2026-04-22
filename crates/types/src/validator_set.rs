@@ -103,7 +103,10 @@ impl ValidatorSet {
 
     /// The total voting power of the validator set
     pub fn total_voting_power(&self) -> VotingPower {
-        self.validators.iter().map(|v| v.voting_power).sum()
+        self.validators
+            .iter()
+            .try_fold(0u64, |acc, v| acc.checked_add(v.voting_power))
+            .expect("total voting power overflow")
     }
 
     /// Get a validator by its index
@@ -180,5 +183,20 @@ mod tests {
 
         let vs = ValidatorSet::new(vec![v1, v2, v3]);
         assert_eq!(vs.total_voting_power(), 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "total voting power overflow")]
+    fn total_voting_power_overflow_panics() {
+        let mut rng = StdRng::seed_from_u64(0x42);
+
+        let sk1 = PrivateKey::generate(&mut rng);
+        let sk2 = PrivateKey::generate(&mut rng);
+
+        let v1 = Validator::new(sk1.public_key(), u64::MAX);
+        let v2 = Validator::new(sk2.public_key(), 1);
+
+        let vs = ValidatorSet::new(vec![v1, v2]);
+        let _ = vs.total_voting_power();
     }
 }

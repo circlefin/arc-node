@@ -1,5 +1,6 @@
 {
   "timestamp": "1757515087",
+  "coinbase": "0xa693CC18Aa09d33dD388013B7A02E5Ff863b8760",
   "NativeFiatToken": {
     "proxy": {
       "admin": "0x49f78af090F1f98e7184B7f61f1F1a8a8064b40d"

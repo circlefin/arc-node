@@ -34,7 +34,8 @@ impl PoolTransactionError for ArcTransactionValidatorError {
         match self {
             Self::BlocklistedError => true,
             Self::InvalidTxError => true,
-            Self::DenylistedAddressError(_) => true,
+            // Node-local policy — peers can't know our denylist config
+            Self::DenylistedAddressError(_) => false,
         }
     }
 
@@ -66,11 +67,11 @@ mod tests {
     }
 
     #[test]
-    fn denylisted_address_variant_is_bad_transaction() {
+    fn denylisted_address_variant_is_not_bad_transaction() {
         let err = ArcTransactionValidatorError::DenylistedAddressError(Address::ZERO);
         assert!(
-            err.is_bad_transaction(),
-            "DenylistedAddressError must be classified as bad transaction"
+            !err.is_bad_transaction(),
+            "DenylistedAddressError must not be classified as bad transaction"
         );
     }
 }

@@ -63,7 +63,7 @@ pub const ERR_SELFDESTRUCTED_BALANCE_INCREASED: &str =
 /// - ABI-encoded string value of the error message.
 pub fn revert_message_to_bytes(msg: &str) -> Bytes {
     let encoded = msg.abi_encode();
-    let mut result = Vec::with_capacity(4 + encoded.len());
+    let mut result = Vec::with_capacity(REVERT_SELECTOR.len().saturating_add(encoded.len()));
     result.extend_from_slice(&REVERT_SELECTOR);
     result.extend_from_slice(&encoded);
     Bytes::from(result)
@@ -240,13 +240,21 @@ pub(crate) fn write(
             if vals.is_original_zero() {
                 20000 // SSTORE_SET
             } else {
-                5000 - revm_interpreter::gas::COLD_SLOAD_COST // WARM_SSTORE_RESET
+                // WARM_SSTORE_RESET: 5000 - COLD_SLOAD_COST (2,100) = 2,900
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    5000 - revm_interpreter::gas::COLD_SLOAD_COST
+                }
             }
         } else {
             revm_interpreter::gas::WARM_STORAGE_READ_COST
         };
         if sstore_result.is_cold {
-            base_cost + revm_interpreter::gas::COLD_SLOAD_COST
+            // base_cost <= 20,000; + COLD_SLOAD_COST (2,100) fits in u64
+            #[allow(clippy::arithmetic_side_effects)]
+            {
+                base_cost + revm_interpreter::gas::COLD_SLOAD_COST
+            }
         } else {
             base_cost
         }
@@ -467,12 +475,12 @@ pub(crate) fn emit_event<Event: SolEvent>(
 ) -> Result<(), PrecompileErrorOrRevert> {
     let data = event.encode_log_data();
 
-    record_cost_or_out_of_gas(
-        gas_counter,
-        LOG_BASE_COST
-            + LOG_TOPIC_COST * data.topics().len() as u64
-            + LOG_DATA_COST * data.data.len() as u64,
-    )?;
+    let topic_gas = LOG_TOPIC_COST.saturating_mul(data.topics().len() as u64);
+    let data_gas = LOG_DATA_COST.saturating_mul(data.data.len() as u64);
+    let log_gas = LOG_BASE_COST
+        .saturating_add(topic_gas)
+        .saturating_add(data_gas);
+    record_cost_or_out_of_gas(gas_counter, log_gas)?;
 
     let log = revm::primitives::Log { address, data };
 

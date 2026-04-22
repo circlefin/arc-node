@@ -14,6 +14,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(
+    test,
+    allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)
+)]
+
 //! Arc EVM configuration, executor, and handler.
 //!
 //! This crate contains the EVM customization for Arc Network: block assembler,

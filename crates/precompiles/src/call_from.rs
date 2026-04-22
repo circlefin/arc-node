@@ -100,9 +100,15 @@ fn decode_child_call(inputs: &CallInputs) -> Result<(CallInputs, u64), SubcallEr
     let overhead = abi_decode_gas(calldata.len());
 
     // EIP-150: deduct init_subcall overhead, then forward 63/64ths to child.
+    // Note: the EVM layer (`ArcEvm::init_subcall`) recalculates child_gas_limit to
+    // include EIP-2929 account access costs. This calculation serves as a fast-fail
+    // OOG check for the ABI decode overhead alone.
     let available = inputs.gas_limit.checked_sub(overhead).ok_or_else(|| {
         SubcallError::InsufficientGas("gas limit below ABI decode overhead".into())
     })?;
+    // EIP-150: forward 63/64ths of available gas to child.
+    // available / 64 <= available, so the subtraction cannot underflow.
+    #[allow(clippy::arithmetic_side_effects)]
     let child_gas_limit = available - (available / 64);
 
     let child_inputs = CallInputs {

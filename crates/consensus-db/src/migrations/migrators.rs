@@ -71,6 +71,7 @@ impl Migrator for CommitCertificateMigrator0To1 {
         // Unconditionally prepend version byte. Otherwise, we might have some
         // false positives when going from unversioned to versioned
         // data.
+        #[allow(clippy::arithmetic_side_effects)] // 1 + slice.len() cannot overflow usize
         let mut result = Vec::with_capacity(1 + old_bytes.len());
         result.push(self.target_version().as_u8());
         result.extend_from_slice(old_bytes);
@@ -107,6 +108,7 @@ impl Migrator for ExecutionPayloadMigrator0To3 {
         // Unconditionally prepend version byte. Otherwise, we might have some
         // false positives when going from unversioned to versioned
         // data.
+        #[allow(clippy::arithmetic_side_effects)] // 1 + slice.len() cannot overflow usize
         let mut result = Vec::with_capacity(1 + old_bytes.len());
         result.push(self.target_version().as_u8());
         result.extend_from_slice(old_bytes);
@@ -142,6 +144,7 @@ impl Migrator for ConsensusBlockMigrator0To1 {
         // Unconditionally prepend version byte. Otherwise, we might have some
         // false positives when going from unversioned to versioned
         // data.
+        #[allow(clippy::arithmetic_side_effects)] // 1 + slice.len() cannot overflow usize
         let mut result = Vec::with_capacity(1 + old_bytes.len());
         result.push(self.target_version().as_u8());
         result.extend_from_slice(old_bytes);
@@ -177,6 +180,7 @@ impl Migrator for ProposalPartsMigrator0To1 {
         // Unconditionally prepend version byte. Otherwise, we might have some
         // false positives when going from unversioned to versioned
         // data.
+        #[allow(clippy::arithmetic_side_effects)] // 1 + slice.len() cannot overflow usize
         let mut result = Vec::with_capacity(1 + old_bytes.len());
         result.push(self.target_version().as_u8());
         result.extend_from_slice(old_bytes);

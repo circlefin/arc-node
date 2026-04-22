@@ -17,7 +17,13 @@
 import { expect } from 'chai'
 import hre from 'hardhat'
 import { getChain } from '../../scripts/hardhat/viem-helper'
-import { ProtocolConfig, loadGenesisConfig, type FeeParams, type ConsensusParams } from '../helpers'
+import {
+  ProtocolConfig,
+  LOCALDEV_FEE_RECIPIENT,
+  loadGenesisConfig,
+  type FeeParams,
+  type ConsensusParams,
+} from '../helpers'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { Address, decodeFunctionResult, encodeFunctionData, parseAbi, zeroAddress } from 'viem'
 import { multicall3Address } from '../../scripts/genesis'
@@ -62,11 +68,14 @@ describe('ProtocolConfig simulation', () => {
   })
 
   describe('ProtocolConfig Network Parameter Validation', () => {
-    it('should verify network block miner matches ProtocolConfig beneficiary', async () => {
+    it('should use LOCALDEV_FEE_RECIPIENT as block miner when rewardBeneficiary is zero', async () => {
       const { client, randomWallet, protocolConfig } = await clients()
-      const beneficiary = await protocolConfig.read.rewardBeneficiary()
+      const protocolConfigBeneficiary = await protocolConfig.read.rewardBeneficiary()
+      expect(protocolConfigBeneficiary).to.addressEqual(
+        zeroAddress,
+        'rewardBeneficiary should be zero address in localdev genesis',
+      )
       const controller = await protocolConfig.read.controller()
-
       // Simulate transactions without changing state
       const result = await client.simulateBlocks({
         blocks: [
@@ -105,8 +114,8 @@ describe('ProtocolConfig simulation', () => {
 
       expect(block.miner).to.not.be.undefined
       expect(block.miner).to.addressEqual(
-        beneficiary,
-        `Simulated block miner (${block.miner}) should use original beneficiary (${beneficiary})`,
+        LOCALDEV_FEE_RECIPIENT,
+        `Simulated block miner (${block.miner}) should use LOCALDEV_FEE_RECIPIENT`,
       )
 
       // verify the beneficiary read call returns the updated value

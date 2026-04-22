@@ -20,6 +20,7 @@ import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
 import { PublicClient, WalletClient } from '@nomicfoundation/hardhat-viem/types'
 import {
   balancesSnapshot,
+  LOCALDEV_FEE_RECIPIENT,
   ReceiptVerifier,
   expectAddressEq,
   ProtocolConfig,
@@ -229,15 +230,11 @@ describe('ProtocolConfig Smoke Tests', function () {
   })
 
   describe('Core Integration', function () {
-    it('should use ProtocolConfig beneficiary as block miner', async function () {
-      // Get current beneficiary from contract
-      const protocolConfig = ProtocolConfig.attach(publicClient)
-      const contractBeneficiary = await protocolConfig.read.rewardBeneficiary()
+    it('should use LOCALDEV_FEE_RECIPIENT as block miner', async function () {
+      // The mock CL propagates LOCALDEV_FEE_RECIPIENT as block.miner
+      const { block } = await sendTransactionAndGetBlock(parseEther('0.01'), 1000000000000n, 100000000n)
 
-      // Send transaction and verify miner and balances match contract beneficiary
-      await sendTransactionAndVerifyBalances({
-        beneficiary: contractBeneficiary,
-      })
+      expectAddressEq(block.miner, LOCALDEV_FEE_RECIPIENT, 'Block miner should be LOCALDEV_FEE_RECIPIENT')
     })
 
     it('should reflect beneficiary changes in block mining', async function () {

@@ -23,6 +23,7 @@ integration-remote-signer = ["integration", "arc-remote-signer/integration-remot
 arc-consensus-types = { workspace = true }
 arc-remote-signer = { workspace = true, optional = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 hex = { workspace = true }
 malachitebft-signing-ed25519 = { workspace = true, optional = true }

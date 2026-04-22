@@ -21,10 +21,10 @@ use reth_network_peers::TrustedPeer;
 
 use arc_shared::chain_ids::{LOCALDEV_CHAIN_ID, TESTNET_CHAIN_ID};
 
-/// Returns the RPC URL for the given chain ID.
-pub fn url_for_chain_id(chain_id: u64) -> Result<String> {
+/// Returns the WebSocket URL for the given chain ID.
+pub fn ws_url_for_chain_id(chain_id: u64) -> Result<String> {
     let url = match chain_id {
-        TESTNET_CHAIN_ID => "https://rpc.quicknode.testnet.arc.network/",
+        TESTNET_CHAIN_ID => "wss://rpc.quicknode.testnet.arc.network",
         LOCALDEV_CHAIN_ID => "ws://localhost:8546",
         _ => return Err(eyre!("Unsupported chain for follow mode: {}", chain_id)),
     };
@@ -50,26 +50,26 @@ mod tests {
     use arc_shared::chain_ids::DEVNET_CHAIN_ID;
 
     #[test]
-    fn test_url_for_chain_id_localdev() {
-        let url = url_for_chain_id(LOCALDEV_CHAIN_ID).unwrap();
+    fn test_ws_url_for_chain_id_localdev() {
+        let url = ws_url_for_chain_id(LOCALDEV_CHAIN_ID).unwrap();
         assert_eq!(url, "ws://localhost:8546");
     }
 
     #[test]
-    fn test_url_for_chain_id_devnet() {
-        let result = url_for_chain_id(DEVNET_CHAIN_ID);
+    fn test_ws_url_for_chain_id_devnet() {
+        let result = ws_url_for_chain_id(DEVNET_CHAIN_ID);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_url_for_chain_id_testnet() {
-        let url = url_for_chain_id(TESTNET_CHAIN_ID).unwrap();
-        assert_eq!(url, "https://rpc.quicknode.testnet.arc.network/");
+    fn test_ws_url_for_chain_id_testnet() {
+        let url = ws_url_for_chain_id(TESTNET_CHAIN_ID).unwrap();
+        assert_eq!(url, "wss://rpc.quicknode.testnet.arc.network");
     }
 
     #[test]
-    fn test_url_for_chain_id_unsupported() {
-        let result = url_for_chain_id(999);
+    fn test_ws_url_for_chain_id_unsupported() {
+        let result = ws_url_for_chain_id(999);
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),

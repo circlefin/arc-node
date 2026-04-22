@@ -119,8 +119,19 @@ pub struct StartCmd {
     /// When set, the node only runs the synchronization protocol
     /// and does not subscribe to consensus-related gossip topics.
     /// Use for sync-only full nodes.
-    #[clap(long)]
+    #[clap(long, conflicts_with = "validator")]
     pub no_consensus: bool,
+
+    /// Run as a validator node.
+    ///
+    /// When set, the node loads its consensus signing key,
+    /// signs a validator proof (ADR-006), and advertises a
+    /// validator identity on the P2P network.
+    ///
+    /// Without this flag the node runs as a full node: it
+    /// participates in gossip but does not sign votes or proposals.
+    #[clap(long, conflicts_with_all = ["no_consensus", "follow"])]
+    pub validator: bool,
 
     // ===== Value Sync =====
     /// Enable value sync
@@ -331,8 +342,15 @@ pub struct StartCmd {
     ///
     /// If not provided, local signing will be used (default behavior).
     ///
+    /// Only meaningful together with `--validator`; for full and sync-only nodes
+    /// no consensus signing occurs.
+    ///
     /// Example: http://validator-signer-proxy:10340
-    #[clap(long = "signing.remote", value_name = "ENDPOINT")]
+    #[clap(
+        long = "signing.remote",
+        value_name = "ENDPOINT",
+        requires = "validator"
+    )]
     pub signing_remote: Option<String>,
 
     /// Path to TLS certificate for remote signing
@@ -351,12 +369,15 @@ pub struct StartCmd {
     /// In RPC sync mode, the node fetches blocks from trusted RPC endpoints
     /// instead of participating in consensus. This is useful for running
     /// read-only nodes that sync from validators.
-    #[clap(long = "follow", requires = "follow_endpoints")]
+    ///
+    /// When no --follow.endpoint is provided, a default endpoint is resolved
+    /// from the chain ID at startup.
+    #[clap(long = "follow")]
     pub follow: bool,
 
     /// RPC endpoint to fetch blocks from in RPC sync mode.
     /// This flag can be repeated.
-    /// Required when --follow is set.
+    /// Optional when --follow is set; defaults are resolved from the chain ID.
     ///
     /// Format:
     /// <http_url>[,<ws_protocol>=<port_or_host_or_host:port>]
@@ -394,6 +415,7 @@ impl Default for StartCmd {
             discovery_num_outbound_peers: 20,
             discovery_num_inbound_peers: 20,
             no_consensus: false,
+            validator: false,
             value_sync: true,
             eth_socket: None,
             execution_socket: None,
@@ -428,7 +450,6 @@ impl StartCmd {
     ///
     /// This method ensures that users don't specify both IPC and RPC options
     /// at the same time, as they represent different communication methods.
-    /// It also ensures that RPC sync mode has at least one endpoint configured.
     pub fn validate(&self) -> eyre::Result<()> {
         // Check if both IPC and RPC options are provided
         let has_ipc_options = self.eth_socket.is_some() || self.execution_socket.is_some();
@@ -442,14 +463,6 @@ impl StartCmd {
                 IPC options: --eth-socket, --execution-socket\n\
                 RPC options: --eth-rpc-endpoint, --execution-endpoint, --execution-jwt\n\
                 Please choose either IPC (for local communication) or RPC (for remote communication)."
-            ));
-        }
-
-        // Validate RPC sync/follow configuration
-        if self.follow && self.follow_endpoints.is_empty() {
-            return Err(eyre::eyre!(
-                "Follow mode enabled but no endpoints provided.\n\
-                Use --follow.endpoint to specify at least one endpoint."
             ));
         }
 
@@ -801,6 +814,7 @@ mod tests {
         assert_eq!(cmd.discovery_num_inbound_peers, 20);
         assert!(cmd.value_sync);
         assert!(!cmd.discovery);
+        assert!(!cmd.validator);
     }
 
     #[test]
@@ -872,6 +886,7 @@ mod tests {
             "test",
             "--p2p.addr",
             "/ip4/127.0.0.1/tcp/27000",
+            "--validator",
             "--signing.remote",
             "http://signer:10340",
         ];
@@ -888,6 +903,7 @@ mod tests {
             "test",
             "--p2p.addr",
             "/ip4/127.0.0.1/tcp/27000",
+            "--validator",
             "--signing.remote",
             "http://signer:10340",
             "--signing.tls-cert-path",
@@ -899,6 +915,20 @@ mod tests {
             cmd.signing_tls_cert_path,
             Some("/path/to/cert.pem".to_string())
         );
+    }
+
+    #[test]
+    fn signing_remote_without_validator_fails() {
+        let args = vec![
+            "arc-node-consensus",
+            "--moniker",
+            "test",
+            "--p2p.addr",
+            "/ip4/127.0.0.1/tcp/27000",
+            "--signing.remote",
+            "http://signer:10340",
+        ];
+        assert!(StartCmd::try_parse_from(args).is_err());
     }
 
     #[test]
@@ -1294,5 +1324,56 @@ mod tests {
         assert!(cmd.gossipsub_explicit_peering);
         assert!(cmd.gossipsub_mesh_prioritization);
         assert_eq!(cmd.gossipsub_load.as_deref(), Some("high"));
+    }
+
+    // Validator flag tests
+    #[test]
+    fn validator_defaults_to_false() {
+        let cmd = StartCmd::default();
+        assert!(!cmd.validator);
+    }
+
+    #[test]
+    fn validator_flag_parsing() {
+        let args = vec![
+            "arc-node-consensus",
+            "--moniker",
+            "test",
+            "--p2p.addr",
+            "/ip4/127.0.0.1/tcp/27000",
+            "--validator",
+        ];
+        let cmd = StartCmd::try_parse_from(args).unwrap();
+        assert!(cmd.validator);
+    }
+
+    #[test]
+    fn validator_conflicts_with_no_consensus() {
+        let args = vec![
+            "arc-node-consensus",
+            "--moniker",
+            "test",
+            "--p2p.addr",
+            "/ip4/127.0.0.1/tcp/27000",
+            "--validator",
+            "--no-consensus",
+        ];
+        assert!(StartCmd::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn validator_conflicts_with_follow() {
+        let args = vec![
+            "arc-node-consensus",
+            "--moniker",
+            "test",
+            "--p2p.addr",
+            "/ip4/127.0.0.1/tcp/27000",
+            "--validator",
+            "--follow",
+            "--follow.endpoint",
+            "http://localhost:8545",
+        ];
+        assert!(StartCmd::try_parse_from(args).is_err());
     }
 }
