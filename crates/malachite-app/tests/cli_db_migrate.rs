@@ -157,7 +157,8 @@ fn test_migrate_command_dry_run() {
     ])
     .assert()
     .success()
-    .stdout(predicate::str::contains("Dry-run mode"));
+    .stdout(predicate::str::contains("Dry-run mode"))
+    .stdout(predicate::str::contains("migration scan complete"));
 }
 
 #[test]

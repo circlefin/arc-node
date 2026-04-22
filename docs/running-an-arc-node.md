@@ -36,17 +36,28 @@ In a simplified version, define `$ARC_HOME` and `$ARC_RUN` variables once,
 then use the derived variables in the remaining of this guide:
 
 ```sh
+cat << "EOF" > ~/.arc_env
 # Base directory for Arc node data (default: ~/.arc)
 ARC_HOME="${ARC_HOME:-$HOME/.arc}"
 
 # Linux runtime directory:
 ARC_RUN="/run/arc"
+
 # Mac OS runtime directory:
 #ARC_RUN="$ARC_HOME/run"
 
 ARC_EXECUTION=$ARC_HOME/execution
 ARC_CONSENSUS=$ARC_HOME/consensus
+EOF
 ```
+
+Source it to load these variables into your current shell session:
+
+```sh
+source ~/.arc_env
+```
+
+Or using the POSIX shorthand: `. ~/.arc_env`
 
 ### Setup directories
 
@@ -157,7 +168,7 @@ arc-node-consensus start \
   --follow \
   --follow.endpoint https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network \
   --follow.endpoint https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network \
-  --follow.endpoint https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network \
+  --follow.endpoint https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network/websocket \
   --metrics 127.0.0.1:29000
 ```
 
@@ -169,11 +180,6 @@ companion execution layer.
 
 The consensus layer operates in the **follow** mode.
 We provide three endpoints from which the node retrieves finalized blocks.
-
-> **Note:** The Blockdaemon endpoint currently does not support WebSocket
-> connections. The node will log retry warnings for this endpoint but still
-> syncs correctly via the other two endpoints. HTTP block fetching from
-> Blockdaemon works normally.
 
 ### Verify operation
 
@@ -273,15 +279,15 @@ address and port, exposing the _protected_ RPC endpoint.
 
 Check out [reth system requirements](https://reth.rs/run/system-requirements/) for more info on EL configuration.
 
-**Note**: during periods of sustained high load, such as during startup or extended sync if the node is far behind, the execution layer memory may surge on some hardware. This should not be an issue if running with the suggested System Requirements. However, if you do observe this, you can enable backpressure to throttle the pace of execution according to the speed of disk writes, which will constrain memory growth. 
+**Note**: during periods of sustained high load, such as during startup or extended sync if the node is far behind, the execution layer memory may surge on some hardware. This should not be an issue if running with the suggested System Requirements. However, if you do observe this, you can enable backpressure to throttle the pace of execution according to the speed of disk writes, which will constrain memory growth.
 
-To enable this, the `reth_` namespace should enabled on the **execution layer**: 
+To enable this, the `reth_` namespace should enabled on the **execution layer**:
 
 ```sh
 --http.api eth,net,web3,txpool,trace,debug,reth
 ```
 
-And on the **consensus layer** backpressure must be activated: 
+And on the **consensus layer** backpressure must be activated:
 
 ```sh
 --execution-persistence-backpressure \
@@ -366,7 +372,7 @@ ExecStart=/usr/local/bin/arc-node-consensus start \
   --follow \
   --follow.endpoint https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network \
   --follow.endpoint https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network \
-  --follow.endpoint https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network \
+  --follow.endpoint https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network/websocket \
   --metrics 127.0.0.1:29000
 
 Restart=always

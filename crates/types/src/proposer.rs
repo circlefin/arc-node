@@ -48,10 +48,16 @@ impl ProposerSelector for RoundRobin {
         assert!(round != Round::Nil && round.as_i64() >= 0);
 
         let proposer_index = {
+            // height >= 1 (genesis doesn't propose), round >= 0 (asserted above).
+            #[allow(clippy::cast_possible_truncation)] // u64 fits usize on 64-bit
             let height = height.as_u64() as usize;
+            #[allow(clippy::cast_possible_truncation)] // round asserted non-negative
             let round = round.as_i64() as usize;
 
-            (height - 1 + round) % validator_set.len()
+            #[allow(clippy::arithmetic_side_effects)] // preconditions guarantee no overflow
+            {
+                (height - 1 + round) % validator_set.len()
+            }
         };
 
         validator_set

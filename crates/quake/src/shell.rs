@@ -202,3 +202,26 @@ pub(crate) fn scp(
 
     exec("scp", args, dir, None, false).wrap_err_with(|| format!("Failed to copy files to {host}"))
 }
+
+/// Copy a file from a remote server to a local path.
+///
+/// `remote_source` is relative to `/home/{user_name}/` on the remote server.
+pub(crate) fn scp_from(
+    host: &str,
+    user_name: &str,
+    private_key_path: &str,
+    dir: &Path,
+    remote_source: &str,
+    local_dest: &Path,
+) -> Result<()> {
+    let opts = ssh_opts(host);
+    let mut args: Vec<&str> = opts.iter().map(|s| s.trim_matches('"')).collect::<Vec<_>>();
+    args.extend(vec!["-i", private_key_path]);
+    args.push("-C"); // compress
+    let source = format!("{user_name}@{host}:/home/{user_name}/{remote_source}");
+    let dest = local_dest.to_string_lossy().into_owned();
+    args.push(&source);
+    args.push(&dest);
+    exec("scp", args, dir, None, false)
+        .wrap_err_with(|| format!("Failed to copy files from {host}"))
+}

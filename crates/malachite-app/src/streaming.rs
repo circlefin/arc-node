@@ -20,13 +20,12 @@ use std::mem::size_of;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-
-use arc_consensus_types::{Height, ProposalPart, ProposalParts, Round};
-
-use malachitebft_app_channel::app::streaming::{Sequence, StreamId, StreamMessage};
-use malachitebft_app_channel::app::types::PeerId;
 use schnellru::{ByLength, LruMap};
 use tracing::{error, warn};
+
+use arc_consensus_types::{Height, ProposalPart, ProposalParts, Round};
+use malachitebft_app_channel::app::streaming::{Sequence, StreamId, StreamMessage};
+use malachitebft_app_channel::app::types::PeerId;
 
 /// Maximum number of messages allowed per stream
 ///
@@ -35,19 +34,15 @@ use tracing::{error, warn};
 /// = 128 * 128 KiB = 16 MiB
 const MAX_MESSAGES_PER_STREAM: usize = 128;
 
-/// Maximum number of concurrent streams allowed per peer
+/// Maximum number of concurrent streams allowed per peer.
 ///
-/// Maximum memory per peer (if all streams at full capacity)
+/// A proposer needs ~2 streams per round (one for the proposal, one potential
+/// retry). A value of 4 gives headroom for a couple of in-flight rounds while
+/// keeping the per-peer memory footprint bounded:
+///
 /// = MAX_STREAMS_PER_PEER * MAX_MESSAGES_PER_STREAM * CHUNK_SIZE
-/// = 64 * 128 * 128 KiB = 1024 MiB
-const MAX_STREAMS_PER_PEER: usize = 64;
-
-/// Maximum total number of concurrent streams across all peers
-///
-/// Maximum total memory across all peers (if all streams at full capacity)
-/// = MAX_TOTAL_STREAMS * MAX_MESSAGES_PER_STREAM * CHUNK_SIZE
-/// = 100 * 128 * 128 KiB = 1600 MiB total memory
-const MAX_TOTAL_STREAMS: usize = 100;
+/// = 4 * 128 * 128 KiB = 64 MiB
+const MAX_STREAMS_PER_PEER: usize = 4;
 
 /// Size of chunks in which proposal data is split for streaming
 pub(crate) const CHUNK_SIZE: usize = 128 * 1024;
@@ -60,6 +55,18 @@ const MAX_EVICTED_STREAMS: usize = 10_000;
 
 /// Stream IDs are exactly 16 bytes: u64 height + u32 round + u32 nonce.
 pub(crate) const STREAM_ID_LEN: usize = size_of::<u64>() + size_of::<u32>() + size_of::<u32>();
+
+/// Compute the global stream cap for a given validator set size.
+///
+/// Sized as `MAX_STREAMS_PER_PEER * num_validators` so every validator can fill
+/// its per-peer quota without triggering global eviction. Floored at
+/// [`MAX_STREAMS_PER_PEER`] so the cap is non-zero before the validator set is
+/// configured at startup (when `num_validators` is still 0).
+fn max_total_streams(num_validators: usize) -> usize {
+    MAX_STREAMS_PER_PEER
+        .saturating_mul(num_validators)
+        .max(MAX_STREAMS_PER_PEER)
+}
 
 /// Outcome of [`PartStreamsMap::insert`].
 #[derive(Debug)]
@@ -214,7 +221,11 @@ impl StreamState {
         }
 
         // Increment message count
-        self.message_count += 1;
+        // Bounded by MAX_MESSAGES_PER_STREAM check above
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            self.message_count += 1;
+        }
 
         // This is the `Init` message.
         if let Some(init) = msg.content.as_data().and_then(|part| part.as_init()) {
@@ -228,7 +239,12 @@ impl StreamState {
             // If we have received the fin message, we can determine when we will be done.
             // We are done if we have already received all messages from 0 to fin.sequence,
             // included. That is to say, if we have received `fin.sequence + 1` messages.
-            self.expected_messages = msg.sequence as usize + 1;
+            // Sequence is a u64 protocol field; on 64-bit targets usize == u64.
+            // The +1 cannot overflow because MAX_MESSAGES_PER_STREAM << u64::MAX.
+            #[allow(clippy::cast_possible_truncation, clippy::arithmetic_side_effects)]
+            {
+                self.expected_messages = msg.sequence as usize + 1;
+            }
         }
 
         // Add the message to the buffer.
@@ -252,37 +268,63 @@ impl StreamState {
     }
 }
 
-/// Map to track active proposal part streams from peers
+/// Map to track active proposal part streams from peers.
 ///
 /// Enforces the following limits:
 /// - [`MAX_STREAMS_PER_PEER`] streams per peer
 /// - [`MAX_MESSAGES_PER_STREAM`] messages per stream
 /// - [`CHUNK_SIZE`] per data chunk
-/// - [`MAX_TOTAL_STREAMS`] total concurrent streams
+/// - `max_total_streams` total concurrent streams (= `MAX_STREAMS_PER_PEER * num_validators`)
 /// - Evict streams older than [`MAX_STREAM_AGE`]
 /// - Immediately evict streams that exceed message or size limits
 /// - Immediately evict streams from previous heights
+///
+/// Worst-case memory at full saturation:
+/// = max_total_streams * MAX_MESSAGES_PER_STREAM * CHUNK_SIZE
+/// = (MAX_STREAMS_PER_PEER * num_validators) * 128 * 128 KiB
+/// = 64 MiB * num_validators
 pub struct PartStreamsMap {
     current_height: Height,
+    /// `MAX_STREAMS_PER_PEER * num_validators`, floored at
+    /// [`MAX_STREAMS_PER_PEER`] during the pre-validator-set startup window.
+    max_total_streams: usize,
     streams: BTreeMap<(PeerId, StreamId), StreamState>,
     evicted: LruMap<(PeerId, StreamId), ()>,
     last_eviction: Instant,
 }
 
 impl PartStreamsMap {
-    /// Create a new empty PartStreamsMap
-    pub fn new(current_height: Height) -> Self {
+    /// Create a new empty PartStreamsMap.
+    ///
+    /// `num_validators` sets the global stream cap to
+    /// `MAX_STREAMS_PER_PEER * num_validators`.
+    pub fn new(current_height: Height, num_validators: usize) -> Self {
         Self {
             streams: BTreeMap::new(),
             last_eviction: Instant::now(),
+            // MAX_EVICTED_STREAMS (10_000) fits in u32
+            #[allow(clippy::cast_possible_truncation)]
             evicted: LruMap::new(ByLength::new(MAX_EVICTED_STREAMS as u32)),
             current_height,
+            max_total_streams: max_total_streams(num_validators),
         }
     }
 
-    /// Update the current height
+    /// Update the current height.
     pub fn set_current_height(&mut self, height: Height) {
         self.current_height = height;
+    }
+
+    /// Update the global stream cap after a validator set change.
+    ///
+    /// If the new cap is below the current stream count, evict from the busiest
+    /// peer until the invariant `streams.len() <= max_total_streams` holds
+    /// again.
+    pub fn set_num_validators(&mut self, num_validators: usize) {
+        self.max_total_streams = max_total_streams(num_validators);
+        while self.streams.len() > self.max_total_streams {
+            self.evict_oldest_stream();
+        }
     }
 
     /// Insert a new proposal part message into the map
@@ -332,7 +374,7 @@ impl PartStreamsMap {
             }
 
             // Check if we've exceeded the total streams limit
-            if self.streams.len() >= MAX_TOTAL_STREAMS {
+            if self.streams.len() >= self.max_total_streams {
                 self.evict_oldest_stream();
             }
         }
@@ -398,14 +440,6 @@ impl PartStreamsMap {
         }
     }
 
-    /// Count active streams for a given peer
-    fn peer_streams_count(&mut self, peer_id: PeerId) -> usize {
-        self.streams
-            .keys()
-            .filter(|(pid, _)| *pid == peer_id)
-            .count()
-    }
-
     /// Evict a stream from the map and mark it as evicted.
     /// The evicted LRU map is bounded by [`MAX_EVICTED_STREAMS`]; the oldest
     /// entry is automatically dropped when capacity is exceeded.
@@ -442,18 +476,56 @@ impl PartStreamsMap {
         }
     }
 
-    /// Evict the oldest stream to make room for a new one
+    /// Evict the oldest stream from the peer with the most active streams.
+    ///
+    /// Targets the busiest peer so no single peer can push others out via the
+    /// global cap.
     fn evict_oldest_stream(&mut self) {
-        if let Some((oldest_key, _)) = self
-            .streams
-            .iter()
-            .min_by_key(|(_, state)| state.created_at)
-        {
-            let ref oldest_key @ (ref peer_id, ref stream_id) = oldest_key.clone();
+        let peer_id = self.busiest_peer();
+        let Some(peer_id) = peer_id else { return };
 
-            warn!(%peer_id, %stream_id, "Evicting oldest stream due to total streams limit");
-            self.evict(oldest_key);
+        let key = self.oldest_stream_of(peer_id);
+        let Some(ref key @ (ref peer_id, ref stream_id)) = key else {
+            return;
+        };
+
+        warn!(%peer_id, %stream_id, "Evicting oldest stream from peer with most streams");
+        self.evict(key);
+    }
+
+    /// Return the peer with the most active streams, if any.
+    ///
+    /// Uses a [`BTreeMap`] so ties are broken deterministically by [`PeerId`]
+    /// ordering rather than by hash-map iteration order.
+    fn busiest_peer(&self) -> Option<PeerId> {
+        let mut counts: BTreeMap<PeerId, usize> = BTreeMap::new();
+        for (pid, _) in self.streams.keys() {
+            #[allow(clippy::arithmetic_side_effects)]
+            {
+                *counts.entry(*pid).or_default() += 1;
+            }
         }
+        counts
+            .into_iter()
+            .max_by_key(|&(_, c)| c)
+            .map(|(pid, _)| pid)
+    }
+
+    /// Count active streams for a given peer
+    fn peer_streams_count(&self, peer_id: PeerId) -> usize {
+        self.streams
+            .keys()
+            .filter(|(pid, _)| *pid == peer_id)
+            .count()
+    }
+
+    /// Return the key of the oldest stream belonging to `peer_id`, if any.
+    fn oldest_stream_of(&self, peer_id: PeerId) -> Option<(PeerId, StreamId)> {
+        self.streams
+            .iter()
+            .filter(|((pid, _), _)| *pid == peer_id)
+            .min_by_key(|(_, state)| state.created_at)
+            .map(|(key, _)| key.clone())
     }
 }
 
@@ -465,6 +537,11 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    /// Default validator count for tests. Large enough that the global cap
+    /// (`MAX_STREAMS_PER_PEER * NUM_VALIDATORS`) does not interfere with
+    /// per-peer or per-stream limit tests.
+    const NUM_VALIDATORS: usize = 100;
 
     impl PartStreamsMap {
         /// Test-only wrapper that panics on [`InsertResult::Invalid`].
@@ -555,7 +632,7 @@ mod tests {
         let peer_1 = PeerId::random();
         let stream_1 = make_stream_id(101);
 
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
         let msg = make_message(&stream_1, 0, make_init_part());
 
         let result = map.must_insert(peer_1, msg);
@@ -572,7 +649,7 @@ mod tests {
         let peer_1 = PeerId::random();
         let stream_1 = make_stream_id(101);
 
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
         let init_msg = make_message(&stream_1, 0, make_init_part());
         let data_msg = make_message(&stream_1, 1, make_data_part(42));
         let data_fin_msg = make_message(&stream_1, 2, make_fin_part());
@@ -620,7 +697,7 @@ mod tests {
 
         // Test all permutations of message order
         for perm in parts.iter().permutations(parts.len()) {
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
             // Insert all but the last message
             for msg in &perm[..3] {
@@ -647,7 +724,7 @@ mod tests {
         let peer_1 = PeerId::random();
         let stream_1 = make_stream_id(101);
 
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
         let init_msg = make_message(&stream_1, 0, make_init_part());
         let data_msg = make_message(&stream_1, 1, make_data_part(42));
         let data_msg_duplicate = make_message(&stream_1, 1, make_data_part(99)); // Same seq
@@ -679,7 +756,7 @@ mod tests {
         let peer_1 = PeerId::random();
         let stream_1 = make_stream_id(101);
 
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
         let init_msg = make_message(&stream_1, 0, make_init_part());
         // Sequence 1 is missing
         let fin_msg = make_message(&stream_1, 2, make_fin_part());
@@ -704,7 +781,7 @@ mod tests {
         let stream_1 = make_stream_id(101);
         let stream_2 = make_stream_id(202);
 
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         // Messages for two different streams
         let s1_init = make_message(&stream_1, 0, make_init_part());
@@ -752,7 +829,7 @@ mod tests {
     #[test]
     fn test_per_peer_stream_limit() {
         let peer_1 = PeerId::random();
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         // Create MAX_STREAMS_PER_PEER streams
         for i in 0..MAX_STREAMS_PER_PEER {
@@ -812,7 +889,7 @@ mod tests {
     fn test_per_stream_message_limit() {
         let peer_1 = PeerId::random();
         let stream_1 = make_stream_id(101);
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         // Send Init
         let init_msg = make_message(&stream_1, 0, make_init_part());
@@ -850,7 +927,7 @@ mod tests {
     fn test_per_peer_limit_independent_across_peers() {
         let peer_1 = PeerId::random();
         let peer_2 = PeerId::random();
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         // Peer 1 creates MAX_STREAMS_PER_PEER streams
         for i in 0..MAX_STREAMS_PER_PEER {
@@ -870,7 +947,7 @@ mod tests {
             );
         }
 
-        if MAX_STREAMS_PER_PEER * 2 <= MAX_TOTAL_STREAMS {
+        if MAX_STREAMS_PER_PEER * 2 <= max_total_streams(NUM_VALIDATORS) {
             // Both peers should have their streams accepted
             assert_eq!(
                 map.streams.len(),
@@ -881,8 +958,8 @@ mod tests {
             // Total streams limit should have been enforced
             assert_eq!(
                 map.streams.len(),
-                MAX_TOTAL_STREAMS,
-                "Should have total streams limited to MAX_TOTAL_STREAMS"
+                max_total_streams(NUM_VALIDATORS),
+                "Should have total streams limited to max_total_streams(NUM_VALIDATORS)"
             );
         }
 
@@ -908,7 +985,7 @@ mod tests {
         let stream_2 = make_stream_id(102);
         let stream_3 = make_stream_id(103);
 
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         // Create first stream
         let msg1 = make_message(&stream_1, 0, make_init_part());
@@ -958,54 +1035,51 @@ mod tests {
 
     #[test]
     fn test_total_streams_limit_eviction() {
-        let mut map = PartStreamsMap::new(Height::new(1));
-        let mut peers = Vec::new();
+        // Use a small validator count so we can fill the global cap easily.
+        let num_validators = 4;
+        let cap = max_total_streams(num_validators);
+        let mut map = PartStreamsMap::new(Height::new(1), num_validators);
 
-        // Create MAX_TOTAL_STREAMS streams from different peers
-        for _ in 0..MAX_TOTAL_STREAMS {
+        // One peer opens 2 streams (more than any other peer).
+        let busy_peer = PeerId::random();
+        for i in 0..2u8 {
+            let stream = make_stream_id(i);
+            let msg = make_message(&stream, 0, make_init_part());
+            map.must_insert(busy_peer, msg);
+        }
+
+        // Make its first stream the oldest.
+        let oldest_stream = make_stream_id(0);
+        let oldest_key = (busy_peer, oldest_stream.clone());
+        map.streams.get_mut(&oldest_key).unwrap().created_at =
+            Instant::now() - Duration::from_secs(100);
+
+        // Fill the remaining capacity with 1-stream peers.
+        #[allow(clippy::arithmetic_side_effects)]
+        for _ in 0..cap - 2 {
             let peer = PeerId::random();
-            peers.push(peer);
             let stream = make_stream_id(0);
             let msg = make_message(&stream, 0, make_init_part());
             map.must_insert(peer, msg);
         }
+        assert_eq!(map.streams.len(), cap);
 
-        assert_eq!(
-            map.streams.len(),
-            MAX_TOTAL_STREAMS,
-            "Should have MAX_TOTAL_STREAMS streams"
-        );
-
-        // Get the oldest stream's creation time to verify it gets evicted
-        let oldest_peer = peers[0];
-        let oldest_stream = make_stream_id(0);
-        let oldest_key = (oldest_peer, oldest_stream.clone());
-
-        // Manually set the first stream to be the oldest
-        if let Some(state) = map.streams.get_mut(&oldest_key) {
-            state.created_at = Instant::now() - Duration::from_secs(100);
-        }
-
-        // Try to create one more stream from a new peer
+        // One more stream from a new peer triggers eviction.
         let new_peer = PeerId::random();
         let new_stream = make_stream_id(0);
         let new_msg = make_message(&new_stream, 0, make_init_part());
         map.must_insert(new_peer, new_msg);
 
-        // Should still have MAX_TOTAL_STREAMS (oldest evicted, new one added)
-        assert_eq!(
-            map.streams.len(),
-            MAX_TOTAL_STREAMS,
-            "Should still have MAX_TOTAL_STREAMS streams after eviction"
-        );
+        // Cap preserved: evicted one, added one.
+        assert_eq!(map.streams.len(), cap);
 
-        // The oldest stream should have been evicted
+        // The busiest peer's oldest stream should have been evicted.
         assert!(
             !map.streams.contains_key(&oldest_key),
-            "Oldest stream should have been evicted"
+            "Oldest stream from the busiest peer should have been evicted"
         );
 
-        // The new stream should be present
+        // The new stream should be present.
         assert!(
             map.streams.contains_key(&(new_peer, new_stream)),
             "New stream should be present"
@@ -1013,9 +1087,144 @@ mod tests {
     }
 
     #[test]
+    fn test_eviction_targets_busiest_peer_not_globally_oldest() {
+        // 3 validators, cap = 3 * 4 = 12 streams.
+        let num_validators = 3;
+        let cap = max_total_streams(num_validators);
+        let mut map = PartStreamsMap::new(Height::new(1), num_validators);
+
+        // Peer A opens 1 stream and we make it the globally oldest.
+        let peer_a = PeerId::random();
+        let stream_a = make_stream_id(0);
+        let msg = make_message(&stream_a, 0, make_init_part());
+        map.must_insert(peer_a, msg);
+        map.streams
+            .get_mut(&(peer_a, stream_a.clone()))
+            .unwrap()
+            .created_at = Instant::now() - Duration::from_secs(200);
+
+        // Peer B opens 4 streams — the per-peer maximum.
+        let peer_b = PeerId::random();
+        for i in 0..MAX_STREAMS_PER_PEER as u8 {
+            let stream = make_stream_id(i);
+            let msg = make_message(&stream, 0, make_init_part());
+            map.must_insert(peer_b, msg);
+        }
+
+        // Make peer B's first stream older than all of its other streams
+        // but still newer than peer A's stream.
+        let peer_b_oldest = make_stream_id(0);
+        map.streams
+            .get_mut(&(peer_b, peer_b_oldest.clone()))
+            .unwrap()
+            .created_at = Instant::now() - Duration::from_secs(100);
+
+        // Fill the rest of the cap with single-stream peers.
+        #[allow(clippy::arithmetic_side_effects)]
+        let remaining = cap - 1 - MAX_STREAMS_PER_PEER;
+        for i in 0..remaining {
+            let peer = PeerId::random();
+            let stream = make_stream_id(i as u8);
+            let msg = make_message(&stream, 0, make_init_part());
+            map.must_insert(peer, msg);
+        }
+        assert_eq!(map.streams.len(), cap);
+
+        // Trigger eviction by inserting one more stream.
+        let new_peer = PeerId::random();
+        let new_stream = make_stream_id(0);
+        map.must_insert(new_peer, make_message(&new_stream, 0, make_init_part()));
+
+        assert_eq!(map.streams.len(), cap);
+
+        // Peer A's stream is the globally oldest, but peer B is the busiest.
+        // The eviction policy targets peer B's oldest stream, not peer A's.
+        assert!(
+            map.streams.contains_key(&(peer_a, stream_a)),
+            "Peer A's stream should be preserved despite being the globally oldest"
+        );
+        assert!(
+            !map.streams.contains_key(&(peer_b, peer_b_oldest)),
+            "Peer B's oldest stream should have been evicted (busiest peer)"
+        );
+    }
+
+    #[test]
+    fn test_zero_validators_uses_per_peer_floor() {
+        // With zero validators the cap must floor at MAX_STREAMS_PER_PEER so the
+        // map is usable during the pre-validator-set startup window.
+        let map = PartStreamsMap::new(Height::new(1), 0);
+        assert_eq!(map.max_total_streams, MAX_STREAMS_PER_PEER);
+        assert_eq!(max_total_streams(0), MAX_STREAMS_PER_PEER);
+    }
+
+    #[test]
+    fn test_set_num_validators_grows_cap() {
+        let mut map = PartStreamsMap::new(Height::new(1), 0);
+        assert_eq!(map.max_total_streams, MAX_STREAMS_PER_PEER);
+
+        map.set_num_validators(25);
+        assert_eq!(map.max_total_streams, MAX_STREAMS_PER_PEER * 25);
+    }
+
+    #[test]
+    fn test_set_num_validators_shrinks_cap_and_trims_over_cap_streams() {
+        // Start with a generous cap and populate it with streams from many peers.
+        let num_validators = 10;
+        let cap = max_total_streams(num_validators);
+        let mut map = PartStreamsMap::new(Height::new(1), num_validators);
+
+        for i in 0..cap {
+            let peer = PeerId::random();
+            let stream = make_stream_id_u16(i as u16);
+            let msg = make_message(&stream, 0, make_init_part());
+            map.must_insert(peer, msg);
+        }
+        assert_eq!(map.streams.len(), cap);
+
+        // Shrinking the validator set reduces the cap; existing streams above
+        // the new cap must be trimmed in place.
+        let new_num_validators = 3;
+        let new_cap = max_total_streams(new_num_validators);
+        map.set_num_validators(new_num_validators);
+
+        assert_eq!(map.max_total_streams, new_cap);
+        assert_eq!(
+            map.streams.len(),
+            new_cap,
+            "streams.len() must be clamped to the new cap after shrinkage"
+        );
+    }
+
+    #[test]
+    fn test_busiest_peer_tie_breaking_is_deterministic() {
+        // Two peers with equal stream counts. The BTreeMap-based implementation
+        // must pick the larger PeerId (max_by_key returns the last tied element
+        // in sorted order) regardless of insertion order.
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let expected = peer_a.max(peer_b);
+
+        for insertion_order in [[peer_a, peer_b], [peer_b, peer_a]] {
+            let mut map = PartStreamsMap::new(Height::new(1), 10);
+            for peer in insertion_order {
+                for i in 0..2u8 {
+                    let stream = make_stream_id(i);
+                    map.must_insert(peer, make_message(&stream, 0, make_init_part()));
+                }
+            }
+            assert_eq!(
+                map.busiest_peer(),
+                Some(expected),
+                "busiest_peer must return the larger PeerId when counts tie"
+            );
+        }
+    }
+
+    #[test]
     fn test_completed_streams_dont_count_toward_limits() {
         let peer_1 = PeerId::random();
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         // Create and complete MAX_STREAMS_PER_PEER streams
         for i in 0..MAX_STREAMS_PER_PEER {
@@ -1057,7 +1266,7 @@ mod tests {
 
     #[test]
     fn test_evict_old_streams_removes_all_expired() {
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
         let peer = PeerId::random();
 
         // Create 3 streams, 2 old and 1 new
@@ -1100,7 +1309,7 @@ mod tests {
     #[test]
     fn test_message_limit_independent_across_streams() {
         let peer = PeerId::random();
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         // Fill first stream to capacity
         let stream_1 = make_stream_id(1);
@@ -1122,7 +1331,7 @@ mod tests {
     fn test_evicted_stream_rejects_new_messages() {
         let peer_1 = PeerId::random();
         let stream_1 = make_stream_id(101);
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         // Send Init
         let init_msg = make_message(&stream_1, 0, make_init_part());
@@ -1160,7 +1369,7 @@ mod tests {
     fn test_stale_height_streams_evicted() {
         let peer_1 = PeerId::random();
         let stream_1 = make_stream_id(101);
-        let mut map = PartStreamsMap::new(Height::new(5));
+        let mut map = PartStreamsMap::new(Height::new(5), NUM_VALIDATORS);
 
         // Send Init message for old height (height 3)
         let mut init_part = make_init_part();
@@ -1184,7 +1393,7 @@ mod tests {
 
     #[test]
     fn test_evicted_set_retained_across_eviction_cycles() {
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
         let peer = PeerId::random();
 
         // Create and evict a stream by exceeding message limit
@@ -1214,7 +1423,7 @@ mod tests {
     fn test_oversized_chunk_rejected() {
         let peer = PeerId::random();
         let stream = make_stream_id(1);
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         let init_msg = make_message(&stream, 0, make_init_part());
         map.insert(peer, init_msg);
@@ -1242,7 +1451,7 @@ mod tests {
     fn test_normal_chunk_accepted() {
         let peer = PeerId::random();
         let stream = make_stream_id(1);
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         let init_msg = make_message(&stream, 0, make_init_part());
         map.insert(peer, init_msg);
@@ -1269,7 +1478,7 @@ mod tests {
     fn test_non_data_parts_not_subject_to_size_check() {
         let peer = PeerId::random();
         let stream = make_stream_id(1);
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         // Init and Fin are not Data variants, so they bypass the byte limit
         let init_msg = make_message(&stream, 0, make_init_part());
@@ -1292,7 +1501,7 @@ mod tests {
     #[test]
     fn test_invalid_stream_id_length_rejected() {
         let peer = PeerId::random();
-        let mut map = PartStreamsMap::new(Height::new(1));
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         // Too short
         let short = StreamId::new(vec![0x01; 8].into());
@@ -1340,7 +1549,7 @@ mod tests {
     #[test]
     fn test_evicted_set_capped() {
         let peer = PeerId::random();
-        let mut map = PartStreamsMap::new(Height::new(100));
+        let mut map = PartStreamsMap::new(Height::new(100), NUM_VALIDATORS);
 
         // Send many Init messages for stale height with distinct stream IDs.
         // Each gets immediately evicted because height 1 < current height 100.
@@ -1389,6 +1598,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_global_eviction_spares_low_volume_peer_when_others_saturate_cap() {
+        // Small validator set so the global cap is easy to saturate and we
+        // can exercise the global-eviction path.
+        let num_validators = 3;
+        let cap = max_total_streams(num_validators);
+        let saturating_peers_num = 2;
+        let mut map = PartStreamsMap::new(Height::new(1), num_validators);
+        let mut stream_id: u16 = 0;
+
+        // Low-volume peer starts a single stream.
+        let low_volume_peer = PeerId::random();
+        let low_volume_stream = make_stream_id_u16(stream_id);
+        let msg_init = make_message(&low_volume_stream, 0, make_init_part());
+        let msg_part = make_message(&low_volume_stream, 1, make_data_part(0x42));
+        stream_id += 1;
+        assert!(
+            map.must_insert(low_volume_peer, msg_init).is_none(),
+            "Init message on the low-volume stream should be accepted"
+        );
+
+        // Make it the globally oldest stream so a naive FIFO policy would
+        // target it first.
+        let low_volume_key = (low_volume_peer, low_volume_stream.clone());
+        map.streams.get_mut(&low_volume_key).unwrap().created_at =
+            Instant::now() - Duration::from_secs(100);
+
+        // Saturating peers each try to open MAX_STREAMS_PER_PEER + 5 streams;
+        // the per-peer limit caps each at MAX_STREAMS_PER_PEER.
+        let mut saturating_peers = Vec::with_capacity(saturating_peers_num);
+        for _ in 0..saturating_peers_num {
+            let peer_id = PeerId::random();
+            saturating_peers.push(peer_id);
+            #[allow(clippy::arithmetic_side_effects)]
+            for _ in 0..MAX_STREAMS_PER_PEER + 5 {
+                let stream = make_stream_id_u16(stream_id);
+                stream_id += 1;
+                let msg = make_message(&stream, 0, make_init_part());
+                map.must_insert(peer_id, msg);
+            }
+
+            assert_eq!(map.peer_streams_count(peer_id), MAX_STREAMS_PER_PEER);
+        }
+
+        // Fill the remaining capacity with 1-stream peers so the pool is at
+        // the global cap and the next insert triggers global eviction.
+        #[allow(clippy::arithmetic_side_effects)]
+        let filler_needed = cap - map.streams.len();
+        for _ in 0..filler_needed {
+            let filler_peer = PeerId::random();
+            let stream = make_stream_id_u16(stream_id);
+            stream_id += 1;
+            let msg = make_message(&stream, 0, make_init_part());
+            map.must_insert(filler_peer, msg);
+        }
+        assert_eq!(map.streams.len(), cap, "Pool should be at the global cap");
+
+        // A new peer's stream now triggers global eviction. The busiest-peer
+        // policy must evict from a saturating peer, never the single-stream
+        // low-volume peer (even though it owns the globally oldest stream).
+        let new_peer = PeerId::random();
+        let new_stream = make_stream_id_u16(stream_id);
+        map.must_insert(new_peer, make_message(&new_stream, 0, make_init_part()));
+
+        assert_eq!(map.streams.len(), cap, "Pool should still be at the cap");
+        assert!(
+            map.streams.contains_key(&low_volume_key),
+            "The low-volume stream should be preserved despite being the globally oldest"
+        );
+        for peer_id in &saturating_peers {
+            assert!(
+                map.peer_streams_count(*peer_id) <= MAX_STREAMS_PER_PEER,
+                "Saturating peers should remain bounded by MAX_STREAMS_PER_PEER"
+            );
+        }
+
+        // Follow-up messages on the low-volume stream should still be accepted.
+        assert!(
+            map.must_insert(low_volume_peer, msg_part).is_none(),
+            "Follow up message on the low-volume stream should be accepted"
+        );
+    }
+
     // --- Property-Based Tests ---
 
     proptest! {
@@ -1397,7 +1689,7 @@ mod tests {
             stream_attempts in prop::collection::vec(any::<u8>(), 1..50)
         ) {
             let peer = PeerId::random();
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
             // Try to create streams using different IDs
             for stream_id_byte in stream_attempts {
@@ -1424,7 +1716,7 @@ mod tests {
         ) {
             let peer = PeerId::random();
             let stream = make_stream_id(1);
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
             // Try to send many messages to the same stream
             for i in 0..message_count {
@@ -1446,9 +1738,13 @@ mod tests {
         #[test]
         fn prop_total_streams_limit_never_exceeded(
             peer_count in 1..50usize,
-            streams_per_peer in 1..20usize
+            streams_per_peer in 1..=MAX_STREAMS_PER_PEER
         ) {
-            let mut map = PartStreamsMap::new(Height::new(1));
+            // Use a small validator count so that `peer_count * streams_per_peer`
+            // can exceed the global cap and actually exercise global eviction.
+            let num_validators = 10;
+            let cap = max_total_streams(num_validators);
+            let mut map = PartStreamsMap::new(Height::new(1), num_validators);
             let mut peers = Vec::new();
 
             // Generate unique peers
@@ -1465,10 +1761,10 @@ mod tests {
 
                     // Total streams should never exceed the limit
                     prop_assert!(
-                        map.streams.len() <= MAX_TOTAL_STREAMS,
+                        map.streams.len() <= cap,
                         "Total stream count {} exceeded limit {}",
                         map.streams.len(),
-                        MAX_TOTAL_STREAMS
+                        cap
                     );
                 }
             }
@@ -1476,10 +1772,10 @@ mod tests {
 
         #[test]
         fn prop_stream_age_eviction_works(
-            stream_count in 1..30usize
+            stream_count in 1..=MAX_STREAMS_PER_PEER
         ) {
             let peer = PeerId::random();
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
             // Create streams
             for i in 0..stream_count {
@@ -1517,7 +1813,7 @@ mod tests {
             completion_count in 1..20usize
         ) {
             let peer = PeerId::random();
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
             // Complete multiple streams
             for i in 0..completion_count {
@@ -1548,7 +1844,7 @@ mod tests {
         fn prop_limits_independent_across_peers(
             peer_count in 2..10usize
         ) {
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
             let mut peers = Vec::new();
 
             // Generate unique peers
@@ -1580,10 +1876,10 @@ mod tests {
 
             // Also verify total doesn't exceed global limit
             prop_assert!(
-                map.streams.len() <= MAX_TOTAL_STREAMS,
+                map.streams.len() <= max_total_streams(NUM_VALIDATORS),
                 "Total stream count {} exceeded limit {}",
                 map.streams.len(),
-                MAX_TOTAL_STREAMS
+                max_total_streams(NUM_VALIDATORS)
             );
         }
 
@@ -1593,7 +1889,7 @@ mod tests {
         ) {
             let peer = PeerId::random();
             let stream = make_stream_id(1);
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
             // Send incomplete stream (no Fin message)
             for i in 0..message_count {
@@ -1624,7 +1920,7 @@ mod tests {
 
             let peer = PeerId::random();
             let stream = make_stream_id(1);
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
             // Create messages in order
             let init = make_message(&stream, 0, make_init_part());
@@ -1668,7 +1964,7 @@ mod tests {
         ) {
             let peer = PeerId::random();
             let stream = make_stream_id(1);
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
             // Send initial messages
             for i in 0..message_count {
@@ -1703,7 +1999,7 @@ mod tests {
         ) {
             let peer = PeerId::random();
             let stream = make_stream_id(1);
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
             // Choose a missing index in the middle of data parts (not init, not fin_part, not fin)
             // For total_parts=5: seq 0=init, 1=data, 2=data, 3=fin_part, 4=fin
@@ -1745,7 +2041,7 @@ mod tests {
 
         #[test]
         fn prop_multiple_interleaved_streams_independent(
-            stream_count in 2..8usize,
+            stream_count in 2..=MAX_STREAMS_PER_PEER,
             messages_per_stream in 2..10usize,
             seed in any::<u64>()
         ) {
@@ -1753,7 +2049,7 @@ mod tests {
             use rand::rngs::StdRng;
 
             let peer = PeerId::random();
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
             let mut rng = StdRng::seed_from_u64(seed);
 
             // Create all messages for all streams
@@ -1824,7 +2120,7 @@ mod tests {
         ) {
             let peer = PeerId::random();
             let stream = make_stream_id(1);
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
             let mut seq = 0u64;
 
@@ -1871,7 +2167,7 @@ mod tests {
             stream2_message_count in 1..(MAX_MESSAGES_PER_STREAM / 2),
         ) {
             let peer = PeerId::random();
-            let mut map = PartStreamsMap::new(Height::new(1));
+            let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
             // Fill first stream up to its message count
             let stream_1 = make_stream_id(1);

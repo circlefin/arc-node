@@ -14,6 +14,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Offline diagnostic CLI tool — not part of the node runtime.
+#![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
+
 mod analyze;
 mod fetch;
 mod parse;
@@ -27,6 +30,6 @@ pub use parse::parse_all_metrics;
 pub use report::format_report;
 pub use tier::{classify_all, MeshTier};
 pub use types::{
-    DiscoveredPeer, MeshAnalysis, MeshDisplayOptions, NodeMetricsData, NodeType, TopicAnalysis,
-    ValidatorConnectivity,
+    DiscoveredPeer, MeshAnalysis, MeshDisplayOptions, MessageCounts, NodeMetricsData, NodeType,
+    TopicAnalysis, ValidatorConnectivity,
 };

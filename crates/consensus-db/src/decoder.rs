@@ -152,11 +152,13 @@ pub fn decode_proposal_monitor_data(bytes: &[u8]) -> Result<ProposalMonitor, Dec
                 .ok_or_else(|| proto_error("Missing proposer in proposal monitor data"))
                 .and_then(|a| Address::from_proto(a).map_err(DecodeError::Proto))?;
 
-            // Convert times from milliseconds since UNIX_EPOCH
+            // SystemTime + Duration panics only on overflow past year ~30 billion — safe for millis from proto
+            #[allow(clippy::arithmetic_side_effects)]
             let start_time = UNIX_EPOCH + Duration::from_millis(proto_data.start_time_ms);
 
             // Convert times from milliseconds; 0 = not present
             let proposal_receive_time = if proto_data.receive_time_ms > 0 {
+                #[allow(clippy::arithmetic_side_effects)]
                 Some(UNIX_EPOCH + Duration::from_millis(proto_data.receive_time_ms))
             } else {
                 None
@@ -515,12 +517,14 @@ mod tests {
         successful: ProposalSuccessState,
         synced: bool,
     ) -> ProposalMonitor {
+        #[allow(clippy::arithmetic_side_effects)]
         let start_time = UNIX_EPOCH + Duration::from_secs(1000000);
         let proposer = Address::new([0x42; 20]);
 
         let mut monitor = ProposalMonitor::new(Height::new(height), proposer, start_time);
 
         if with_proposal {
+            #[allow(clippy::arithmetic_side_effects)]
             let receive_time = start_time + Duration::from_millis(150);
             let value_id = ValueId::new(B256::repeat_byte(0xAB));
             monitor.proposal_receive_time = Some(receive_time);

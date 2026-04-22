@@ -9,6 +9,14 @@ scrape_configs:
         labels:
           client_name: "reth"
           client_type: "execution"
+  - job_name: "arc_engine_bench_target"
+    metrics_path: "/"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:19001']
+        labels:
+          client_name: "reth"
+          client_type: "execution"
   - job_name: "arc_execution0"
     metrics_path: "/"
     scrape_interval: 1s

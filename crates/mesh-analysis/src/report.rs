@@ -218,6 +218,20 @@ pub fn format_report(analysis: &MeshAnalysis, options: &MeshDisplayOptions) -> S
         format_explicit_peering(&mut out, analysis);
     }
 
+    // -- Duplicates -----------------------------------------------------------
+    if options.show_duplicates {
+        let has_any = analysis
+            .nodes
+            .iter()
+            .any(|n| n.message_counts.unfiltered > 0);
+        if has_any {
+            let _ = write!(out, "\n{}\n", "=".repeat(80));
+            let _ = writeln!(out, "Gossipsub Duplicate Message Rates");
+            let _ = write!(out, "{}\n\n", "=".repeat(80));
+            format_duplicates(&mut out, &analysis.nodes);
+        }
+    }
+
     // -- Peers detail --------------------------------------------------------
     if options.show_peers {
         let _ = write!(out, "\n{}\n", "=".repeat(80));
@@ -454,6 +468,60 @@ fn format_validator_connectivity(out: &mut String, vc: &ValidatorConnectivity) {
                 intermediate.join(", ")
             );
         }
+    }
+}
+
+fn format_duplicates(out: &mut String, nodes: &[NodeMetricsData]) {
+    let nodes_with_counts: Vec<&NodeMetricsData> = nodes
+        .iter()
+        .filter(|n| n.message_counts.unfiltered > 0)
+        .collect();
+
+    if nodes_with_counts.is_empty() {
+        let _ = writeln!(out, "  No duplicate metrics available.");
+        return;
+    }
+
+    let max_name = nodes_with_counts
+        .iter()
+        .map(|n| n.moniker.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let _ = writeln!(
+        out,
+        "{:<mw$}  {:>12}  {:>10}  {:>10}  {:>8}",
+        "Node",
+        "Unfiltered",
+        "Filtered",
+        "Dups",
+        "Dup%",
+        mw = max_name,
+    );
+    let _ = writeln!(
+        out,
+        "{:-<mw$}  {:->12}  {:->10}  {:->10}  {:->8}",
+        "",
+        "",
+        "",
+        "",
+        "",
+        mw = max_name,
+    );
+
+    for node in &nodes_with_counts {
+        let mc = &node.message_counts;
+        let _ = writeln!(
+            out,
+            "{:<mw$}  {:>12}  {:>10}  {:>10}  {:>7.1}%",
+            node.moniker,
+            mc.unfiltered,
+            mc.filtered,
+            mc.duplicates(),
+            mc.duplicate_pct(),
+            mw = max_name,
+        );
     }
 }
 

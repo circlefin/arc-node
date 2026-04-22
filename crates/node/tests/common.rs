@@ -14,7 +14,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code, clippy::unwrap_used)]
+#![allow(
+    dead_code,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::unwrap_used
+)]
 
 use alloy_genesis::Genesis;
 use alloy_primitives::KECCAK256_EMPTY;

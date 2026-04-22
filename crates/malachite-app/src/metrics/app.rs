@@ -447,7 +447,11 @@ struct AsLabelValue<T>(T);
 
 impl EncodeLabelValue for AsLabelValue<Address> {
     fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
-        encoder.write_fmt(format_args!("{}", self.0))
+        // Preserve legacy uppercase-no-prefix format for Prometheus label continuity
+        for byte in self.0.into_inner() {
+            encoder.write_fmt(format_args!("{byte:02X}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -526,5 +530,41 @@ impl Drop for MetricsGuard {
         let elapsed = self.start_time.elapsed();
 
         (self.callback)(&self.inner, self.label, elapsed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prometheus_client::encoding::text::encode;
+    use prometheus_client::metrics::gauge::Gauge;
+    use prometheus_client::registry::Registry;
+
+    #[test]
+    fn test_address_label_preserves_legacy_format() {
+        let address = Address::new([
+            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+        ]);
+
+        let mut registry = Registry::default();
+        let family = prometheus_client::metrics::family::Family::<AddressLabel, Gauge>::default();
+        registry.register("test_metric", "test", family.clone());
+
+        family.get_or_create(&AddressLabel::new(address)).set(1);
+
+        let mut buf = String::new();
+        encode(&mut buf, &registry).unwrap();
+
+        // Prometheus labels must use legacy uppercase-no-prefix format, quoted
+        assert!(
+            buf.contains("\"123456789ABCDEF0112233445566778899AABBCC\""),
+            "Expected uppercase-no-prefix address in metrics, got: {buf}"
+        );
+        // No 0x prefix anywhere in the output
+        assert!(
+            !buf.contains("0x"),
+            "Metrics should not contain 0x prefix: {buf}"
+        );
     }
 }

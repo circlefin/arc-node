@@ -65,7 +65,8 @@ class ProcessManager {
   start = async (options = {}) => {
     this._check_not_running(options) && (await this._prepare?.(options))
     return new Promise((resolve) => {
-      const child = spawn(this.command, this._getArgs(options), { stdio: 'inherit' })
+      const command = options.bin ?? this.command
+      const child = spawn(command, this._getArgs(options), { stdio: 'inherit' })
       child.on('spawn', () => fs.writeFileSync(this.pidfile(options), `${child.pid}`))
       ;['exit', 'SIGINT', 'SIGTERM'].forEach((signal) => {
         process.on(signal, () => {
@@ -92,16 +93,7 @@ const localdevManager = new ProcessManager({
     const network = options.network ?? 'localdev'
     const chain_or_genesis = options.genesis ?? `arc-${network}`
     const blockTime = options.blockTime ?? '200ms'
-    const launchArgs = [
-      'run',
-      '--release',
-      ...(options.frozen ? ['--frozen'] : []),
-      ...(options.offline ? ['--offline'] : []),
-      '--package',
-      'arc-node-execution',
-      '--bin',
-      'arc-node-execution',
-      '--',
+    const nodeArgs = [
       'node',
       `--chain=${chain_or_genesis}`,
       `--config=${path.join(rootdir, `assets/localdev/reth.toml`)}`,
@@ -118,7 +110,21 @@ const localdevManager = new ProcessManager({
       '--invalid-tx-list-enable',
       '--arc.denylist.enabled',
     ]
-    return launchArgs
+    if (options.bin) {
+      return nodeArgs
+    }
+    return [
+      'run',
+      '--release',
+      ...(options.frozen ? ['--frozen'] : []),
+      ...(options.offline ? ['--offline'] : []),
+      '--package',
+      'arc-node-execution',
+      '--bin',
+      'arc-node-execution',
+      '--',
+      ...nodeArgs,
+    ]
   },
   prepare: (options = {}) => {
     const network = options.network ?? 'localdev'
@@ -145,6 +151,9 @@ const localdevManager = new ProcessManager({
     }
     if (options.genesis) {
       launchArgs.push(`--genesis=${options.genesis}`)
+    }
+    if (options.bin) {
+      launchArgs.push(`--bin=${options.bin}`)
     }
 
     const child = spawn(process.argv[0], launchArgs, {
@@ -208,6 +217,9 @@ try {
           break
         case '--genesis':
           options.genesis = tokens[1]
+          break
+        case '--bin':
+          options.bin = tokens[1]
       }
       continue
     }

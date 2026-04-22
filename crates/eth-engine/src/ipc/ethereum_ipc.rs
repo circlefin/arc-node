@@ -103,6 +103,14 @@ impl EthereumIPC {
         Ok(Self { ipc })
     }
 
+    /// Returns a future that resolves when the IPC connection closes.
+    pub fn on_disconnect(&self) -> impl std::future::Future<Output = ()> + 'static {
+        let client = self.ipc.client_arc();
+        async move {
+            let _ = client.on_disconnect().await;
+        }
+    }
+
     /// Send an RPC request to the Ethereum RPC endpoint via IPC.
     pub async fn rpc_request<D: DeserializeOwned>(
         &self,

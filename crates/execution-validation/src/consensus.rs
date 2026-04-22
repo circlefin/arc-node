@@ -280,7 +280,7 @@ fn arc_validate_header_timestamp_with_time<H: BlockHeader>(
     local_time: u64,
 ) -> Result<(), ConsensusError> {
     // Validate that the header's timestamp is not too far in the future
-    if header.timestamp() > local_time + ARC_PROPOSER_CLOCK_SKEW_THRESHOLD {
+    if header.timestamp() > local_time.saturating_add(ARC_PROPOSER_CLOCK_SKEW_THRESHOLD) {
         return Err(ConsensusError::TimestampIsInFuture {
             timestamp: header.timestamp(),
             present_timestamp: local_time,

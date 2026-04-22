@@ -19,6 +19,29 @@ use std::fmt;
 
 pub(super) const TOPICS: [&str; 3] = ["/consensus", "/proposal_parts", "/liveness"];
 
+/// Aggregated message receive counts across all topics (total and after dedup).
+#[derive(Debug, Clone, Default)]
+pub struct MessageCounts {
+    /// Total messages received (including duplicates), summed across all topics.
+    pub unfiltered: u64,
+    /// Messages after deduplication, summed across all topics.
+    pub filtered: u64,
+}
+
+impl MessageCounts {
+    pub fn duplicates(&self) -> u64 {
+        self.unfiltered.saturating_sub(self.filtered)
+    }
+
+    /// Duplicate percentage (0.0–100.0). Returns 0.0 when no messages received.
+    pub fn duplicate_pct(&self) -> f64 {
+        if self.unfiltered == 0 {
+            return 0.0;
+        }
+        (self.duplicates() as f64 / self.unfiltered as f64) * 100.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NodeType {
     FullNode,
@@ -53,6 +76,9 @@ pub struct NodeMetricsData {
     /// Per-peer detail from `malachitebft_network_discovered_peers`
     /// (moniker -> discovered peer info as seen by this node)
     pub discovered_peers: BTreeMap<String, DiscoveredPeer>,
+
+    /// Gossipsub message counts (aggregate across all topics) for duplicate analysis.
+    pub message_counts: MessageCounts,
 
     // connection counts
     pub connected_peers: i64,
@@ -112,4 +138,5 @@ pub struct MeshDisplayOptions {
     pub show_mesh: bool,
     pub show_peers: bool,
     pub show_peers_full: bool,
+    pub show_duplicates: bool,
 }

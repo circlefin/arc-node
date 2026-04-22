@@ -14,8 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::unwrap_used)]
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::unwrap_used
+)]
 
+use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
 use clap::{Args, Parser, Subcommand};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
 use color_eyre::eyre::{self, bail, Context, Result};
@@ -309,6 +314,9 @@ struct StartArgs {
     /// Create the testnet in remote infrastructure and start it immediately (no confirmation asked)
     #[clap(long, default_value = "false")]
     remote: bool,
+    /// Whether to start monitoring services (Prometheus, Grafana, cAdvisor, Blockscout)
+    #[clap(short = 'm', long, num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
+    monitoring: bool,
     #[command(flatten)]
     setup_args: SetupArgs,
     #[command(flatten)]
@@ -446,6 +454,9 @@ pub(crate) enum InfoSubcommand {
         /// Show full peer detail including peer types and scores
         #[clap(long, default_value = "false")]
         peers_full: bool,
+        /// Show duplicate message rates
+        #[clap(long, default_value = "false")]
+        duplicates: bool,
     },
     /// Show performance metrics: block latency and throughput
     Perf {
@@ -455,6 +466,15 @@ pub(crate) enum InfoSubcommand {
         /// Show only throughput metrics (txs/block, block size, gas/block)
         #[clap(long, default_value = "false")]
         throughput_only: bool,
+        /// Use two scrapes and show histogram deltas for the observation window only
+        #[clap(long, default_value = "false")]
+        interval: bool,
+        /// Seconds to wait before the first scrape (interval mode only)
+        #[clap(long, default_value = "30")]
+        warmup_seconds: u64,
+        /// Seconds between first and second scrape (interval mode only)
+        #[clap(long, default_value = "60")]
+        observation_seconds: u64,
     },
     /// Show Malachite CL store.db table statistics (record counts, height ranges)
     Store {
@@ -557,6 +577,93 @@ pub(crate) enum RemoteSubcommand {
     Import {
         /// Path to the JSON file created by `quake remote export`
         path: PathBuf,
+    },
+    /// Download metrics or database data from remote infrastructure
+    Download {
+        #[clap(subcommand)]
+        command: DownloadSubcommand,
+    },
+}
+
+/// A datetime accepted by `--from`/`--to` flags, converted to a Unix timestamp.
+///
+/// Accepted formats (timezone-naive values are treated as UTC):
+///   `2024-01-15T10:30:00Z`, `2024-01-15T10:30:00+05:00` (RFC 3339)
+///   `2024-01-15T10:30:00`, `2024-01-15 10:30:00` (naive datetime, UTC assumed)
+///   `2024-01-15` (date only, start of day UTC)
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CliTimestamp(i64);
+
+impl CliTimestamp {
+    pub(crate) fn unix_secs(self) -> i64 {
+        self.0
+    }
+}
+
+impl std::str::FromStr for CliTimestamp {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+            return Ok(CliTimestamp(dt.timestamp()));
+        }
+        for fmt in &["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
+            if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+                return Ok(CliTimestamp(Utc.from_utc_datetime(&ndt).timestamp()));
+            }
+        }
+        if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            let ndt = nd.and_hms_opt(0, 0, 0).expect("valid HMS");
+            return Ok(CliTimestamp(Utc.from_utc_datetime(&ndt).timestamp()));
+        }
+        Err(format!(
+            "invalid datetime '{s}'; expected RFC 3339 or one of: \
+             YYYY-MM-DDTHH:MM:SS, YYYY-MM-DD HH:MM:SS, YYYY-MM-DD"
+        ))
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum DownloadSubcommand {
+    /// Download Prometheus metrics from the Control Center.
+    ///
+    /// SSHes to CC and queries the Prometheus query_range API — no local SSM tunnel required.
+    /// Downloads all metrics by default; pass metric names after -- to filter.
+    /// Without --from/--to, start defaults to headStats.minTime (Prometheus head block only, ~2h max).
+    Metrics {
+        /// Start of the time range (default: headStats.minTime from Prometheus, covering the current head block; e.g. 2024-01-15T10:30:00Z or 2024-01-15)
+        #[clap(long)]
+        from: Option<CliTimestamp>,
+        /// End of the time range (default: now; e.g. 2024-01-15T10:30:00Z or 2024-01-15)
+        #[clap(long)]
+        to: Option<CliTimestamp>,
+        /// Query resolution — interval between data points (e.g. 30s, 1m, 5m).
+        /// Defaults to ceil((end-start)/10000) to stay within Prometheus' 11,000-point limit.
+        #[clap(long)]
+        step: Option<String>,
+        /// Metric names to download (all metrics if not specified)
+        #[clap(last = true)]
+        metric_names: Vec<String>,
+        /// Output file path (default: ./quake-metrics-<timestamp>.tar.gz)
+        #[clap(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
+    /// Download node databases from one or more remote validators.
+    ///
+    /// Defaults to all nodes in the manifest. Pass node names after -- to restrict.
+    Db {
+        /// Node names to download from (default: all nodes in manifest)
+        #[clap(last = true)]
+        nodes: Vec<String>,
+        /// Download only execution layer (Reth) data
+        #[clap(long, conflicts_with = "consensus_only")]
+        execution_only: bool,
+        /// Download only consensus layer (Malachite) data
+        #[clap(long)]
+        consensus_only: bool,
+        /// Output file path (default: ./quake-db-<timestamp>.tar.gz)
+        #[clap(short = 'o', long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -681,7 +788,9 @@ async fn main() -> Result<()> {
                 rpc_manifest,
             )
             .await?;
-            testnet.start(start_args.nodes_or_containers).await?
+            testnet
+                .start(start_args.nodes_or_containers, start_args.monitoring)
+                .await?
         }
         Commands::Stop {
             nodes_or_containers,
@@ -706,7 +815,9 @@ async fn main() -> Result<()> {
                 rpc_manifest,
             )
             .await?;
-            testnet.start(start_args.nodes_or_containers).await?;
+            testnet
+                .start(start_args.nodes_or_containers, start_args.monitoring)
+                .await?;
         }
         Commands::Perturb {
             action,

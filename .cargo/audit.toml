@@ -19,4 +19,9 @@ ignore = [
     "RUSTSEC-2025-0134",
     # lru IterMut violates Stacked Borrows - used by discv5, reth-network
     "RUSTSEC-2026-0002",
+
+    # rand 0.8.5 is unsound with a custom logger - no 0.8.x patch available; upgrading
+    # to 0.9+ requires a major-version API migration and transitive deps (yamux, libp2p)
+    # still require rand 0.8.x
+    "RUSTSEC-2026-0097",
 ]

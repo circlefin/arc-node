@@ -25,7 +25,7 @@ use tracing::{info, warn};
 
 use crate::infra::remote::CC_INSTANCE;
 use crate::infra::terraform::TERRAFORM_STATE_FILENAME;
-use crate::infra::{InfraData, INFRA_DATA_FILENAME};
+use crate::infra::{ssm, InfraData, INFRA_DATA_FILENAME};
 use crate::testnet::{LAST_MANIFEST_FILENAME, QUAKE_DIR};
 
 pub(crate) const SSH_KEY_FILENAME: &str = "ssh-private-key.pem";
@@ -174,6 +174,7 @@ pub fn import_shared_testnet(path: &Path) -> Result<()> {
     let testnet_dir = quake_dir.join(bundle.testnet_name.replace('_', "-"));
     fs::create_dir_all(&testnet_dir)
         .wrap_err_with(|| format!("Failed to create {testnet_dir:?}"))?;
+    ssm::ensure_owner_id(&testnet_dir).wrap_err("Failed to create local SSM owner ID")?;
 
     // Write the manifest and infra-data
     let manifest_path = quake_dir.join(format!("{}.toml", bundle.testnet_name));

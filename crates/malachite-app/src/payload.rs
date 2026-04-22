@@ -53,9 +53,11 @@ pub async fn generate_payload_with_retry(
         let timestamp = std::cmp::max(previous_block.timestamp, now);
 
         if previous_block.timestamp > now {
+            // timestamp >= now (since max chose previous_block.timestamp > now)
+            let skew = timestamp.saturating_sub(now);
             warn!(
                 timestamp = timestamp,
-                skew = timestamp - now,
+                skew = skew,
                 "Clock skew detected: using parent timestamp",
             );
         }
@@ -67,13 +69,17 @@ pub async fn generate_payload_with_retry(
             .await
     };
 
-    let mut attempt_num = 0;
+    let mut attempt_num = 0usize;
 
     call_once
         .retry(RETRY_POLICY.build())
         .sleep(tokio::time::sleep) // give reth time to breathe
         .notify(|_e, dur| {
-            attempt_num += 1;
+            // Bounded by MAX_RETRIES (5)
+            #[allow(clippy::arithmetic_side_effects)]
+            {
+                attempt_num += 1;
+            }
             let attempts_left = MAX_RETRIES.saturating_sub(attempt_num);
             error!(
                 attempt = attempt_num,

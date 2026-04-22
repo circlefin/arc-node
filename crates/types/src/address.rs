@@ -85,10 +85,7 @@ impl Default for Address {
 
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0.iter() {
-            write!(f, "{byte:02X}")?;
-        }
-        Ok(())
+        write!(f, "{:#x}", self.0)
     }
 }
 
@@ -177,7 +174,7 @@ mod tests {
         ];
         let address = Address::new(address_bytes);
         let display_string = address.to_string();
-        assert_eq!(display_string, "123456789ABCDEF0112233445566778899AABBCC");
+        assert_eq!(display_string, "0x123456789abcdef0112233445566778899aabbcc");
     }
 
     #[test]
@@ -187,7 +184,7 @@ mod tests {
         let debug_string = format!("{:?}", address);
         assert_eq!(
             debug_string,
-            "Address(AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)"
+            "Address(0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
         );
     }
 
@@ -234,6 +231,23 @@ mod tests {
 
         // Test deserialization
         let deserialized: Address = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, address);
+    }
+
+    #[test]
+    fn test_address_serde_lowercase() {
+        let address = Address::new([
+            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+        ]);
+
+        // Serde uses 0x + lowercase hex (same as Display)
+        let serialized = serde_json::to_string(&address).unwrap();
+        assert_eq!(serialized, "\"0x123456789abcdef0112233445566778899aabbcc\"");
+
+        // Deserialization is case-insensitive
+        let upper = "\"0x123456789ABCDEF0112233445566778899AABBCC\"";
+        let deserialized: Address = serde_json::from_str(upper).unwrap();
         assert_eq!(deserialized, address);
     }
 

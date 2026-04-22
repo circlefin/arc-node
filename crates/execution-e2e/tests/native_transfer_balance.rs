@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
+
 //! E2E tests verifying that native value transfers produce correct balance changes.
 
 use alloy_primitives::{address, Address, U256};

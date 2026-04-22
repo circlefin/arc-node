@@ -14,6 +14,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Offline diagnostic CLI tool — not part of the node runtime.
+#![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
+
 use std::io::{self, BufRead};
 
 use clap::Parser;
@@ -50,6 +53,10 @@ struct Cli {
     /// Include peer types and scores in peer detail
     #[arg(long)]
     peers_full: bool,
+
+    /// Show duplicate message rates
+    #[arg(long)]
+    duplicates: bool,
 
     /// Exit non-zero if any node is classified at this tier.
     /// Can be repeated: `--fail not-connected --fail multi-hop`.
@@ -124,6 +131,7 @@ async fn main() -> Result<()> {
         show_mesh: true,
         show_peers: cli.peers || cli.peers_full,
         show_peers_full: cli.peers_full,
+        show_duplicates: cli.duplicates,
     };
 
     print!("{}", format_report(&analysis, &options));

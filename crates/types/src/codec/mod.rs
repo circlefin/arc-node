@@ -18,16 +18,8 @@ pub use malachitebft_codec::{Codec, HasEncodedLen};
 
 /// Shared macro for implementing versioned codecs.
 ///
-/// # Phased Rollout Strategy
-///
-/// **Phase 1 (Current)**: Decoder supports both legacy and versioned messages, encoder uses legacy format
-/// - Encoding: Uses legacy protobuf-only format (no version byte prefix)
-/// - Decoding: Supports both legacy protobuf AND versioned messages (with version byte prefix)
-/// - This ensures backward compatibility with existing nodes
-///
-/// **Phase 2 (Future)**: Once all nodes are upgraded to Phase 1, enable versioned encoding
-/// - Encoding: Add version byte prefix to all encoded messages
-/// - Decoding: Continue supporting both formats for a transition period
+/// Encoding: Adds a version byte prefix to all encoded messages.
+/// Decoding: Reads the version byte prefix and decodes the rest as protobuf.
 ///
 /// # Parameters
 /// - `$codec_ty`: The codec type to implement for (e.g., `NetCodec`, `WalCodec`)
@@ -46,7 +38,7 @@ macro_rules! impl_versioned_codec {
                     return Err($crate::codec::error::CodecError::EmptyBytes);
                 }
 
-                // XXX: remove after all nodes are upgraded to use versioning
+                // TODO: Phase 3: Remove after all nodes are upgraded to use versioning
                 if let Ok(msg) = malachitebft_codec::Codec::decode(
                     &$crate::codec::proto::ProtobufCodec,
                     bytes.clone(),
@@ -67,25 +59,19 @@ macro_rules! impl_versioned_codec {
                     .map_err($crate::codec::error::CodecError::Protobuf)
             }
 
-            // TODO: Phase 2 - Enable versioned encoding once all nodes support decoding versioned messages
-            // fn encode(&self, msg: &$ty) -> Result<bytes::Bytes, Self::Error> {
-            //     use bytes::BufMut;
-            //
-            //     let encoded =
-            //         malachitebft_codec::Codec::encode(&$crate::codec::proto::ProtobufCodec, msg)
-            //             .map_err($crate::codec::error::CodecError::Protobuf)?;
-            //
-            //     let mut result = bytes::BytesMut::with_capacity(1 + encoded.len());
-            //     result.put_u8($version_val as u8);
-            //     result.put(encoded);
-            //
-            //     Ok(result.freeze())
-            // }
-
-            // Phase 1: Use legacy protobuf encoding for backward compatibility
             fn encode(&self, msg: &$ty) -> Result<bytes::Bytes, Self::Error> {
-                malachitebft_codec::Codec::encode(&$crate::codec::proto::ProtobufCodec, msg)
-                    .map_err($crate::codec::error::CodecError::Protobuf)
+                use bytes::BufMut;
+
+                let encoded =
+                    malachitebft_codec::Codec::encode(&$crate::codec::proto::ProtobufCodec, msg)
+                        .map_err($crate::codec::error::CodecError::Protobuf)?;
+
+                #[allow(clippy::arithmetic_side_effects)] // 1 + valid allocation length
+                let mut result = bytes::BytesMut::with_capacity(1 + encoded.len());
+                result.put_u8($version_val as u8);
+                result.put(encoded);
+
+                Ok(result.freeze())
             }
         }
     };

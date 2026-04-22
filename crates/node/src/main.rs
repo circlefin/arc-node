@@ -104,7 +104,7 @@ fn follow_url_for_consensus(
     let chain_id = builder.config().chain.chain().id();
 
     let url = if follow_url.is_empty() || follow_url == "auto" {
-        follow::url_for_chain_id(chain_id)?
+        follow::ws_url_for_chain_id(chain_id)?
     } else {
         follow_url.to_string()
     };

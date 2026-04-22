@@ -19,7 +19,7 @@
 //! Shared between execution-config and malachite-app to ensure consistency.
 
 /// Arc mainnet.
-pub const MAINNET_CHAIN_ID: u64 = 5042000;
+pub const MAINNET_CHAIN_ID: u64 = 5042;
 /// Arc devnet.
 pub const DEVNET_CHAIN_ID: u64 = 5042001;
 /// Arc testnet.

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: circle-chain-reth
+version: 0.1.0
+appVersion: "1.0"
+description: EaaS deployment for arc-execution and engine-bench
+dependencies:
+  - name: circle-helm-lib
+    repository: oci://ghcr.io/circlefin/circle-helm-charts
+    version: 4.0.0-f6299dfe

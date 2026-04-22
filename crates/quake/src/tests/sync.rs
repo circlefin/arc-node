@@ -92,7 +92,7 @@ fn speed_test<'a>(
             info!("Waiting {downtime_s}s for the network to advance...");
             tokio::time::sleep(Duration::from_secs(downtime_s)).await;
             info!("Starting {node}");
-            testnet.start(vec![node.clone()]).await?;
+            testnet.start(vec![node.clone()], false).await?;
         }
 
         let config = arc_checks::SyncSpeedConfig {

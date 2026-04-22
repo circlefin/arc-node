@@ -37,7 +37,7 @@ use bytesize::ByteSize;
 use eyre::Context;
 use rand::rngs::OsRng;
 use tokio::signal::unix::SignalKind;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -101,6 +101,8 @@ pub struct Handle {
     pub store_monitor: JoinHandle<()>,
     pub tx_event: TxEvent<ArcContext>,
     pub cancel_token: CancellationToken,
+    /// Fires when the EL IPC watchdog triggered shutdown (as opposed to SIGTERM or normal halt).
+    el_watchdog_triggered: oneshot::Receiver<()>,
     /// Kept alive to prevent the app request channel from closing when RPC is disabled.
     _tx_app_req: mpsc::Sender<AppRequest>,
 }
@@ -256,7 +258,12 @@ impl App {
         }
 
         let p2p_identity = self.p2p_identity()?;
-        let consensus_identity = self.consensus_identity().await?;
+
+        let consensus_identity = if self.start_config.validator {
+            self.consensus_identity().await?
+        } else {
+            self.ephemeral_consensus_identity()
+        };
 
         Ok(NodeIdentity::new(
             self.config.moniker.clone(),
@@ -300,6 +307,28 @@ impl App {
             self.config.moniker.clone(),
             p2p_identity,
             consensus_identity,
+        )
+    }
+
+    /// Generate an ephemeral consensus identity for full nodes.
+    ///
+    /// Full nodes participate in gossip but do not sign votes or proposals,
+    /// so they do not need a persistent consensus key.
+    fn ephemeral_consensus_identity(&self) -> ConsensusIdentity {
+        let consensus_key = PrivateKey::generate(OsRng);
+        let local_provider = LocalSigningProvider::new(consensus_key);
+        let public_key = local_provider.public_key();
+        let address = Address::from_public_key(&public_key);
+
+        info!(
+            %address,
+            "Using ephemeral consensus identity for full node (no signing will occur)"
+        );
+
+        ConsensusIdentity::new(
+            address,
+            public_key,
+            ArcSigningProvider::Local(local_provider),
         )
     }
 
@@ -429,18 +458,14 @@ impl App {
             // Streaming will start when Sync actor receives first StartedHeight from Consensus
             self.start_rpc_sync_engine(ctx, identity, wal_path).await
         } else {
-            // Create validator proof (ADR-006) binding public key to peer ID
-            //
-            // TODO: Currently all non-RPC-sync nodes create a validator proof, but this should
-            // only apply to actual validators. Non-validator full nodes should use
-            // `NetworkIdentity::new(moniker, keypair, None)` instead of `new_validator`.
-            // This requires a way to detect if the node is configured as a validator
-            let network_identity = self
-                .create_network_identity_with_proof(&identity)
-                .await
-                .wrap_err("Failed to create network identity with validator proof")?;
+            let network_identity = if self.start_config.validator {
+                self.create_network_identity_with_proof(&identity)
+                    .await
+                    .wrap_err("Failed to create network identity with validator proof")?
+            } else {
+                NetworkIdentity::new(identity.moniker.clone(), identity.p2p.keypair.clone(), None)
+            };
 
-            // Use default engine for consensus mode
             let (channels, engine_handle) = malachitebft_app_channel::start_engine(
                 ctx,
                 self.config.clone(),
@@ -621,6 +646,11 @@ impl App {
 
         let consensus_spec = ConsensusSpec::from(chain_id);
 
+        // Resolve default follow endpoints when --follow is used without explicit endpoints
+        self.start_config
+            .resolve_default_rpc_sync_endpoints(chain_id.as_u64())
+            .wrap_err("Failed to resolve default follow endpoints")?;
+
         // Configure Engine API version selection (V4 vs V5) based on the chainspec.
         // When ARC_GENESIS_FILE_PATH is set, parse the same genesis.json the EL uses
         // so that patched hardfork timestamps (e.g. nightly-upgrade) are picked up
@@ -666,6 +696,27 @@ impl App {
         let tx_event = channels.events.clone();
         let cancel_token = CancellationToken::new();
 
+        // Watchdog: cancel the app task if the EL IPC connection closes unexpectedly.
+        // run() will detect the signal and return an error, letting the tokio runtime
+        // unwind naturally (running all Drop implementations) instead of process::exit.
+        let engine_for_watchdog = engine.clone();
+        let (el_watchdog_tx, el_watchdog_rx) = oneshot::channel::<()>();
+        tokio::spawn({
+            let cancel_token = cancel_token.clone();
+            async move {
+                tokio::select! {
+                    _ = engine_for_watchdog.wait_for_disconnect() => {
+                        tracing::error!("EL IPC connection closed; shutting down");
+                        // Send before cancel so the oneshot is filled before the app task
+                        // can observe cancellation and exit, eliminating a try_recv race.
+                        el_watchdog_tx.send(()).ok();
+                        cancel_token.cancel();
+                    }
+                    _ = cancel_token.cancelled() => {}
+                }
+            }
+        });
+
         // Start the application task
         let app_handle = tokio::spawn({
             let cancel_token = cancel_token.clone();
@@ -685,6 +736,7 @@ impl App {
             tx_event,
             store,
             cancel_token,
+            el_watchdog_triggered: el_watchdog_rx,
             _tx_app_req: tx_app_req,
         })
     }
@@ -695,7 +747,7 @@ impl App {
         }
 
         // Start the application
-        let handles = match self.start().await {
+        let mut handles = match self.start().await {
             Ok(handles) => handles,
             Err(e) => {
                 let startup_error = e.wrap_err("Node failed to start");
@@ -714,6 +766,13 @@ impl App {
 
         // Wait for the application to finish
         let result = handles.app.await?;
+
+        // If the EL IPC watchdog triggered the shutdown, propagate an error so the
+        // caller (main) exits with a non-zero code. The tokio runtime unwinds naturally
+        // after run() returns, running all Drop implementations — no process::exit needed.
+        if handles.el_watchdog_triggered.try_recv().is_ok() {
+            return Err(eyre::eyre!("EL IPC connection closed unexpectedly"));
+        }
 
         if let Err(e) = &result {
             // If the application halted due to reaching a configured height,
@@ -820,3 +879,83 @@ fn spawn_pprof_server(bind_address: std::net::SocketAddr) {
 
 #[cfg(not(feature = "pprof"))]
 fn spawn_pprof_server(_bind_address: std::net::SocketAddr) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn write_key_file(dir: &std::path::Path) -> (PathBuf, PrivateKey) {
+        let key = PrivateKey::generate(OsRng);
+        let path = dir.join("priv_validator_key.json");
+        let json = serde_json::to_string(&key).expect("serialize key");
+        std::fs::write(&path, json).expect("write key file");
+        (path, key)
+    }
+
+    fn test_app(private_key_file: PathBuf, validator: bool) -> App {
+        let config = Config {
+            moniker: "test-node".to_string(),
+            ..Default::default()
+        };
+        let start_config = StartConfig {
+            validator,
+            ..Default::default()
+        };
+        App::new(
+            config,
+            PathBuf::from("/tmp"),
+            private_key_file,
+            start_config,
+        )
+    }
+
+    #[tokio::test]
+    async fn full_node_uses_ephemeral_consensus_identity() {
+        let dir = tempdir().unwrap();
+        let (key_path, original_key) = write_key_file(dir.path());
+
+        let app = test_app(key_path, false);
+        let identity = app.setup_node_identity().await.unwrap();
+
+        // P2P identity uses the key from file
+        let expected_keypair =
+            Keypair::ed25519_from_bytes(original_key.inner().to_bytes()).unwrap();
+        assert_eq!(
+            identity.p2p.keypair.public().to_peer_id(),
+            expected_keypair.public().to_peer_id(),
+        );
+
+        // Consensus identity is ephemeral (address differs from the file key)
+        let file_provider = LocalSigningProvider::new(original_key);
+        let file_address = Address::from_public_key(&file_provider.public_key());
+        assert_ne!(identity.consensus.address(), file_address);
+    }
+
+    #[tokio::test]
+    async fn validator_loads_consensus_identity_from_key_file() {
+        let dir = tempdir().unwrap();
+        let (key_path, original_key) = write_key_file(dir.path());
+
+        let app = test_app(key_path, true);
+        let identity = app.setup_node_identity().await.unwrap();
+
+        // Both P2P and consensus derive from the same key file
+        let file_provider = LocalSigningProvider::new(original_key);
+        let file_address = Address::from_public_key(&file_provider.public_key());
+        assert_eq!(identity.consensus.address(), file_address);
+    }
+
+    #[test]
+    fn ephemeral_consensus_identity_generates_valid_identity() {
+        let dir = tempdir().unwrap();
+        let (key_path, _) = write_key_file(dir.path());
+
+        let app = test_app(key_path, false);
+        let id1 = app.ephemeral_consensus_identity();
+        let id2 = app.ephemeral_consensus_identity();
+
+        // Each call produces a different address
+        assert_ne!(id1.address(), id2.address());
+    }
+}

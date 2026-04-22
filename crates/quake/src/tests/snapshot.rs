@@ -67,7 +67,7 @@ pub(crate) async fn create_snapshot(
 
     info!("🔄 Restarting {node}");
     testnet
-        .start(vec![node.to_string()])
+        .start(vec![node.to_string()], false)
         .await
         .wrap_err_with(|| format!("Failed to restart {node}"))?;
 
@@ -179,7 +179,7 @@ pub(crate) async fn restore_from_snapshot(
 
     info!("🚀 Starting {target_node}");
     testnet
-        .start(vec![target_node.to_string()])
+        .start(vec![target_node.to_string()], false)
         .await
         .wrap_err_with(|| format!("Failed to start {target_node}"))?;
 

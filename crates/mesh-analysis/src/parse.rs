@@ -18,13 +18,14 @@ use std::collections::{BTreeMap, HashSet};
 
 use prometheus_parse::{Sample, Scrape, Value};
 
-use super::types::{DiscoveredPeer, NodeMetricsData, NodeType, TOPICS};
+use super::types::{DiscoveredPeer, MessageCounts, NodeMetricsData, NodeType, TOPICS};
 
 /// Metric name prefixes we actually use. Lines not matching any of these
 /// (and not starting with `#`) are dropped before parsing, which avoids
 /// allocating `Sample` objects for the hundreds of metrics we don't need.
 const METRIC_PREFIXES: &[&str] = &[
     "malachitebft_network_gossipsub_mesh_peer_counts",
+    "malachitebft_network_gossipsub_topic_msg_recv_counts",
     "malachitebft_network_peer_mesh_membership",
     "malachitebft_network_explicit_peers",
     "malachitebft_network_discovered_peers",
@@ -135,6 +136,27 @@ fn extract_explicit_peers(samples: &[Sample]) -> Vec<String> {
     let mut v: Vec<_> = peers.into_iter().collect();
     v.sort();
     v
+}
+
+/// Sum message counts across all topics for duplicate analysis.
+fn extract_message_counts(samples: &[Sample]) -> MessageCounts {
+    let mut unfiltered = 0u64;
+    let mut filtered = 0u64;
+
+    for sample in samples {
+        let value = value_as_f64(&sample.value).unwrap_or(0.0) as u64;
+        if sample.metric == "malachitebft_network_gossipsub_topic_msg_recv_counts_unfiltered_total"
+        {
+            unfiltered += value;
+        } else if sample.metric == "malachitebft_network_gossipsub_topic_msg_recv_counts_total" {
+            filtered += value;
+        }
+    }
+
+    MessageCounts {
+        unfiltered,
+        filtered,
+    }
 }
 
 /// Extract per-peer detail from `malachitebft_network_discovered_peers` for this node.
@@ -248,6 +270,7 @@ pub fn parse_all_metrics(raw_metrics: &[(String, String)]) -> Vec<NodeMetricsDat
 
             let explicit_peers = extract_explicit_peers(samples);
             let discovered_peers = extract_discovered_peers(samples);
+            let message_counts = extract_message_counts(samples);
 
             let connected_peers =
                 extract_gauge_value(samples, "malachitebft_core_consensus_connected_peers");
@@ -269,6 +292,7 @@ pub fn parse_all_metrics(raw_metrics: &[(String, String)]) -> Vec<NodeMetricsDat
                 mesh_peers,
                 explicit_peers,
                 discovered_peers,
+                message_counts,
                 connected_peers,
                 inbound_peers,
                 outbound_peers,
