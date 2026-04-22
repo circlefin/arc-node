@@ -1,0 +1,14 @@
+# Placeholder values for EaaS engine-bench deployment.
+# Actual values are provided by customized_helm_values/circle-chain-reth.yaml
+# in terraform-aws-argocd-eaas.
+
+common:
+  name: circle-chain-reth
+  repo: 452601555275.dkr.ecr.us-east-1.amazonaws.com/loadtest/arc-execution
+  logTagSvc: circle-chain-reth
+
+deployments:
+  arc-execution:
+
+jobs:
+  engine-bench:

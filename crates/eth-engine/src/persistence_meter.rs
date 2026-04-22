@@ -381,7 +381,11 @@ async fn reconnect(
                     "Persistence meter: reconnection failed; retrying"
                 );
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                // backoff <= MAX_RECONNECT_BACKOFF (60s); *2 fits in Duration
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                }
             }
         }
     }
@@ -414,17 +418,22 @@ async fn connect_client(endpoint: &SubscriptionEndpoint) -> eyre::Result<Client>
             .build(socket_path)
             .await
             .wrap_err_with(|| format!("Failed to connect to IPC socket {socket_path}")),
-        SubscriptionEndpoint::Ws { url } => WsClientBuilder::default()
-            .request_timeout(REQUEST_TIMEOUT)
-            .connection_timeout(CONNECT_TIMEOUT)
-            .enable_ws_ping(
-                PingConfig::new()
-                    .ping_interval(WS_PING_INTERVAL)
-                    .inactive_limit(WS_PING_INTERVAL * 2),
-            )
-            .build(url)
-            .await
-            .wrap_err_with(|| format!("Failed to connect to WebSocket endpoint {url}")),
+        SubscriptionEndpoint::Ws { url } => {
+            // 30s * 2 = 60s — fits in Duration
+            #[allow(clippy::arithmetic_side_effects)]
+            let ws_inactive_limit = WS_PING_INTERVAL * 2;
+            WsClientBuilder::default()
+                .request_timeout(REQUEST_TIMEOUT)
+                .connection_timeout(CONNECT_TIMEOUT)
+                .enable_ws_ping(
+                    PingConfig::new()
+                        .ping_interval(WS_PING_INTERVAL)
+                        .inactive_limit(ws_inactive_limit),
+                )
+                .build(url)
+                .await
+                .wrap_err_with(|| format!("Failed to connect to WebSocket endpoint {url}"))
+        }
     }
 }
 

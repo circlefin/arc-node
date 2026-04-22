@@ -70,14 +70,27 @@ fn abi_get_consensus_params_params_rpc(block_height: u64) -> eyre::Result<Value>
 pub struct EthereumRPC {
     client: Client,
     url: Url,
+    default_timeout: Duration,
+    batch_request_timeout: Duration,
 }
 
 impl EthereumRPC {
     /// Create a new `EthereumRPC` struct given the URL.
     pub fn new(url: Url) -> eyre::Result<Self> {
+        Self::new_with_timeouts(url, ETH_DEFAULT_TIMEOUT, ETH_BATCH_REQUEST_TIMEOUT)
+    }
+
+    /// Create a new `EthereumRPC` struct given the URL and request timeouts.
+    pub fn new_with_timeouts(
+        url: Url,
+        default_timeout: Duration,
+        batch_request_timeout: Duration,
+    ) -> eyre::Result<Self> {
         Ok(Self {
             client: Client::builder().build()?,
             url,
+            default_timeout,
+            batch_request_timeout,
         })
     }
 
@@ -110,7 +123,7 @@ impl EthereumRPC {
     /// Probe the RPC server with `net_listening` to confirm
     /// it is accepting requests.
     pub async fn check_connectivity(&self) -> eyre::Result<bool> {
-        self.rpc_request("net_listening", json!([]), ETH_DEFAULT_TIMEOUT)
+        self.rpc_request("net_listening", json!([]), self.default_timeout)
             .await
     }
 
@@ -118,7 +131,7 @@ impl EthereumRPC {
     pub async fn get_chain_id(&self) -> eyre::Result<String> {
         self.build_rpc_request("eth_chainId")
             .params(json!([]))
-            .timeout(ETH_DEFAULT_TIMEOUT)
+            .timeout(self.default_timeout)
             .retry(ETH_CALL_RETRY.build())
             .send()
             .await
@@ -130,7 +143,7 @@ impl EthereumRPC {
             .rpc_request(
                 "eth_getBlockByNumber",
                 json!(["0x0", false]),
-                ETH_DEFAULT_TIMEOUT,
+                self.default_timeout,
             )
             .await?;
 
@@ -145,7 +158,7 @@ impl EthereumRPC {
         let result: String = self
             .build_rpc_request("eth_call")
             .params(params)
-            .timeout(ETH_DEFAULT_TIMEOUT)
+            .timeout(self.default_timeout)
             .retry(ETH_CALL_RETRY.build())
             .send()
             .await
@@ -169,7 +182,7 @@ impl EthereumRPC {
         let result: String = self
             .build_rpc_request("eth_call")
             .params(params)
-            .timeout(ETH_DEFAULT_TIMEOUT)
+            .timeout(self.default_timeout)
             .retry(ETH_CALL_RETRY.build())
             .send()
             .await
@@ -191,7 +204,7 @@ impl EthereumRPC {
     ) -> eyre::Result<Option<ExecutionBlock>> {
         let return_full_transaction_objects = false;
         let params = json!([block_number, return_full_transaction_objects]);
-        self.rpc_request("eth_getBlockByNumber", params, ETH_DEFAULT_TIMEOUT)
+        self.rpc_request("eth_getBlockByNumber", params, self.default_timeout)
             .await
     }
 
@@ -225,7 +238,7 @@ impl EthereumRPC {
             .client
             .post(self.url.clone())
             .json(&batch_requests)
-            .timeout(ETH_BATCH_REQUEST_TIMEOUT)
+            .timeout(self.batch_request_timeout)
             .send()
             .await
             .wrap_err("Failed to send RPC batch request")?;
@@ -250,6 +263,7 @@ impl EthereumRPC {
                 continue;
             };
 
+            #[allow(clippy::cast_possible_truncation)] // bounded by block_numbers.len() below
             let id = id as usize;
             if id >= block_numbers.len() {
                 debug!(
@@ -297,13 +311,13 @@ impl EthereumRPC {
 
     /// Get the status of the transaction pool.
     pub async fn txpool_status(&self) -> eyre::Result<TxpoolStatus> {
-        self.rpc_request("txpool_status", json!([]), ETH_DEFAULT_TIMEOUT)
+        self.rpc_request("txpool_status", json!([]), self.default_timeout)
             .await
     }
 
     /// Get the contents of the transaction pool.
     pub async fn txpool_inspect(&self) -> eyre::Result<TxpoolInspect> {
-        self.rpc_request("txpool_inspect", json!([]), ETH_DEFAULT_TIMEOUT)
+        self.rpc_request("txpool_inspect", json!([]), self.default_timeout)
             .await
     }
 }
@@ -474,10 +488,7 @@ mod tests {
             .await;
 
         let url = Url::parse(&server.uri()).unwrap();
-        let ethereum_rpc = EthereumRPC {
-            url,
-            client: Client::new(),
-        };
+        let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
         let result = ethereum_rpc.get_genesis_block().await.unwrap();
         assert_eq!(result.block_hash, genesis_hash.parse::<B256>().unwrap());
@@ -499,10 +510,7 @@ mod tests {
             .await;
 
         let url = Url::parse(&server.uri()).unwrap();
-        let ethereum_rpc = EthereumRPC {
-            url,
-            client: Client::new(),
-        };
+        let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
         let err = ethereum_rpc.get_genesis_block().await.unwrap_err();
         assert!(err.to_string().contains("Genesis block not found"));
@@ -560,10 +568,7 @@ mod tests {
             .await;
 
         let url = Url::parse(&server.uri()).unwrap();
-        let ethereum_rpc = EthereumRPC {
-            url,
-            client: Client::new(),
-        };
+        let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
         let block_numbers = vec!["0x1".to_string(), "0x2".to_string()];
         let result = ethereum_rpc
@@ -628,10 +633,7 @@ mod tests {
             .await;
 
         let url = Url::parse(&server.uri()).unwrap();
-        let ethereum_rpc = EthereumRPC {
-            url,
-            client: Client::new(),
-        };
+        let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
         let block_numbers = vec!["0x1".to_string(), "0x999".to_string()];
         let result = ethereum_rpc
@@ -678,10 +680,7 @@ mod tests {
             .await;
 
         let url = Url::parse(&server.uri()).unwrap();
-        let ethereum_rpc = EthereumRPC {
-            url,
-            client: Client::new(),
-        };
+        let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
         let block_numbers = vec!["0x1".to_string()];
         let result = ethereum_rpc
@@ -724,10 +723,7 @@ mod tests {
             .await;
 
         let url = Url::parse(&server.uri()).unwrap();
-        let ethereum_rpc = EthereumRPC {
-            url,
-            client: Client::new(),
-        };
+        let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
         let block_numbers = vec!["0x1".to_string()];
         let result = ethereum_rpc
@@ -743,10 +739,7 @@ mod tests {
     async fn test_ethereum_rpc_batch_payloads_network_error() {
         // Use invalid URL to trigger network error
         let url = Url::parse("http://invalid-host:8545").unwrap();
-        let ethereum_rpc = EthereumRPC {
-            url,
-            client: Client::new(),
-        };
+        let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
         let block_numbers = vec!["0x1".to_string()];
         let result = ethereum_rpc.get_execution_payloads(&block_numbers).await;
@@ -789,10 +782,7 @@ mod tests {
             .await;
 
         let url = Url::parse(&server.uri()).unwrap();
-        let ethereum_rpc = EthereumRPC {
-            url,
-            client: Client::new(),
-        };
+        let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
         let block_numbers = vec!["0x1".to_string()];
         let result = ethereum_rpc

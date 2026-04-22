@@ -39,7 +39,7 @@ use crate::rpc::{ControllerInfo, Controllers};
 use crate::valset::ValidatorPowerUpdate;
 use crate::wait::{check_ws_connectable, wait_for_nodes, wait_for_nodes_sync, wait_for_rounds};
 use crate::{build, genesis, info as info_mod, latency, monitor, setup, shell};
-use crate::{InfoSubcommand, RemoteSubcommand, SSMSubcommand};
+use crate::{DownloadSubcommand, InfoSubcommand, RemoteSubcommand, SSMSubcommand};
 
 pub(crate) const QUAKE_DIR: &str = ".quake";
 pub(crate) const LAST_MANIFEST_FILENAME: &str = ".last_manifest";
@@ -186,6 +186,12 @@ impl Testnet {
                 )
             }
             InfraType::Remote => {
+                let owner_id = if infra_data.control_center.is_some() {
+                    infra::ssm::ensure_owner_id(&dir)
+                        .wrap_err("Failed to initialize local SSM owner ID")?
+                } else {
+                    String::new()
+                };
                 let terraform = Terraform::new(
                     &repo_root_dir.join("crates").join("quake").join("terraform"),
                     &relative_dir,
@@ -194,8 +200,9 @@ impl Testnet {
                     node_names,
                     manifest.build_network_topology(),
                 )?;
-                let ssm_tunnels = infra::ssm::Ssm::new(infra_data.control_center.as_ref())
-                    .wrap_err("Failed to initialize SSM tunnels")?;
+                let ssm_tunnels =
+                    infra::ssm::Ssm::new(owner_id, infra_data.control_center.as_ref())
+                        .wrap_err("Failed to initialize SSM tunnels")?;
                 Arc::new(
                     RemoteInfra::new(
                         &repo_root_dir,
@@ -370,6 +377,9 @@ impl Testnet {
                 setup::generate_prometheus_config(&path, self.nodes_metadata.values())?;
             }
             InfraType::Remote => {
+                infra::ssm::ensure_owner_id(&self.dir)
+                    .wrap_err("Failed to create local SSM owner ID")?;
+
                 // Get consensus container IPs for all nodes (needed for persistent peers)
                 let consensus_addresses_map = self.nodes_metadata.consensus_ip_addresses_map();
 
@@ -434,6 +444,7 @@ impl Testnet {
                         &peers_ips,
                         Some(self.images.cl.as_str()),
                         &follow_endpoint_urls,
+                        None,
                     );
 
                     let compose_data = setup::ComposeTemplateDataRemote {
@@ -535,7 +546,7 @@ impl Testnet {
     }
 
     /// Start testnet containers using Docker Compose
-    pub async fn start(&self, names: Vec<NodeOrContainerName>) -> Result<()> {
+    pub async fn start(&self, names: Vec<NodeOrContainerName>, monitoring: bool) -> Result<()> {
         // In remote mode, open long-lived SSM tunnels to the Control Center
         // server ports (required for RPC proxy and monitoring services)
         if let Ok(remote_infra) = self.remote_infra() {
@@ -551,7 +562,16 @@ impl Testnet {
             self.infra.start(&containers)?;
         } else {
             // Start the testnet following the starting heights in the manifest
-            self.start_from_manifest().await?;
+            self.start_from_manifest(monitoring).await?;
+        }
+
+        if monitoring {
+            if let Ok(remote_infra) = self.remote_infra() {
+                match remote_infra.start_monitoring() {
+                    Ok(output) => info!(%output, "✅ Monitoring started on CC"),
+                    Err(err) => warn!("⚠️ Failed to start monitoring on CC: {err:#}"),
+                }
+            }
         }
 
         if let Ok(remote_infra) = self.remote_infra() {
@@ -563,12 +583,14 @@ impl Testnet {
 
         info!(dir=%self.dir.display(), "✅ Testnet started");
         println!("📁 Testnet files: {}", self.dir.display());
-        self.print_monitoring_info();
+        if monitoring {
+            self.print_monitoring_info();
+        }
         Ok(())
     }
 
     /// Start nodes in the testnet following their starting heights in the manifest
-    async fn start_from_manifest(&self) -> Result<()> {
+    async fn start_from_manifest(&self, monitoring: bool) -> Result<()> {
         // Group nodes by starting height, then sort groups by height
         let nodes_by_height = self
             .manifest
@@ -612,12 +634,14 @@ impl Testnet {
             // Start containers associated with the node group
             let mut containers: Vec<_> = nodes.iter().flat_map(|n| n.container_names()).collect();
             // In local mode, start monitoring services with the first group of nodes
-            if let Ok(local_infra) = self.local_infra() {
-                if started_nodes.is_empty() {
-                    containers.extend(BLOCKSCOUT_CONTAINERS.map(String::from));
+            if monitoring {
+                if let Ok(local_infra) = self.local_infra() {
+                    if started_nodes.is_empty() {
+                        containers.extend(BLOCKSCOUT_CONTAINERS.map(String::from));
 
-                    let monitoring = local_infra.monitoring.clone();
-                    tokio::task::spawn_blocking(move || monitoring.start()).await??;
+                        let monitoring = local_infra.monitoring.clone();
+                        tokio::task::spawn_blocking(move || monitoring.start()).await??;
+                    }
                 }
             }
 
@@ -897,6 +921,7 @@ impl Testnet {
                 mesh_only,
                 peers,
                 peers_full,
+                duplicates,
             }) => {
                 let metrics_urls = self.nodes_metadata.all_consensus_metrics_urls();
                 let raw_metrics = crate::mesh::fetch_all_metrics(&metrics_urls).await;
@@ -911,6 +936,7 @@ impl Testnet {
                         show_mesh: true,
                         show_peers: peers || peers_full,
                         show_peers_full: peers_full,
+                        show_duplicates: duplicates,
                     };
                     print!("{}", crate::mesh::format_report(&analysis, &options));
                 }
@@ -918,25 +944,68 @@ impl Testnet {
             Some(InfoSubcommand::Perf {
                 latency_only,
                 throughput_only,
+                interval,
+                warmup_seconds,
+                observation_seconds,
             }) => {
                 let metrics_urls = self.nodes_metadata.all_consensus_metrics_urls();
-                let raw_metrics = arc_checks::fetch_all_metrics(&metrics_urls).await;
-                let mut nodes = arc_checks::parse_perf_metrics(&raw_metrics);
+                let options = arc_checks::PerfDisplayOptions {
+                    show_latency: !throughput_only,
+                    show_throughput: !latency_only,
+                    show_summary: !latency_only && !throughput_only,
+                };
 
-                crate::util::assign_node_groups(
-                    nodes.iter_mut().map(|n| (n.name.as_str(), &mut n.group)),
-                    &self.manifest.nodes,
-                );
+                if interval {
+                    if warmup_seconds > 0 {
+                        println!("Warming up ({warmup_seconds}s) before first scrape...");
+                        tokio::time::sleep(std::time::Duration::from_secs(warmup_seconds)).await;
+                    }
+                    let raw_before = arc_checks::fetch_all_metrics(&metrics_urls).await;
+                    println!("Observing ({observation_seconds}s) before second scrape...");
+                    tokio::time::sleep(std::time::Duration::from_secs(observation_seconds)).await;
+                    let raw_after = arc_checks::fetch_all_metrics(&metrics_urls).await;
 
-                if nodes.is_empty() {
-                    println!("No nodes responded to metrics requests. Is the testnet running?");
+                    let nodes = crate::util::parse_perf_metrics_delta_with_groups(
+                        &raw_before,
+                        &raw_after,
+                        &self.manifest.nodes,
+                    );
+
+                    if nodes.is_empty() {
+                        println!(
+                            "No interval perf data (no nodes with metrics in both scrapes). Is the testnet running?"
+                        );
+                    } else {
+                        print!(
+                            "{}",
+                            arc_checks::format_perf_report(
+                                &nodes,
+                                &options,
+                                arc_checks::PerfReportKind::Interval {
+                                    observation_secs: observation_seconds,
+                                },
+                            )
+                        );
+                    }
                 } else {
-                    let options = arc_checks::PerfDisplayOptions {
-                        show_latency: !throughput_only,
-                        show_throughput: !latency_only,
-                        show_summary: !latency_only && !throughput_only,
-                    };
-                    print!("{}", arc_checks::format_perf_report(&nodes, &options));
+                    let raw_metrics = arc_checks::fetch_all_metrics(&metrics_urls).await;
+                    let nodes = crate::util::parse_perf_metrics_with_groups(
+                        &raw_metrics,
+                        &self.manifest.nodes,
+                    );
+
+                    if nodes.is_empty() {
+                        println!("No nodes responded to metrics requests. Is the testnet running?");
+                    } else {
+                        print!(
+                            "{}",
+                            arc_checks::format_perf_report(
+                                &nodes,
+                                &options,
+                                arc_checks::PerfReportKind::CumulativeSinceStart,
+                            )
+                        );
+                    }
                 }
             }
             Some(InfoSubcommand::Store { nodes }) => {
@@ -1089,6 +1158,44 @@ impl Testnet {
             }
             // File import handled in main(); start SSM tunnels so quake commands work immediately
             RemoteSubcommand::Import { .. } => infra.ssm_tunnels.start().await,
+            RemoteSubcommand::Download { command } => {
+                let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                let resolve = |output: Option<PathBuf>, prefix: &str| -> PathBuf {
+                    let default = PathBuf::from(format!("{prefix}-{ts}.tar.gz"));
+                    match output {
+                        None => default,
+                        Some(p) if p.is_dir() => p.join(default),
+                        Some(p) => p,
+                    }
+                };
+                match command {
+                    DownloadSubcommand::Metrics {
+                        from,
+                        to,
+                        step,
+                        metric_names,
+                        output,
+                    } => {
+                        let dest = resolve(output, "quake-metrics");
+                        infra.download_metrics(
+                            &metric_names,
+                            from.map(|dt| dt.unix_secs()),
+                            to.map(|dt| dt.unix_secs()),
+                            step.as_deref(),
+                            &dest,
+                        )
+                    }
+                    DownloadSubcommand::Db {
+                        nodes,
+                        execution_only,
+                        consensus_only,
+                        output,
+                    } => {
+                        let dest = resolve(output, "quake-db");
+                        infra.download_node_db(&nodes, execution_only, consensus_only, &dest)
+                    }
+                }
+            }
         }
     }
 
@@ -1230,6 +1337,8 @@ impl Testnet {
                 })
                 .unwrap_or_default();
 
+            let fee_recipient = node_config.and_then(|nc| nc.cl_suggested_fee_recipient);
+
             // Generate CLI flags for the consensus layer
             let cli_flags = setup::generate_node_cli_flags(
                 name,
@@ -1238,6 +1347,7 @@ impl Testnet {
                 &peers_ips,
                 Some(self.images.cl.as_str()),
                 &follow_endpoint_urls,
+                fee_recipient,
             );
             node_metadata.consensus.set_cli_flags(cli_flags);
 
@@ -1249,6 +1359,7 @@ impl Testnet {
                 &peers_ips,
                 self.images.cl_upgrade.as_deref(),
                 &follow_endpoint_urls,
+                fee_recipient,
             );
             node_metadata.consensus.set_cli_flags_upgraded(cli_flags);
         }

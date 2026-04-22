@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use alloy_primitives::Address;
 use arc_consensus_types::Config as ClConfigOverride;
 use color_eyre::eyre::{bail, Result};
 use indexmap::{IndexMap, IndexSet};
@@ -147,6 +148,10 @@ pub struct RawNode {
     /// Only meaningful for validator nodes. When set, all validators must specify it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cl_voting_power: Option<u64>,
+
+    /// Address to receive transaction fees and block rewards (--suggested-fee-recipient).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cl_suggested_fee_recipient: Option<Address>,
 
     /// Mark this node as external (operated by a third party).
     /// External validators are expected to be multi-hop in mesh health checks
@@ -444,6 +449,7 @@ impl TryFrom<RawManifest> for Manifest {
                     follow_endpoints: raw_node.follow_endpoints,
                     cl_voting_power: raw_node.cl_voting_power,
                     cl_prune_preset: raw_node.cl_prune_preset,
+                    cl_suggested_fee_recipient: raw_node.cl_suggested_fee_recipient,
                     external: raw_node.external,
                 },
             );
@@ -548,6 +554,7 @@ impl RawNode {
             follow: node.follow,
             follow_endpoints: node.follow_endpoints,
             cl_voting_power: node.cl_voting_power,
+            cl_suggested_fee_recipient: node.cl_suggested_fee_recipient,
             external: node.external,
         })
     }

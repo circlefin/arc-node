@@ -66,7 +66,9 @@ impl SyncEndpointUrl {
 
             // If HTTP uses a non-default port, set WS port to HTTP port + 1
             if let Some(http_port) = self.http.port() {
-                ws_url.set_port(Some(http_port + 1)).expect("valid port");
+                ws_url
+                    .set_port(Some(http_port.checked_add(1).expect("port overflow")))
+                    .expect("valid port");
             }
 
             ws_url

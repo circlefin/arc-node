@@ -1572,6 +1572,31 @@ Send transaction load:
 ```
 Under the hood, this commands calls Spammer from CC. All Spammer options are supported.
 
+Download diagnostic artifacts from the remote testnet:
+```bash
+# Download all Prometheus metrics (covers the current head block, ~2h by default)
+./quake remote download metrics
+
+# Download metrics for a specific time range
+./quake remote download metrics --from 2024-01-15T10:30:00Z --to 2024-01-15T12:00:00Z
+
+# Download specific metrics only (metric names go after --)
+./quake remote download metrics -- reth_db_size_bytes go_goroutines
+
+# Download node databases (both execution and consensus layers, all nodes)
+./quake remote download db
+
+# Download execution layer only, from specific nodes
+./quake remote download db --execution-only -- validator1 validator2
+
+# Save to a custom output path
+./quake remote download metrics -o /tmp/my-metrics.tar.gz
+./quake remote download db -o /tmp/my-db.tar.gz
+```
+
+Both `download` subcommands output a `.tar.gz` archive named `quake-metrics-<timestamp>.tar.gz` /
+`quake-db-<timestamp>.tar.gz` unless overridden with `-o`.
+
 Once finished with your tests, remember to destroy the remote infrastructure!
 ```bash
 ./quake remote destroy

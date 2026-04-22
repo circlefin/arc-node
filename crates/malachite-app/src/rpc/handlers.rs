@@ -31,6 +31,7 @@ use crate::rpc::types::persistent_peer_error_to_response;
 use crate::rpc::types::request_error_to_response;
 use crate::rpc::types::RpcVersion;
 use crate::rpc::version::ApiVersion;
+use crate::utils::sync_state::SyncState;
 
 use super::types::{
     AddOrRemovePersistentPeerBody, GetCertificateParams, RpcAppStatus, RpcCommitCertificate,
@@ -169,6 +170,24 @@ pub(crate) async fn get_health(
         .await
         .map(|()| Json(json!({ "status": "ok" })))
         .map_err(request_error_to_response)
+}
+
+pub(crate) async fn get_ready(
+    tx_app_req: State<TxAppReq>,
+    Extension(version): Extension<ApiVersion>,
+) -> impl IntoResponse {
+    tracing::debug!(?version, "get_ready called");
+
+    match AppRequest::get_sync_state(&tx_app_req).await {
+        Ok(sync_state) => {
+            let status_code = match sync_state {
+                SyncState::InSync => StatusCode::OK,
+                SyncState::CatchingUp => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (status_code, Json(json!({ "sync_state": sync_state }))).into_response()
+        }
+        Err(e) => request_error_to_response(e).into_response(),
+    }
 }
 
 pub(crate) async fn get_version(Extension(version): Extension<ApiVersion>) -> impl IntoResponse {

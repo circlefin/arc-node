@@ -156,7 +156,13 @@ async fn get_decided_values(
         //
         // Moreover, Malachite will perform a very similar over-approximation when checking
         // the response to GetDecidedValues, so this keeps our behavior consistent.
-        if total_bytes + raw_bytes_len > max_response_size {
+        #[allow(clippy::arithmetic_side_effects)]
+        // Equivalent to `total_bytes + raw_bytes_len > max_response_size`,
+        // but rearranged so the subtraction cannot overflow (raw_bytes_len <= max_response_size
+        // is checked first, and max_response_size.0 - raw_bytes_len.0 is then non-negative).
+        if raw_bytes_len > max_response_size
+            || total_bytes.as_u64() > max_response_size.as_u64() - raw_bytes_len.as_u64()
+        {
             warn!(
                 %height, %max_response_size, %raw_bytes_len,
                 "GetDecidedValues: Reached max total bytes limit for response, stopping here",
@@ -165,7 +171,10 @@ async fn get_decided_values(
             break;
         }
 
-        total_bytes += raw_bytes_len;
+        #[allow(clippy::arithmetic_side_effects)] // Guarded by the comparison above
+        {
+            total_bytes += raw_bytes_len;
+        }
 
         values.push(raw_value);
     }
@@ -205,6 +214,8 @@ async fn get_raw_decided_value(
         ));
     };
 
+    // encoded_len returns usize; on 64-bit targets this fits in u64
+    #[allow(clippy::cast_possible_truncation)]
     Ok((raw_value, ByteSize::b(raw_bytes_len as u64)))
 }
 
@@ -264,9 +275,17 @@ fn get_clamped_request_range(
         return None;
     }
 
-    let requested_count = end.as_u64() - start.as_u64() + 1;
+    // start <= end guaranteed by clamp logic above; +1 cannot overflow after clamping
+    // to real block heights, but we handle it gracefully regardless.
+    #[allow(clippy::arithmetic_side_effects)]
+    let Some(requested_count) = (end.as_u64() - start.as_u64()).checked_add(1) else {
+        warn!("GetDecidedValues: height range count overflow");
+        return None;
+    };
+    // batch_size > 0 checked above; fits in u64 on 64-bit targets
+    #[allow(clippy::cast_possible_truncation)]
     if requested_count > batch_size as u64 {
-        end = start.increment_by((batch_size - 1) as u64);
+        end = start.increment_by(batch_size.saturating_sub(1) as u64);
         warn!(
             requested = %requested_count,
             max = %batch_size,

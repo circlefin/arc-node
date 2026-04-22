@@ -47,6 +47,8 @@ pub struct MigrationStats {
 }
 
 impl MigrationStats {
+    // Migration counters are bounded by total DB records — overflow is not reachable.
+    #[allow(clippy::arithmetic_side_effects)]
     fn merge(&mut self, other: MigrationStats) {
         self.tables_migrated += other.tables_migrated;
         self.records_scanned += other.records_scanned;
@@ -184,14 +186,63 @@ impl MigrationCoordinator {
         for (schema_version, migrators) in migration_chain {
             info!("Migrating to schema version {}", schema_version);
 
-            stats.merge(self.migrate_certificates(migrators.certificate.as_ref())?);
-            stats.merge(self.migrate_decided_blocks(migrators.decided_block.as_ref())?);
-            stats.merge(self.migrate_undecided_blocks(migrators.undecided_block.as_ref())?);
-            stats.merge(self.migrate_pending_parts(migrators.pending_parts.as_ref())?);
+            stats.merge(self.migrate_certificates(migrators.certificate.as_ref(), false)?);
+            stats.merge(self.migrate_decided_blocks(migrators.decided_block.as_ref(), false)?);
+            stats.merge(self.migrate_undecided_blocks(migrators.undecided_block.as_ref(), false)?);
+            stats.merge(self.migrate_pending_parts(migrators.pending_parts.as_ref(), false)?);
 
             // Update schema version after successful migration
             self.set_schema_version(schema_version)?;
             info!("Successfully migrated to schema version {}", schema_version);
+        }
+
+        stats.duration = start.elapsed();
+
+        Ok(stats)
+    }
+
+    /// Scan what [`Self::migrate`] would apply without persisting: schema steps, per-table
+    /// migrator names, and record counts. Uses the same code path as migration (including
+    /// write transactions) but aborts each transaction instead of committing.
+    pub fn preview_migrate(&self) -> Result<MigrationStats, StoreError> {
+        let start = Instant::now();
+        let mut stats = MigrationStats::default();
+
+        let from_version = self.current_schema_version()?.ok_or_else(|| {
+            StoreError::Migration(
+                "database schema version is not set; cannot preview migration".to_owned(),
+            )
+        })?;
+        let to_version = DB_SCHEMA_VERSION;
+
+        info!(
+            from = %from_version,
+            to = %to_version,
+            "Dry-run: scanning pending database migrations (no commits)"
+        );
+
+        let migration_chain = self.build_migration_chain(from_version, to_version)?;
+
+        if migration_chain.is_empty() {
+            info!("Dry-run: no schema steps in migration chain");
+            stats.duration = start.elapsed();
+            return Ok(stats);
+        }
+
+        for (schema_version, migrators) in &migration_chain {
+            info!(schema_version = %schema_version, "Would migrate to schema version (dry-run)");
+            info!(
+                certificates = migrators.certificate.name(),
+                decided_blocks = migrators.decided_block.name(),
+                undecided_blocks = migrators.undecided_block.name(),
+                pending_parts = migrators.pending_parts.name(),
+                "Pending migrators for this step"
+            );
+
+            stats.merge(self.migrate_certificates(migrators.certificate.as_ref(), true)?);
+            stats.merge(self.migrate_decided_blocks(migrators.decided_block.as_ref(), true)?);
+            stats.merge(self.migrate_undecided_blocks(migrators.undecided_block.as_ref(), true)?);
+            stats.merge(self.migrate_pending_parts(migrators.pending_parts.as_ref(), true)?);
         }
 
         stats.duration = start.elapsed();
@@ -239,8 +290,16 @@ impl MigrationCoordinator {
     }
 
     /// Migrate certificates table.
-    fn migrate_certificates(&self, migrator: &dyn Migrator) -> Result<MigrationStats, StoreError> {
-        info!("Migrating certificates table");
+    ///
+    /// When `dry_run` is true, uses the same write transaction and iteration path as a real
+    /// migration but aborts each batch without persisting changes.
+    #[allow(clippy::arithmetic_side_effects)] // counter arithmetic bounded by DB record counts
+    fn migrate_certificates(
+        &self,
+        migrator: &dyn Migrator,
+        dry_run: bool,
+    ) -> Result<MigrationStats, StoreError> {
+        info!(dry_run, "Processing certificates table");
 
         let mut stats = MigrationStats::default();
 
@@ -253,7 +312,7 @@ impl MigrationCoordinator {
         {
             min_height.value()
         } else {
-            // no records to migrate, return early
+            stats.tables_migrated += 1;
             return Ok(stats);
         };
 
@@ -287,14 +346,19 @@ impl MigrationCoordinator {
                     next_height = key.value().increment();
                 }
 
-                // migrate the records in this batch
                 records_upgraded = batch.len();
-                for (key, value) in batch {
-                    table.insert(key, value)?;
+                if !dry_run {
+                    for (key, value) in batch {
+                        table.insert(key, value)?;
+                    }
                 }
             }
-            tx.commit()?;
-            debug!("migrated batch of {} records", records_upgraded);
+            if dry_run {
+                tx.abort()?;
+            } else {
+                tx.commit()?;
+            }
+            debug!("{} records in batch", records_upgraded);
 
             stats.records_scanned += records_scanned;
             stats.records_upgraded += records_upgraded;
@@ -309,20 +373,25 @@ impl MigrationCoordinator {
         stats.tables_migrated += 1;
 
         info!(
+            dry_run,
             scanned = stats.records_scanned,
             upgraded = stats.records_upgraded,
-            "Completed certificates migration"
+            "Finished certificates table"
         );
 
         Ok(stats)
     }
 
     /// Migrate decided blocks table.
+    ///
+    /// When `dry_run` is true, uses write transactions but aborts each batch without persisting.
+    #[allow(clippy::arithmetic_side_effects)] // counter arithmetic bounded by DB record counts
     fn migrate_decided_blocks(
         &self,
         migrator: &dyn Migrator,
+        dry_run: bool,
     ) -> Result<MigrationStats, StoreError> {
-        info!("Migrating decided blocks table");
+        info!(dry_run, "Processing decided blocks table");
 
         let mut stats = MigrationStats::default();
 
@@ -335,7 +404,7 @@ impl MigrationCoordinator {
         {
             min_height.value()
         } else {
-            // no records to migrate, return early
+            stats.tables_migrated += 1;
             return Ok(stats);
         };
 
@@ -369,14 +438,19 @@ impl MigrationCoordinator {
                     next_height = key.value().increment();
                 }
 
-                // migrate the records in this batch
                 records_upgraded = batch.len();
-                for (key, value) in batch {
-                    table.insert(key, value)?;
+                if !dry_run {
+                    for (key, value) in batch {
+                        table.insert(key, value)?;
+                    }
                 }
             }
-            tx.commit()?;
-            debug!("migrated batch of {} records", records_upgraded);
+            if dry_run {
+                tx.abort()?;
+            } else {
+                tx.commit()?;
+            }
+            debug!("{} records in batch", records_upgraded);
 
             stats.records_scanned += records_scanned;
             stats.records_upgraded += records_upgraded;
@@ -391,20 +465,26 @@ impl MigrationCoordinator {
         stats.tables_migrated += 1;
 
         info!(
+            dry_run,
             scanned = stats.records_scanned,
             upgraded = stats.records_upgraded,
-            "Completed decided blocks migration"
+            "Finished decided blocks table"
         );
 
         Ok(stats)
     }
 
     /// Migrate undecided blocks table.
+    ///
+    /// When `dry_run` is true, opens a write transaction (creating the table if needed) but
+    /// aborts without applying updates.
+    #[allow(clippy::arithmetic_side_effects)] // counter arithmetic bounded by DB record counts
     fn migrate_undecided_blocks(
         &self,
         migrator: &dyn Migrator,
+        dry_run: bool,
     ) -> Result<MigrationStats, StoreError> {
-        info!("Migrating undecided blocks table");
+        info!(dry_run, "Processing undecided blocks table");
 
         let mut stats = MigrationStats::default();
 
@@ -433,29 +513,43 @@ impl MigrationCoordinator {
                 }
             }
 
-            // Apply all migrations
-            for (key, value) in to_migrate {
-                table.insert(key, value)?;
-                stats.records_upgraded += 1;
+            stats.records_upgraded = to_migrate.len();
+            if !dry_run {
+                for (key, value) in to_migrate {
+                    table.insert(key, value)?;
+                }
             }
         }
-        tx.commit()?;
+        if dry_run {
+            tx.abort()?;
+        } else {
+            tx.commit()?;
+        }
 
         stats.records_skipped = stats.records_scanned - stats.records_upgraded;
         stats.tables_migrated += 1;
 
         info!(
+            dry_run,
             scanned = stats.records_scanned,
             upgraded = stats.records_upgraded,
-            "Completed undecided blocks migration"
+            "Finished undecided blocks table"
         );
 
         Ok(stats)
     }
 
     /// Migrate pending proposal parts table.
-    fn migrate_pending_parts(&self, migrator: &dyn Migrator) -> Result<MigrationStats, StoreError> {
-        info!("Migrating pending proposal parts table");
+    ///
+    /// When `dry_run` is true, opens a write transaction (creating the table if needed) but
+    /// aborts without applying updates.
+    #[allow(clippy::arithmetic_side_effects)] // counter arithmetic bounded by DB record counts
+    fn migrate_pending_parts(
+        &self,
+        migrator: &dyn Migrator,
+        dry_run: bool,
+    ) -> Result<MigrationStats, StoreError> {
+        info!(dry_run, "Processing pending proposal parts table");
 
         let mut stats = MigrationStats::default();
 
@@ -484,21 +578,27 @@ impl MigrationCoordinator {
                 }
             }
 
-            // Apply all migrations
-            for (key, value) in to_migrate {
-                table.insert(key, value)?;
-                stats.records_upgraded += 1;
+            stats.records_upgraded = to_migrate.len();
+            if !dry_run {
+                for (key, value) in to_migrate {
+                    table.insert(key, value)?;
+                }
             }
         }
-        tx.commit()?;
+        if dry_run {
+            tx.abort()?;
+        } else {
+            tx.commit()?;
+        }
 
         stats.records_skipped = stats.records_scanned - stats.records_upgraded;
         stats.tables_migrated += 1;
 
         info!(
+            dry_run,
             scanned = stats.records_scanned,
             upgraded = stats.records_upgraded,
-            "Completed pending parts migration"
+            "Finished pending proposal parts table"
         );
 
         Ok(stats)
@@ -740,6 +840,70 @@ mod tests {
     }
 
     #[test]
+    fn test_preview_migrate_stats_match_migrate() {
+        let (db, _path) = create_test_db();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut meta = tx.open_table(METADATA_TABLE).unwrap();
+            meta.insert("schema_version", SchemaVersion::V0).unwrap();
+            // Use V0 version byte (0x00) so records actually need migration.
+            let mut cert = tx.open_table(CERTIFICATES_TABLE).unwrap();
+            cert.insert(Height::new(1), vec![0u8, 1, 2, 3]).unwrap();
+            let mut dec = tx.open_table(DECIDED_BLOCKS_TABLE).unwrap();
+            dec.insert(Height::new(1), vec![0u8, 4, 5, 6]).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let coordinator = MigrationCoordinator::new(db);
+        let preview = coordinator.preview_migrate().unwrap();
+
+        // Dry-run must not commit: schema version and record data must be unchanged.
+        assert_eq!(
+            coordinator.current_schema_version().unwrap(),
+            Some(SchemaVersion::V0),
+            "preview_migrate must not alter schema version"
+        );
+        let tx = coordinator.db.begin_read().unwrap();
+        let cert_table = tx.open_table(CERTIFICATES_TABLE).unwrap();
+        assert_eq!(
+            cert_table.get(Height::new(1)).unwrap().unwrap().value()[0],
+            0,
+            "preview_migrate must not alter record data"
+        );
+        drop(cert_table);
+        drop(tx);
+
+        let migrated = coordinator.migrate().unwrap();
+
+        assert_eq!(preview.records_scanned, migrated.records_scanned);
+        assert_eq!(preview.records_upgraded, migrated.records_upgraded);
+        assert_eq!(preview.records_skipped, migrated.records_skipped);
+        assert_eq!(preview.tables_migrated, migrated.tables_migrated);
+    }
+
+    #[test]
+    fn test_preview_migrate_already_current() {
+        let (db, _path) = create_test_db();
+        let coordinator = MigrationCoordinator::new(db);
+
+        // Initialize DB at current schema version (simulates a node that is already up to date).
+        coordinator.needs_migration(false).unwrap();
+        assert_eq!(
+            coordinator.current_schema_version().unwrap(),
+            Some(DB_SCHEMA_VERSION)
+        );
+
+        let stats = coordinator
+            .preview_migrate()
+            .expect("preview_migrate must not error when already at current version");
+
+        assert_eq!(stats.tables_migrated, 0);
+        assert_eq!(stats.records_scanned, 0);
+        assert_eq!(stats.records_upgraded, 0);
+        assert_eq!(stats.records_skipped, 0);
+    }
+
+    #[test]
     fn test_certificate_table_migration() {
         let (db, _path) = create_test_db();
 
@@ -764,7 +928,7 @@ mod tests {
             from: SchemaVersion::V0,
             to: SchemaVersion::V1,
         };
-        let stats = coordinator.migrate_certificates(&migrator).unwrap();
+        let stats = coordinator.migrate_certificates(&migrator, false).unwrap();
 
         assert_eq!(stats.records_scanned, 2);
         assert_eq!(stats.records_upgraded, 2);
@@ -805,7 +969,9 @@ mod tests {
             from: SchemaVersion::V0,
             to: SchemaVersion::V1,
         };
-        let stats = coordinator.migrate_decided_blocks(&migrator).unwrap();
+        let stats = coordinator
+            .migrate_decided_blocks(&migrator, false)
+            .unwrap();
 
         assert_eq!(stats.records_scanned, 2);
         assert_eq!(stats.records_upgraded, 0);
@@ -838,7 +1004,9 @@ mod tests {
             from: SchemaVersion::V0,
             to: SchemaVersion::V1,
         };
-        let stats = coordinator.migrate_decided_blocks(&migrator).unwrap();
+        let stats = coordinator
+            .migrate_decided_blocks(&migrator, false)
+            .unwrap();
 
         assert_eq!(stats.records_scanned, 3);
         assert_eq!(stats.records_upgraded, 2);
@@ -943,6 +1111,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_certificate_migration_batch_size_plus_one() {
         let (db, _path) = create_test_db();
 
@@ -985,7 +1154,7 @@ mod tests {
             from: SchemaVersion::V0,
             to: SchemaVersion::V1,
         };
-        let stats = coordinator.migrate_certificates(&migrator).unwrap();
+        let stats = coordinator.migrate_certificates(&migrator, false).unwrap();
 
         // Verify all records were scanned and upgraded
         assert_eq!(
@@ -1080,7 +1249,9 @@ mod tests {
             from: SchemaVersion::V0,
             to: SchemaVersion::V1,
         };
-        let stats = coordinator.migrate_undecided_blocks(&migrator).unwrap();
+        let stats = coordinator
+            .migrate_undecided_blocks(&migrator, false)
+            .unwrap();
 
         assert_eq!(stats.records_scanned, 3);
         assert_eq!(stats.records_upgraded, 3);
@@ -1127,7 +1298,9 @@ mod tests {
             from: SchemaVersion::V0,
             to: SchemaVersion::V1,
         };
-        let stats = coordinator.migrate_undecided_blocks(&migrator).unwrap();
+        let stats = coordinator
+            .migrate_undecided_blocks(&migrator, false)
+            .unwrap();
 
         assert_eq!(stats.records_scanned, 0);
         assert_eq!(stats.records_upgraded, 0);
@@ -1172,7 +1345,9 @@ mod tests {
             from: SchemaVersion::V0,
             to: SchemaVersion::V1,
         };
-        let stats = coordinator.migrate_undecided_blocks(&migrator).unwrap();
+        let stats = coordinator
+            .migrate_undecided_blocks(&migrator, false)
+            .unwrap();
 
         assert_eq!(stats.records_scanned, 3);
         assert_eq!(stats.records_upgraded, 2);
@@ -1251,7 +1426,7 @@ mod tests {
             from: SchemaVersion::V0,
             to: SchemaVersion::V1,
         };
-        let stats = coordinator.migrate_pending_parts(&migrator).unwrap();
+        let stats = coordinator.migrate_pending_parts(&migrator, false).unwrap();
 
         assert_eq!(stats.records_scanned, 4);
         assert_eq!(stats.records_upgraded, 4);
@@ -1305,7 +1480,7 @@ mod tests {
             from: SchemaVersion::V0,
             to: SchemaVersion::V1,
         };
-        let stats = coordinator.migrate_pending_parts(&migrator).unwrap();
+        let stats = coordinator.migrate_pending_parts(&migrator, false).unwrap();
 
         assert_eq!(stats.records_scanned, 0);
         assert_eq!(stats.records_upgraded, 0);
@@ -1354,7 +1529,7 @@ mod tests {
             from: SchemaVersion::V0,
             to: SchemaVersion::V1,
         };
-        let stats = coordinator.migrate_pending_parts(&migrator).unwrap();
+        let stats = coordinator.migrate_pending_parts(&migrator, false).unwrap();
 
         assert_eq!(stats.records_scanned, 4);
         assert_eq!(stats.records_upgraded, 2);

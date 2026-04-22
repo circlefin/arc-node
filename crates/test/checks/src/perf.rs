@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 
 use color_eyre::eyre::Result;
@@ -21,7 +22,9 @@ use prometheus_parse::{Sample, Scrape, Value};
 use url::Url;
 
 use crate::fetch::fetch_all_metrics;
-use crate::types::{CheckResult, HistogramStats, NodePerfData, PerfDisplayOptions, Report};
+use crate::types::{
+    CheckResult, HistogramStats, NodePerfData, PerfDisplayOptions, PerfReportKind, Report,
+};
 
 /// Only lines starting with these prefixes (plus their `# TYPE`/`# HELP`
 /// comments) are kept from the raw scrape. Everything else is dropped before
@@ -69,6 +72,15 @@ fn extract_moniker(samples: &[Sample]) -> Option<String> {
     samples
         .iter()
         .find_map(|s| s.labels.get("moniker").map(|m| m.to_string()))
+}
+
+/// Stable node id for perf: Prometheus `moniker` when present, else the
+/// connection name from [`fetch_all_metrics`]. Must match everywhere we pair
+/// scrapes (see [`parse_perf_metrics`], [`samples_by_moniker`]) and aligns
+/// with manifest keys used by Quake's `assign_node_groups` when moniker
+/// equals the manifest node name.
+fn display_name_for_scrape(connection_name: &str, samples: &[Sample]) -> String {
+    extract_moniker(samples).unwrap_or_else(|| connection_name.to_string())
 }
 
 /// Extract a gauge/counter value as f64.
@@ -267,7 +279,7 @@ pub fn parse_perf_metrics(raw_metrics: &[(String, String)]) -> Vec<NodePerfData>
         .filter(|(_, m)| !m.is_empty())
         .map(|(name, raw)| {
             let samples = parse_metrics(raw);
-            let display_name = extract_moniker(&samples).unwrap_or_else(|| name.clone());
+            let display_name = display_name_for_scrape(name, &samples);
 
             NodePerfData {
                 name: display_name,
@@ -291,6 +303,105 @@ pub fn parse_perf_metrics(raw_metrics: &[(String, String)]) -> Vec<NodePerfData>
             }
         })
         .collect()
+}
+
+/// Map each node's Prometheus scrape to parsed samples keyed by
+/// [`display_name_for_scrape`] (same rule as [`parse_perf_metrics`] per row).
+///
+/// If two connections share the same display name, the last scrape wins — same
+/// as collapsing duplicate keys; avoid duplicate monikers across endpoints.
+fn samples_by_moniker(raw: &[(String, String)]) -> HashMap<String, Vec<Sample>> {
+    let mut m = HashMap::new();
+    for (name, raw_text) in raw {
+        if raw_text.is_empty() {
+            continue;
+        }
+        let samples = parse_metrics(raw_text);
+        let display_name = display_name_for_scrape(name, &samples);
+        m.insert(display_name, samples);
+    }
+    m
+}
+
+fn delta_histogram_stats(
+    before_samples: &[Sample],
+    after_samples: &[Sample],
+    metric: &str,
+) -> Option<HistogramStats> {
+    let b = extract_raw_histogram(before_samples, metric)?;
+    let a = extract_raw_histogram(after_samples, metric)?;
+    subtract_raw_histograms(&b, &a).and_then(|d| stats_from_raw(&d))
+}
+
+/// Parse performance metrics from the **delta** between two scrapes per node.
+///
+/// Only nodes present in **both** scrapes are included (intersection by
+/// [`display_name_for_scrape`], same pairing idea as [`crate::health::compute_health_deltas`]).
+/// Histograms use the same metric names as [`parse_perf_metrics`]; percentiles apply to
+/// observations recorded between the two scrapes.
+pub fn parse_perf_metrics_delta(
+    raw_before: &[(String, String)],
+    raw_after: &[(String, String)],
+) -> Vec<NodePerfData> {
+    let before_map = samples_by_moniker(raw_before);
+    let after_map = samples_by_moniker(raw_after);
+
+    let mut names: Vec<String> = after_map
+        .keys()
+        .filter(|n| before_map.contains_key(*n))
+        .cloned()
+        .collect();
+    names.sort();
+
+    let mut out = Vec::new();
+    for name in names {
+        let (Some(before_samples), Some(after_samples)) =
+            (before_map.get(&name), after_map.get(&name))
+        else {
+            continue;
+        };
+
+        out.push(NodePerfData {
+            name,
+            group: None,
+            block_time: delta_histogram_stats(
+                before_samples,
+                after_samples,
+                "arc_malachite_app_block_time",
+            ),
+            block_finalize_time: delta_histogram_stats(
+                before_samples,
+                after_samples,
+                "arc_malachite_app_block_finalize_time",
+            ),
+            block_build_time: delta_histogram_stats(
+                before_samples,
+                after_samples,
+                "arc_malachite_app_block_build_time",
+            ),
+            consensus_time: delta_histogram_stats(
+                before_samples,
+                after_samples,
+                "malachitebft_core_consensus_consensus_time",
+            ),
+            block_tx_count: delta_histogram_stats(
+                before_samples,
+                after_samples,
+                "arc_malachite_app_block_transactions_count",
+            ),
+            block_size: delta_histogram_stats(
+                before_samples,
+                after_samples,
+                "arc_malachite_app_block_size_bytes",
+            ),
+            block_gas_used: delta_histogram_stats(
+                before_samples,
+                after_samples,
+                "arc_malachite_app_block_gas_used",
+            ),
+        });
+    }
+    out
 }
 
 // ── Formatting ───────────────────────────────────────────────────────────
@@ -469,7 +580,11 @@ fn write_table(
 }
 
 /// Build a formatted performance report from parsed node data.
-pub fn format_perf_report(nodes: &[NodePerfData], options: &PerfDisplayOptions) -> String {
+pub fn format_perf_report(
+    nodes: &[NodePerfData],
+    options: &PerfDisplayOptions,
+    kind: PerfReportKind,
+) -> String {
     let mut out = String::new();
     let sorted = sorted_by_group(nodes);
     let has_groups = nodes.iter().any(|n| n.group.is_some());
@@ -484,20 +599,42 @@ pub fn format_perf_report(nodes: &[NodePerfData], options: &PerfDisplayOptions) 
 
     let _ = writeln!(out, "{}", "=".repeat(80));
     let _ = writeln!(out, "Performance Metrics");
-    if let Some(s) = max_block_stats {
-        let _ = writeln!(
-            out,
-            "({node_count} node{}, ~{} blocks over {}, cumulative since start)",
-            if node_count == 1 { "" } else { "s" },
-            s.count,
-            fmt_duration(s.sum),
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "({node_count} node{})",
-            if node_count == 1 { "" } else { "s" }
-        );
+    match kind {
+        PerfReportKind::CumulativeSinceStart => {
+            if let Some(s) = max_block_stats {
+                let _ = writeln!(
+                    out,
+                    "({node_count} node{}, ~{} blocks over {}, cumulative since start)",
+                    if node_count == 1 { "" } else { "s" },
+                    s.count,
+                    fmt_duration(s.sum),
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "({node_count} node{})",
+                    if node_count == 1 { "" } else { "s" }
+                );
+            }
+        }
+        PerfReportKind::Interval { observation_secs } => {
+            if let Some(s) = max_block_stats {
+                let _ = writeln!(
+                    out,
+                    "({node_count} node{}, ~{} blocks in window, observation {}s, delta between two scrapes)",
+                    if node_count == 1 { "" } else { "s" },
+                    s.count,
+                    observation_secs,
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "({node_count} node{}, observation {}s, delta between two scrapes)",
+                    if node_count == 1 { "" } else { "s" },
+                    observation_secs,
+                );
+            }
+        }
     }
     let _ = writeln!(out, "{}", "=".repeat(80));
 
@@ -679,20 +816,6 @@ pub async fn check_block_time(
     Ok(Report { checks })
 }
 
-/// Parse raw Prometheus text into per-node raw block_time histograms.
-fn parse_raw_block_time(raw_metrics: &[(String, String)]) -> Vec<(String, Option<RawHistogram>)> {
-    raw_metrics
-        .iter()
-        .filter(|(_, m)| !m.is_empty())
-        .map(|(name, raw)| {
-            let samples = parse_metrics(raw);
-            let display_name = extract_moniker(&samples).unwrap_or_else(|| name.clone());
-            let hist = extract_raw_histogram(&samples, "arc_malachite_app_block_time");
-            (display_name, hist)
-        })
-        .collect()
-}
-
 /// Assert block time p50/p95 thresholds using only the **delta** between two
 /// Prometheus scrapes, isolating the observation window.
 ///
@@ -704,57 +827,44 @@ pub fn check_block_time_delta(
     p50_threshold_ms: u64,
     p95_threshold_ms: u64,
 ) -> Report {
-    let before_nodes = parse_raw_block_time(raw_before);
-    let after_nodes = parse_raw_block_time(raw_after);
+    // Single source of truth: same intersection and subtraction as the full
+    // perf delta report (avoids duplicate node names from Vec+HashMap pairing).
+    let nodes = parse_perf_metrics_delta(raw_before, raw_after);
 
     let p50_threshold_s = p50_threshold_ms as f64 / 1000.0;
     let p95_threshold_s = p95_threshold_ms as f64 / 1000.0;
 
-    let mut checks: Vec<CheckResult> = after_nodes
-        .iter()
-        .filter_map(|(name, after_hist)| {
-            let before_hist = before_nodes
-                .iter()
-                .find(|(n, _)| n == name)
-                .and_then(|(_, h)| h.as_ref());
-
-            let delta_stats = match (before_hist, after_hist.as_ref()) {
-                (Some(before), Some(after)) => {
-                    subtract_raw_histograms(before, after).and_then(|d| stats_from_raw(&d))
-                }
-                _ => {
-                    // Node not present in both scrapes — skip (not a perf concern)
-                    return None;
-                }
-            };
-
-            Some(match delta_stats {
-                Some(stats) if stats.count > 0 => {
-                    let p50_ok = stats.p50 <= p50_threshold_s;
-                    let p95_ok = stats.p95 <= p95_threshold_s;
+    let mut checks: Vec<CheckResult> = nodes
+        .into_iter()
+        .map(|node| {
+            let name = node.name;
+            match node.block_time {
+                Some(ref s) if s.count > 0 => {
+                    let p50_ok = s.p50 <= p50_threshold_s;
+                    let p95_ok = s.p95 <= p95_threshold_s;
                     let passed = p50_ok && p95_ok;
-                    let message = format!(
-                        "block_time p50={:.3}s (limit {:.3}s{}) p95={:.3}s (limit {:.3}s{}) ({} blocks)",
-                        stats.p50,
-                        p50_threshold_s,
-                        if p50_ok { "" } else { " EXCEEDED" },
-                        stats.p95,
-                        p95_threshold_s,
-                        if p95_ok { "" } else { " EXCEEDED" },
-                        stats.count,
-                    );
                     CheckResult {
-                        name: name.clone(),
+                        name,
                         passed,
-                        message,
+                        message: format!(
+                            "block_time p50={:.3}s (limit {:.3}s{}) p95={:.3}s (limit {:.3}s{}) ({} blocks)",
+                            s.p50,
+                            p50_threshold_s,
+                            if p50_ok { "" } else { " EXCEEDED" },
+                            s.p95,
+                            p95_threshold_s,
+                            if p95_ok { "" } else { " EXCEEDED" },
+                            s.count,
+                        ),
                     }
                 }
                 _ => CheckResult {
-                    name: name.clone(),
+                    name,
                     passed: false,
-                    message: "no block_time delta data (counter reset or no observations)".to_string(),
+                    message: "no block_time delta data (counter reset or no observations)"
+                        .to_string(),
                 },
-            })
+            }
         })
         .collect();
 
@@ -900,7 +1010,11 @@ arc_malachite_app_block_time_count{moniker="v1"} 100
     fn format_report_produces_output() {
         let raw = vec![("node1".to_string(), sample_histogram_text())];
         let nodes = parse_perf_metrics(&raw);
-        let report = format_perf_report(&nodes, &PerfDisplayOptions::default());
+        let report = format_perf_report(
+            &nodes,
+            &PerfDisplayOptions::default(),
+            PerfReportKind::CumulativeSinceStart,
+        );
 
         assert!(report.contains("Performance Metrics"));
         assert!(report.contains("Latency"));
@@ -916,6 +1030,33 @@ arc_malachite_app_block_time_count{moniker="v1"} 100
     }
 
     #[test]
+    fn parse_perf_metrics_delta_block_time_count_matches_delta_check() {
+        let before_text = make_histogram_text("v1", &[0, 0, 0, 0, 50, 50, 50, 50], 15.0);
+        let after_text = make_histogram_text("v1", &[0, 0, 0, 0, 50, 90, 140, 150], 90.0);
+        let raw_before = vec![("node1".to_string(), before_text)];
+        let raw_after = vec![("node1".to_string(), after_text)];
+        let nodes = parse_perf_metrics_delta(&raw_before, &raw_after);
+        assert_eq!(nodes.len(), 1);
+        let bt = nodes[0].block_time.as_ref().expect("block_time delta");
+        assert_eq!(bt.count, 100);
+    }
+
+    #[test]
+    fn format_perf_report_interval_banner() {
+        let raw = vec![("n1".to_string(), sample_histogram_text())];
+        let nodes = parse_perf_metrics(&raw);
+        let out = format_perf_report(
+            &nodes,
+            &PerfDisplayOptions::default(),
+            PerfReportKind::Interval {
+                observation_secs: 60,
+            },
+        );
+        assert!(out.contains("delta between two scrapes"));
+        assert!(out.contains("60"));
+    }
+
+    #[test]
     fn format_report_respects_display_options() {
         let raw = vec![("node1".to_string(), sample_histogram_text())];
         let nodes = parse_perf_metrics(&raw);
@@ -925,7 +1066,8 @@ arc_malachite_app_block_time_count{moniker="v1"} 100
             show_throughput: false,
             show_summary: false,
         };
-        let report = format_perf_report(&nodes, &latency_only);
+        let report =
+            format_perf_report(&nodes, &latency_only, PerfReportKind::CumulativeSinceStart);
         assert!(report.contains("Latency"), "should contain Latency section");
         assert!(
             !report.contains("Throughput"),
@@ -938,7 +1080,11 @@ arc_malachite_app_block_time_count{moniker="v1"} 100
             show_throughput: true,
             show_summary: false,
         };
-        let report = format_perf_report(&nodes, &throughput_only);
+        let report = format_perf_report(
+            &nodes,
+            &throughput_only,
+            PerfReportKind::CumulativeSinceStart,
+        );
         assert!(!report.contains("Latency"), "should not contain Latency");
         assert!(
             report.contains("Throughput"),

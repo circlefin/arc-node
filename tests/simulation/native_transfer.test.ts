@@ -16,10 +16,12 @@
 
 import hre from 'hardhat'
 import { expect } from 'chai'
-import { encodeFunctionData, parseEther, parseEventLogs } from 'viem'
+import { erc20Abi, encodeFunctionData, parseEther, parseEventLogs } from 'viem'
 import { getChain } from '../../scripts/hardhat/viem-helper'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
-import { NativeCoinAuthority } from '../helpers'
+
+// EIP-7708 system address
+const EIP7708_SYSTEM_ADDRESS = '0xfffffffffffffffffffffffffffffffffffffffe'
 
 /**
  * Tests for native token transfers
@@ -75,14 +77,14 @@ describe('Native Transfer Tests', () => {
     expect(calls[0].logs).to.have.lengthOf(1, 'One native transfer event from the EOA to the contract')
 
     const events = parseEventLogs({
-      abi: NativeCoinAuthority.abi,
-      eventName: 'NativeCoinTransferred',
+      abi: erc20Abi,
+      eventName: 'Transfer',
       logs: calls[0].logs,
-    })
+    }).filter((x) => x.address.toLowerCase() === EIP7708_SYSTEM_ADDRESS)
     expect(events).to.have.lengthOf(1)
     expect(events[0].args.from).to.equal(caller)
     expect(events[0].args.to).to.equal(nativeTransferHelperAddress)
-    expect(events[0].args.amount).to.equal(1n)
+    expect(events[0].args.value).to.equal(1n)
   })
 
   it('CREATE + call value that overflows recipient balance does not emit an event', async () => {
@@ -135,14 +137,14 @@ describe('Native Transfer Tests', () => {
     expect(calls[0].logs).to.have.lengthOf(1, 'One native transfer event from the EOA to the contract')
 
     const events = parseEventLogs({
-      abi: NativeCoinAuthority.abi,
-      eventName: 'NativeCoinTransferred',
+      abi: erc20Abi,
+      eventName: 'Transfer',
       logs: calls[0].logs,
-    })
+    }).filter((x) => x.address.toLowerCase() === EIP7708_SYSTEM_ADDRESS)
     expect(events).to.have.lengthOf(1)
     expect(events[0].args.from).to.equal(caller)
     expect(events[0].args.to).to.equal(nativeTransferHelperAddress)
-    expect(events[0].args.amount).to.equal(1n)
+    expect(events[0].args.value).to.equal(1n)
   })
 
   it('CALL with value that overflows recipient balance does not emit an event', async () => {
@@ -192,13 +194,13 @@ describe('Native Transfer Tests', () => {
     expect(calls[0].status).to.equal('success', 'Overall txn should succeed')
 
     const events = parseEventLogs({
-      abi: NativeCoinAuthority.abi,
-      eventName: 'NativeCoinTransferred',
+      abi: erc20Abi,
+      eventName: 'Transfer',
       logs: calls[0].logs,
-    })
+    }).filter((x) => x.address.toLowerCase() === EIP7708_SYSTEM_ADDRESS)
     expect(events).to.have.lengthOf(1)
     expect(events[0].args.from).to.equal(caller)
     expect(events[0].args.to).to.equal(callHelperAddress)
-    expect(events[0].args.amount).to.equal(1n)
+    expect(events[0].args.value).to.equal(1n)
   })
 })

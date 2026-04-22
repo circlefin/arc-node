@@ -36,7 +36,10 @@ pub fn determine_ema_parent_gas_used(
 
     // (1-α) * G[t-1] + α * G[t]
     // α is expressed as an integer value [0, 100]
-    let left = (ALPHA_MAX - a).checked_mul(smoothed)?;
+    // a <= ALPHA_MAX is guaranteed by the guard above.
+    #[allow(clippy::arithmetic_side_effects)]
+    let complement = ALPHA_MAX - a;
+    let left = complement.checked_mul(smoothed)?;
     let right = a.checked_mul(raw)?;
     let together = left.checked_add(right)?;
 
@@ -70,11 +73,21 @@ pub fn arc_calc_next_block_base_fee(
     k_rate: u64,                        // 2500 => 25%
     inverse_elasticity_multiplier: u64, // 7500 => 75%
 ) -> u64 {
-    // Calculate the target gas by dividing the gas limit by the elasticity multiplier.
-    let gas_target = (gas_limit as u128 * inverse_elasticity_multiplier as u128
-        / ARC_BASE_FEE_FIXED_POINT_SCALE) as u64;
+    // All u64×u64 products fit in u128 without overflow.
+    #[allow(clippy::arithmetic_side_effects)]
+    let gas_target_u128 =
+        gas_limit as u128 * inverse_elasticity_multiplier as u128 / ARC_BASE_FEE_FIXED_POINT_SCALE;
+    let gas_target = u64::try_from(gas_target_u128).unwrap_or(u64::MAX);
 
     if gas_target == 0 || k_rate == 0 {
+        return base_fee;
+    }
+
+    // k_rate != 0 checked above; gas_target (u64) × 10_000 fits in u128
+    #[allow(clippy::arithmetic_side_effects)]
+    let denominator = gas_target as u128 * ARC_BASE_FEE_FIXED_POINT_SCALE / k_rate as u128;
+
+    if denominator == 0 {
         return base_fee;
     }
 
@@ -86,22 +99,22 @@ pub fn arc_calc_next_block_base_fee(
         // increased base fee.
         core::cmp::Ordering::Greater => {
             // Calculate the increase in base fee based on the formula defined by EIP-1559.
-            base_fee.saturating_add(core::cmp::max(
-                // Ensure a minimum increase of 1.
-                1,
-                base_fee as u128 * (gas_used - gas_target) as u128
-                    / (gas_target as u128 * ARC_BASE_FEE_FIXED_POINT_SCALE / k_rate as u128),
-            ) as u64)
+            // gas_used > gas_target in this arm, so subtraction is safe
+            #[allow(clippy::arithmetic_side_effects)]
+            let increase = base_fee as u128 * (gas_used - gas_target) as u128 / denominator;
+            let increase = u64::try_from(increase).unwrap_or(u64::MAX);
+            // Ensure a minimum increase of 1.
+            base_fee.saturating_add(core::cmp::max(1, increase))
         }
         // If the gas used in the current block is less than the gas target, calculate a new
         // decreased base fee.
         core::cmp::Ordering::Less => {
             // Calculate the decrease in base fee based on the formula defined by EIP-1559.
-            base_fee.saturating_sub(
-                (base_fee as u128 * (gas_target - gas_used) as u128
-                    / (gas_target as u128 * ARC_BASE_FEE_FIXED_POINT_SCALE / k_rate as u128))
-                    as u64,
-            )
+            // gas_target > gas_used in this arm, so subtraction is safe
+            #[allow(clippy::arithmetic_side_effects)]
+            let decrease = base_fee as u128 * (gas_target - gas_used) as u128 / denominator;
+            let decrease = u64::try_from(decrease).unwrap_or(u64::MAX);
+            base_fee.saturating_sub(decrease)
         }
     }
 }
@@ -300,6 +313,7 @@ mod tests {
             .next_block_base_fee(gas_used, gas_limit, base_fee);
 
             // use kRate 12.5% and inverse elasticity multiplier 50% to compute the same value as eip1559
+            #[allow(clippy::cast_possible_truncation)] // 10_000u128 fits in u64
             let next_base_fee = arc_calc_next_block_base_fee(
                 gas_used,
                 gas_limit,

@@ -20,7 +20,12 @@
 //!
 //! Runs mesh connectivity checks, block-time performance assertions, and
 //! consensus health checks in a single pass. Both performance and health use a
-//! two-scrape delta approach, measuring only the observation window.
+//! two-scrape delta approach, measuring only the observation window. After health,
+//! it prints a full interval performance report (same delta as the block-time checks)
+//! before the short per-node pass/fail lines. For mesh, by default it also prints the
+//! same detailed topology report as `quake info mesh` before the compact mesh check
+//! (`mesh_verbose=false` to skip). Health already prints per-node delta lines; no separate
+//! `quake info health` is needed.
 //! Transaction load is configurable (default: 50 TPS of native transfers for 60 seconds).
 //!
 //! Works on both local (Docker Compose) and remote (AWS EC2) testnets.
@@ -40,6 +45,7 @@
 //! | `load_targets`      | `""` (all nodes) | Comma-separated node names to send load to        |
 //! | `load_mix`          | `transfer=100`   | Tx type mix (`--mix` format; `erc20`/`guzzler` need contracts in genesis) |
 //! | `strict_mesh`       | `true`           | Enforce mesh tier expectations                    |
+//! | `mesh_verbose`      | `true`           | Print full `quake info mesh`-style report before mesh checks |
 //! | `block_time_p50_ms` | `550`            | Fail if any node's p50 block time exceeds this    |
 //! | `block_time_p95_ms` | `1000`           | Fail if any node's p95 block time exceeds this    |
 //!
@@ -50,6 +56,7 @@
 //! quake test validation:basic --set load_rate=0                  # no load (baseline)
 //! quake test validation:basic --set load_mix=transfer=70,erc20=30
 //! quake test validation:basic --set load_rate=500 --set duration_s=120 --set load_targets=rpc1,rpc2
+//! quake test validation:basic --set mesh_verbose=false   # shorter logs (skip full mesh topology table)
 //! ```
 
 use std::time::Duration;
@@ -215,6 +222,7 @@ fn basic_test<'a>(
         let load_targets_str = params.get_or("load_targets", "");
         let load_mix = params.get_or("load_mix", DEFAULT_LOAD_MIX);
         let strict_mesh = params.get_or("strict_mesh", "true") == "true";
+        let mesh_verbose = params.get_or("mesh_verbose", "true") == "true";
         let p50_ms: u64 = params
             .get_or("block_time_p50_ms", &DEFAULT_P50_MS.to_string())
             .parse()
@@ -248,10 +256,12 @@ fn basic_test<'a>(
         println!("  warmup:     {warmup_s}s");
         println!("  duration:   {duration_s}s");
         println!("  load:       {load_desc}");
-        if !load_targets.is_empty() {
+        if load_rate > 0 && !load_targets.is_empty() {
             println!("  targets:    {}", load_targets.join(", "));
+        } else if load_rate > 0 {
+            println!("  targets:    all nodes");
         }
-        println!("  mesh:       strict={strict_mesh}");
+        println!("  mesh:       strict={strict_mesh}, full_report={mesh_verbose}");
         println!("  perf:       p50 < {p50_ms}ms, p95 < {p95_ms}ms");
         println!("─────────────────────────────────────────────────────\n");
 
@@ -322,6 +332,31 @@ fn basic_test<'a>(
             health_checks.push(check.into());
         }
 
+        // ── Performance (full interval tables, same delta as checks) ──
+        let perf_interval_nodes = crate::util::parse_perf_metrics_delta_with_groups(
+            &raw_before,
+            &raw_after,
+            &testnet.manifest.nodes,
+        );
+        if !perf_interval_nodes.is_empty() {
+            let perf_display = arc_checks::PerfDisplayOptions {
+                show_latency: true,
+                show_throughput: true,
+                show_summary: true,
+            };
+            println!("\n── Performance (observation window) ─────────────────");
+            print!(
+                "{}",
+                arc_checks::format_perf_report(
+                    &perf_interval_nodes,
+                    &perf_display,
+                    arc_checks::PerfReportKind::Interval {
+                        observation_secs: duration_s,
+                    },
+                )
+            );
+        }
+
         // ── Performance (delta between scrapes) ────────────────────
         let perf_report =
             arc_checks::check_block_time_delta(&raw_before, &raw_after, p50_ms, p95_ms);
@@ -335,8 +370,8 @@ fn basic_test<'a>(
             perf_checks.push(check.into());
         }
 
-        // ── Mesh ───────────────────────────────────────────────────
-        let mesh_checks = run_mesh_checks(testnet, strict_mesh, "mesh", false).await?;
+        // ── Mesh (optional full topology table like `quake info mesh`, then checks) ──
+        let mesh_checks = run_mesh_checks(testnet, strict_mesh, "mesh", mesh_verbose).await?;
 
         // ── Summary ────────────────────────────────────────────────
         println!("\n── Summary ──────────────────────────────────────────");

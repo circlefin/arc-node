@@ -173,6 +173,7 @@ test-unit-hardhat: ## Run hardhat unit tests
 .PHONY: test-localdev
 test-localdev: ## Run hardhat localdev tests
 	$(HARDHAT) test ./tests/localdev/*.test.ts --network localdev
+	$(MAKE) test-simulation
 
 .PHONY: test-simulation
 test-simulation: ## Run hardhat simulation tests
@@ -192,12 +193,12 @@ smoke: genesis ## Run smoke tests (both reth and malachite)
 .PHONY: smoke-reth
 smoke-reth: genesis ## Run Reth smoke tests
 	@echo "Running smoke tests on local reth(mock CL)..."
+	cargo build --release --bin arc-node-execution
 	@bash -c '\
 		set -ex; \
 		trap "./scripts/localdev.mjs stop --network=localdev" EXIT; \
-		./scripts/localdev.mjs stop clean daemon --network=localdev $(LAUNCH_ARGS); \
+		./scripts/localdev.mjs stop clean daemon --network=localdev --bin=target/release/arc-node-execution $(LAUNCH_ARGS); \
 		$(MAKE) test-localdev; \
-		$(MAKE) test-simulation; \
 	'
 
 .PHONY: smoke-malachite
@@ -218,7 +219,7 @@ smoke-quake: testnet
 .PHONY: testnet
 testnet: genesis build-docker ## Start testnet as defined in QUAKE_MANIFEST file
 	@echo "Setting up and starting Quake testnet..."
-	$(QUAKE) -f $(QUAKE_MANIFEST) start
+	$(QUAKE) -f $(QUAKE_MANIFEST) start $(QUAKE_START_ARGS)
 
 .PHONY: testnet-test
 testnet-test: ## Run tests against running testnet

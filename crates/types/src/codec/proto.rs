@@ -36,6 +36,13 @@ use crate::{
 
 use super::{Codec, HasEncodedLen};
 
+/// Upper bound on signatures per certificate. Well above any realistic validator set size,
+/// but prevents unbounded allocation from a malicious peer sending inflated repeated fields.
+const MAX_SIGNATURES_PER_CERTIFICATE: usize = 1_000;
+
+/// Upper bound on values in a single sync response.
+const MAX_SYNC_VALUES: usize = 1_000;
+
 #[derive(Copy, Clone, Debug)]
 pub struct ProtobufCodec;
 
@@ -178,6 +185,13 @@ pub fn encode_round_certificate(
 pub fn decode_round_certificate(
     certificate: proto::RoundCertificate,
 ) -> Result<RoundCertificate<ArcContext>, ProtoError> {
+    if certificate.signatures.len() > MAX_SIGNATURES_PER_CERTIFICATE {
+        return Err(ProtoError::Other(format!(
+            "RoundCertificate signature count {} exceeds maximum {MAX_SIGNATURES_PER_CERTIFICATE}",
+            certificate.signatures.len(),
+        )));
+    }
+
     Ok(RoundCertificate {
         height: Height::new(certificate.height),
         round: Round::new(certificate.round),
@@ -442,6 +456,12 @@ pub fn decode_sync_response(
 
     let response = match response {
         proto::sync_response::Response::ValueResponse(value_response) => {
+            if value_response.values.len() > MAX_SYNC_VALUES {
+                return Err(ProtoError::Other(format!(
+                    "ValueResponse value count {} exceeds maximum {MAX_SYNC_VALUES}",
+                    value_response.values.len(),
+                )));
+            }
             sync::Response::ValueResponse(sync::ValueResponse::new(
                 Height::new(value_response.start_height),
                 value_response
@@ -535,6 +555,13 @@ pub(crate) fn encode_polka_certificate(
 pub(crate) fn decode_polka_certificate(
     certificate: proto::PolkaCertificate,
 ) -> Result<PolkaCertificate<ArcContext>, ProtoError> {
+    if certificate.signatures.len() > MAX_SIGNATURES_PER_CERTIFICATE {
+        return Err(ProtoError::Other(format!(
+            "PolkaCertificate signature count {} exceeds maximum {MAX_SIGNATURES_PER_CERTIFICATE}",
+            certificate.signatures.len(),
+        )));
+    }
+
     let value_id = certificate
         .value_id
         .ok_or_else(|| ProtoError::missing_field::<proto::PolkaCertificate>("value_id"))
@@ -624,6 +651,13 @@ fn decode_commit_certificate_fields(
     value_id: Option<proto::ValueId>,
     signatures: Vec<proto::sync::CommitSignature>,
 ) -> Result<CommitCertificate<ArcContext>, ProtoError> {
+    if signatures.len() > MAX_SIGNATURES_PER_CERTIFICATE {
+        return Err(ProtoError::Other(format!(
+            "CommitCertificate signature count {} exceeds maximum {MAX_SIGNATURES_PER_CERTIFICATE}",
+            signatures.len(),
+        )));
+    }
+
     let value_id = value_id
         .ok_or_else(|| ProtoError::missing_field::<proto::sync::CommitCertificate>("value_id"))
         .and_then(ValueId::from_proto)?;
@@ -919,5 +953,218 @@ mod tests {
             err.to_string().contains("Invalid peer ID"),
             "error should mention invalid peer ID, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_commit_certificate_rejects_excessive_signatures() {
+        let oversized: Vec<proto::sync::CommitSignature> = (0..MAX_SIGNATURES_PER_CERTIFICATE + 1)
+            .map(|_| proto::sync::CommitSignature {
+                validator_address: Some(proto::Address {
+                    value: Bytes::from(vec![0u8; 20]),
+                }),
+                signature: Some(proto::Signature {
+                    bytes: Bytes::from(vec![0u8; 64]),
+                }),
+            })
+            .collect();
+
+        let result = decode_commit_certificate_fields(
+            1,
+            0,
+            Some(proto::ValueId {
+                block_hash: Bytes::from(vec![0u8; 32]),
+            }),
+            oversized,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum"),);
+    }
+
+    #[test]
+    fn test_polka_certificate_rejects_excessive_signatures() {
+        let oversized: Vec<proto::PolkaSignature> = (0..MAX_SIGNATURES_PER_CERTIFICATE + 1)
+            .map(|_| proto::PolkaSignature {
+                validator_address: Some(proto::Address {
+                    value: Bytes::from(vec![0u8; 20]),
+                }),
+                signature: Some(proto::Signature {
+                    bytes: Bytes::from(vec![0u8; 64]),
+                }),
+            })
+            .collect();
+
+        let cert = proto::PolkaCertificate {
+            height: 1,
+            round: 0,
+            value_id: Some(proto::ValueId {
+                block_hash: Bytes::from(vec![0u8; 32]),
+            }),
+            signatures: oversized,
+        };
+
+        let result = decode_polka_certificate(cert);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum"),);
+    }
+
+    #[test]
+    fn test_round_certificate_rejects_excessive_signatures() {
+        let oversized: Vec<proto::RoundSignature> = (0..MAX_SIGNATURES_PER_CERTIFICATE + 1)
+            .map(|_| proto::RoundSignature {
+                vote_type: 0,
+                validator_address: Some(proto::Address {
+                    value: Bytes::from(vec![0u8; 20]),
+                }),
+                signature: Some(proto::Signature {
+                    bytes: Bytes::from(vec![0u8; 64]),
+                }),
+                value_id: None,
+            })
+            .collect();
+
+        let cert = proto::RoundCertificate {
+            height: 1,
+            round: 0,
+            cert_type: 0,
+            signatures: oversized,
+        };
+
+        let result = decode_round_certificate(cert);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum"),);
+    }
+
+    #[test]
+    fn test_value_response_rejects_excessive_values() {
+        let oversized: Vec<proto::SyncedValue> = (0..MAX_SYNC_VALUES + 1)
+            .map(|_| proto::SyncedValue {
+                value_bytes: Bytes::new(),
+                certificate: Some(proto::sync::CommitCertificate {
+                    height: 1,
+                    round: 0,
+                    value_id: Some(proto::ValueId {
+                        block_hash: Bytes::from(vec![0u8; 32]),
+                    }),
+                    signatures: vec![],
+                }),
+            })
+            .collect();
+
+        let proto_response = proto::SyncResponse {
+            response: Some(proto::sync_response::Response::ValueResponse(
+                proto::ValueResponse {
+                    start_height: 1,
+                    values: oversized,
+                },
+            )),
+        };
+
+        let result = decode_sync_response(proto_response);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum"),);
+    }
+
+    #[test]
+    fn test_commit_certificate_accepts_max_signatures() {
+        let at_limit: Vec<proto::sync::CommitSignature> = (0..MAX_SIGNATURES_PER_CERTIFICATE)
+            .map(|_| proto::sync::CommitSignature {
+                validator_address: Some(proto::Address {
+                    value: Bytes::from(vec![0u8; 20]),
+                }),
+                signature: Some(proto::Signature {
+                    bytes: Bytes::from(vec![0u8; 64]),
+                }),
+            })
+            .collect();
+
+        let result = decode_commit_certificate_fields(
+            1,
+            0,
+            Some(proto::ValueId {
+                block_hash: Bytes::from(vec![0u8; 32]),
+            }),
+            at_limit,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_polka_certificate_accepts_max_signatures() {
+        let at_limit: Vec<proto::PolkaSignature> = (0..MAX_SIGNATURES_PER_CERTIFICATE)
+            .map(|_| proto::PolkaSignature {
+                validator_address: Some(proto::Address {
+                    value: Bytes::from(vec![0u8; 20]),
+                }),
+                signature: Some(proto::Signature {
+                    bytes: Bytes::from(vec![0u8; 64]),
+                }),
+            })
+            .collect();
+
+        let cert = proto::PolkaCertificate {
+            height: 1,
+            round: 0,
+            value_id: Some(proto::ValueId {
+                block_hash: Bytes::from(vec![0u8; 32]),
+            }),
+            signatures: at_limit,
+        };
+
+        assert!(decode_polka_certificate(cert).is_ok());
+    }
+
+    #[test]
+    fn test_round_certificate_accepts_max_signatures() {
+        let at_limit: Vec<proto::RoundSignature> = (0..MAX_SIGNATURES_PER_CERTIFICATE)
+            .map(|_| proto::RoundSignature {
+                vote_type: 0,
+                validator_address: Some(proto::Address {
+                    value: Bytes::from(vec![0u8; 20]),
+                }),
+                signature: Some(proto::Signature {
+                    bytes: Bytes::from(vec![0u8; 64]),
+                }),
+                value_id: None,
+            })
+            .collect();
+
+        let cert = proto::RoundCertificate {
+            height: 1,
+            round: 0,
+            cert_type: 0,
+            signatures: at_limit,
+        };
+
+        assert!(decode_round_certificate(cert).is_ok());
+    }
+
+    #[test]
+    fn test_value_response_accepts_max_values() {
+        let at_limit: Vec<proto::SyncedValue> = (0..MAX_SYNC_VALUES)
+            .map(|_| proto::SyncedValue {
+                value_bytes: Bytes::new(),
+                certificate: Some(proto::sync::CommitCertificate {
+                    height: 1,
+                    round: 0,
+                    value_id: Some(proto::ValueId {
+                        block_hash: Bytes::from(vec![0u8; 32]),
+                    }),
+                    signatures: vec![],
+                }),
+            })
+            .collect();
+
+        let proto_response = proto::SyncResponse {
+            response: Some(proto::sync_response::Response::ValueResponse(
+                proto::ValueResponse {
+                    start_height: 1,
+                    values: at_limit,
+                },
+            )),
+        };
+
+        assert!(decode_sync_response(proto_response).is_ok());
     }
 }

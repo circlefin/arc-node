@@ -56,6 +56,135 @@ write_files:
           [ -f "$f" ] && [ "$(cat "$f")" != "0" ] && FAILED=1
       done
       exit $FAILED
+  - path: /home/${username}/download-metrics.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # Usage: download-metrics.sh [-s <start_unix_ts>] [-e <end_unix_ts>] [-t <step>] [metric1 metric2 ...]
+      # Queries Prometheus query_range and saves each metric to a JSON file,
+      # then creates ~/quake-metrics-tmp-<pid>.tar.gz.
+      # Outputs a single JSON line: {"archive":"<basename>","errors":["<metric>: <reason>",...]}
+      # Per-metric failures are collected and reported; the archive is always created.
+      # -t sets the query resolution (interval between data points, e.g. 30s, 1m, 5m).
+      #    Defaults to ceil((end-start)/10000) to stay within Prometheus' 11,000-point limit.
+      set -uo pipefail
+      START=""
+      END=""
+      STEP=""
+      while getopts "s:e:t:" OPT; do
+        case "$OPT" in
+          s) START="$OPTARG" ;;
+          e) END="$OPTARG" ;;
+          t) STEP="$OPTARG" ;;
+          *) exit 1 ;;
+        esac
+      done
+      shift "$((OPTIND-1))"
+      NOW=$(date +%s)
+      if [ -z "$START" ]; then
+        START=$(curl -sf http://localhost:9090/api/v1/status/tsdb | jq -r '.data.headStats.minTime / 1000 | floor' 2>/dev/null) || START=0
+      fi
+      [ -z "$END" ] && END=$NOW
+      if [ -z "$STEP" ]; then
+        STEP=$(( (END - START + 9999) / 10000 ))
+        [ "$STEP" -lt 1 ] && STEP=1
+        STEP="$STEP"s
+      fi
+      PARAMS="start=$START&end=$END&step=$STEP"
+      TMP_DIR=$(mktemp -d)
+      trap "rm -rf $TMP_DIR" EXIT
+      if [ $# -eq 0 ]; then
+        METRICS_RESPONSE=$(curl -sf http://localhost:9090/api/v1/label/__name__/values)
+        CURL_EXIT=$?
+        if [ $CURL_EXIT -ne 0 ]; then
+          printf '{"archive":"","errors":["failed to list Prometheus metric names (curl exited with code %s)"]}\n' "$CURL_EXIT"
+          exit 0
+        fi
+        METRICS=$(printf '%s' "$METRICS_RESPONSE" | jq -r '.data[]')
+      else
+        METRICS=$(printf '%s\n' "$@")
+      fi
+      ARCHIVE="quake-metrics-tmp-$$.tar.gz"
+      ERRORS=()
+      while IFS= read -r M; do
+        if RESPONSE=$(curl -s "http://localhost:9090/api/v1/query_range?query=$M&$PARAMS" 2>/dev/null); then
+          STATUS=$(printf '%s' "$RESPONSE" | jq -r '.status // "error"' 2>/dev/null) || STATUS="error"
+          if [ "$STATUS" = "success" ]; then
+            printf '%s' "$RESPONSE" > "$TMP_DIR/$M.json"
+          else
+            ERR=$(printf '%s' "$RESPONSE" | jq -r '.error // "unknown error"' 2>/dev/null || echo "unknown error")
+            ERRORS+=("$M: $ERR")
+          fi
+        else
+          ERRORS+=("$M: curl failed")
+        fi
+      done <<< "$METRICS"
+      tar czf ~/$ARCHIVE -C "$TMP_DIR" .
+      if [ $${#ERRORS[@]} -eq 0 ]; then
+        ERRORS_JSON="[]"
+      else
+        ERRORS_JSON=$(printf '%s\n' "$${ERRORS[@]}" | jq -R . | jq -s .)
+      fi
+      printf '{"archive":"%s","errors":%s}\n' "$ARCHIVE" "$ERRORS_JSON"
+  - path: /home/${username}/download-db.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # Usage: download-db.sh [-x] [-c] <ip1> [ip2 ...]
+      # Archives node data from all specified nodes in parallel, then bundles
+      # everything into ~/quake-db-tmp-<pid>.tar.gz.
+      # Outputs a single JSON line: {"archive":"<basename>","errors":["<node>: <reason>",...]}
+      # Per-node failures are collected and reported; the archive is always created.
+      # -x: execution layer only (reth); -c: consensus layer only (malachite); default: both
+      set -uo pipefail
+      EXEC_ONLY=false
+      CONS_ONLY=false
+      while getopts "xc" OPT; do
+        case "$OPT" in
+          x) EXEC_ONLY=true ;;
+          c) CONS_ONLY=true ;;
+          *) exit 1 ;;
+        esac
+      done
+      shift "$((OPTIND-1))"
+      SSH_OPTS="-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ~/.ssh/id_rsa"
+      USER="${username}"
+      NODE_TMP=quake-db-node-tmp-$$.tar.gz
+      if [ "$EXEC_ONLY" = true ]; then
+        DIRS="~/data/reth"
+      elif [ "$CONS_ONLY" = true ]; then
+        DIRS="~/data/malachite"
+      else
+        DIRS="~/data/reth ~/data/malachite"
+      fi
+      ARCHIVE="quake-db-tmp-$$.tar.gz"
+      TMP_DIR=$(mktemp -d)
+      ALL_IPS="$*"
+      ERRORS=()
+      trap "rm -rf $TMP_DIR; ./pssh.sh 'rm -f ~/$NODE_TMP' $ALL_IPS 2>/dev/null || true" EXIT
+      PSSH_OUTPUT=$(./pssh.sh "sudo tar czf ~/$NODE_TMP $DIRS" $ALL_IPS 2>&1)
+      PSSH_EXIT=$?
+      if [ $PSSH_EXIT -ne 0 ]; then
+        PSSH_SUMMARY=$(printf '%s' "$PSSH_OUTPUT" | head -1)
+        ERRORS+=("failed to archive node data (exit $PSSH_EXIT): $PSSH_SUMMARY")
+      fi
+      for IP in $ALL_IPS; do
+        SCP_OUTPUT=$(scp $SSH_OPTS $USER@$IP:~/$NODE_TMP "$TMP_DIR/$IP.tar.gz" 2>&1)
+        SCP_EXIT=$?
+        if [ $SCP_EXIT -ne 0 ]; then
+          SCP_SUMMARY=$(printf '%s' "$SCP_OUTPUT" | head -1)
+          ERRORS+=("$IP: scp failed (exit $SCP_EXIT): $SCP_SUMMARY")
+        fi
+      done
+      tar czf ~/$ARCHIVE -C "$TMP_DIR" .
+      if [ $${#ERRORS[@]} -eq 0 ]; then
+        ERRORS_JSON="[]"
+      else
+        ERRORS_JSON=$(printf '%s\n' "$${ERRORS[@]}" | jq -R . | jq -s .)
+      fi
+      printf '{"archive":"%s","errors":%s}\n' "$ARCHIVE" "$ERRORS_JSON"
 runcmd:
 # Set up 4 GiB swap to prevent hard OOM kills (dd instead of fallocate for XFS compatibility)
   - dd if=/dev/zero of=/swapfile bs=1M count=4096

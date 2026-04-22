@@ -21,13 +21,15 @@ use std::net::SocketAddr;
 
 use arc_consensus_types::rpc_sync::SyncEndpointUrl;
 use backon::{BackoffBuilder, Retryable};
-use tracing::warn;
+use eyre::eyre;
+use tracing::{info, warn};
 use url::Url;
 
 use malachitebft_app_channel::app::consensus::Multiaddr;
 
 use arc_consensus_db::DbUpgrade;
 use arc_consensus_types::Address;
+use arc_shared::chain_ids::{LOCALDEV_CHAIN_ID, TESTNET_CHAIN_ID};
 
 use crate::hardcoded_config::GossipSubOverrides;
 use arc_eth_engine::{engine::Engine, INITIAL_RETRY_DELAY};
@@ -125,6 +127,9 @@ pub struct StartConfig {
     /// Skip database schema upgrade on startup
     pub skip_db_upgrade: bool,
 
+    /// Run as a validator (load consensus key, sign validator proof)
+    pub validator: bool,
+
     /// Enable RPC sync mode, a.k.a. follow (fetch blocks via HTTP RPC instead of P2P)
     pub rpc_sync_enabled: bool,
     /// RPC endpoints to fetch blocks from (only used in RPC sync mode)
@@ -134,11 +139,19 @@ pub struct StartConfig {
 impl StartConfig {
     /// Check if RPC sync mode is enabled
     pub fn is_rpc_sync_mode(&self) -> bool {
-        if self.rpc_sync_enabled && self.rpc_sync_endpoints.is_empty() {
-            warn!("RPC sync mode is enabled but no RPC sync endpoints are configured. Falling back to P2P sync mode.");
+        self.rpc_sync_enabled
+    }
+
+    /// Populate `rpc_sync_endpoints` with chain-specific defaults when the user
+    /// enabled `--follow` without explicit `--follow.endpoint` arguments.
+    pub fn resolve_default_rpc_sync_endpoints(&mut self, chain_id: u64) -> eyre::Result<()> {
+        if !self.rpc_sync_enabled || !self.rpc_sync_endpoints.is_empty() {
+            return Ok(());
         }
 
-        self.rpc_sync_enabled && !self.rpc_sync_endpoints.is_empty()
+        let url = default_rpc_sync_endpoint(chain_id)?;
+        self.rpc_sync_endpoints.push(url);
+        Ok(())
     }
 
     pub fn engine_config(&'_ self) -> Option<EngineConfig<'_>> {
@@ -177,6 +190,24 @@ impl StartConfig {
             DbUpgrade::Perform
         }
     }
+}
+
+/// Returns the default RPC sync endpoint for the given chain ID.
+fn default_rpc_sync_endpoint(chain_id: u64) -> eyre::Result<SyncEndpointUrl> {
+    let url = match chain_id {
+        TESTNET_CHAIN_ID => "https://rpc.quicknode.testnet.arc.network/",
+        LOCALDEV_CHAIN_ID => "http://localhost:8545",
+        _ => {
+            return Err(eyre!(
+                "No default follow endpoint for chain ID {chain_id}. \
+                 Use --follow.endpoint to specify one explicitly."
+            ))
+        }
+    };
+
+    info!("Using default follow endpoint for chain {chain_id}: {url}");
+    url.parse()
+        .map_err(|e| eyre!("Failed to parse default follow endpoint: {e}"))
 }
 
 /// Derive a WebSocket URL from an HTTP RPC URL using the reth convention:
@@ -230,5 +261,142 @@ mod tests {
     fn derive_ws_url_returns_none_for_unsupported_scheme() {
         let ftp = Url::parse("ftp://localhost:8545").unwrap();
         assert!(derive_ws_url(&ftp).is_none());
+    }
+
+    #[test]
+    fn default_rpc_sync_endpoint_testnet() {
+        let endpoint = default_rpc_sync_endpoint(TESTNET_CHAIN_ID).unwrap();
+        assert_eq!(
+            endpoint.http().as_str(),
+            "https://rpc.quicknode.testnet.arc.network/"
+        );
+    }
+
+    #[test]
+    fn default_rpc_sync_endpoint_localdev() {
+        let endpoint = default_rpc_sync_endpoint(LOCALDEV_CHAIN_ID).unwrap();
+        assert_eq!(endpoint.http().as_str(), "http://localhost:8545/");
+    }
+
+    #[test]
+    fn default_rpc_sync_endpoint_unsupported_chain() {
+        let result = default_rpc_sync_endpoint(999);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No default follow endpoint"));
+    }
+
+    #[test]
+    fn resolve_defaults_populates_empty_endpoints() {
+        let mut config = StartConfig {
+            persistent_peers: Vec::new(),
+            persistent_peers_only: false,
+            gossipsub_overrides: Default::default(),
+            eth_socket: None,
+            execution_socket: None,
+            eth_rpc_endpoint: None,
+            execution_endpoint: None,
+            execution_ws_endpoint: None,
+            execution_jwt: None,
+            pprof_bind_address: None,
+            suggested_fee_recipient: None,
+            skip_db_upgrade: false,
+            validator: false,
+            rpc_sync_enabled: true,
+            rpc_sync_endpoints: Vec::new(),
+        };
+
+        config
+            .resolve_default_rpc_sync_endpoints(TESTNET_CHAIN_ID)
+            .unwrap();
+        assert_eq!(config.rpc_sync_endpoints.len(), 1);
+        assert_eq!(
+            config.rpc_sync_endpoints[0].http().as_str(),
+            "https://rpc.quicknode.testnet.arc.network/"
+        );
+    }
+
+    #[test]
+    fn resolve_defaults_preserves_explicit_endpoints() {
+        let explicit: SyncEndpointUrl = "http://my-validator:8545".parse().unwrap();
+        let mut config = StartConfig {
+            persistent_peers: Vec::new(),
+            persistent_peers_only: false,
+            gossipsub_overrides: Default::default(),
+            eth_socket: None,
+            execution_socket: None,
+            eth_rpc_endpoint: None,
+            execution_endpoint: None,
+            execution_ws_endpoint: None,
+            execution_jwt: None,
+            pprof_bind_address: None,
+            suggested_fee_recipient: None,
+            skip_db_upgrade: false,
+            validator: false,
+            rpc_sync_enabled: true,
+            rpc_sync_endpoints: vec![explicit.clone()],
+        };
+
+        config
+            .resolve_default_rpc_sync_endpoints(TESTNET_CHAIN_ID)
+            .unwrap();
+        assert_eq!(config.rpc_sync_endpoints.len(), 1);
+        assert_eq!(config.rpc_sync_endpoints[0], explicit);
+    }
+
+    #[test]
+    fn resolve_defaults_noop_when_disabled() {
+        let mut config = StartConfig {
+            persistent_peers: Vec::new(),
+            persistent_peers_only: false,
+            gossipsub_overrides: Default::default(),
+            eth_socket: None,
+            execution_socket: None,
+            eth_rpc_endpoint: None,
+            execution_endpoint: None,
+            execution_ws_endpoint: None,
+            execution_jwt: None,
+            pprof_bind_address: None,
+            suggested_fee_recipient: None,
+            skip_db_upgrade: false,
+            validator: false,
+            rpc_sync_enabled: false,
+            rpc_sync_endpoints: Vec::new(),
+        };
+
+        config
+            .resolve_default_rpc_sync_endpoints(TESTNET_CHAIN_ID)
+            .unwrap();
+        assert!(config.rpc_sync_endpoints.is_empty());
+    }
+
+    #[test]
+    fn resolve_defaults_errors_on_unsupported_chain() {
+        let mut config = StartConfig {
+            persistent_peers: Vec::new(),
+            persistent_peers_only: false,
+            gossipsub_overrides: Default::default(),
+            eth_socket: None,
+            execution_socket: None,
+            eth_rpc_endpoint: None,
+            execution_endpoint: None,
+            execution_ws_endpoint: None,
+            execution_jwt: None,
+            pprof_bind_address: None,
+            suggested_fee_recipient: None,
+            skip_db_upgrade: false,
+            validator: false,
+            rpc_sync_enabled: true,
+            rpc_sync_endpoints: Vec::new(),
+        };
+
+        let result = config.resolve_default_rpc_sync_endpoints(999);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No default follow endpoint"));
     }
 }

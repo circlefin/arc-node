@@ -281,8 +281,12 @@ impl IoMetricsInner {
 
         // Update stats metrics
         if let Ok(stat) = process.stat() {
-            // CPU time in seconds (user + system)
+            // CPU time in seconds (user + system).
+            // Kernel tick counters fit in u64; sum of two won't overflow for any real process.
+            // Seconds as i64 covers ~292 billion years of CPU time.
+            #[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
             let cpu_time = (stat.utime + stat.stime) as f64 / procfs::ticks_per_second() as f64;
+            #[allow(clippy::cast_possible_truncation)]
             self.process_cpu_seconds_total.set(cpu_time as i64);
 
             // Number of threads

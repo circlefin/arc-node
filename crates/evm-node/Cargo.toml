@@ -32,7 +32,6 @@ eyre.workspace = true
 jsonrpsee.workspace = true
 reqwest.workspace = true
 reth-chainspec.workspace = true
-reth-engine-local.workspace = true
 reth-engine-primitives.workspace = true
 reth-ethereum = { workspace = true, features = ["node-api", "node", "provider", "network", "evm", "pool", "cli", "js-tracer"] }
 reth-ethereum-engine-primitives.workspace = true

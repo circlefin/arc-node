@@ -54,13 +54,16 @@ async fn submit_with_overridden_beneficiary(
 
 /// Ensure `apply_pre_execution_changes` rejects payloads whose beneficiary does
 /// not match `ProtocolConfig.rewardBeneficiary()`.
-/// The LOCAL_DEV genesis has rewardBeneficiary set to 0xa0Ee7A142d267C1f36714E4a8F75612F20a79720.
 #[tokio::test]
 async fn test_beneficiary_mismatch_rejected_with_error() -> Result<()> {
     reth_tracing::init_test_tracing();
 
+    // Set a non-zero expected beneficiary so the mismatch check is active.
+    let expected_beneficiary = address!("0x65E0a200006D4FF91bD59F9694220dafc49dbBC1");
+    let chain_spec = localdev_with_storage_override(expected_beneficiary, None);
+
     let status = submit_with_overridden_beneficiary(
-        ArcSetup::new(),
+        ArcSetup::new().with_chain_spec(chain_spec),
         address!("0xbad0000000000000000000000000000000000000"),
         "submit_payload should return Ok for beneficiary mismatch",
     )

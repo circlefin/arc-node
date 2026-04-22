@@ -14,6 +14,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(
+    test,
+    allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)
+)]
+
 mod app;
 mod block;
 mod config;
@@ -26,7 +31,7 @@ mod proposal_parts;
 mod state;
 mod stats;
 mod streaming;
-mod utils;
+pub mod utils;
 mod validator_proof;
 
 pub mod hardcoded_config;

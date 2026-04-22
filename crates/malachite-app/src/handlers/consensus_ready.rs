@@ -367,10 +367,18 @@ async fn handshake_and_replay(
         .unwrap_or_default();
 
     if latest_height_el > latest_height_cons {
+        if latest_height_cons == Height::default() {
+            return Err(eyre!(
+                "Handshake: EL has blocks (height {latest_height_el}) but CL has no committed \
+                state (height 0). The CL snapshot is missing. \
+                Download one with: `arc-node-consensus download`"
+            ));
+        }
         return Err(eyre!(
             "Handshake: inconsistent state: EL latest height ({latest_height_el}) \
             is greater than CL latest committed height ({latest_height_cons}). \
-            Something is wrong with CL DB",
+            This may indicate CL database corruption or a partial snapshot restore. \
+            Try re-downloading both snapshots with: `arc-snapshots download`"
         ));
     }
 
@@ -463,7 +471,10 @@ async fn handshake_and_replay(
 /// Defined to be equal to the size of the consensus input buffer,
 /// which is itself sized to handle all in-flight sync responses.
 fn max_pending_proposals(config: &ValueSyncConfig) -> usize {
-    let limit = config.parallel_requests * config.batch_size;
+    let limit = config
+        .parallel_requests
+        .checked_mul(config.batch_size)
+        .expect("max_pending_proposals overflow");
     assert!(limit > 0, "max_pending_proposals must be greater than 0");
     limit
 }
@@ -1048,7 +1059,7 @@ mod tests {
         assert_eq!(next_height, Height::new(1));
     }
 
-    // Test 5: EL ahead of CL
+    // Test 5: EL ahead of CL (generic case — both have data but EL is further)
     #[tokio::test]
     async fn test_el_ahead_of_cl_error() {
         let el_height = 10u64;
@@ -1082,8 +1093,54 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("inconsistent state"));
-        assert!(err_msg.contains("EL latest height"));
-        assert!(err_msg.contains("CL latest committed height"));
+        assert!(
+            err_msg.contains("arc-snapshots download"),
+            "should suggest re-downloading snapshots"
+        );
+    }
+
+    // Test 5b: EL has data but CL is at height 0 (missing CL snapshot)
+    #[tokio::test]
+    async fn test_el_ahead_of_cl_missing_snapshot() {
+        let el_height = 10u64;
+        let latest_block_el = test_execution_block(el_height, 1000);
+
+        let payload_validator = MockPayloadValidator::new();
+        let block_finalizer = MockBlockFinalizer::new();
+        let engine_api = setup_mock_engine_api_success();
+        let ethereum_api =
+            setup_mock_ethereum_api_with_block(latest_block_el, Height::default().as_u64());
+
+        // CL has no data — max_height returns None → defaults to Height(0)
+        let mut certificates_repo = MockCertificatesRepository::new();
+        certificates_repo
+            .expect_max_height()
+            .return_once(move || Ok(None));
+
+        let payloads_repo = MockPayloadsRepository::new();
+        let metrics = test_metrics();
+
+        let result = handshake_and_replay(
+            &payload_validator,
+            &block_finalizer,
+            &engine_api,
+            &ethereum_api,
+            &certificates_repo,
+            &payloads_repo,
+            NoopPersistenceMeter,
+            &metrics,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("CL snapshot is missing"),
+            "should identify missing CL snapshot, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("arc-node-consensus download"),
+            "should suggest downloading CL snapshot, got: {err_msg}"
+        );
     }
 
     // Test 6: Missing latest block from EL

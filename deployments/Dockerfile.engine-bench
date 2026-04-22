@@ -1,0 +1,81 @@
+###############
+# cargo chef
+###############
+FROM public.ecr.aws/docker/library/rust:1.91.1-bookworm AS chef
+
+# Install any custom CA certificates from the certs named context.
+RUN --mount=type=bind,from=certs,target=/usr/local/share/ca-certificates/ \
+    update-ca-certificates -v
+
+COPY assets/apt/apt-retry.conf /etc/apt/apt.conf.d/apt-retry.conf
+COPY assets/apt/debian.sources /etc/apt/sources.list.d/debian.sources
+# Remove default sources.list to use only our fallback-enabled sources
+RUN rm -f /etc/apt/sources.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends libclang-dev pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef@0.1.73
+
+FROM chef AS planner
+
+WORKDIR /src
+COPY . .
+
+RUN cargo chef prepare --bin arc-engine-bench --recipe-path arc-engine-bench-recipe.json
+
+###############
+# builder image
+###############
+FROM chef AS builder
+
+RUN printf 'arc:x:999:999::/data:/bin/false\n' > /tmp/passwd && \
+    printf 'arc:x:999:\n' > /tmp/group
+
+ARG BUILD_PROFILE=release
+ARG RUSTFLAGS=""
+ARG GIT_COMMIT_HASH="0000000000000000000000000000000000000000"
+ARG GIT_VERSION="v0.0.0-unknown"
+ARG GIT_SHORT_HASH="00000000"
+ARG ARC_IDEMPOTENT_BUILD=false
+
+ENV CARGO_HOME=/usr/local/cargo
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
+ENV RUSTFLAGS=$RUSTFLAGS
+ENV VERGEN_GIT_SHA=$GIT_COMMIT_HASH
+ENV VERGEN_GIT_DESCRIBE=$GIT_VERSION
+ENV VERGEN_GIT_SHA_SHORT=$GIT_SHORT_HASH
+ENV ARC_IDEMPOTENT_BUILD=$ARC_IDEMPOTENT_BUILD
+
+WORKDIR /app
+
+COPY --from=planner /src/arc-engine-bench-recipe.json arc-engine-bench-recipe.json
+RUN --mount=type=cache,id=bench-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=bench-cargo-git,sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=bench-cargo-target,sharing=locked,target=/app/target \
+    cargo chef cook --bin arc-engine-bench --profile $BUILD_PROFILE --recipe-path arc-engine-bench-recipe.json
+
+COPY . .
+
+RUN --mount=type=cache,id=bench-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=bench-cargo-git,sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=bench-cargo-target,sharing=locked,target=/app/target \
+    cargo build --bin arc-engine-bench --profile $BUILD_PROFILE --locked && \
+    if [ "$BUILD_PROFILE" = "dev" ]; then TARGET_DIR="debug"; else TARGET_DIR="$BUILD_PROFILE"; fi && \
+    cp /app/target/$TARGET_DIR/arc-engine-bench /tmp/arc-engine-bench
+
+#######################
+# dev runtime image
+#######################
+FROM gcr.io/distroless/cc-debian12:nonroot AS dev-runtime
+
+COPY --from=chef /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+COPY --from=builder /tmp/passwd /etc/passwd
+COPY --from=builder /tmp/group /etc/group
+COPY --from=builder /tmp/arc-engine-bench /usr/local/bin/arc-engine-bench
+
+USER arc
+
+ENTRYPOINT ["/usr/local/bin/arc-engine-bench"]
+CMD ["--help"]

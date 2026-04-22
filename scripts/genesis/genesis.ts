@@ -48,6 +48,11 @@ export const schemaGenesisConfig = z
     timestamp: schemaBigInt,
 
     /**
+     * The coinbase of the genesis block.
+     */
+    coinbase: schemaAddress,
+
+    /**
      * The prefund accounts. The balance of the account will be initialized to the specified value in the genesis block.
      */
     prefund: z.array(z.object({ address: schemaAddress, balance: schemaBigInt }).strict()).optional(),
@@ -137,6 +142,7 @@ export const buildGenesis = async (ctx: BuilderContext, config: GenesisConfig) =
   const parsed = schemaGenesisConfig.parse(config)
   const {
     timestamp,
+    coinbase,
     prefund,
     NativeFiatToken: nativeFiatToken,
     ProtocolConfig: protocolConfig,
@@ -302,7 +308,7 @@ export const buildGenesis = async (ctx: BuilderContext, config: GenesisConfig) =
     gasLimit: toHex(protocolConfig.feeParams.blockGasLimit ?? 30_000_000n),
     difficulty: '0x0',
     mixHash: toBytes32(0n),
-    coinbase: protocolConfig.beneficiary,
+    coinbase: coinbase,
     number: '0x0',
     alloc: allocs,
   }
