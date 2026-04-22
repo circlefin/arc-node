@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
+
 use alloy_primitives::{Bytes, U256};
 use alloy_rpc_types_engine::PayloadStatusEnum;
 use arc_execution_config::{gas_fee::decode_base_fee_from_bytes, hardforks::ArcHardfork};

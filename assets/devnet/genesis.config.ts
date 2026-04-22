@@ -46,6 +46,7 @@ const build = async () => {
 
   const config: GenesisConfig = {
     timestamp: currentTimestamp(),
+    coinbase: '0x65E0a200006D4FF91bD59F9694220dafc49dbBC1',
 
     NativeFiatToken: {
       proxy: { admin: creator.nextAccount('NativeFiatToken.proxyAdmin', adminPrefund) },

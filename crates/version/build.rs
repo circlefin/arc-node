@@ -198,6 +198,7 @@ fn emit_long_version(idempotent: bool) {
     let version = extract_version_from_describe(&git_describe);
 
     // Extract commits since tag (e.g., "74" from "v0.2.0-rc1-74-g3ecc938-dirty")
+    #[allow(clippy::arithmetic_side_effects)] // build script, index after '-' char
     let commits_since_tag = if let Some(pos) = git_describe.find("-g") {
         if let Some(commits_pos) = git_describe[..pos].rfind('-') {
             &git_describe[commits_pos + 1..pos]

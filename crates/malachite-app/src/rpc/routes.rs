@@ -88,6 +88,12 @@ routes![
     ),
     route!(
         get,
+        "/ready",
+        crate::rpc::handlers::get_ready,
+        "Readiness probe. Returns 200 when in sync, 503 when catching up"
+    ),
+    route!(
+        get,
         "/version",
         crate::rpc::handlers::get_version,
         "Get the consensus layer version information"
@@ -233,6 +239,7 @@ mod tests {
     use crate::rpc::types::{
         RpcAppStatus, RpcCommitCertificate, RpcConsensusStateDump, RpcNetworkStateDump,
     };
+    use crate::utils::sync_state::SyncState;
 
     enum MockValue {
         Present,
@@ -242,6 +249,7 @@ mod tests {
     enum MockConfig {
         AppGetHealth,
         AppGetStatus,
+        AppGetSyncState(SyncState),
         AppGetCertificate(MockValue),
         ConsensusDumpState(MockValue),
         NetworkDumpState(MockValue),
@@ -331,6 +339,12 @@ mod tests {
                         panic!("Unexpected msg");
                     };
                     let _ = reply_port.send(Self::a_status());
+                }
+                MockConfig::AppGetSyncState(state) => {
+                    let Some(AppRequest::GetSyncState(reply)) = msg else {
+                        panic!("Unexpected msg");
+                    };
+                    let _ = reply.send(state);
                 }
                 MockConfig::AppGetCertificate(ret) => {
                     let Some(AppRequest::GetCertificate(None, reply_port)) = msg else {
@@ -456,13 +470,15 @@ mod tests {
             let pending_proposal_parts = vec![];
 
             let sk = PrivateKey::from([0x33; 32]);
-            let v = Validator::new(sk.public_key(), 1234);
+            let public_key = sk.public_key();
+            let v = Validator::new(public_key, 1234);
             let validator_set = ValidatorSet::new(vec![v]);
 
             Status {
                 height,
                 round,
                 address,
+                public_key,
                 proposer,
                 height_start_time,
                 prev_payload_hash,
@@ -471,6 +487,7 @@ mod tests {
                 undecided_blocks_count,
                 pending_proposal_parts,
                 validator_set,
+                sync_state: SyncState::InSync,
             }
         }
 
@@ -560,6 +577,7 @@ mod tests {
                 "/persistent-peers",
                 "/persistent-peers",
                 "/proposal-monitor",
+                "/ready",
                 "/status",
                 "/version",
             ]
@@ -680,6 +698,26 @@ mod tests {
             build_router_and_request(tx_cons_req, tx_app_req, tx_nw_req, "/health").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(val, json!({"status": "ok"}));
+    }
+
+    #[tokio::test]
+    async fn test_ready_in_sync() {
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetSyncState(SyncState::InSync));
+        let (status, val) =
+            build_router_and_request(tx_cons_req, tx_app_req, tx_nw_req, "/ready").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(val, json!({"sync_state": "InSync"}));
+    }
+
+    #[tokio::test]
+    async fn test_ready_catching_up() {
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetSyncState(SyncState::CatchingUp));
+        let (status, val) =
+            build_router_and_request(tx_cons_req, tx_app_req, tx_nw_req, "/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(val, json!({"sync_state": "CatchingUp"}));
     }
 
     #[tokio::test]

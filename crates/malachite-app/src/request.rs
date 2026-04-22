@@ -22,11 +22,14 @@ use tracing::error;
 use arc_consensus_db::invalid_payloads::StoredInvalidPayloads;
 use arc_consensus_types::evidence::StoredMisbehaviorEvidence;
 use arc_consensus_types::{
-    Address, ArcContext, BlockHash, CommitCertificateType, Height, Round, ValidatorSet,
+    signing::PublicKey, Address, ArcContext, BlockHash, CommitCertificateType, Height, Round,
+    ValidatorSet,
 };
 use malachitebft_core_types::CommitCertificate;
 
 use arc_consensus_types::proposal_monitor::ProposalMonitor;
+
+use crate::utils::sync_state::SyncState;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AppRequestError {
@@ -55,6 +58,7 @@ pub struct Status {
     pub height: Height,
     pub round: Round,
     pub address: Address,
+    pub public_key: PublicKey,
     pub proposer: Option<Address>,
     pub height_start_time: SystemTime,
     pub prev_payload_hash: Option<BlockHash>,
@@ -63,6 +67,7 @@ pub struct Status {
     pub undecided_blocks_count: usize,
     pub pending_proposal_parts: Vec<(Height, usize)>,
     pub validator_set: ValidatorSet,
+    pub sync_state: SyncState,
 }
 
 #[derive(Debug)]
@@ -106,6 +111,8 @@ pub enum AppRequest {
     GetStatus(oneshot::Sender<Status>),
     /// Check if the application is healthy
     GetHealth(oneshot::Sender<()>),
+    /// Get the current sync state (lightweight, no DB queries)
+    GetSyncState(oneshot::Sender<SyncState>),
 }
 
 pub type TxAppReq = mpsc::Sender<AppRequest>;
@@ -214,6 +221,23 @@ impl AppRequest {
             .inspect_err(|e| error!("Failed to receive GetStatus response from consensus: {e}"))?;
 
         Ok(status)
+    }
+
+    /// Get the current sync state. Lightweight — reads an in-memory field, no DB queries.
+    pub async fn get_sync_state(
+        tx_app_req: &mpsc::Sender<AppRequest>,
+    ) -> Result<SyncState, AppRequestError> {
+        let (tx, rx) = oneshot::channel();
+
+        tx_app_req
+            .try_send(Self::GetSyncState(tx))
+            .inspect_err(|e| error!("Failed to send GetSyncState request to consensus: {e}"))?;
+
+        let sync_state = rx.await.inspect_err(|e| {
+            error!("Failed to receive GetSyncState response from consensus: {e}")
+        })?;
+
+        Ok(sync_state)
     }
 
     /// Get node's health. Returns unit type. Used to check whether the node is responsive.

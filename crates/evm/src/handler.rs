@@ -91,6 +91,8 @@ where
         let effective_gas_price = ctx.tx().effective_gas_price(basefee);
         let gas_used = exec_result.gas().used();
 
+        // u128 * u64 fits in U256 (max 192 bits).
+        #[allow(clippy::arithmetic_side_effects)]
         let total_fee_amount = U256::from(effective_gas_price) * U256::from(gas_used);
 
         // Transfer the total fee to the beneficiary (both base fee and priority fee)
@@ -126,7 +128,11 @@ where
             // Charge for recipient blocklist check if value > 0
             // This applies to both Call and Create transactions with value
             if !tx.value().is_zero() {
-                extra_gas += PRECOMPILE_SLOAD_GAS_COST;
+                // 2,100 + 2,100 = 4,200; fits in u64
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    extra_gas += PRECOMPILE_SLOAD_GAS_COST;
+                }
             }
 
             // Add extra gas to initial gas

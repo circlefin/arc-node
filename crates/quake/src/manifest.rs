@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use alloy_primitives::Address;
 use color_eyre::eyre::{bail, Context, Result};
 use indexmap::IndexMap;
 use once_cell::sync::Lazy;
@@ -559,6 +560,10 @@ pub struct Node {
     /// Mutually exclusive with explicit `cl.config.prune.*` values.
     #[serde(default)]
     pub cl_prune_preset: Option<ClPruningPreset>,
+
+    /// Address to receive transaction fees and block rewards (--suggested-fee-recipient).
+    #[serde(default)]
+    pub cl_suggested_fee_recipient: Option<Address>,
 
     /// Mark this node as external (operated by a third party).
     /// External validators are expected to be multi-hop in mesh health checks

@@ -209,6 +209,8 @@ impl ConsensusSpec {
     pub fn fork_version_at(&self, height: Height, timestamp: BlockTimestamp) -> ForkVersion {
         match &self.next_fork_condition {
             None => self.current_fork_version,
+            // Fork versions increment once per hardfork; u32::MAX is unreachable
+            #[allow(clippy::arithmetic_side_effects)]
             Some(cond) if cond.active_at(height, timestamp) => self.current_fork_version + 1,
             Some(_) => self.current_fork_version,
         }
@@ -264,7 +266,7 @@ pub const LOCALDEV: ConsensusSpec = ConsensusSpec {
 
 /// Error returned when the chain ID is not recognized.
 #[derive(Debug, Error)]
-#[error("Unknown chain ID {chain_id}; expected one of MAINNET (5042000), TESTNET (5042002), DEVNET (5042001), LOCALDEV (1337)")]
+#[error("Unknown chain ID {chain_id}; expected one of MAINNET (5042), TESTNET (5042002), DEVNET (5042001), LOCALDEV (1337)")]
 pub struct UnknownChainId {
     pub chain_id: String,
 }

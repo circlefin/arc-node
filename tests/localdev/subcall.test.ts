@@ -20,7 +20,7 @@ import { balancesSnapshot, NativeCoinAuthority, ReceiptVerifier, getClients } fr
 import { USDC } from '../helpers/FiatToken'
 import { CallHelper } from '../helpers/CallHelper'
 import { callFromAddress, memoAddress, multicall3FromAddress } from '../../scripts/genesis'
-import { encodeFunctionData, erc20Abi, keccak256, pad, toHex, maxUint256, Address, parseAbi, parseEther } from 'viem'
+import { encodeErrorResult, encodeFunctionData, erc20Abi, keccak256, pad, toHex, maxUint256, Address, parseAbi, parseEther } from 'viem'
 
 const memoArtifact = hre.artifacts.readArtifactSync('Memo')
 const multicall3FromArtifact = hre.artifacts.readArtifactSync('Multicall3From')
@@ -152,50 +152,32 @@ describe('Memo', () => {
       .verify()
   })
 
-  // Indirect call through CallHelper — callFrom spoofs CallHelper as sender, transfers from its balance.
-  // sender → CallHelper.execute → Memo → callFrom(CallHelper, USDC, transfer)
-  it('indirect call via CallHelper', async () => {
+  // sender → CallHelper.execute → Memo → callFrom(CallHelper, USDC, transfer) → REVERT
+  // CallHelper ≠ tx.origin, so the sender validation rejects the spoofed sender.
+  it('indirect call via CallHelper rejected as sender spoofing', async () => {
     const { client, sender, receiver } = await clients()
 
-    const memoIndex = await readMemoIndex()
     const amount = USDC.parseUnits('0.001')
-    const nativeAmount = USDC.toNative(amount)
     const memoId = keccak256(toHex('indirect-memo'))
     const memo = toHex('indirect hello')
     const transferData = encodeUSDCTransfer(receiver.account.address, amount)
-    const callDataHash = keccak256(transferData)
     const memoData = encodeMemo(USDC.address, transferData, memoId, memo)
 
-    const balances = await balancesSnapshot(client, {
-      sender,
-      receiver,
-      callHelper: callHelper.address,
-    })
+    const balances = await balancesSnapshot(client, { sender, receiver })
 
     const receipt = await CallHelper.attach({ wallet: sender, public: client }, callHelper.address)
       .write.execute([memoAddress, memoData, 0n])
       .then(ReceiptVerifier.waitSuccess)
 
     receipt.verifyEvents((ev) => {
-      ev.expectBeforeMemo({ memoIndex })
-        .expectNativeTransfer({ from: callHelper.address, to: receiver, amount: nativeAmount })
-        .expectUSDCTransfer({ from: callHelper.address, to: receiver, value: amount })
-        .expectMemo({
-          sender: callHelper.address,
-          target: USDC.address,
-          callDataHash,
-          memoId,
-          memo,
-          memoIndex,
-        })
-        .expectExecutionResult({ helper: callHelper.address, success: true, result: '0x' })
-        .expectAllEventsMatched()
+      ev.expectExecutionResult({
+        helper: callHelper.address,
+        success: false,
+        revertString: 'sender spoofing requires tx.origin as sender',
+      }).expectAllEventsMatched()
     })
 
-    await balances
-      .increase({ receiver: nativeAmount })
-      .decrease({ callHelper: nativeAmount, sender: receipt.totalFee() })
-      .verify()
+    await balances.decrease({ sender: receipt.totalFee() }).verify()
   })
 
   // 3-deep recursive memo nesting, innermost does transferFrom.
@@ -305,10 +287,10 @@ describe('Memo', () => {
     await balances.decrease({ sender: receipt.totalFee() }).verify()
   })
 
-  // Child reverts — journal rollback undoes memoIndex++ and events. Only ExecutionResult survives.
-  // sender → CallHelper.execute → Memo → callFrom → CallHelper.revertWithString → REVERT
+  // sender → Memo → callFrom(sender, callHelper, revertWithString) → REVERT
+  // Outer tx reverts; memoIndex increment is rolled back.
   it('child reverts — state and memoIndex rolled back', async () => {
-    const { client, sender, receiver } = await clients()
+    const { sender } = await clients()
 
     const memoIndexBefore = await readMemoIndex()
     const revertData = encodeFunctionData({
@@ -318,30 +300,17 @@ describe('Memo', () => {
     })
     const memoData = encodeMemo(callHelper.address, revertData, keccak256(toHex('revert-test')), toHex('will revert'))
 
-    const balances = await balancesSnapshot(client, { sender, receiver })
-
-    const receipt = await CallHelper.attach({ wallet: sender, public: client }, callHelper.address)
-      .write.execute([memoAddress, memoData, 0n])
-      .then(ReceiptVerifier.waitSuccess)
-
-    // Only the CallHelper ExecutionResult event survives (Memo events rolled back).
-    expect(receipt.receipt.logs).to.have.lengthOf(1)
-    receipt.verifyEvents((ev) => {
-      const result = ev.getExecutionResult(0)
-      expect(result.slice(0, 10)).to.eq('0xed1966a2') // MemoFailed selector
-      ev.setLogIndex(1).expectAllEventsMatched()
-    })
+    await expect(
+      sender.sendTransaction({ to: memoAddress, data: memoData }),
+    ).to.be.rejectedWith('execution reverted')
 
     // memoIndex unchanged — the increment was inside the reverted frame
     const memoIndexAfter = await readMemoIndex()
     expect(memoIndexAfter).to.eq(memoIndexBefore)
-
-    // No balance changes except gas
-    await balances.decrease({ sender: receipt.totalFee() }).verify()
   })
 
-  // Custom error propagation: ErrorMessage wraps inside MemoFailed through multiple layers.
-  // sender → CallHelper.execute → Memo → callFrom → CallHelper.revertWithError → REVERT
+  // sender → Memo → callFrom(sender, callHelper, revertWithError) → REVERT
+  // MemoFailed wraps the inner ErrorMessage.
   it('child reverts with custom error — error propagated through MemoFailed', async () => {
     const { client, sender } = await clients()
 
@@ -352,64 +321,38 @@ describe('Memo', () => {
     })
     const memoData = encodeMemo(callHelper.address, revertData, keccak256(toHex('error-prop')), toHex('error test'))
 
-    const receipt = await CallHelper.attach({ wallet: sender, public: client }, callHelper.address)
-      .write.execute([memoAddress, memoData, 0n])
-      .then(ReceiptVerifier.waitSuccess)
+    // Build the expected nested error: MemoFailed(abi.encode(ErrorMessage('custom error message')))
+    const innerError = encodeErrorResult({ abi: CallHelper.abi, errorName: 'ErrorMessage', args: ['custom error message'] })
+    const expectedError = encodeErrorResult({ abi: memoArtifact.abi, errorName: 'MemoFailed', args: [innerError] })
 
-    expect(receipt.receipt.logs).to.have.lengthOf(1)
-    receipt.verifyEvents((ev) => {
-      const result = ev.getExecutionResult(0)
-      // Outer: MemoFailed(bytes) selector = 0xed1966a2
-      expect(result.slice(0, 10)).to.eq('0xed1966a2')
-      // The inner bytes contain ErrorMessage("custom error message") selector = 0xa183e9a5
-      expect(result).to.contain('a183e9a5')
-      ev.setLogIndex(1).expectAllEventsMatched()
-    })
+    // eth_call surfaces raw revert data (sendTransaction doesn't via viem)
+    interface ChainedError { data?: string; cause?: ChainedError }
+    const err = await client.call({ account: sender.account.address, to: memoAddress, data: memoData }).catch((e: unknown) => e as ChainedError)
+    const findData = (e?: ChainedError): string | undefined => e?.data?.startsWith('0x') ? e.data : e?.cause ? findData(e.cause) : undefined
+    const rawRevert = findData(err as ChainedError)
+    expect(rawRevert).to.equal(expectedError, 'revert data should be MemoFailed(ErrorMessage)')
   })
 
   // Two sequential txs: CALL succeeds, then STATICCALL reverts. State from first persists.
-  // tx1: sender → CallHelper.execute → Memo → callFrom → USDC.transfer (success)
-  // tx2: sender → CallHelper.staticCall → Memo → REVERT (read-only)
+  // tx1: sender → Memo → callFrom(sender, USDC, transfer) (success)
+  // tx2: sender → CallHelper.staticCall → Memo → REVERT (read-only context)
   it('call then static call — first succeeds, second reverts', async () => {
     const { client, sender, receiver } = await clients()
 
-    const memoIndex = await readMemoIndex()
     const amount = USDC.parseUnits('0.001')
     const nativeAmount = USDC.toNative(amount)
     const memoIdCall = keccak256(toHex('call-then-static'))
     const memo = toHex('first call')
     const transferData = encodeUSDCTransfer(receiver.account.address, amount)
-    const callDataHash = keccak256(transferData)
     const memoData = encodeMemo(USDC.address, transferData, memoIdCall, memo)
 
-    const balances = await balancesSnapshot(client, {
-      sender,
-      receiver,
-      callHelper: callHelper.address,
-    })
+    const balances = await balancesSnapshot(client, { sender, receiver })
 
-    // Transaction 1: execute (CALL) succeeds
-    const receipt1 = await CallHelper.attach({ wallet: sender, public: client }, callHelper.address)
-      .write.execute([memoAddress, memoData, 0n])
-      .then(ReceiptVerifier.waitSuccess)
+    // Transaction 1: direct EOA → Memo (CALL) succeeds
+    // Event sequence (BeforeMemo → NativeTransfer → USDCTransfer → Memo) covered by "direct call to Memo" test above
+    const receipt1 = await sender.sendTransaction({ to: memoAddress, data: memoData }).then(ReceiptVerifier.waitSuccess)
 
-    receipt1.verifyEvents((ev) => {
-      ev.expectBeforeMemo({ memoIndex })
-        .expectNativeTransfer({ from: callHelper.address, to: receiver, amount: nativeAmount })
-        .expectUSDCTransfer({ from: callHelper.address, to: receiver, value: amount })
-        .expectMemo({
-          sender: callHelper.address,
-          target: USDC.address,
-          callDataHash,
-          memoId: memoIdCall,
-          memo,
-          memoIndex,
-        })
-        .expectExecutionResult({ helper: callHelper.address, success: true, result: '0x' })
-        .expectAllEventsMatched()
-    })
-
-    // Transaction 2: staticCall should fail
+    // Transaction 2: staticCall should fail (static context rejected before sender check)
     const receipt2 = await CallHelper.attach({ wallet: sender, public: client }, callHelper.address)
       .write.staticCall([memoAddress, memoData])
       .then(ReceiptVerifier.waitSuccess)
@@ -421,10 +364,7 @@ describe('Memo', () => {
     // Only the first call transferred funds
     await balances
       .increase({ receiver: nativeAmount })
-      .decrease({
-        callHelper: nativeAmount,
-        sender: receipt1.totalFee() + receipt2.totalFee(),
-      })
+      .decrease({ sender: nativeAmount + receipt1.totalFee() + receipt2.totalFee() })
       .verify()
   })
 
@@ -741,77 +681,4 @@ describe('Memo + Multicall3From', () => {
       .verify()
   })
 
-  // Two sequential memos in a single tx via executeBatch — tests callFrom depth-keyed
-  // continuation storage doesn't collide; memoIndex increments correctly across both.
-  // sender → CallHelper.executeBatch → Memo × 2 → callFrom(CallHelper, USDC, transfer) × 2
-  it('batch sequential memo in one transaction', async () => {
-    const { client, sender, receiver } = await clients()
-
-    const memoIndex = await readMemoIndex()
-    const amount1 = USDC.parseUnits('0.0001')
-    const amount2 = USDC.parseUnits('0.0002')
-    const nativeAmount1 = USDC.toNative(amount1)
-    const nativeAmount2 = USDC.toNative(amount2)
-    const batchMemoId1 = keccak256(toHex('batch-1'))
-    const batchMemoId2 = keccak256(toHex('batch-2'))
-    const batchMemo1 = toHex('first')
-    const batchMemo2 = toHex('second')
-
-    const transferData1 = encodeUSDCTransfer(receiver.account.address, amount1)
-    const transferData2 = encodeUSDCTransfer(receiver.account.address, amount2)
-    const memoData1 = encodeMemo(USDC.address, transferData1, batchMemoId1, batchMemo1)
-    const memoData2 = encodeMemo(USDC.address, transferData2, batchMemoId2, batchMemo2)
-
-    const balances = await balancesSnapshot(client, {
-      sender,
-      receiver,
-      callHelper: callHelper.address,
-    })
-
-    const receipt = await CallHelper.attach({ wallet: sender, public: client }, callHelper.address)
-      .write.executeBatch([
-        [
-          { target: memoAddress, allowFailure: false, value: 0n, callData: memoData1 },
-          { target: memoAddress, allowFailure: false, value: 0n, callData: memoData2 },
-        ],
-      ])
-      .then(ReceiptVerifier.waitSuccess)
-
-    receipt.verifyEvents((ev) => {
-      // First call
-      ev.expectBeforeMemo({ memoIndex })
-        .expectNativeTransfer({ from: callHelper.address, to: receiver, amount: nativeAmount1 })
-        .expectUSDCTransfer({ from: callHelper.address, to: receiver, value: amount1 })
-        .expectMemo({
-          sender: callHelper.address,
-          target: USDC.address,
-          callDataHash: keccak256(transferData1),
-          memoId: batchMemoId1,
-          memo: batchMemo1,
-          memoIndex,
-        })
-        .expectExecutionResult({ helper: callHelper.address, success: true, result: '0x' })
-        // Second call
-        .expectBeforeMemo({ memoIndex: memoIndex + 1n })
-        .expectNativeTransfer({ from: callHelper.address, to: receiver, amount: nativeAmount2 })
-        .expectUSDCTransfer({ from: callHelper.address, to: receiver, value: amount2 })
-        .expectMemo({
-          sender: callHelper.address,
-          target: USDC.address,
-          callDataHash: keccak256(transferData2),
-          memoId: batchMemoId2,
-          memo: batchMemo2,
-          memoIndex: memoIndex + 1n,
-        })
-        .expectExecutionResult({ helper: callHelper.address, success: true, result: '0x' })
-        .expectAllEventsMatched()
-    })
-
-    // Both transfers from callHelper
-    const totalNative = nativeAmount1 + nativeAmount2
-    await balances
-      .increase({ receiver: totalNative })
-      .decrease({ callHelper: totalNative, sender: receipt.totalFee() })
-      .verify()
-  })
 })

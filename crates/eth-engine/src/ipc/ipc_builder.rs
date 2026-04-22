@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{Backoff, Retryable};
@@ -36,7 +37,7 @@ use crate::rpc::EngineApiRpcError;
 /// Common IPC client functionality for connecting to IPC endpoints via Unix Domain Socket.
 #[derive(Debug)]
 pub struct Ipc {
-    client: Client,
+    client: Arc<Client>,
     socket_path: String,
 }
 
@@ -57,7 +58,7 @@ impl Ipc {
         info!("🟢 Connected to IPC: {}", socket_path);
 
         Ok(Self {
-            client,
+            client: Arc::new(client),
             socket_path: socket_path.to_string(),
         })
     }
@@ -142,6 +143,14 @@ impl Ipc {
     /// Get the socket path this client is connected to
     pub fn socket_path(&self) -> &str {
         &self.socket_path
+    }
+
+    /// Returns a cloned `Arc` reference to the underlying client.
+    ///
+    /// Callers can use this to monitor connection lifetime independently of the
+    /// `Ipc` owner (e.g. `arc_client.on_disconnect().await`).
+    pub fn client_arc(&self) -> Arc<Client> {
+        self.client.clone()
     }
 }
 

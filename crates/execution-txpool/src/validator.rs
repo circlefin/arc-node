@@ -134,7 +134,11 @@ where
                 if !map.insert(hash, ()) {
                     success = false;
                 }
-                hashes_count += 1;
+                // Bounded by the iterator length
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    hashes_count += 1;
+                }
             }
             map.len()
         };

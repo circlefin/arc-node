@@ -15,7 +15,14 @@
 // limitations under the License.
 
 import { expect } from 'chai'
-import { balancesSnapshot, NativeCoinAuthority, NativeTransferHelper, ReceiptVerifier, getClients } from '../helpers'
+import {
+  balancesSnapshot,
+  NativeCoinAuthority,
+  NativeTransferHelper,
+  ReceiptVerifier,
+  LOCALDEV_FEE_RECIPIENT,
+  getClients,
+} from '../helpers'
 import { ProtocolConfig } from '../helpers/ProtocolConfig'
 import { signPermit, USDC } from '../helpers/FiatToken'
 import { NativeCoinControl, ERR_BLOCKED_ADDRESS } from '../helpers/NativeCoinControl'
@@ -436,9 +443,10 @@ describe('NativeFiatToken', () => {
       const { client, operator, sender, createRandWallet } = await clients()
       const receiver = await createRandWallet().then((x) => x.account)
 
-      // Get beneficiary address from ProtocolConfig
+      // When rewardBeneficiary is zero, fees go to the genesis coinbase
       const protocolConfig = ProtocolConfig.attach(client)
-      const beneficiary = await protocolConfig.read.rewardBeneficiary()
+      const configBeneficiary = await protocolConfig.read.rewardBeneficiary()
+      const beneficiary = configBeneficiary === zeroAddress ? LOCALDEV_FEE_RECIPIENT : configBeneficiary
 
       // Blocklist the receiver address first
       await USDC.attach(operator).write.blacklist([receiver.address]).then(ReceiptVerifier.waitSuccess)
@@ -561,7 +569,7 @@ describe('NativeFiatToken', () => {
 
       // Verify we have 1 transfer events for the chain
       // - Event 0: sender -> nativeTransferHelperA
-      receipt.verifyGasUsedApproximately(37760n).verifyEvents((ev) => {
+      receipt.verifyGasUsedApproximately(39918n).verifyEvents((ev) => {
         ev.expectCount(1).expectNativeTransfer({ from: sender, to: nativeTransferHelperA.address, amount })
       })
 
@@ -645,7 +653,7 @@ describe('NativeFiatToken', () => {
           60000n, // set gas manually
         )
         .then(ReceiptVerifier.build)
-      receipt.isReverted().verifyNoEvents().verifyGasUsedApproximately(37849n)
+      receipt.isReverted().verifyNoEvents().verifyGasUsedApproximately(40007n)
 
       // Verify that no balance changes occurred
       await balances.decrease({ sender: receipt.totalFee() }).verify()
@@ -663,7 +671,7 @@ describe('NativeFiatToken', () => {
           120000n, // set gas manually
         )
         .then(ReceiptVerifier.build)
-      receipt2.isReverted().verifyNoEvents().verifyGasUsedApproximately(37849n)
+      receipt2.isReverted().verifyNoEvents().verifyGasUsedApproximately(40007n)
 
       // Verify that no balance changes occurred
       await balances.decrease({ sender: receipt2.totalFee() }).verify()

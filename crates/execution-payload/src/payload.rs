@@ -363,11 +363,11 @@ fn dump_tx_data(bytes: &[u8]) -> String {
     let mut offset = 0usize;
     let mut lines = 0usize;
     while offset < bytes.len() && lines < MAX_LINES {
-        let end = (offset + BYTES_PER_LINE).min(bytes.len());
+        let end = (offset.saturating_add(BYTES_PER_LINE)).min(bytes.len());
         let slice = &bytes[offset..end];
         out.push_str(&format!("{:04x}: {}\n", offset, hex::encode(slice)));
         offset = end;
-        lines += 1;
+        lines = lines.saturating_add(1);
     }
     if offset < bytes.len() {
         out.push_str(&format!(
@@ -539,7 +539,7 @@ where
     let chain_spec = client.chain_spec();
 
     info!(target: "payload_builder", id=%attributes.id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "(arc) building new payload");
-    let mut cumulative_gas_used = 0;
+    let mut cumulative_gas_used = 0u64;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
 
@@ -556,7 +556,7 @@ where
     })?;
     PayloadBuildMetrics::record_stage_pre_execution(stage_start.elapsed());
 
-    let mut block_transactions_rlp_length = 0;
+    let mut block_transactions_rlp_length = 0usize;
     let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp);
 
     let withdrawals_rlp_length = attributes.withdrawals().length();
@@ -567,16 +567,15 @@ where
         // Break early if loop time budget exhausted
         if let Some(limit) = loop_time_limit {
             if loop_started.elapsed() >= limit {
-                warn!(
-                    elapsed_ms = loop_started.elapsed().as_millis() as u64,
-                    "(arc) loop time budget reached; sealing early"
-                );
+                #[allow(clippy::cast_possible_truncation)]
+                let elapsed_ms = loop_started.elapsed().as_millis() as u64;
+                warn!(elapsed_ms, "(arc) loop time budget reached; sealing early");
                 break;
             }
         }
 
         // ensure we still have capacity for this transaction
-        if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
+        if cumulative_gas_used.saturating_add(pool_tx.gas_limit()) > block_gas_limit {
             // we can't fit this transaction into the block, so we need to mark it as invalid
             // which also removes all dependent transaction from the iterator before we can
             // continue
@@ -600,8 +599,10 @@ where
 
         let tx_rlp_len = tx.inner().length();
 
-        let estimated_block_size_with_tx =
-            block_transactions_rlp_length + tx_rlp_len + withdrawals_rlp_length + 1024; // 1Kb of overhead for the block header
+        let estimated_block_size_with_tx = block_transactions_rlp_length
+            .saturating_add(tx_rlp_len)
+            .saturating_add(withdrawals_rlp_length)
+            .saturating_add(1024); // 1Kb of overhead for the block header
 
         if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
             best_txs.mark_invalid(
@@ -650,14 +651,18 @@ where
             }
         };
 
-        block_transactions_rlp_length += tx_rlp_len;
+        block_transactions_rlp_length = block_transactions_rlp_length.saturating_add(tx_rlp_len);
 
         // update and add to total fees
         let miner_fee = tx
             .effective_tip_per_gas(base_fee)
             .expect("fee is always valid; execution succeeded");
-        total_fees += U256::from(miner_fee) * U256::from(gas_used);
-        cumulative_gas_used += gas_used;
+        // u128 * u64 fits in U256 (max 192 bits); total_fees is bounded by block gas limit * max fee.
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            total_fees += U256::from(miner_fee) * U256::from(gas_used);
+        }
+        cumulative_gas_used = cumulative_gas_used.saturating_add(gas_used);
     }
 
     PayloadBuildMetrics::record_stage_tx_execution(loop_started.elapsed());

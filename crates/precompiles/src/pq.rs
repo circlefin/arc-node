@@ -70,6 +70,8 @@ stateful!(run_pq, precompile_input, hardfork_flags; {
             // Charge base gas, then per-word message gas, then validate inputs
             record_cost_or_out_of_gas(&mut gas_counter, VERIFY_BASE_GAS)?;
 
+            // GAS_PER_MSG_WORD (6) < 32, so the product cannot exceed u64::MAX
+            #[allow(clippy::arithmetic_side_effects)]
             let msg_word_gas = (args.msg.len() as u64).div_ceil(32) * GAS_PER_MSG_WORD;
             record_cost_or_out_of_gas(&mut gas_counter, msg_word_gas)?;
 

@@ -16,7 +16,7 @@
 
 //! Frame result utilities for Arc EVM handler
 
-use arc_precompiles::helpers::{revert_message_to_bytes, ERR_BLOCKED_ADDRESS};
+use arc_precompiles::helpers::revert_message_to_bytes;
 use reth_ethereum::primitives::Log;
 use revm::{
     handler::FrameResult,
@@ -39,8 +39,6 @@ pub enum BeforeFrameInitResult {
     /// No transfer to process (zero amount or non-value operation). No SLOADs performed.
     None,
 }
-
-pub(crate) const BLOCKLISTED_GAS_PENALTY: u64 = 0;
 
 /// Creates a new FrameResult for out-of-gas during blocklist checks.
 /// This is used when a nested frame doesn't have enough gas to cover the SLOAD costs
@@ -120,15 +118,11 @@ pub fn create_frame_result(
     }
 }
 
-/// Creates a new FrameResult for blocklist violations from a FrameInit.
-pub fn create_blocklisted_frame_result(frame_init: &FrameInit) -> FrameResult {
-    create_frame_result(frame_init, ERR_BLOCKED_ADDRESS, BLOCKLISTED_GAS_PENALTY)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::{Address, Bytes, U256};
+    use arc_precompiles::helpers::ERR_BLOCKED_ADDRESS;
     use revm::interpreter::{
         interpreter_action::{CreateInputs, FrameInit, FrameInput},
         SharedMemory,
@@ -136,7 +130,7 @@ mod tests {
     use revm_interpreter::CreateScheme;
 
     #[test]
-    fn test_create_blocklisted_frame_result_returns_none_address_for_create() {
+    fn test_create_frame_result_returns_none_address_for_create() {
         let create_inputs = CreateInputs::new(
             Address::repeat_byte(0x42),
             CreateScheme::Create,
@@ -151,7 +145,7 @@ mod tests {
             frame_input: FrameInput::Create(Box::new(create_inputs)),
         };
 
-        let result = create_blocklisted_frame_result(&frame_init);
+        let result = create_frame_result(&frame_init, ERR_BLOCKED_ADDRESS, 0);
 
         match result {
             FrameResult::Create(outcome) => {

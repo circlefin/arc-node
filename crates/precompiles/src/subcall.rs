@@ -65,6 +65,13 @@ pub trait SubcallPrecompile: Send + Sync {
     /// Called during `frame_init` when the EVM encounters a call to this precompile's address.
     /// Returns either a subcall request (with continuation data for `complete_subcall`) or an
     /// error.
+    ///
+    /// # Sender constraint
+    ///
+    /// The framework enforces that `child_inputs.caller` must equal `call_inputs.caller`
+    /// (the address that called this precompile) or `tx.origin` (the signing EOA).
+    /// Setting `child_inputs.caller` to any other address will cause the framework to
+    /// revert with "sender spoofing requires tx.origin as sender".
     fn init_subcall(&self, inputs: &CallInputs) -> Result<SubcallInitResult, SubcallError>;
 
     /// Finalize the precompile result after the child call completes.

@@ -18,10 +18,7 @@ extern crate alloc;
 
 use crate::assembler::ArcBlockAssembler;
 use crate::executor::ArcBlockExecutor;
-use crate::frame_result::{
-    create_blocklisted_frame_result, create_frame_result, create_oog_frame_result,
-    BeforeFrameInitResult, BLOCKLISTED_GAS_PENALTY,
-};
+use crate::frame_result::{create_frame_result, create_oog_frame_result, BeforeFrameInitResult};
 use crate::log::{create_eip7708_transfer_log, create_native_transfer_log};
 use alloc::sync::Arc;
 use alloy_evm::eth::EthEvmContext;
@@ -37,7 +34,8 @@ use arc_execution_config::native_coin_control::{
     compute_is_blocklisted_storage_slot, is_blocklisted_status,
 };
 use arc_precompiles::helpers::{
-    ERR_SELFDESTRUCTED_BALANCE_INCREASED, ERR_ZERO_ADDRESS, PRECOMPILE_SLOAD_GAS_COST,
+    ERR_BLOCKED_ADDRESS, ERR_SELFDESTRUCTED_BALANCE_INCREASED, ERR_ZERO_ADDRESS,
+    PRECOMPILE_SLOAD_GAS_COST,
 };
 use arc_precompiles::NATIVE_COIN_CONTROL_ADDRESS;
 use core::fmt::Debug;
@@ -93,7 +91,7 @@ use crate::opcode::{arc_network_selfdestruct, arc_network_selfdestruct_zero4};
 use crate::subcall::{SubcallContinuation, SubcallRegistry};
 use arc_execution_config::chainspec::{ArcChainSpec, BlockGasLimitProvider};
 use arc_execution_config::protocol_config::{
-    expected_gas_limit, retrieve_fee_params, retrieve_reward_beneficiary,
+    expected_gas_limit, retrieve_fee_params, retrieve_reward_beneficiary, ProtocolConfigError,
 };
 use arc_precompiles::call_from::{CallFromPrecompile, CALL_FROM_ADDRESS};
 use arc_precompiles::precompile_provider::ArcPrecompileProvider;
@@ -101,8 +99,8 @@ use arc_precompiles::subcall::SubcallPrecompile;
 use revm::interpreter::interpreter_action::CallInputs;
 
 /// Flat gas cost charged for rejected subcall dispatches (unauthorized caller, wrong scheme,
-/// static context, value attached, init_subcall errors). Charged by `init_subcall_revert` calls.
-/// Prevents zero-cost probing of subcall precompile addresses.
+/// static context, value attached, sender spoofing, init_subcall errors). Charged by
+/// `init_subcall_revert` calls. Prevents zero-cost probing of subcall precompile addresses.
 const SUBCALL_DISPATCH_COST: u64 = 100;
 
 /// Construct a revert `FrameResult` for a subcall precompile rejection.
@@ -184,6 +182,7 @@ fn extract_call_transfer_params(
 
 /// Deducts a gas cost from a frame's gas limit. Returns `Some(oog_result)` if the
 /// frame has insufficient gas, `None` on success.
+#[allow(clippy::arithmetic_side_effects)] // Subtractions are guarded by the `< cost` checks.
 fn deduct_gas_from_frame(frame_input: &mut FrameInit, cost: u64) -> Option<FrameResult> {
     match &mut frame_input.frame_input {
         FrameInput::Call(inputs) => {
@@ -201,6 +200,30 @@ fn deduct_gas_from_frame(frame_input: &mut FrameInit, cost: u64) -> Option<Frame
         FrameInput::Empty => {}
     }
     None
+}
+
+fn frame_gas_limit(frame_input: &FrameInit) -> u64 {
+    match &frame_input.frame_input {
+        FrameInput::Call(inputs) => inputs.gas_limit,
+        FrameInput::Create(inputs) => inputs.gas_limit(),
+        FrameInput::Empty => 0,
+    }
+}
+
+/// Creates a revert that charges the actual SLOAD gas cost when metered, or OOGs if the
+/// frame's gas budget is insufficient.
+fn metered_revert(
+    frame_input: &FrameInit,
+    meter_sloads: bool,
+    gas_cost: u64,
+    reason: &str,
+) -> BeforeFrameInitResult {
+    let gas_spent = if meter_sloads { gas_cost } else { 0 };
+    if gas_spent > 0 && frame_gas_limit(frame_input) < gas_spent {
+        BeforeFrameInitResult::Reverted(create_oog_frame_result(frame_input))
+    } else {
+        BeforeFrameInitResult::Reverted(create_frame_result(frame_input, reason, gas_spent))
+    }
 }
 
 /// Defensive revert for when a subcall interception fires on a non-Call frame.
@@ -344,6 +367,18 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
         Ok((is_blocklisted_status(state_load.data), state_load.is_cold))
     }
 
+    fn sload_cost(&self, is_cold: bool) -> u64 {
+        if self.hardfork_flags.is_active(ArcHardfork::Zero6) {
+            if is_cold {
+                revm_interpreter::gas::COLD_SLOAD_COST
+            } else {
+                revm_interpreter::gas::WARM_STORAGE_READ_COST
+            }
+        } else {
+            PRECOMPILE_SLOAD_GAS_COST
+        }
+    }
+
     /// Extracts transfer parameters (from, to, amount) from a Create frame input.
     /// Returns None if value is zero or scheme is Custom.
     fn extract_create_transfer_params(
@@ -399,6 +434,11 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
         amount: U256,
         frame_input: &FrameInit,
     ) -> Result<BeforeFrameInitResult, ContextDbError<CTX>> {
+        // Meter SLOAD gas on revert for nested frames (depth > 0) with Zero6 active.
+        // Depth 0 is covered by `validate_initial_tx_gas` which charges fixed cold SLOAD costs.
+        let meter_sloads =
+            frame_input.depth > 0 && self.hardfork_flags.is_active(ArcHardfork::Zero6);
+
         // Zero5: reject CALL/CREATE value transfers involving the zero address.
         // This prevents accidental burn/mint semantics at the EVM execution layer.
         //
@@ -412,48 +452,35 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
             return Ok(BeforeFrameInitResult::Reverted(create_frame_result(
                 frame_input,
                 ERR_ZERO_ADDRESS,
-                BLOCKLISTED_GAS_PENALTY,
+                0,
             )));
         }
 
         let (from_blocklisted, from_is_cold) = self.is_address_blocklisted(from)?;
-
-        // Compute gas cost for the `from` sload
-        let from_sload_cost = if self.hardfork_flags.is_active(ArcHardfork::Zero6) {
-            if from_is_cold {
-                revm_interpreter::gas::COLD_SLOAD_COST
-            } else {
-                revm_interpreter::gas::WARM_STORAGE_READ_COST
-            }
-        } else {
-            PRECOMPILE_SLOAD_GAS_COST
-        };
+        let from_sload_cost = self.sload_cost(from_is_cold);
 
         if from_blocklisted {
-            // Short-circuit: only the `from` sload was performed
-            return Ok(BeforeFrameInitResult::Reverted(
-                create_blocklisted_frame_result(frame_input),
+            return Ok(metered_revert(
+                frame_input,
+                meter_sloads,
+                from_sload_cost,
+                ERR_BLOCKED_ADDRESS,
             ));
         }
 
         let (to_blocklisted, to_is_cold) = self.is_address_blocklisted(to)?;
+        let to_sload_cost = self.sload_cost(to_is_cold);
 
-        // Compute gas cost for the `to` sload
-        let to_sload_cost = if self.hardfork_flags.is_active(ArcHardfork::Zero6) {
-            if to_is_cold {
-                revm_interpreter::gas::COLD_SLOAD_COST
-            } else {
-                revm_interpreter::gas::WARM_STORAGE_READ_COST
-            }
-        } else {
-            PRECOMPILE_SLOAD_GAS_COST
-        };
-
+        // Both are PRECOMPILE_SLOAD_GAS_COST (2,100); sum fits in u64
+        #[allow(clippy::arithmetic_side_effects)]
         let total_sload_cost = from_sload_cost + to_sload_cost;
 
         if to_blocklisted {
-            return Ok(BeforeFrameInitResult::Reverted(
-                create_blocklisted_frame_result(frame_input),
+            return Ok(metered_revert(
+                frame_input,
+                meter_sloads,
+                total_sload_cost,
+                ERR_BLOCKED_ADDRESS,
             ));
         }
         if self.hardfork_flags.is_active(ArcHardfork::Zero5) {
@@ -462,11 +489,12 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
             // execution, so this usually has no practical gas impact even if the first load is cold.
             let target_account = self.inner.journal_mut().load_account(to)?;
             if target_account.is_selfdestructed() {
-                return Ok(BeforeFrameInitResult::Reverted(create_frame_result(
+                return Ok(metered_revert(
                     frame_input,
+                    meter_sloads,
+                    total_sload_cost,
                     ERR_SELFDESTRUCTED_BALANCE_INCREASED,
-                    BLOCKLISTED_GAS_PENALTY,
-                )));
+                ));
             }
         }
 
@@ -851,6 +879,17 @@ where
             }
         };
 
+        // Prevent sender spoofing by contracts: if the precompile changes the caller
+        // (e.g. callFrom), the new caller must be tx.origin (the signing EOA).
+        if init_result.child_inputs.caller != call_inputs.caller
+            && init_result.child_inputs.caller != self.inner.ctx.tx().caller()
+        {
+            return Ok(ItemOrResult::Result(init_subcall_revert(
+                "sender spoofing requires tx.origin as sender",
+                call_inputs,
+            )));
+        }
+
         let return_memory_offset = call_inputs.return_memory_offset.clone();
 
         // Store continuation keyed by the precompile call's depth.
@@ -876,9 +915,6 @@ where
             },
         );
 
-        // Construct child frame input
-        let child_inputs = &init_result.child_inputs;
-
         // Pre-load the child's caller and target accounts into the journal. The normal EVM
         // execution path has these already loaded (caller is the executing frame, target was
         // loaded by the CALL opcode handler), but we're constructing a synthetic child frame
@@ -892,23 +928,68 @@ where
         // Side effect: these `load_account` calls create `AccountWarmed` journal entries
         // outside the child frame's checkpoint scope. If the child reverts, the child's
         // journal entries are rolled back but these pre-loads persist — the addresses stay
-        // warm for the rest of the transaction. For CallFrom this is bounded by the
-        // allowlist and the addresses are typically already warm. Future subcall precompiles
-        // with `AllowedCallers::Unrestricted` targeting user-supplied addresses should
-        // account for this.
+        // warm for the rest of the transaction.
+        //
+        // The target's cold/warm status is captured to charge the EIP-2929 account access
+        // cost, mirroring the normal CALL opcode's gas metering. Note: when caller==target,
+        // `load_account(caller)` warms the address first, so `target_load.is_cold` is false
+        // and only the warm cost (100) is charged — matching normal EVM CALL behavior.
+        let mut child_inputs = init_result.child_inputs;
         self.inner
             .ctx
             .journal_mut()
             .load_account(child_inputs.caller)?;
-        self.inner
+        let target_load = self
+            .inner
             .ctx
             .journal_mut()
             .load_account(child_inputs.target_address)?;
 
+        // EIP-2929 account access cost for the child target. Our `load_account` call
+        // above pre-warms the target, so revm's internal CALL handler won't charge cold
+        // access. We charge it explicitly to match the normal CALL opcode's gas metering.
+        let account_access_cost = if target_load.is_cold {
+            revm_interpreter::gas::COLD_ACCOUNT_ACCESS_COST
+        } else {
+            revm_interpreter::gas::WARM_STORAGE_READ_COST
+        };
+
+        let total_overhead = init_result.gas_overhead.saturating_add(account_access_cost);
+
+        let Some(available) = call_inputs.gas_limit.checked_sub(total_overhead) else {
+            // OOG: total overhead exceeds the caller's gas budget. Consume all gas.
+            // Remove the continuation inserted above — no child frame will run.
+            self.subcall_continuations.remove(&depth);
+            let mut gas = Gas::new(call_inputs.gas_limit);
+            gas.spend_all();
+            return Ok(ItemOrResult::Result(FrameResult::Call(CallOutcome {
+                result: InterpreterResult::new(InstructionResult::OutOfGas, Bytes::new(), gas),
+                memory_offset: call_inputs.return_memory_offset.clone(),
+                was_precompile_called: true,
+                precompile_call_logs: Default::default(),
+            })));
+        };
+
+        // Recalculate child gas with EIP-150 (63/64ths) applied to the gas remaining
+        // after total overhead. This overwrites the gas_limit set by the trait's
+        // `init_subcall`, which only accounted for the ABI decode overhead.
+        // available / 64 <= available, so the subtraction cannot underflow.
+        #[allow(clippy::arithmetic_side_effects)]
+        let child_gas_limit = available - (available / 64);
+        child_inputs.gas_limit = child_gas_limit;
+
+        // Update the continuation with the total overhead (ABI decode + account access).
+        self.subcall_continuations
+            .get_mut(&depth)
+            .expect("continuation was inserted above")
+            .init_subcall_gas_overhead = total_overhead;
+
         let child_frame_input = FrameInit {
+            // Call depth is bounded by the EVM stack limit (1024)
+            #[allow(clippy::arithmetic_side_effects)]
             depth: depth + 1,
             memory: frame_input.memory,
-            frame_input: FrameInput::Call(init_result.child_inputs),
+            frame_input: FrameInput::Call(child_inputs),
         };
 
         // Initialize the child frame through checked_frame_init so that
@@ -1585,6 +1666,23 @@ impl BlockExecutorFactory for ArcEvmConfig {
     }
 }
 
+/// Pick the fee recipient for the next block, given the ProtocolConfig lookup result and the
+/// CL-provided recipient. The contract value wins when explicitly set; zero or lookup failure
+/// defers to the CL.
+fn select_fee_recipient(
+    protocol_config_beneficiary: Result<Address, ProtocolConfigError<HaltReason>>,
+    cl_suggested_recipient: Address,
+) -> Address {
+    match protocol_config_beneficiary {
+        Ok(addr) if !addr.is_zero() => addr,
+        Ok(_) => cl_suggested_recipient,
+        Err(err) => {
+            tracing::warn!(error = %err, "ProtocolConfig rewardBeneficiary() failed; using CL-provided fee recipient");
+            cl_suggested_recipient
+        }
+    }
+}
+
 impl ConfigureEvm for ArcEvmConfig {
     type Primitives = <EthEvmConfig as ConfigureEvm>::Primitives;
     type Error = <EthEvmConfig as ConfigureEvm>::Error;
@@ -1629,13 +1727,10 @@ impl ConfigureEvm for ArcEvmConfig {
                 })?,
         );
 
-        // Override the suggested fee recipient with the reward beneficiary from the ProtocolConfig contract.
-        attributes.suggested_fee_recipient = retrieve_reward_beneficiary(&mut system_evm)
-            .unwrap_or_else(|err| {
-                tracing::warn!(error = ?err, "Failed to get reward beneficiary from ProtocolConfig");
-                // fallback - the coinbase address from the parent block
-                parent.beneficiary
-            });
+        attributes.suggested_fee_recipient = select_fee_recipient(
+            retrieve_reward_beneficiary(&mut system_evm),
+            attributes.suggested_fee_recipient,
+        );
 
         // Override the gas limit with the gas limit from the ProtocolConfig contract.
         // ADR-0003: use chainspec bounds; fall back to chainspec default when ProtocolConfig
@@ -1644,7 +1739,7 @@ impl ConfigureEvm for ArcEvmConfig {
         let fee_params = retrieve_fee_params(&mut system_evm).inspect_err(|err| {
                 tracing::warn!(error = ?err, "Failed to get fee params from ProtocolConfig, using default gas limit");
             }).ok();
-        let next_block_height = parent.number + 1;
+        let next_block_height = parent.number.checked_add(1).expect("block number overflow");
 
         let gas_limit_config = chain_spec.block_gas_limit_config(next_block_height);
         attributes.gas_limit = expected_gas_limit(fee_params.as_ref(), &gas_limit_config);
@@ -1707,7 +1802,7 @@ impl ConfigureEngineEvm<ExecutionData> for ArcEvmConfig {
 mod tests {
     use super::*;
     use crate::frame_result::BeforeFrameInitResult;
-    use crate::frame_result::BLOCKLISTED_GAS_PENALTY;
+
     use crate::log::NativeCoinTransferred;
     use alloy_consensus::Block;
     use alloy_primitives::{address, Bytes, B256, U256};
@@ -2000,40 +2095,151 @@ mod tests {
         let evm_config = ArcEvmConfig::new(inner_config);
         let mut db = State::builder().build();
 
-        // Create a minimal sealed parent header with a known beneficiary
-        let fallback_beneficiary = Address::repeat_byte(0x99);
+        // ProtocolConfig contract is absent from `db`, so `retrieve_reward_beneficiary` errors
+        // and `select_fee_recipient` falls back to `attributes.suggested_fee_recipient`.
         let parent_header = Header {
             number: 1,
-            gas_limit: 30_000_000, // Standard gas limit
+            gas_limit: 30_000_000,
             gas_used: 21_000,
             base_fee_per_gas: Some(1_000_000_000), // 1 gwei
             timestamp: 1000,
-            beneficiary: fallback_beneficiary,
             ..Default::default()
         };
         let sealed_parent = SealedHeader::new(parent_header, B256::ZERO);
 
-        // Create next block attributes
         let attributes = NextBlockEnvAttributes {
             timestamp: 1001,
             prev_randao: B256::ZERO,
-            suggested_fee_recipient: Address::ZERO, // Different from parent beneficiary
+            suggested_fee_recipient: Address::repeat_byte(0x42),
             gas_limit: 30_000_000,
             parent_beacon_block_root: None,
             withdrawals: None,
             extra_data: Default::default(),
         };
 
-        // Test builder_for_next_block - should succeed and use fallback beneficiary
         let result = evm_config.builder_for_next_block(&mut db, &sealed_parent, attributes);
         assert!(
             result.is_ok(),
-            "builder_for_next_block should succeed with fallback"
+            "builder_for_next_block should succeed when ProtocolConfig is absent"
+        );
+    }
+
+    #[test]
+    fn test_retrieve_reward_beneficiary_nonzero_address() {
+        use arc_execution_config::protocol_config::{
+            retrieve_reward_beneficiary, PROTOCOL_CONFIG_ADDRESS,
+        };
+        use revm::bytecode::opcode;
+        use revm::state::AccountInfo;
+
+        let expected = Address::repeat_byte(0xAB);
+
+        // Mock contract at PROTOCOL_CONFIG_ADDRESS that returns a non-zero address,
+        // exercising the `Ok(addr) if !addr.is_zero() => addr` branch.
+        // rewardBeneficiary() returns (address) ABI-encodes as [12 zero bytes | 20 addr bytes];
+        // MSTORE right-aligns the stack value to produce exactly that.
+        //
+        // Equivalent assembly:
+        // ```text
+        //   PUSH20 <addr>  ; push address as uint256 (zero-fills upper 12 bytes on stack)
+        //   PUSH1  0       ; memory offset for MSTORE
+        //   MSTORE         ; memory[0..32] = [12 zero bytes][20 addr bytes]
+        //   PUSH1  0x20    ; return size = 32
+        //   PUSH1  0       ; return offset
+        //   RETURN
+        // ```
+        let mut code = vec![opcode::PUSH20];
+        code.extend_from_slice(expected.as_slice());
+        code.extend_from_slice(&[opcode::PUSH1, 0x00, opcode::MSTORE]);
+        code.extend_from_slice(&[opcode::PUSH1, 0x20, opcode::PUSH1, 0x00, opcode::RETURN]);
+        let raw = Bytes::from(code);
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            PROTOCOL_CONFIG_ADDRESS,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash: keccak256(&raw),
+                code: Some(Bytecode::new_raw(raw)),
+                account_id: None,
+            },
         );
 
-        // The function should have set suggested_fee_recipient to parent.beneficiary
-        // We can't directly inspect the builder's internal state, but we know it succeeded
-        // and the fallback logic was triggered since ProtocolConfig contract doesn't exist
+        let mut evm = create_test_evm(db, ArcHardforkFlags::default());
+        assert_eq!(retrieve_reward_beneficiary(&mut evm).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_retrieve_reward_beneficiary_zero_address() {
+        use arc_execution_config::protocol_config::{
+            retrieve_reward_beneficiary, PROTOCOL_CONFIG_ADDRESS,
+        };
+        use revm::bytecode::opcode;
+        use revm::state::AccountInfo;
+
+        // Mock contract returning address(0): rewardBeneficiary() ABI-encodes as 32 zero
+        // bytes, which EVM memory provides by default — no MSTORE needed.
+        //
+        // Equivalent assembly:
+        // ```text
+        //   PUSH1  0x20    ; return size = 32
+        //   PUSH1  0       ; return offset (memory[0..32] is all zeros by default)
+        //   RETURN         ; returns 32 zero bytes = abi.encode(address(0))
+        // ```
+        let raw = Bytes::from(vec![
+            opcode::PUSH1,
+            0x20,
+            opcode::PUSH1,
+            0x00,
+            opcode::RETURN,
+        ]);
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            PROTOCOL_CONFIG_ADDRESS,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash: keccak256(&raw),
+                code: Some(Bytecode::new_raw(raw)),
+                account_id: None,
+            },
+        );
+
+        let mut evm = create_test_evm(db, ArcHardforkFlags::default());
+        assert_eq!(
+            retrieve_reward_beneficiary(&mut evm).unwrap(),
+            Address::ZERO
+        );
+    }
+
+    #[test]
+    fn select_fee_recipient_uses_protocol_config_when_nonzero() {
+        let pc_beneficiary = Address::repeat_byte(0x11);
+        let cl_suggested = Address::repeat_byte(0x22);
+        assert_eq!(
+            select_fee_recipient(Ok(pc_beneficiary), cl_suggested),
+            pc_beneficiary,
+        );
+    }
+
+    #[test]
+    fn select_fee_recipient_falls_back_to_cl_suggested_when_protocol_config_returns_zero() {
+        let cl_suggested = Address::repeat_byte(0x22);
+        assert_eq!(
+            select_fee_recipient(Ok(Address::ZERO), cl_suggested),
+            cl_suggested,
+        );
+    }
+
+    #[test]
+    fn select_fee_recipient_falls_back_to_cl_suggested_on_error() {
+        let cl_suggested = Address::repeat_byte(0x22);
+        assert_eq!(
+            select_fee_recipient(Err(ProtocolConfigError::EmptyOutput), cl_suggested),
+            cl_suggested,
+        );
     }
 
     /// Under Zero5, Arc self-emits EIP-7708 Transfer logs for CALL/CREATE value transfers.
@@ -2434,8 +2640,8 @@ mod tests {
             if let BeforeFrameInitResult::Reverted(reverted) = transfer_result {
                 assert_eq!(
                     reverted.gas().spent(),
-                    BLOCKLISTED_GAS_PENALTY,
-                    "{} (hardfork: {:?}): expect reverted gas spent BLOCKLISTED_GAS_PENALTY",
+                    0,
+                    "{} (hardfork: {:?}): depth-0 reverts should have zero gas spent",
                     test_case.name,
                     hardfork
                 );
@@ -3524,6 +3730,7 @@ mod tests {
         const REVERT_CONTRACT: Address = address!("c000000000000000000000000000000000000003");
         const CALLER_CONTRACT: Address = address!("c000000000000000000000000000000000000004");
         const WRAPPER_INNER: Address = address!("c000000000000000000000000000000000000005");
+        const SPOOFED_SENDER: Address = address!("a000000000000000000000000000000000000001");
 
         // ----- Integration tests -----
 
@@ -5475,6 +5682,51 @@ mod tests {
             );
         }
 
+        // ================================================================
+        // tx.origin sender validation tests
+        // ================================================================
+
+        /// EOA → WRAPPER → callFrom(sender=SPOOFED_SENDER, target=ECHO, data)
+        /// SPOOFED_SENDER is neither tx.origin (EOA) nor the actual caller (WRAPPER),
+        /// so the sender validation rejects it.
+        #[test]
+        fn test_call_from_contract_sender_spoofing_rejected() {
+            let contract_a_code = wrapper_call_bytecode(CALL_FROM_ADDRESS);
+            let contract_b_code = echo_double_bytecode();
+            const CONTRACT_A: Address = WRAPPER;
+            const CONTRACT_B: Address = ECHO_CONTRACT;
+
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(CONTRACT_A, contract_a_code), (CONTRACT_B, contract_b_code)],
+                &[CONTRACT_A],
+            );
+
+            let inner_calldata = U256::from(42).to_be_bytes::<32>().to_vec();
+            let call_from_input =
+                encode_call_from_input(SPOOFED_SENDER, CONTRACT_B, &inner_calldata);
+
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(CONTRACT_A),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: call_from_input,
+                ..Default::default()
+            };
+
+            let result = evm.transact_one(tx).expect("transact_one should succeed");
+            match &result {
+                ExecutionResult::Success { output, .. } => {
+                    let reason = decode_revert_reason(output.data());
+                    assert_eq!(reason, "sender spoofing requires tx.origin as sender");
+                }
+                other => panic!("expected Success (wrapper catches revert), got {other:?}"),
+            }
+        }
+
         /// complete_subcall error should consume all gas allocated to the subcall.
         #[test]
         fn test_complete_subcall_error_consumes_all_gas() {
@@ -5600,6 +5852,513 @@ mod tests {
                 gas_used_failing > gas_used_normal,
                 "complete_subcall error ({gas_used_failing}) should consume more gas than \
                  normal path ({gas_used_normal}) because all subcall gas is consumed"
+            );
+        }
+
+        // These tests verify that `init_subcall` correctly charges EIP-2929 account
+        // access costs for the child target address.
+
+        /// Integration test: CallFrom targeting a cold account should cost more gas
+        /// than targeting a warm one (pre-warmed via access_list).
+        ///
+        /// Uses two separate EVM instances so each transaction starts with a fresh
+        /// journal — reusing one EVM would leave addresses warm from the first tx.
+        #[test]
+        fn test_call_from_cold_target_costs_more_gas_than_warm() {
+            let contract_a_code = wrapper_call_bytecode(CALL_FROM_ADDRESS);
+            let contract_b_code = echo_double_bytecode();
+            const CONTRACT_A: Address = WRAPPER;
+            const CONTRACT_B: Address = ECHO_CONTRACT;
+
+            let inner_calldata = U256::from(42).to_be_bytes::<32>().to_vec();
+            let call_from_input = encode_call_from_input(EOA, CONTRACT_B, &inner_calldata);
+
+            // Cold target: fresh EVM, no access_list
+            let mut evm_cold = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[
+                    (CONTRACT_A, contract_a_code.clone()),
+                    (CONTRACT_B, contract_b_code.clone()),
+                ],
+                &[CONTRACT_A],
+            );
+            let tx_cold = TxEnv {
+                tx_type: 1, // EIP-2930
+                caller: EOA,
+                kind: TxKind::Call(CONTRACT_A),
+                value: U256::ZERO,
+                gas_limit: 200_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: call_from_input.clone(),
+                access_list: Default::default(),
+                ..Default::default()
+            };
+            let result_cold = evm_cold
+                .transact_one(tx_cold)
+                .expect("cold tx should succeed");
+            let gas_cold = match &result_cold {
+                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                other => panic!("expected Success, got {other:?}"),
+            };
+
+            // Warm target: fresh EVM, pre-warm CONTRACT_B via access_list.
+            // tx_type must be EIP-2930 (1) so revm processes the access_list warmup;
+            // the default Legacy type skips access list handling entirely.
+            let mut evm_warm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(CONTRACT_A, contract_a_code), (CONTRACT_B, contract_b_code)],
+                &[CONTRACT_A],
+            );
+            let tx_warm = TxEnv {
+                tx_type: 1, // EIP-2930
+                caller: EOA,
+                kind: TxKind::Call(CONTRACT_A),
+                value: U256::ZERO,
+                gas_limit: 200_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: call_from_input,
+                access_list: vec![alloy_eips::eip2930::AccessListItem {
+                    address: CONTRACT_B,
+                    storage_keys: vec![],
+                }]
+                .into(),
+                ..Default::default()
+            };
+            let result_warm = evm_warm
+                .transact_one(tx_warm)
+                .expect("warm tx should succeed");
+            let gas_warm = match &result_warm {
+                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                other => panic!("expected Success, got {other:?}"),
+            };
+
+            // Both txs are EIP-2930; the only difference is the access_list entry.
+            // Delta = COLD_ACCOUNT_ACCESS_COST (2600) − ACCESS_LIST_ADDRESS_COST (2400)
+            //       - WARM_STORAGE_READ_COST (100) = 100.
+            assert_eq!(
+                gas_cold - gas_warm,
+                100,
+                "cold/warm gas delta should be exactly 100 (COLD_ACCOUNT_ACCESS_COST 2600 \
+                 - ACCESS_LIST_ADDRESS_COST 2400 - WARM_STORAGE_READ_COST 100)"
+            );
+        }
+
+        /// Unit test: init_subcall with a cold target should set
+        /// init_subcall_gas_overhead = abi_decode_gas + COLD_ACCOUNT_ACCESS_COST.
+        #[test]
+        fn test_call_from_cold_target_recalculates_child_gas() {
+            use alloy_sol_types::SolCall;
+            use arc_precompiles::call_from::{abi_decode_gas, ICallFrom};
+            use revm_interpreter::gas::COLD_ACCOUNT_ACCESS_COST;
+
+            let echo_code = echo_double_bytecode();
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(ECHO_CONTRACT, echo_code)],
+                &[WRAPPER],
+            );
+
+            // Clear journal state and load required accounts
+            evm.ctx_mut().journal_mut().clear();
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+                .unwrap();
+
+            // tx.origin must match the spoofed sender for the origin check.
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                ..Default::default()
+            });
+
+            let child_data: Vec<u8> = vec![0x42];
+            let calldata = ICallFrom::callFromCall {
+                sender: EOA,
+                target: ECHO_CONTRACT,
+                data: child_data.clone().into(),
+            }
+            .abi_encode();
+
+            let gas_limit: u64 = 100_000;
+            let call_inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: CALL_FROM_ADDRESS,
+                bytecode_address: CALL_FROM_ADDRESS,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(Bytes::from(calldata)),
+                gas_limit,
+                is_static: false,
+                caller: WRAPPER,
+                return_memory_offset: 0..0,
+            };
+
+            let frame_input = FrameInit {
+                frame_input: FrameInput::Call(Box::new(call_inputs)),
+                memory: SharedMemory::default(),
+                depth: 1,
+            };
+
+            let precompile: Arc<dyn arc_precompiles::subcall::SubcallPrecompile> =
+                Arc::new(CallFromPrecompile);
+            let result = evm
+                .init_subcall(frame_input, precompile)
+                .expect("init_subcall should succeed");
+            assert!(
+                matches!(result, ItemOrResult::Item(_)),
+                "expected child frame, got immediate result"
+            );
+
+            let continuation = evm
+                .subcall_continuations
+                .get(&1)
+                .expect("continuation should be stored at depth 1");
+
+            let expected_overhead = abi_decode_gas(child_data.len()) + COLD_ACCOUNT_ACCESS_COST;
+            assert_eq!(
+                continuation.init_subcall_gas_overhead,
+                expected_overhead,
+                "overhead should be abi_decode ({}) + cold access ({COLD_ACCOUNT_ACCESS_COST}), \
+                 got {}",
+                abi_decode_gas(child_data.len()),
+                continuation.init_subcall_gas_overhead
+            );
+        }
+
+        /// Unit test: when the target is already warm, init_subcall should use
+        /// WARM_STORAGE_READ_COST (100) instead of COLD_ACCOUNT_ACCESS_COST (2600).
+        #[test]
+        fn test_call_from_warm_target_uses_warm_cost() {
+            use alloy_sol_types::SolCall;
+            use arc_precompiles::call_from::{abi_decode_gas, ICallFrom};
+            use revm_interpreter::gas::WARM_STORAGE_READ_COST;
+
+            let echo_code = echo_double_bytecode();
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(ECHO_CONTRACT, echo_code)],
+                &[WRAPPER],
+            );
+
+            // Clear journal state and load required accounts
+            evm.ctx_mut().journal_mut().clear();
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+                .unwrap();
+
+            // Pre-warm the target account
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(ECHO_CONTRACT)
+                .unwrap();
+
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                ..Default::default()
+            });
+
+            let child_data: Vec<u8> = vec![0x42];
+            let calldata = ICallFrom::callFromCall {
+                sender: EOA,
+                target: ECHO_CONTRACT,
+                data: child_data.clone().into(),
+            }
+            .abi_encode();
+
+            let gas_limit: u64 = 100_000;
+            let call_inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: CALL_FROM_ADDRESS,
+                bytecode_address: CALL_FROM_ADDRESS,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(Bytes::from(calldata)),
+                gas_limit,
+                is_static: false,
+                caller: WRAPPER,
+                return_memory_offset: 0..0,
+            };
+
+            let frame_input = FrameInit {
+                frame_input: FrameInput::Call(Box::new(call_inputs)),
+                memory: SharedMemory::default(),
+                depth: 1,
+            };
+
+            let precompile: Arc<dyn arc_precompiles::subcall::SubcallPrecompile> =
+                Arc::new(CallFromPrecompile);
+            let result = evm
+                .init_subcall(frame_input, precompile)
+                .expect("init_subcall should succeed");
+            assert!(
+                matches!(result, ItemOrResult::Item(_)),
+                "expected child frame, got immediate result"
+            );
+
+            let continuation = evm
+                .subcall_continuations
+                .get(&1)
+                .expect("continuation should be stored at depth 1");
+
+            let expected_overhead = abi_decode_gas(child_data.len()) + WARM_STORAGE_READ_COST;
+            assert_eq!(
+                continuation.init_subcall_gas_overhead,
+                expected_overhead,
+                "overhead should be abi_decode ({}) + warm read ({WARM_STORAGE_READ_COST}), \
+                 got {}",
+                abi_decode_gas(child_data.len()),
+                continuation.init_subcall_gas_overhead
+            );
+        }
+
+        /// When caller == target, `load_account(caller)` warms the address before
+        /// `load_account(target)`, so only the warm access cost (100) is charged.
+        #[test]
+        fn test_call_from_caller_equals_target_uses_warm_cost() {
+            use alloy_sol_types::SolCall;
+            use arc_precompiles::call_from::{abi_decode_gas, ICallFrom};
+            use revm_interpreter::gas::WARM_STORAGE_READ_COST;
+
+            let echo_code = echo_double_bytecode();
+            // ECHO_CONTRACT is both the sender and target — give it balance and code.
+            let mut evm = setup_test_evm(
+                &[(ECHO_CONTRACT, U256::from(10_000_000))],
+                &[(ECHO_CONTRACT, echo_code)],
+                &[WRAPPER],
+            );
+
+            evm.ctx_mut().journal_mut().clear();
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+                .unwrap();
+
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: ECHO_CONTRACT,
+                ..Default::default()
+            });
+
+            let child_data: Vec<u8> = vec![0x42];
+            let calldata = ICallFrom::callFromCall {
+                sender: ECHO_CONTRACT,
+                target: ECHO_CONTRACT,
+                data: child_data.clone().into(),
+            }
+            .abi_encode();
+
+            let gas_limit: u64 = 100_000;
+            let call_inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: CALL_FROM_ADDRESS,
+                bytecode_address: CALL_FROM_ADDRESS,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(Bytes::from(calldata)),
+                gas_limit,
+                is_static: false,
+                caller: WRAPPER,
+                return_memory_offset: 0..0,
+            };
+
+            let frame_input = FrameInit {
+                frame_input: FrameInput::Call(Box::new(call_inputs)),
+                memory: SharedMemory::default(),
+                depth: 1,
+            };
+
+            let precompile: Arc<dyn arc_precompiles::subcall::SubcallPrecompile> =
+                Arc::new(CallFromPrecompile);
+            let result = evm
+                .init_subcall(frame_input, precompile)
+                .expect("init_subcall should succeed");
+            assert!(
+                matches!(result, ItemOrResult::Item(_)),
+                "expected child frame, got immediate result"
+            );
+
+            let continuation = evm
+                .subcall_continuations
+                .get(&1)
+                .expect("continuation should be stored at depth 1");
+
+            let expected_overhead = abi_decode_gas(child_data.len()) + WARM_STORAGE_READ_COST;
+            assert_eq!(
+                continuation.init_subcall_gas_overhead,
+                expected_overhead,
+                "caller==target: overhead should be abi_decode ({}) + warm read \
+                 ({WARM_STORAGE_READ_COST}), got {}",
+                abi_decode_gas(child_data.len()),
+                continuation.init_subcall_gas_overhead
+            );
+        }
+
+        /// Unit test: when gas_limit is just below abi_decode + COLD_ACCOUNT_ACCESS_COST,
+        /// init_subcall should OOG.
+        #[test]
+        fn test_call_from_oog_with_cold_account_access() {
+            use alloy_sol_types::SolCall;
+            use arc_precompiles::call_from::{abi_decode_gas, ICallFrom};
+            use revm_interpreter::gas::COLD_ACCOUNT_ACCESS_COST;
+
+            let echo_code = echo_double_bytecode();
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(ECHO_CONTRACT, echo_code)],
+                &[WRAPPER],
+            );
+
+            evm.ctx_mut().journal_mut().clear();
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+                .unwrap();
+
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                ..Default::default()
+            });
+
+            let child_data: Vec<u8> = vec![0x42];
+            let calldata = ICallFrom::callFromCall {
+                sender: EOA,
+                target: ECHO_CONTRACT,
+                data: child_data.clone().into(),
+            }
+            .abi_encode();
+
+            // Gas is enough for ABI decode but NOT enough for ABI decode + cold access
+            let insufficient_gas = abi_decode_gas(child_data.len()) + COLD_ACCOUNT_ACCESS_COST - 1;
+            let call_inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: CALL_FROM_ADDRESS,
+                bytecode_address: CALL_FROM_ADDRESS,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(Bytes::from(calldata)),
+                gas_limit: insufficient_gas,
+                is_static: false,
+                caller: WRAPPER,
+                return_memory_offset: 0..0,
+            };
+
+            let frame_input = FrameInit {
+                frame_input: FrameInput::Call(Box::new(call_inputs)),
+                memory: SharedMemory::default(),
+                depth: 1,
+            };
+
+            let precompile: Arc<dyn arc_precompiles::subcall::SubcallPrecompile> =
+                Arc::new(CallFromPrecompile);
+            let result = evm
+                .init_subcall(frame_input, precompile)
+                .expect("init_subcall should not return db error");
+
+            match result {
+                ItemOrResult::Result(FrameResult::Call(outcome)) => {
+                    assert_eq!(
+                        outcome.result.result,
+                        InstructionResult::OutOfGas,
+                        "should OOG when gas is insufficient for account access cost"
+                    );
+                    assert_eq!(
+                        outcome.result.gas.spent(),
+                        insufficient_gas,
+                        "OOG should consume all allocated gas"
+                    );
+                    assert!(
+                        !evm.subcall_continuations.contains_key(&1),
+                        "continuation should be removed after OOG"
+                    );
+                }
+                ItemOrResult::Result(other) => {
+                    panic!("expected Call result, got {other:?}");
+                }
+                ItemOrResult::Item(_) => {
+                    panic!(
+                        "expected OutOfGas when gas_limit ({insufficient_gas}) < \
+                         abi_decode ({}) + cold access ({COLD_ACCOUNT_ACCESS_COST})",
+                        abi_decode_gas(child_data.len())
+                    );
+                }
+            }
+        }
+
+        /// Boundary: gas_limit == abi_decode + COLD_ACCOUNT_ACCESS_COST should succeed
+        /// with child_gas_limit = 0 (child will OOG when it runs, but init_subcall itself
+        /// should not reject it).
+        #[test]
+        fn test_call_from_exact_overhead_gas_succeeds_with_zero_child_gas() {
+            use alloy_sol_types::SolCall;
+            use arc_precompiles::call_from::{abi_decode_gas, ICallFrom};
+            use revm_interpreter::gas::COLD_ACCOUNT_ACCESS_COST;
+
+            let echo_code = echo_double_bytecode();
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(ECHO_CONTRACT, echo_code)],
+                &[WRAPPER],
+            );
+
+            evm.ctx_mut().journal_mut().clear();
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+                .unwrap();
+
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                ..Default::default()
+            });
+
+            let child_data: Vec<u8> = vec![0x42];
+            let calldata = ICallFrom::callFromCall {
+                sender: EOA,
+                target: ECHO_CONTRACT,
+                data: child_data.clone().into(),
+            }
+            .abi_encode();
+
+            let exact_gas = abi_decode_gas(child_data.len()) + COLD_ACCOUNT_ACCESS_COST;
+            let call_inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: CALL_FROM_ADDRESS,
+                bytecode_address: CALL_FROM_ADDRESS,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(Bytes::from(calldata)),
+                gas_limit: exact_gas,
+                is_static: false,
+                caller: WRAPPER,
+                return_memory_offset: 0..0,
+            };
+
+            let frame_input = FrameInit {
+                frame_input: FrameInput::Call(Box::new(call_inputs)),
+                memory: SharedMemory::default(),
+                depth: 1,
+            };
+
+            let precompile: Arc<dyn arc_precompiles::subcall::SubcallPrecompile> =
+                Arc::new(CallFromPrecompile);
+            let result = evm
+                .init_subcall(frame_input, precompile)
+                .expect("init_subcall should not return db error");
+
+            assert!(
+                matches!(result, ItemOrResult::Item(_)),
+                "exact overhead gas should push a child frame, not OOG"
+            );
+
+            let continuation = evm
+                .subcall_continuations
+                .get(&1)
+                .expect("continuation should exist at depth 1");
+            assert_eq!(
+                continuation.init_subcall_gas_overhead, exact_gas,
+                "overhead should equal the full gas budget"
             );
         }
     }
@@ -6194,8 +6953,488 @@ mod tests {
         );
     }
 
-    // ----- Revm upgrade checklist -----
+    #[test]
+    fn test_zero6_nested_from_blocklisted_charges_sload_gas() {
+        let sender = address!("A000000000000000000000000000000000000001");
+        let recipient = address!("B000000000000000000000000000000000000002");
 
+        let mut db = CacheDB::new(EmptyDB::default());
+        let storage_slot = native_coin_control::compute_is_blocklisted_storage_slot(sender);
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            storage_slot.into(),
+            U256::from(1),
+        )
+        .unwrap();
+
+        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+        let mut evm = create_test_evm(db, flags);
+
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+            .unwrap();
+
+        let frame = FrameInit {
+            frame_input: FrameInput::Call(call_input(
+                CallScheme::Call,
+                U256::from(100),
+                sender,
+                recipient,
+            )),
+            memory: SharedMemory::default(),
+            depth: 1,
+        };
+
+        let result = evm.before_frame_init(&frame).unwrap();
+        if let BeforeFrameInitResult::Reverted(reverted) = result {
+            assert_eq!(
+                reverted.gas().spent(),
+                revm_interpreter::gas::COLD_SLOAD_COST,
+                "Zero6 nested from-blocklisted revert should charge one cold SLOAD"
+            );
+            let expected_revert =
+                arc_precompiles::helpers::revert_message_to_bytes(ERR_BLOCKED_ADDRESS);
+            assert_eq!(
+                reverted.interpreter_result().output,
+                expected_revert,
+                "revert reason should be ERR_BLOCKED_ADDRESS"
+            );
+        } else {
+            panic!("Expected Reverted result for blocklisted sender");
+        }
+    }
+
+    #[test]
+    fn test_zero6_nested_to_blocklisted_charges_sload_gas() {
+        let sender = address!("A000000000000000000000000000000000000001");
+        let recipient = address!("B000000000000000000000000000000000000002");
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let storage_slot = native_coin_control::compute_is_blocklisted_storage_slot(recipient);
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            storage_slot.into(),
+            U256::from(1),
+        )
+        .unwrap();
+
+        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+        let mut evm = create_test_evm(db, flags);
+
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+            .unwrap();
+
+        let frame = FrameInit {
+            frame_input: FrameInput::Call(call_input(
+                CallScheme::Call,
+                U256::from(100),
+                sender,
+                recipient,
+            )),
+            memory: SharedMemory::default(),
+            depth: 1,
+        };
+
+        let result = evm.before_frame_init(&frame).unwrap();
+        if let BeforeFrameInitResult::Reverted(reverted) = result {
+            assert_eq!(
+                reverted.gas().spent(),
+                2 * revm_interpreter::gas::COLD_SLOAD_COST,
+                "Zero6 nested to-blocklisted revert should charge two cold SLOADs"
+            );
+        } else {
+            panic!("Expected Reverted result for blocklisted recipient");
+        }
+    }
+
+    #[test]
+    fn test_pre_zero6_nested_blocklisted_charges_zero_gas() {
+        let sender = address!("A000000000000000000000000000000000000001");
+        let recipient = address!("B000000000000000000000000000000000000002");
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let storage_slot = native_coin_control::compute_is_blocklisted_storage_slot(sender);
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            storage_slot.into(),
+            U256::from(1),
+        )
+        .unwrap();
+
+        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5]);
+        let mut evm = create_test_evm(db, flags);
+
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+            .unwrap();
+
+        let frame = FrameInit {
+            frame_input: FrameInput::Call(call_input(
+                CallScheme::Call,
+                U256::from(100),
+                sender,
+                recipient,
+            )),
+            memory: SharedMemory::default(),
+            depth: 1,
+        };
+
+        let result = evm.before_frame_init(&frame).unwrap();
+        if let BeforeFrameInitResult::Reverted(reverted) = result {
+            assert_eq!(
+                reverted.gas().spent(),
+                0,
+                "Pre-Zero6 nested revert should charge zero gas (unchanged behavior)"
+            );
+        } else {
+            panic!("Expected Reverted result for blocklisted sender");
+        }
+    }
+
+    #[test]
+    fn test_zero6_depth0_blocklisted_charges_zero_gas() {
+        let sender = address!("A000000000000000000000000000000000000001");
+        let recipient = address!("B000000000000000000000000000000000000002");
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let storage_slot = native_coin_control::compute_is_blocklisted_storage_slot(sender);
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            storage_slot.into(),
+            U256::from(1),
+        )
+        .unwrap();
+
+        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+        let mut evm = create_test_evm(db, flags);
+
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+            .unwrap();
+
+        let frame = FrameInit {
+            frame_input: FrameInput::Call(call_input(
+                CallScheme::Call,
+                U256::from(100),
+                sender,
+                recipient,
+            )),
+            memory: SharedMemory::default(),
+            depth: 0,
+        };
+
+        let result = evm.before_frame_init(&frame).unwrap();
+        if let BeforeFrameInitResult::Reverted(reverted) = result {
+            assert_eq!(
+                reverted.gas().spent(),
+                0,
+                "Depth-0 Zero6 revert should charge zero gas (covered by validate_initial_tx_gas)"
+            );
+        } else {
+            panic!("Expected Reverted result for blocklisted sender");
+        }
+    }
+
+    #[test]
+    fn test_zero6_nested_from_blocklisted_warm_sload_gas() {
+        let sender = address!("A000000000000000000000000000000000000001");
+        let recipient = address!("B000000000000000000000000000000000000002");
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let storage_slot = native_coin_control::compute_is_blocklisted_storage_slot(sender);
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            storage_slot.into(),
+            U256::from(1),
+        )
+        .unwrap();
+
+        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+        let mut evm = create_test_evm(db, flags);
+
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+            .unwrap();
+
+        // Warm the slot by reading it first
+        evm.inner
+            .ctx
+            .journal_mut()
+            .sload(NATIVE_COIN_CONTROL_ADDRESS, storage_slot.into())
+            .unwrap();
+
+        let frame = FrameInit {
+            frame_input: FrameInput::Call(call_input(
+                CallScheme::Call,
+                U256::from(100),
+                sender,
+                recipient,
+            )),
+            memory: SharedMemory::default(),
+            depth: 1,
+        };
+
+        let result = evm.before_frame_init(&frame).unwrap();
+        if let BeforeFrameInitResult::Reverted(reverted) = result {
+            assert_eq!(
+                reverted.gas().spent(),
+                revm_interpreter::gas::WARM_STORAGE_READ_COST,
+                "Zero6 nested from-blocklisted warm revert should charge one warm SLOAD"
+            );
+        } else {
+            panic!("Expected Reverted result for blocklisted sender");
+        }
+    }
+
+    #[test]
+    fn test_zero6_nested_to_blocklisted_mixed_warm_cold_sload_gas() {
+        let sender = address!("A000000000000000000000000000000000000001");
+        let recipient = address!("B000000000000000000000000000000000000002");
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let recipient_slot = native_coin_control::compute_is_blocklisted_storage_slot(recipient);
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            recipient_slot.into(),
+            U256::from(1),
+        )
+        .unwrap();
+
+        let sender_slot = native_coin_control::compute_is_blocklisted_storage_slot(sender);
+        db.insert_account_storage(NATIVE_COIN_CONTROL_ADDRESS, sender_slot.into(), U256::ZERO)
+            .unwrap();
+
+        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+        let mut evm = create_test_evm(db, flags);
+
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+            .unwrap();
+
+        // Warm the sender's slot by reading it
+        evm.inner
+            .ctx
+            .journal_mut()
+            .sload(NATIVE_COIN_CONTROL_ADDRESS, sender_slot.into())
+            .unwrap();
+
+        // Recipient's slot stays cold
+
+        let frame = FrameInit {
+            frame_input: FrameInput::Call(call_input(
+                CallScheme::Call,
+                U256::from(100),
+                sender,
+                recipient,
+            )),
+            memory: SharedMemory::default(),
+            depth: 1,
+        };
+
+        let result = evm.before_frame_init(&frame).unwrap();
+        if let BeforeFrameInitResult::Reverted(reverted) = result {
+            // Warm from-SLOAD (100) + cold to-SLOAD (2100) = 2200
+            assert_eq!(
+                reverted.gas().spent(),
+                revm_interpreter::gas::WARM_STORAGE_READ_COST
+                    + revm_interpreter::gas::COLD_SLOAD_COST,
+                "Mixed warm/cold: warm from-SLOAD + cold to-SLOAD should be 2200"
+            );
+        } else {
+            panic!("Expected Reverted result for blocklisted recipient");
+        }
+    }
+
+    #[test]
+    fn test_zero6_nested_selfdestructed_target_charges_sload_gas() {
+        let db = CacheDB::new(EmptyDB::default());
+        let flags =
+            ArcHardforkFlags::with(&[ArcHardfork::Zero4, ArcHardfork::Zero5, ArcHardfork::Zero6]);
+        let mut evm = create_test_evm(db, flags);
+
+        let spec_id = evm.ctx().cfg.spec;
+        let journal = evm.ctx_mut().journal_mut();
+
+        journal.load_account(NATIVE_COIN_CONTROL_ADDRESS).unwrap();
+
+        journal
+            .load_account_mut_optional_code(ADDRESS_A, false)
+            .expect("load ADDRESS_A")
+            .set_balance(U256::from(100));
+
+        journal.load_account(ADDRESS_B).expect("load ADDRESS_B");
+        journal
+            .create_account_checkpoint(ADDRESS_A, ADDRESS_B, U256::from(100), spec_id)
+            .unwrap();
+        journal
+            .selfdestruct(ADDRESS_B, ADDRESS_A, false)
+            .expect("selfdestruct");
+
+        let frame = FrameInit {
+            frame_input: FrameInput::Call(Box::new(CallInputs {
+                scheme: CallScheme::Call,
+                target_address: ADDRESS_B,
+                bytecode_address: ADDRESS_A,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::from(100)),
+                input: CallInput::Bytes(Bytes::new()),
+                gas_limit: 100_000,
+                caller: ADDRESS_A,
+                is_static: false,
+                return_memory_offset: 0..0,
+            })),
+            memory: SharedMemory::default(),
+            depth: 1,
+        };
+
+        let result = evm.before_frame_init(&frame);
+        match result {
+            Ok(BeforeFrameInitResult::Reverted(reverted)) => {
+                assert_eq!(
+                    reverted.gas().spent(),
+                    2 * revm_interpreter::gas::COLD_SLOAD_COST,
+                    "Zero6 nested selfdestructed-target revert should charge two cold SLOADs"
+                );
+                let expected_revert = arc_precompiles::helpers::revert_message_to_bytes(
+                    ERR_SELFDESTRUCTED_BALANCE_INCREASED,
+                );
+                assert_eq!(
+                    reverted.interpreter_result().output,
+                    expected_revert,
+                    "revert reason should be ERR_SELFDESTRUCTED_BALANCE_INCREASED"
+                );
+            }
+            other => panic!(
+                "Expected Reverted for selfdestructed target, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_zero6_nested_blocklisted_oog_when_gas_below_sload_cost() {
+        let sender = address!("A000000000000000000000000000000000000001");
+        let recipient = address!("B000000000000000000000000000000000000002");
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let storage_slot = native_coin_control::compute_is_blocklisted_storage_slot(sender);
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            storage_slot.into(),
+            U256::from(1),
+        )
+        .unwrap();
+
+        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+        let mut evm = create_test_evm(db, flags);
+
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+            .unwrap();
+
+        // gas_limit just below COLD_SLOAD_COST — frame can't afford the SLOAD
+        let frame = FrameInit {
+            frame_input: FrameInput::Call(Box::new(CallInputs {
+                scheme: CallScheme::Call,
+                target_address: recipient,
+                bytecode_address: recipient,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::from(100)),
+                input: CallInput::Bytes(Bytes::new()),
+                gas_limit: revm_interpreter::gas::COLD_SLOAD_COST - 1,
+                is_static: false,
+                caller: sender,
+                return_memory_offset: 0..0,
+            })),
+            memory: SharedMemory::default(),
+            depth: 1,
+        };
+
+        let result = evm.before_frame_init(&frame).unwrap();
+        if let BeforeFrameInitResult::Reverted(reverted) = result {
+            assert_eq!(
+                reverted.instruction_result(),
+                InstructionResult::OutOfGas,
+                "Should OOG when gas_limit < SLOAD cost"
+            );
+            assert_eq!(
+                reverted.gas().spent(),
+                revm_interpreter::gas::COLD_SLOAD_COST - 1,
+                "OOG should consume all available gas"
+            );
+        } else {
+            panic!("Expected Reverted result for blocklisted sender with insufficient gas");
+        }
+    }
+
+    #[test]
+    fn test_zero6_nested_to_blocklisted_oog_when_gas_between_one_and_two_sloads() {
+        let sender = address!("A000000000000000000000000000000000000001");
+        let recipient = address!("B000000000000000000000000000000000000002");
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        // Only recipient is blocklisted — requires 2 SLOADs (from check + to check)
+        let storage_slot = native_coin_control::compute_is_blocklisted_storage_slot(recipient);
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            storage_slot.into(),
+            U256::from(1),
+        )
+        .unwrap();
+
+        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+        let mut evm = create_test_evm(db, flags);
+
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+            .unwrap();
+
+        // gas_limit between COLD_SLOAD_COST and 2*COLD_SLOAD_COST — enough for 1 SLOAD but not 2
+        let gas_limit = revm_interpreter::gas::COLD_SLOAD_COST + 100;
+        let frame = FrameInit {
+            frame_input: FrameInput::Call(Box::new(CallInputs {
+                scheme: CallScheme::Call,
+                target_address: recipient,
+                bytecode_address: recipient,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::from(100)),
+                input: CallInput::Bytes(Bytes::new()),
+                gas_limit,
+                is_static: false,
+                caller: sender,
+                return_memory_offset: 0..0,
+            })),
+            memory: SharedMemory::default(),
+            depth: 1,
+        };
+
+        let result = evm.before_frame_init(&frame).unwrap();
+        if let BeforeFrameInitResult::Reverted(reverted) = result {
+            assert_eq!(
+                reverted.instruction_result(),
+                InstructionResult::OutOfGas,
+                "Should OOG when gas_limit < 2 * SLOAD cost for to-blocklisted"
+            );
+            assert_eq!(
+                reverted.gas().spent(),
+                gas_limit,
+                "OOG should consume all available gas"
+            );
+        } else {
+            panic!("Expected Reverted result for blocklisted recipient with insufficient gas");
+        }
+    }
+
+    /// ----- Revm upgrade checklist -----
     /// Guard against silent drift when upgrading revm. If this test fails, the revm
     /// dependency version has changed and the forked/mirrored functions below must be
     /// reviewed for upstream behavioral changes:

@@ -254,7 +254,7 @@ async fn handle_consensus(
         AppMsg::GetHistoryMinHeight { reply } => {
             let _guard = state.metrics.start_msg_process_timer("GetHistoryMinHeight");
 
-            get_history_min_height::handle(state, reply).await?;
+            get_history_min_height::handle(state, engine, reply).await?;
         }
 
         // Request to re-stream a proposal that was previously seen at valid_round or round (if valid_round is Nil).
@@ -306,7 +306,7 @@ async fn handle_app_request(req: AppRequest, state: &State, engine: &Engine) -> 
                 })?;
 
             let info = match result {
-                Some(certificate) => get_certificate_info(state, engine, certificate).await,
+                Some(certificate) => get_certificate_info(&state.ctx, engine, certificate).await,
                 None => None,
             };
 
@@ -369,31 +369,38 @@ async fn handle_app_request(req: AppRequest, state: &State, engine: &Engine) -> 
                 error!("GetHealth: Failed to reply: {e:?}");
             }
         }
+
+        AppRequest::GetSyncState(reply) => {
+            if let Err(e) = reply.send(state.sync_state) {
+                error!("GetSyncState: Failed to reply: {e:?}");
+            }
+        }
     }
 
     Ok(())
 }
 
 async fn get_certificate_info(
-    state: &State,
+    ctx: &ArcContext,
     engine: &Engine,
     stored: StoredCommitCertificate,
 ) -> Option<CommitCertificateInfo> {
+    // The validator set that signed the certificate is the one *before* executing that block,
+    // since the block itself could contain validator set changes.
+    let prev_height = stored.certificate.height.as_u64().saturating_sub(1);
     let validator_set = engine
         .eth
-        .get_active_validator_set(stored.certificate.height.as_u64())
+        .get_active_validator_set(prev_height)
         .await
         .ok()?;
 
     let proposer = stored.proposer.unwrap_or_else(|| {
-        state
-            .ctx
-            .select_proposer(
-                &validator_set,
-                stored.certificate.height,
-                stored.certificate.round,
-            )
-            .address
+        ctx.select_proposer(
+            &validator_set,
+            stored.certificate.height,
+            stored.certificate.round,
+        )
+        .address
     });
 
     Some(CommitCertificateInfo {
@@ -401,4 +408,74 @@ async fn get_certificate_info(
         certificate_type: stored.certificate_type,
         proposer,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arc_consensus_types::{
+        Address, BlockHash, CommitCertificate, CommitCertificateType, Height, Round, ValueId,
+    };
+    use arc_eth_engine::engine::{MockEngineAPI, MockEthereumAPI};
+    use mockall::predicate::eq;
+
+    fn stored_cert(height: u64) -> StoredCommitCertificate {
+        StoredCommitCertificate {
+            certificate: CommitCertificate::new(
+                Height::new(height),
+                Round::new(0),
+                ValueId::new(BlockHash::new([0xAA; 32])),
+                vec![],
+            ),
+            certificate_type: CommitCertificateType::Minimal,
+            // Set so get_certificate_info skips select_proposer (keeps the test focused
+            // on the validator set lookup).
+            proposer: Some(Address::new([0x42; 20])),
+        }
+    }
+
+    /// get_certificate_info must fetch the validator set at `certificate.height - 1` — the
+    /// set that signed the certificate, i.e. the state *before* executing the certified block.
+    #[tokio::test]
+    async fn get_certificate_info_queries_validator_set_at_prev_height() {
+        let cert_height = 42u64;
+
+        let mut mock_eth = MockEthereumAPI::new();
+        mock_eth
+            .expect_get_active_validator_set()
+            .with(eq(cert_height - 1))
+            .once()
+            .returning(|_| Ok(Default::default()));
+
+        let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(mock_eth));
+        let ctx = ArcContext::default();
+
+        let info = get_certificate_info(&ctx, &engine, stored_cert(cert_height))
+            .await
+            .expect("should return Some");
+
+        assert_eq!(info.certificate.height, Height::new(cert_height));
+    }
+
+    /// At genesis (height 0), the saturating subtraction must keep the query at 0 rather
+    /// than underflowing.
+    #[tokio::test]
+    async fn get_certificate_info_handles_genesis_height() {
+        let mut mock_eth = MockEthereumAPI::new();
+        mock_eth
+            .expect_get_active_validator_set()
+            .with(eq(0u64))
+            .once()
+            .returning(|_| Ok(Default::default()));
+
+        let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(mock_eth));
+        let ctx = ArcContext::default();
+
+        let info = get_certificate_info(&ctx, &engine, stored_cert(0))
+            .await
+            .expect("should return Some");
+
+        assert_eq!(info.certificate.height, Height::new(0));
+    }
 }

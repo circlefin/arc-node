@@ -34,8 +34,12 @@ use crate::versions::{
     ProposalPartsVersion,
 };
 
+// All encode_* functions prepend a 1-byte version tag to the serialized payload.
+// The `1 + len` capacity calculation cannot overflow because any valid allocation
+// already fits in usize and adding 1 byte stays within bounds.
 pub fn encode_execution_payload(payload: &ExecutionPayloadV3) -> Vec<u8> {
     let ssz_bytes = payload.as_ssz_bytes();
+    #[allow(clippy::arithmetic_side_effects)]
     let mut bytes = Vec::with_capacity(1 + ssz_bytes.len());
     bytes.push(ExecutionPayloadVersion::V3 as u8);
     bytes.extend_from_slice(&ssz_bytes);
@@ -46,6 +50,7 @@ pub fn encode_proposal_parts(parts: &ProposalParts) -> Result<Vec<u8>, malachite
     let proto = proto_funcs::encode_proposal_parts(parts)?;
     let proto_bytes = proto.encode_to_vec();
     // version byte + encoded protobuf
+    #[allow(clippy::arithmetic_side_effects)]
     let mut bytes = Vec::with_capacity(1 + proto_bytes.len());
     bytes.push(ProposalPartsVersion::V1 as u8);
     bytes.extend_from_slice(&proto_bytes);
@@ -59,6 +64,7 @@ pub fn encode_certificate(
     let proto = proto_funcs::encode_store_commit_certificate(certificate)?;
     let proto_bytes = proto.encode_to_vec();
     // version byte + encoded protobuf
+    #[allow(clippy::arithmetic_side_effects)]
     let mut bytes = Vec::with_capacity(1 + proto_bytes.len());
     bytes.push(CommitCertificateVersion::V1 as u8);
     bytes.extend_from_slice(&proto_bytes);
@@ -70,6 +76,7 @@ pub fn encode_block(block: &ConsensusBlock) -> Bytes {
     let data = block_as_ssz_data(block);
     let ssz_bytes = data.as_ssz_bytes();
     // version byte + encoded SSZ
+    #[allow(clippy::arithmetic_side_effects)]
     let mut bytes = Vec::with_capacity(1 + ssz_bytes.len());
     bytes.push(ConsensusBlockVersion::V1 as u8);
     bytes.extend_from_slice(&ssz_bytes);
@@ -80,20 +87,25 @@ pub fn encode_block(block: &ConsensusBlock) -> Bytes {
 pub fn encode_proposal_monitor_data(
     data: &ProposalMonitor,
 ) -> Result<Vec<u8>, malachitebft_proto::Error> {
-    // SystemTime is converted to milliseconds since UNIX_EPOCH
+    // SystemTime is converted to milliseconds since UNIX_EPOCH.
+    // u64 millis covers ~584 million years from epoch — truncation is unreachable.
     let start_time_ms = {
         let duration = data
             .start_time
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        duration.as_millis() as u64
+        #[allow(clippy::cast_possible_truncation)]
+        let ms = duration.as_millis() as u64;
+        ms
     };
 
     let receive_time_ms = data
         .proposal_receive_time
         .map(|t| {
             let duration = t.duration_since(UNIX_EPOCH).unwrap_or_default();
-            duration.as_millis() as u64
+            #[allow(clippy::cast_possible_truncation)]
+            let ms = duration.as_millis() as u64;
+            ms
         })
         .unwrap_or(0);
 
@@ -117,6 +129,7 @@ pub fn encode_proposal_monitor_data(
 
     let proto_bytes = proto_data.encode_to_vec();
     // version byte + encoded protobuf
+    #[allow(clippy::arithmetic_side_effects)]
     let mut bytes = Vec::with_capacity(1 + proto_bytes.len());
     bytes.push(ProposalMonitorDataVersion::V1 as u8);
     bytes.extend_from_slice(&proto_bytes);
@@ -168,6 +181,7 @@ pub fn encode_misbehavior_evidence(
 
     let proto_bytes = proto_evidence.encode_to_vec();
     // version byte + encoded protobuf
+    #[allow(clippy::arithmetic_side_effects)]
     let mut bytes = Vec::with_capacity(1 + proto_bytes.len());
     bytes.push(MisbehaviorEvidenceVersion::V1 as u8);
     bytes.extend_from_slice(&proto_bytes);
@@ -203,6 +217,7 @@ pub fn encode_invalid_payloads(
 
     let proto_bytes = proto_payloads.encode_to_vec();
     // version byte + encoded protobuf
+    #[allow(clippy::arithmetic_side_effects)]
     let mut bytes = Vec::with_capacity(1 + proto_bytes.len());
     bytes.push(InvalidPayloadsVersion::V1 as u8);
     bytes.extend_from_slice(&proto_bytes);

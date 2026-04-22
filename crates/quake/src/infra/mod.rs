@@ -38,22 +38,22 @@ pub(crate) const COMPOSE_PROJECT_NAME: &str = "arc_testnet";
 
 pub(crate) const INFRA_DATA_FILENAME: &str = "infra-data.json";
 
-const PROMETHEUS_PORT: usize = 9090;
-const GRAFANA_PORT: usize = 3000;
-const BLOCKSCOUT_PORT: usize = 80;
+const PROMETHEUS_PORT: u16 = 9090;
+const GRAFANA_PORT: u16 = 3000;
+const BLOCKSCOUT_PORT: u16 = 80;
 
 // Use ports >1024: AWS SSM can only bind to ports <1024 when the client process runs as root.
-const PROMETHEUS_SSM_PORT: usize = 19090;
-const GRAFANA_SSM_PORT: usize = 13000;
-const BLOCKSCOUT_SSM_PORT: usize = 8000;
+const PROMETHEUS_SSM_PORT: u16 = 19090;
+const GRAFANA_SSM_PORT: u16 = 13000;
+const BLOCKSCOUT_SSM_PORT: u16 = 8000;
 
 // RPC Proxy port on CC for routing RPC requests to nodes
-pub(crate) const RPC_PROXY_PORT: usize = 8080;
-pub(crate) const RPC_PROXY_SSM_PORT: usize = 18080;
+pub(crate) const RPC_PROXY_PORT: u16 = 8080;
+pub(crate) const RPC_PROXY_SSM_PORT: u16 = 18080;
 
 // Pprof Proxy port on CC for routing pprof requests to nodes
-const PPROF_PROXY_PORT: usize = 6060;
-pub(crate) const PPROF_PROXY_SSM_PORT: usize = 16060;
+const PPROF_PROXY_PORT: u16 = 6060;
+pub(crate) const PPROF_PROXY_SSM_PORT: u16 = 16060;
 
 #[derive(Debug, Default, Copy, Clone, ValueEnum)]
 pub(crate) enum BuildProfile {
@@ -258,7 +258,9 @@ impl InfraData {
         }
     }
 
-    pub fn monitoring_ports(&self) -> (usize, usize, usize) {
+    /// Local testnets expose these services directly. Remote testnets expose
+    /// them through the Control Center SSM forwards instead.
+    pub fn monitoring_ports(&self) -> (u16, u16, u16) {
         match self.infra_type {
             InfraType::Local => (PROMETHEUS_PORT, GRAFANA_PORT, BLOCKSCOUT_PORT),
             InfraType::Remote => (PROMETHEUS_SSM_PORT, GRAFANA_SSM_PORT, BLOCKSCOUT_SSM_PORT),
@@ -272,7 +274,7 @@ pub(crate) struct NodeInfraData {
     pub public_ip: IpAddress,
     pub instance_id: Option<String>,
     // Mapping of remote to local ports for SSM tunnels (remote mode only).
-    pub ssm_tunnel_ports: Option<HashMap<usize, usize>>,
+    pub ssm_tunnel_ports: Option<HashMap<u16, u16>>,
     /// Map of subnet name to private IP for that subnet.
     /// Bridge nodes have multiple entries (one per ENI/network).
     /// Guaranteed non-empty by the custom deserializer.

@@ -331,6 +331,7 @@ impl QuakeMcpServer {
             show_mesh: true,
             show_peers: false,
             show_peers_full: false,
+            show_duplicates: false,
         };
         let report = crate::mesh::format_report(&analysis, &options);
         Ok(CallToolResult::success(vec![Content::text(report)]))
@@ -346,7 +347,8 @@ impl QuakeMcpServer {
         let testnet = self.testnet.read().await;
         let metrics_urls = testnet.nodes_metadata.all_consensus_metrics_urls();
         let raw_metrics = arc_checks::fetch_all_metrics(&metrics_urls).await;
-        let mut nodes = arc_checks::parse_perf_metrics(&raw_metrics);
+        let nodes =
+            crate::util::parse_perf_metrics_with_groups(&raw_metrics, &testnet.manifest.nodes);
 
         if nodes.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -354,13 +356,12 @@ impl QuakeMcpServer {
             )]));
         }
 
-        crate::util::assign_node_groups(
-            nodes.iter_mut().map(|n| (n.name.as_str(), &mut n.group)),
-            &testnet.manifest.nodes,
-        );
-
         let options = arc_checks::PerfDisplayOptions::default();
-        let report = arc_checks::format_perf_report(&nodes, &options);
+        let report = arc_checks::format_perf_report(
+            &nodes,
+            &options,
+            arc_checks::PerfReportKind::CumulativeSinceStart,
+        );
         Ok(CallToolResult::success(vec![Content::text(report)]))
     }
 
@@ -403,17 +404,18 @@ impl QuakeMcpServer {
     )]
     async fn start_nodes(
         &self,
-        params: Parameters<NodeNamesParams>,
+        params: Parameters<StartNodeParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.ensure_ssm_tunnels().await?;
         let names = params.0.nodes.unwrap_or_default();
+        let monitoring = params.0.monitoring.unwrap_or(true);
         let label = if names.is_empty() {
             "all nodes".to_string()
         } else {
             names.join(", ")
         };
         let testnet = self.testnet.read().await;
-        testnet.start(names).await.map_err(|e| {
+        testnet.start(names, monitoring).await.map_err(|e| {
             rmcp::ErrorData::internal_error(format!("Failed to start nodes: {e}"), None)
         })?;
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -502,10 +504,11 @@ impl QuakeMcpServer {
     )]
     async fn restart_testnet(
         &self,
-        params: Parameters<NodeNamesParams>,
+        params: Parameters<StartNodeParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.ensure_ssm_tunnels().await?;
         let names = params.0.nodes.unwrap_or_default();
+        let monitoring = params.0.monitoring.unwrap_or(true);
         let label = if names.is_empty() {
             "all nodes".to_string()
         } else {
@@ -519,7 +522,7 @@ impl QuakeMcpServer {
         }
         {
             let testnet = self.testnet.read().await;
-            testnet.start(names).await.map_err(|e| {
+            testnet.start(names, monitoring).await.map_err(|e| {
                 rmcp::ErrorData::internal_error(format!("Failed to start nodes: {e}"), None)
             })?;
         }
@@ -869,7 +872,8 @@ impl QuakeMcpServer {
     /// Only available for remote testnets.
     ///
     /// Actions:
-    ///   "start" — opens inactive tunnels (idempotent)
+    ///   "start" — ensures tunnels are usable and recreates stale ones if
+    ///             needed
     ///   "stop"  — closes all active tunnels
     ///   "list"  — shows active tunnel status
     #[tool(
@@ -968,6 +972,15 @@ impl QuakeMcpServer {
 struct NodeNamesParams {
     /// Optional list of node or container names. If empty or omitted, applies to all nodes.
     nodes: Option<Vec<String>>,
+}
+
+/// Parameters for start/restart tools that accept node names and monitoring control.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct StartNodeParams {
+    /// Optional list of node or container names. If empty or omitted, applies to all nodes.
+    nodes: Option<Vec<String>>,
+    /// Start monitoring services (Prometheus, Grafana, cAdvisor, Blockscout). Defaults to true.
+    monitoring: Option<bool>,
 }
 
 /// Parameters for the clean_testnet tool.
@@ -1099,7 +1112,10 @@ impl QuakeMcpServer {
     /// Ensure SSM tunnels are active before performing remote operations.
     ///
     /// For local testnets this is a no-op. For remote testnets it calls the
-    /// idempotent `ssm_tunnels.start()` which only opens inactive sessions.
+    /// idempotent `ssm_tunnels.start()` which ensures the expected tunnels are
+    /// usable, recreates stale AWS sessions when needed, and fails if some
+    /// other local process is already listening on one of Quake's expected
+    /// localhost ports.
     async fn ensure_ssm_tunnels(&self) -> Result<(), rmcp::ErrorData> {
         let ssm = {
             let testnet = self.testnet.read().await;

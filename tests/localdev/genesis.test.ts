@@ -16,7 +16,17 @@
 
 import hre from 'hardhat'
 import { expect } from 'chai'
-import { createWalletClient, encodeDeployData, Hex, http, keccak256, parseAbi, parseGwei, toHex } from 'viem'
+import {
+  createWalletClient,
+  encodeDeployData,
+  Hex,
+  http,
+  keccak256,
+  parseAbi,
+  parseGwei,
+  toHex,
+  zeroAddress,
+} from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import {
   Denylist,
@@ -182,7 +192,8 @@ describe('genesis', () => {
       expect(owner.toLowerCase()).to.be.eq(expectAddr.admin)
       expect(controller.toLowerCase()).to.be.eq(expectAddr.admin)
       expect(pauser.toLowerCase()).to.be.eq(expectAddr.admin)
-      expect(beneficiary.toLowerCase()).to.be.eq(expectAddr.proxyAdmin)
+      // Zero sentinel: EL honors the CL-provided --suggested-fee-recipient per validator.
+      expect(beneficiary.toLowerCase()).to.be.eq(zeroAddress)
     })
 
     it('fee params', async () => {

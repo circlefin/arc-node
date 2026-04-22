@@ -31,7 +31,6 @@ use crate::capabilities::EngineCapabilities;
 use crate::constants::*;
 use crate::engine::EngineAPI;
 use crate::ipc::ipc_builder::Ipc;
-use crate::retry::NoRetry;
 
 /// Engine API client for connecting to Engine IPC via Unix Domain Socket.
 pub struct EngineIPC {
@@ -54,6 +53,14 @@ impl EngineIPC {
     pub async fn new_with_timeout(socket_path: &str, timeout: Duration) -> eyre::Result<Self> {
         let ipc = Ipc::new_with_timeout(socket_path, timeout).await?;
         Ok(Self { ipc })
+    }
+
+    /// Returns a future that resolves when the IPC connection closes.
+    pub fn on_disconnect(&self) -> impl std::future::Future<Output = ()> + 'static {
+        let client = self.ipc.client_arc();
+        async move {
+            let _ = client.on_disconnect().await;
+        }
     }
 
     /// Send an RPC request to the Engine RPC endpoint via IPC.
@@ -110,7 +117,7 @@ impl EngineAPI for EngineIPC {
             ENGINE_FORKCHOICE_UPDATED_V3,
             params,
             ENGINE_FORKCHOICE_UPDATED_TIMEOUT,
-            NoRetry,
+            ENGINE_API_RETRY_IPC.build(),
         )
         .await
     }
@@ -130,7 +137,7 @@ impl EngineAPI for EngineIPC {
                     ENGINE_GET_PAYLOAD_V5,
                     rpc_params![payload_id],
                     ENGINE_GET_PAYLOAD_TIMEOUT,
-                    NoRetry,
+                    ENGINE_API_RETRY_IPC.build(),
                 )
                 .await?;
             Ok(execution_payload)
@@ -140,7 +147,7 @@ impl EngineAPI for EngineIPC {
                     ENGINE_GET_PAYLOAD_V4,
                     rpc_params![payload_id],
                     ENGINE_GET_PAYLOAD_TIMEOUT,
-                    NoRetry,
+                    ENGINE_API_RETRY_IPC.build(),
                 )
                 .await?;
             Ok(envelope_inner.execution_payload)
@@ -169,7 +176,7 @@ impl EngineAPI for EngineIPC {
             ENGINE_NEW_PAYLOAD_V4,
             params,
             ENGINE_NEW_PAYLOAD_TIMEOUT,
-            NoRetry,
+            ENGINE_API_RETRY_IPC.build(),
         )
         .await
     }

@@ -47,7 +47,11 @@ fn derive_bip39_child_sk_bytes(start_index: usize, count: usize) -> Result<Vec<[
 
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
+        // start_index and count are small test constants; cannot overflow
+        #[allow(clippy::arithmetic_side_effects)]
         let idx = start_index + i;
+        // idx is bounded by start_index + count, both small; fits in u32
+        #[allow(clippy::cast_possible_truncation)]
         let cn =
             ChildNumber::new(idx as u32, false).map_err(|e| Error::DeriveBip39(e.to_string()))?;
         let child = base_xprv

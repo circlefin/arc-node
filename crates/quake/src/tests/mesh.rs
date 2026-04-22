@@ -170,6 +170,8 @@ pub(super) fn check_strict(
     }
 }
 
+const MAX_DUPLICATE_PCT: f64 = 98.0;
+
 /// Run mesh analysis and optionally enforce strict tier expectations.
 ///
 /// Fetches gossipsub metrics, analyzes topology, classifies and categorizes
@@ -200,6 +202,7 @@ pub(super) async fn run_mesh_checks(
             show_mesh: true,
             show_peers: false,
             show_peers_full: false,
+            show_duplicates: true,
         };
         println!();
         print!("{}", format_report(&analysis, &options));
@@ -269,6 +272,31 @@ pub(super) async fn run_mesh_checks(
             )),
         }
     }
+
+    for node in &nodes_data {
+        let mc = &node.message_counts;
+        if mc.unfiltered == 0 {
+            continue;
+        }
+        let pct = mc.duplicate_pct();
+        let passed = pct <= MAX_DUPLICATE_PCT;
+        let check_name = if label.is_empty() {
+            format!("dup:{}", node.moniker)
+        } else {
+            format!("{label}:dup:{}", node.moniker)
+        };
+        let message = format!(
+            "{pct:.1}% duplicates ({} / {} unfiltered, threshold {MAX_DUPLICATE_PCT:.1}%)",
+            mc.duplicates(),
+            mc.unfiltered,
+        );
+        if passed {
+            checks.push(CheckResult::success(check_name, message));
+        } else {
+            checks.push(CheckResult::failure(check_name, message));
+        }
+    }
+
     Ok(checks)
 }
 
@@ -282,6 +310,7 @@ pub(super) async fn run_mesh_checks(
 ///   - External validators (behind sentries): must not be isolated
 ///   - Sentries and full nodes (consensus enabled): must not be isolated
 ///   - Nodes with consensus disabled or follow mode: skipped
+///   - Duplicate rate must stay under 98%
 #[quake_test(group = "mesh", name = "health")]
 fn health_test<'a>(
     testnet: &'a Testnet,

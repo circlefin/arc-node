@@ -1,11 +1,13 @@
 # Install
 
-The Arc node binaries can be installed by [building from source](#build-from-source).
+The Arc node binaries can be installed in two ways:
+downloading pre-built binaries via [`arcup`](#pre-built-binary),
+or by building them from [source](#build-from-source).
 
 After the installation, refer to [Running an Arc Node](./running-an-arc-node.md)
 for how to run an Arc node.
 
-> **Pre-built binaries** and **Docker images** are coming soon.
+> **Docker:** Container images and Docker Compose instructions are coming soon.
 
 ## Versions
 
@@ -15,6 +17,43 @@ Consult the table below to confirm which version to run for each network.
 | Network     | Version |
 |-------------|---------|
 | Arc Testnet | v0.6.0  |
+
+## Pre-built Binary
+
+This repository includes `arcup`, a script that installs Arc node binaries
+into `$ARC_BIN_DIR` directory, defaulting to `~/.arc/bin`:
+
+```sh
+curl -L https://raw.githubusercontent.com/circlefin/arc-node/main/arcup/install | bash
+```
+
+More precisely, the [configured paths](./running-an-arc-node.md#configure-paths)
+for Arc nodes are based on the `$ARC_HOME` variable, with `~/.arc` as default value.
+If `$ARC_BIN_DIR` is not set, its default value is `$ARC_HOME/bin`, defaulting
+to `~/.arc/bin`.
+`$ARC_BIN_DIR` must be part of the system `PATH`.
+
+To be sure that the binaries installed under `$ARC_BIN_DIR` are available in
+the `PATH`, load the produced environment file:
+
+```sh
+source $ARC_HOME/env
+```
+
+Next, verify that the three Arc binaries are installed:
+
+```sh
+arc-snapshots --version
+arc-node-execution --version
+arc-node-consensus --version
+```
+
+The `arcup` script should also be in the `PATH`
+and can be used to update Arc binaries:
+
+```sh
+arcup
+```
 
 ## Build from Source
 

@@ -9,6 +9,7 @@ variable "IMAGES" {
   default = [
     { name = "execution" },
     { name = "consensus" },
+    { name = "engine-bench" },
   ]
 }
 

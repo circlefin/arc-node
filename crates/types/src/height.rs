@@ -38,7 +38,7 @@ impl Height {
     }
 
     pub fn increment(&self) -> Self {
-        Self(self.0 + 1)
+        Self(self.0.checked_add(1).expect("block height overflow"))
     }
 
     pub fn decrement(&self) -> Option<Self> {
@@ -73,7 +73,7 @@ impl malachitebft_core_types::Height for Height {
     const INITIAL: Self = Self(1);
 
     fn increment_by(&self, n: u64) -> Self {
-        Self(self.0 + n)
+        Self(self.0.checked_add(n).expect("block height overflow"))
     }
 
     fn decrement_by(&self, n: u64) -> Option<Self> {

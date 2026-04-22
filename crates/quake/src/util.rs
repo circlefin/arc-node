@@ -67,6 +67,36 @@ pub fn assign_node_groups<'a>(
     }
 }
 
+/// Parse perf metrics and assign Validator / Non-Validator groups from the manifest.
+///
+/// Combines [`arc_checks::parse_perf_metrics`] with [`assign_node_groups`] (same idea as
+/// [`crate::mesh::parse_and_classify_metrics`] for mesh).
+pub fn parse_perf_metrics_with_groups(
+    raw_metrics: &[(String, String)],
+    manifest_nodes: &IndexMap<String, Node>,
+) -> Vec<arc_checks::NodePerfData> {
+    let mut nodes = arc_checks::parse_perf_metrics(raw_metrics);
+    assign_node_groups(
+        nodes.iter_mut().map(|n| (n.name.as_str(), &mut n.group)),
+        manifest_nodes,
+    );
+    nodes
+}
+
+/// Parse perf metrics from the delta between two scrapes and assign groups from the manifest.
+pub fn parse_perf_metrics_delta_with_groups(
+    raw_before: &[(String, String)],
+    raw_after: &[(String, String)],
+    manifest_nodes: &IndexMap<String, Node>,
+) -> Vec<arc_checks::NodePerfData> {
+    let mut nodes = arc_checks::parse_perf_metrics_delta(raw_before, raw_after);
+    assign_node_groups(
+        nodes.iter_mut().map(|n| (n.name.as_str(), &mut n.group)),
+        manifest_nodes,
+    );
+    nodes
+}
+
 /// Override mesh-analysis node types using the manifest's authoritative NodeType.
 ///
 /// The mesh-analysis crate infers node types from Prometheus `peer_type` labels,

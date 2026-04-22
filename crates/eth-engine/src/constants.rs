@@ -74,6 +74,13 @@ pub const ENGINE_EXCHANGE_CAPABILITIES_RETRY_IPC: backon::FibonacciBuilder =
         .with_max_delay(Duration::from_secs(1))
         .with_max_times(30);
 
+// Retry policy for IPC Engine API calls (newPayload, forkchoiceUpdated, getPayload).
+// All three are idempotent per the Engine API spec.
+pub const ENGINE_API_RETRY_IPC: backon::FibonacciBuilder = backon::FibonacciBuilder::new()
+    .with_min_delay(Duration::from_millis(200))
+    .with_max_delay(Duration::from_secs(2))
+    .with_max_times(5);
+
 // Engine API retries for RPC -- First call to `reth`, keep retrying indefinitely.
 pub const ENGINE_EXCHANGE_CAPABILITIES_RETRY_RPC: backon::ConstantBuilder =
     backon::ConstantBuilder::new()

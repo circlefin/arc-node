@@ -2,10 +2,21 @@
 # enabled by default.
 cl.config.execution.persistence_backpressure = true
 
+# All 5 validators use 0x65E0a200006D4FF91bD59F9694220dafc49dbBC1 (LOCALDEV_FEE_RECIPIENT) as
+# cl_suggested_fee_recipient so tests can hard-code a single known beneficiary address.
 [nodes.validator1]
+cl_suggested_fee_recipient = "0x65E0a200006D4FF91bD59F9694220dafc49dbBC1"
+
 [nodes.validator2]
+cl_suggested_fee_recipient = "0x65E0a200006D4FF91bD59F9694220dafc49dbBC1"
+
 [nodes.validator3]
+cl_suggested_fee_recipient = "0x65E0a200006D4FF91bD59F9694220dafc49dbBC1"
+
 [nodes.validator4]
+cl_suggested_fee_recipient = "0x65E0a200006D4FF91bD59F9694220dafc49dbBC1"
+
 [nodes.validator5]
+cl_suggested_fee_recipient = "0x65E0a200006D4FF91bD59F9694220dafc49dbBC1"
 
 [nodes.full1]
