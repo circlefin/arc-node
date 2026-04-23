@@ -725,7 +725,7 @@ impl App {
 
         // Start the pprof server if enabled
         if let Some(pprof_bind_address) = self.start_config.pprof_bind_address {
-            spawn_pprof_server(pprof_bind_address);
+            spawn_pprof_server(pprof_bind_address, self.start_config.pprof_heap_prof);
         }
 
         Ok(Handle {
@@ -867,7 +867,16 @@ async fn wait_for_termination() {
 }
 
 #[cfg(feature = "pprof")]
-fn spawn_pprof_server(bind_address: std::net::SocketAddr) {
+fn spawn_pprof_server(bind_address: std::net::SocketAddr, heap_prof: bool) {
+    if heap_prof {
+        // SAFETY: writing a bool to a well-known jemalloc mallctl key.
+        if let Err(e) = unsafe { tikv_jemalloc_ctl::raw::write(b"prof.active\0", true) } {
+            tracing::error!(error = %e, "failed to activate jemalloc heap profiling; /debug/pprof/allocs will return empty profiles");
+        } else {
+            tracing::info!("jemalloc heap profiling activated");
+        }
+    }
+
     tokio::spawn(async move {
         if let Err(e) =
             pprof_hyper_server::serve(bind_address, pprof_hyper_server::Config::default()).await
@@ -878,7 +887,7 @@ fn spawn_pprof_server(bind_address: std::net::SocketAddr) {
 }
 
 #[cfg(not(feature = "pprof"))]
-fn spawn_pprof_server(_bind_address: std::net::SocketAddr) {}
+fn spawn_pprof_server(_bind_address: std::net::SocketAddr, _heap_prof: bool) {}
 
 #[cfg(test)]
 mod tests {

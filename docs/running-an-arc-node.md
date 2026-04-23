@@ -18,8 +18,6 @@ An Arc node is composed of two processes:
 Refer to the [installation](installation.md) instructions to install
 `arc-node-execution` (EL) and `arc-node-consensus` (CL).
 
-> **Docker:** Container images and Docker Compose instructions are coming soon.
-
 ### Configure paths
 
 This guide adopts the following variables to define paths of Arc components:
@@ -169,6 +167,8 @@ arc-node-consensus start \
   --follow.endpoint https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network \
   --follow.endpoint https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network \
   --follow.endpoint https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network/websocket \
+  --execution-persistence-backpressure \
+  --execution-persistence-backpressure-threshold=50 \
   --metrics 127.0.0.1:29000
 ```
 
@@ -202,6 +202,9 @@ If it remains `0x0`, check the logs of the consensus layer for errors.
 > a local JSON-RPC API.
 > If the address and port of the HTTP endpoint are configured differently than
 > the above example, adapt the command accordingly.
+
+> **Docker:** For running with Docker Compose instead of binaries, see
+> [Running an Arc Node with Docker](running-an-arc-node-docker.md).
 
 ## Separated hosts
 
@@ -373,6 +376,8 @@ ExecStart=/usr/local/bin/arc-node-consensus start \
   --follow.endpoint https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network \
   --follow.endpoint https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network \
   --follow.endpoint https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network/websocket \
+  --execution-persistence-backpressure \
+  --execution-persistence-backpressure-threshold=50 \
   --metrics 127.0.0.1:29000
 
 Restart=always

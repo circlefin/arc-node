@@ -122,6 +122,8 @@ pub struct StartConfig {
     pub execution_jwt: Option<String>,
     /// The bind address for the pprof server
     pub pprof_bind_address: Option<SocketAddr>,
+    /// Whether to activate jemalloc heap profiling
+    pub pprof_heap_prof: bool,
     /// The address to receive the fees and rewards from the execution layer
     pub suggested_fee_recipient: Option<Address>,
     /// Skip database schema upgrade on startup
@@ -301,6 +303,7 @@ mod tests {
             execution_ws_endpoint: None,
             execution_jwt: None,
             pprof_bind_address: None,
+            pprof_heap_prof: false,
             suggested_fee_recipient: None,
             skip_db_upgrade: false,
             validator: false,
@@ -332,6 +335,7 @@ mod tests {
             execution_ws_endpoint: None,
             execution_jwt: None,
             pprof_bind_address: None,
+            pprof_heap_prof: false,
             suggested_fee_recipient: None,
             skip_db_upgrade: false,
             validator: false,
@@ -359,6 +363,7 @@ mod tests {
             execution_ws_endpoint: None,
             execution_jwt: None,
             pprof_bind_address: None,
+            pprof_heap_prof: false,
             suggested_fee_recipient: None,
             skip_db_upgrade: false,
             validator: false,
@@ -385,6 +390,7 @@ mod tests {
             execution_ws_endpoint: None,
             execution_jwt: None,
             pprof_bind_address: None,
+            pprof_heap_prof: false,
             suggested_fee_recipient: None,
             skip_db_upgrade: false,
             validator: false,

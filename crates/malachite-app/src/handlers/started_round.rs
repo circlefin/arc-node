@@ -28,11 +28,12 @@ use arc_signer::ArcSigningProvider;
 
 use crate::block::ConsensusBlock;
 use crate::metrics::AppMetrics;
-use crate::payload::{validate_consensus_block, EnginePayloadValidator};
+use crate::payload::{validate_consensus_block, EnginePayloadValidator, PayloadValidator};
 use crate::proposal_parts::{
     assemble_block_from_parts, resolve_expected_proposer, validate_proposal_parts,
 };
 use crate::state::State;
+use crate::store::repositories::{InvalidPayloadsRepository, UndecidedBlocksRepository};
 use crate::store::Store;
 use arc_consensus_db::invalid_payloads::InvalidPayload;
 
@@ -143,9 +144,15 @@ async fn fetch_and_process_pending_proposals(
     .await
     .wrap_err("Failed to validate pending proposal parts")?;
 
-    let blocks = validate_undecided_blocks(height, round, store, engine, metrics)
-        .await
-        .wrap_err("failed to validate undecided blocks")?;
+    let blocks = validate_undecided_blocks(
+        height,
+        round,
+        store,
+        &EnginePayloadValidator::new(engine, metrics),
+        store,
+    )
+    .await
+    .wrap_err("failed to validate undecided blocks")?;
 
     Ok(blocks.iter().map(ProposedValue::from).collect())
 }
@@ -222,12 +229,12 @@ async fn process_pending_proposal_parts(
 async fn validate_undecided_blocks(
     height: Height,
     round: Round,
-    store: &Store,
-    engine: &Engine,
-    metrics: &AppMetrics,
+    undecided_blocks: &impl UndecidedBlocksRepository,
+    payload_validator: &impl PayloadValidator,
+    invalid_payloads: &impl InvalidPayloadsRepository,
 ) -> eyre::Result<Vec<ConsensusBlock>> {
-    let undecided_blocks = store
-        .get_undecided_blocks(height, round)
+    let blocks = undecided_blocks
+        .get_by_round(height, round)
         .await
         .wrap_err_with(|| {
             format!(
@@ -237,21 +244,21 @@ async fn validate_undecided_blocks(
         })?;
 
     // Holds all blocks that were validated (either valid or invalid)
-    let mut validated_blocks = Vec::with_capacity(undecided_blocks.len());
-    let validator = EnginePayloadValidator::new(engine, metrics);
+    let mut validated_blocks = Vec::with_capacity(blocks.len());
 
-    for mut block in undecided_blocks {
+    for mut block in blocks {
         let block_hash = block.block_hash();
 
         info!(%height, %round, %block_hash, "Validating undecided block");
 
-        let validity = match validate_consensus_block(&validator, &block, store).await {
-            Ok(validity) => validity,
-            Err(e) => {
-                error!(%height, %round, %block_hash, "Failed to validate undecided block: {e}");
-                continue;
-            }
-        };
+        let validity =
+            match validate_consensus_block(payload_validator, &block, invalid_payloads).await {
+                Ok(validity) => validity,
+                Err(e) => {
+                    error!(%height, %round, %block_hash, "Failed to validate undecided block: {e}");
+                    continue;
+                }
+            };
 
         // Update the block validity
         block.validity = validity;
@@ -288,4 +295,187 @@ async fn remove_pending_parts_and_store_undecided_block(
                 height, round, block_hash
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::payload::{MockPayloadValidator, PayloadValidationResult};
+    use crate::store::repositories::mocks::{
+        MockInvalidPayloadsRepository, MockUndecidedBlocksRepository,
+    };
+
+    use alloy_rpc_types_engine::ExecutionPayloadV3;
+    use arbitrary::{Arbitrary, Unstructured};
+    use malachitebft_core_types::Validity;
+
+    fn create_dummy_block(height: Height, round: Round, seed: u8) -> ConsensusBlock {
+        let bytes = [seed; 1024];
+        let mut u = Unstructured::new(&bytes);
+
+        ConsensusBlock {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: Address::arbitrary(&mut u).unwrap(),
+            validity: Validity::Valid,
+            execution_payload: ExecutionPayloadV3::arbitrary(&mut u).unwrap(),
+            signature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_undecided_blocks_all_valid() {
+        let height = Height::new(1);
+        let round = Round::new(0);
+
+        let block1 = create_dummy_block(height, round, 0x11);
+        let block2 = create_dummy_block(height, round, 0x22);
+        let blocks = vec![block1, block2];
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided
+            .expect_get_by_round()
+            .returning(move |_, _| Ok(blocks.clone()));
+
+        let mut validator = MockPayloadValidator::new();
+        validator
+            .expect_validate_payload()
+            .times(2)
+            .returning(|_| Ok(PayloadValidationResult::Valid));
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(0);
+
+        let result = validate_undecided_blocks(height, round, &undecided, &validator, &invalid)
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|b| b.validity == Validity::Valid));
+    }
+
+    #[tokio::test]
+    async fn validate_undecided_blocks_mixed_validity() {
+        let height = Height::new(1);
+        let round = Round::new(0);
+
+        let block1 = create_dummy_block(height, round, 0x11);
+        let block2 = create_dummy_block(height, round, 0x22);
+        let blocks = vec![block1, block2];
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided
+            .expect_get_by_round()
+            .returning(move |_, _| Ok(blocks.clone()));
+
+        let mut call_count = 0usize;
+        let mut validator = MockPayloadValidator::new();
+        validator
+            .expect_validate_payload()
+            .times(2)
+            .returning(move |_| {
+                call_count += 1;
+                if call_count == 1 {
+                    Ok(PayloadValidationResult::Valid)
+                } else {
+                    Ok(PayloadValidationResult::Invalid {
+                        reason: "bad block".into(),
+                    })
+                }
+            });
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(1).returning(|_| Ok(()));
+
+        let result = validate_undecided_blocks(height, round, &undecided, &validator, &invalid)
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].validity, Validity::Valid);
+        assert_eq!(result[1].validity, Validity::Invalid);
+    }
+
+    #[tokio::test]
+    async fn validate_undecided_blocks_empty() {
+        let height = Height::new(1);
+        let round = Round::new(0);
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided.expect_get_by_round().returning(|_, _| Ok(vec![]));
+
+        let validator = MockPayloadValidator::new();
+        let invalid = MockInvalidPayloadsRepository::new();
+
+        let result = validate_undecided_blocks(height, round, &undecided, &validator, &invalid)
+            .await
+            .expect("should succeed");
+
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validate_undecided_blocks_repository_error() {
+        let height = Height::new(1);
+        let round = Round::new(0);
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided
+            .expect_get_by_round()
+            .returning(|_, _| Err(std::io::Error::other("DB connection failed")));
+
+        let validator = MockPayloadValidator::new();
+        let invalid = MockInvalidPayloadsRepository::new();
+
+        let err = validate_undecided_blocks(height, round, &undecided, &validator, &invalid)
+            .await
+            .expect_err("should propagate repository error");
+
+        assert!(
+            err.to_string().contains("Failed to fetch undecided blocks"),
+            "error should describe the failure, got: {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_undecided_blocks_validation_error_skips_block() {
+        let height = Height::new(1);
+        let round = Round::new(0);
+
+        let block1 = create_dummy_block(height, round, 0x11);
+        let block2 = create_dummy_block(height, round, 0x22);
+        let blocks = vec![block1, block2];
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided
+            .expect_get_by_round()
+            .returning(move |_, _| Ok(blocks.clone()));
+
+        let mut call_count = 0usize;
+        let mut validator = MockPayloadValidator::new();
+        validator
+            .expect_validate_payload()
+            .times(2)
+            .returning(move |_| {
+                call_count += 1;
+                if call_count == 1 {
+                    Err(eyre::eyre!("engine down"))
+                } else {
+                    Ok(PayloadValidationResult::Valid)
+                }
+            });
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(0);
+
+        let result = validate_undecided_blocks(height, round, &undecided, &validator, &invalid)
+            .await
+            .expect("should succeed despite one block erroring");
+
+        // First block errored and was skipped, only second block returned
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].validity, Validity::Valid);
+    }
 }

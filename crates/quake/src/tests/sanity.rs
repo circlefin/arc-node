@@ -42,7 +42,7 @@
 //! | `warmup_s`          | `30`             | Seconds to wait for network stabilization         |
 //! | `duration_s`        | `60`             | Experiment window (load duration or sleep)        |
 //! | `load_rate`         | `50`             | TPS sent during experiment (0 = no load)          |
-//! | `load_targets`      | `""` (all nodes) | Comma-separated node names to send load to        |
+//! | `load_targets`      | `""` (all nodes) | Load selectors: node names or manifest groups    |
 //! | `load_mix`          | `transfer=100`   | Tx type mix (`--mix` format; `erc20`/`guzzler` need contracts in genesis) |
 //! | `strict_mesh`       | `true`           | Enforce mesh tier expectations                    |
 //! | `mesh_verbose`      | `true`           | Print full `quake info mesh`-style report before mesh checks |
@@ -130,7 +130,11 @@ fn build_remote_load_args(
     mix: &str,
     targets: &[String],
 ) -> Vec<String> {
-    let mut args: Vec<String> = targets.to_vec();
+    let mut args = Vec::new();
+    if !targets.is_empty() {
+        args.push("--targets".into());
+        args.push(targets.join(","));
+    }
     args.extend(["-r".into(), rate.to_string()]);
     args.extend(["-t".into(), duration_s.to_string()]);
     args.extend(["--mix".into(), mix.into()]);

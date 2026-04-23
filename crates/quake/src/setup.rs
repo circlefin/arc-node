@@ -19,16 +19,17 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 use std::{fs, path::Path};
 
-use alloy_primitives::Address;
+use alloy_primitives::{address, Address};
 use arc_consensus_types::{
     Config, LoggingConfig, MetricsConfig, PruningConfig, RemoteSigningConfig, RpcConfig,
     RuntimeConfig, SigningConfig,
 };
 use arc_node_consensus::hardcoded_config;
 use arc_node_consensus_cli::args::Args;
-use arc_node_consensus_cli::cmd::start::StartCmd;
+use arc_node_consensus_cli::cmd::start::{StartCmd, RUNTIME_SINGLE_THREADED};
 use arc_node_consensus_cli::file::save_priv_validator_key;
 use arc_node_consensus_cli::new::generate_private_keys;
+use clap::Parser;
 use color_eyre::eyre::{eyre, Context, Result};
 use handlebars::Handlebars;
 use indexmap::{IndexMap, IndexSet};
@@ -50,6 +51,10 @@ const APP_CONSENSUS_DEFAULT_PORT: usize = 27000;
 const APP_METRICS_DEFAULT_PORT: usize = 29000;
 const APP_RPC_DEFAULT_PORT: usize = 31000;
 const REMOTE_SIGNER_PROXY_PORT: usize = 10340;
+
+/// Placeholder recipient for validators that don't set `cl_suggested_fee_recipient`;
+/// matches `LOCALDEV_FEE_RECIPIENT` in `tests/helpers/networks/localdev.ts`.
+const QUAKE_DEFAULT_FEE_RECIPIENT: Address = address!("0x65E0a200006D4FF91bD59F9694220dafc49dbBC1");
 
 /// Compile system contracts and bindings
 pub(crate) fn generate_system_contracts(repo_root_dir: &Path, force: bool) -> Result<()> {
@@ -463,6 +468,13 @@ pub(crate) fn generate_app_config_files(
             continue;
         }
 
+        // Only generate config.toml for Legacy nodes (< v0.5.0).
+        // Modern nodes use CLI flags exclusively.
+        let legacy_config = match &node.cl_config {
+            manifest::NodeClConfig::Legacy(config) => config,
+            manifest::NodeClConfig::Modern(_) => continue,
+        };
+
         debug!(node=%name, dir=%node_home_dir.display(), "Generating node configuration...");
 
         let peers_ips: Vec<String> = if let Some(peers) = &node.cl_persistent_peers {
@@ -491,10 +503,11 @@ pub(crate) fn generate_app_config_files(
         };
 
         // Generate an initial config and merge it with the config customisations from the manifest by ser/deserializing to TOML values
-        let initial_config = generate_consensus_config(name, node, &peers_ips)?;
+        let initial_config =
+            generate_legacy_consensus_config(name, node, legacy_config, &peers_ips)?;
         let config = util::merge_toml_values(
             toml::Value::try_from(initial_config)?,
-            toml::Value::try_from(node.cl_config.clone())?,
+            toml::Value::try_from(legacy_config.clone())?,
         )?
         .try_into()?;
 
@@ -510,10 +523,11 @@ pub(crate) fn generate_app_config_files(
     Ok(())
 }
 
-/// Generate a consensus configuration for a node.
-fn generate_consensus_config(
+/// Generate a consensus configuration for a legacy (< v0.5.0) node.
+fn generate_legacy_consensus_config(
     name: &str,
     node: &manifest::Node,
+    cl_config: &Config,
     peers_ips: &[String],
 ) -> Result<Config> {
     let transport = TransportProtocol::default();
@@ -530,7 +544,7 @@ fn generate_consensus_config(
 
     let metrics_listen_addr = format!("{listen_ip}:{APP_METRICS_DEFAULT_PORT}")
         .parse()
-        .unwrap();
+        .context("failed to parse metrics listen address")?;
 
     let persistent_peers_only = node.cl_persistent_peers_only;
 
@@ -540,7 +554,7 @@ fn generate_consensus_config(
         load: hardcoded_config::GossipLoad::from_str_opt(node.cl_gossipsub.load.as_deref()),
     };
 
-    let discovery = &node.cl_config.consensus.p2p.discovery;
+    let discovery = &cl_config.consensus.p2p.discovery;
     let discovery_enabled = discovery.enabled;
     let num_outbound_peers = if discovery.num_outbound_peers > 0 {
         discovery.num_outbound_peers
@@ -582,7 +596,9 @@ fn generate_consensus_config(
         rpc: RpcConfig {
             enabled: true,
             // IPADDR_ANY because we need external access to it for testing.
-            listen_addr: format!("0.0.0.0:{APP_RPC_DEFAULT_PORT}").parse().unwrap(),
+            listen_addr: format!("0.0.0.0:{APP_RPC_DEFAULT_PORT}")
+                .parse()
+                .context("failed to parse RPC listen address")?,
         },
         signing: if node.remote_signer.is_some() {
             SigningConfig::Remote(RemoteSigningConfig {
@@ -740,163 +756,161 @@ pub(crate) fn supports_cli_flags(image_tag: Option<&str>) -> bool {
 
 /// Generate CLI flags for a node based on its configuration.
 ///
-/// If `image_tag` is provided and the version is older than v0.5.0, returns an empty
-/// Vec (older versions use config.toml instead of CLI flags).
+/// For `NodeClConfig::Modern`: builds a `StartCmd` from the manifest config +
+/// Node-level overrides + deployment-specific fields, then calls `to_cli_flags()`.
+/// For `NodeClConfig::Legacy`: returns an empty Vec (uses config.toml instead).
 ///
 /// `follow_endpoint_urls` are pre-resolved container-accessible EL RPC URLs for follow
 /// mode (e.g. `http://validator-1_el:8545` for local, `http://10.0.0.5:8545` for remote).
-pub(crate) fn generate_node_cli_flags(
+pub(crate) fn generate_consensus_cli_flags(
     name: &str,
     node: Option<&manifest::Node>,
     listen_ip: &str,
     peers_ips: &[String],
     image_tag: Option<&str>,
     follow_endpoint_urls: &[String],
-    suggested_fee_recipient: Option<Address>,
-) -> Vec<String> {
-    // For older versions (< v0.5.0), skip CLI flags as they use config.toml
+) -> Result<Vec<String>> {
+    let Some(node) = node else {
+        return generate_default_consensus_cli_flags(name, listen_ip, peers_ips, image_tag);
+    };
+
+    match &node.cl_config {
+        manifest::NodeClConfig::Legacy(_) => {
+            debug!("Skipping CLI flags for legacy CL node {name}");
+            Ok(Vec::new())
+        }
+        manifest::NodeClConfig::Modern(start_cmd) => {
+            let transport = TransportProtocol::default();
+
+            let mut cmd = start_cmd.clone();
+
+            cmd.moniker = Some(name.to_string());
+            cmd.p2p_addr = transport.multiaddr(listen_ip, APP_CONSENSUS_DEFAULT_PORT);
+            cmd.metrics = Some(
+                format!("{listen_ip}:{APP_METRICS_DEFAULT_PORT}")
+                    .parse()
+                    .context("failed to parse metrics listen address")?,
+            );
+            cmd.rpc_addr = Some(
+                format!("0.0.0.0:{APP_RPC_DEFAULT_PORT}")
+                    .parse()
+                    .context("failed to parse RPC listen address")?,
+            );
+
+            if !peers_ips.is_empty() {
+                cmd.p2p_persistent_peers = peers_ips
+                    .iter()
+                    .map(|ip| transport.multiaddr(ip, APP_CONSENSUS_DEFAULT_PORT))
+                    .collect();
+            }
+
+            cmd.p2p_persistent_peers_only = node.cl_persistent_peers_only;
+            cmd.gossipsub_explicit_peering = node.cl_gossipsub.explicit_peering;
+            cmd.gossipsub_mesh_prioritization = node.cl_gossipsub.mesh_prioritization;
+            cmd.gossipsub_load = node.cl_gossipsub.load.clone();
+
+            if node.node_type == manifest::NodeType::Validator {
+                cmd.validator = true;
+            }
+
+            // `--validator` requires a non-zero `--suggested-fee-recipient`. When
+            // validator scenarios omit `cl_suggested_fee_recipient`, fall back to
+            // the localdev placeholder so consensus can still start.
+            let effective_fee_recipient = node.cl_suggested_fee_recipient.or_else(|| {
+                (node.node_type == manifest::NodeType::Validator)
+                    .then_some(QUAKE_DEFAULT_FEE_RECIPIENT)
+            });
+            if let Some(addr) = effective_fee_recipient {
+                cmd.suggested_fee_recipient = Some(addr.into());
+            }
+
+            if node.remote_signer.is_some() {
+                cmd.signing_remote = Some(format!(
+                    "http://{name}-signer-proxy:{REMOTE_SIGNER_PROXY_PORT}"
+                ));
+            }
+
+            if cmd.prune_certificates_distance == 0 && cmd.prune_certificates_before == 0 {
+                if let Some(preset) = node.cl_prune_preset {
+                    match preset {
+                        manifest::ClPruningPreset::Full => cmd.full = true,
+                        manifest::ClPruningPreset::Minimal => cmd.minimal = true,
+                    }
+                }
+            }
+
+            if node.follow {
+                cmd.follow = true;
+                cmd.follow_endpoints = follow_endpoint_urls
+                    .iter()
+                    .map(|url| {
+                        url.parse()
+                            .context(format!("invalid follow endpoint URL: {url}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
+
+            let flags = cmd.to_cli_flags();
+            validate_generated_cl_flags(&flags)?;
+            Ok(flags)
+        }
+    }
+}
+
+/// Generate default CLI flags when no node config is provided.
+/// Used for nodes without manifest entries that use the modern CL.
+fn generate_default_consensus_cli_flags(
+    name: &str,
+    listen_ip: &str,
+    peers_ips: &[String],
+    image_tag: Option<&str>,
+) -> Result<Vec<String>> {
     if !supports_cli_flags(image_tag) {
-        debug!("Skipping CLI flags for node {name}: image version {image_tag:?} does not support CLI flags");
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let transport = TransportProtocol::default();
-
-    let mut flags = vec![
-        format!("--moniker={name}"),
-        format!(
-            "--p2p.addr={}",
-            transport.multiaddr(listen_ip, APP_CONSENSUS_DEFAULT_PORT)
+    let cmd = StartCmd {
+        moniker: Some(name.to_string()),
+        p2p_addr: transport.multiaddr(listen_ip, APP_CONSENSUS_DEFAULT_PORT),
+        metrics: Some(
+            format!("{listen_ip}:{APP_METRICS_DEFAULT_PORT}")
+                .parse()
+                .context("failed to parse metrics listen address")?,
         ),
-    ];
-
-    // Add persistent peers if any
-    if !peers_ips.is_empty() {
-        let cl_persistent_peers: Vec<String> = peers_ips
+        rpc_addr: Some(
+            format!("0.0.0.0:{APP_RPC_DEFAULT_PORT}")
+                .parse()
+                .context("failed to parse RPC listen address")?,
+        ),
+        // Use single-threaded runtime for lower resource usage when running local devnet.
+        runtime_flavor: RUNTIME_SINGLE_THREADED.to_string(),
+        p2p_persistent_peers: peers_ips
             .iter()
-            .map(|ip| {
-                transport
-                    .multiaddr(ip, APP_CONSENSUS_DEFAULT_PORT)
-                    .to_string()
-            })
-            .collect();
+            .map(|ip| transport.multiaddr(ip, APP_CONSENSUS_DEFAULT_PORT))
+            .collect(),
+        ..StartCmd::default()
+    };
 
-        flags.push(format!(
-            "--p2p.persistent-peers={}",
-            cl_persistent_peers.join(",")
-        ));
-    }
+    let flags = cmd.to_cli_flags();
+    validate_generated_cl_flags(&flags)?;
+    Ok(flags)
+}
 
-    // Add metrics
-    flags.push(format!("--metrics={listen_ip}:{APP_METRICS_DEFAULT_PORT}"));
+/// Validate generated CL CLI flags by trial-parsing them against the actual
+/// Args/StartCmd parser. Any flag accepted by the CL binary is automatically valid.
+fn validate_generated_cl_flags(flags: &[String]) -> Result<()> {
+    let trial_args = std::iter::once("arc-node-consensus")
+        .chain(std::iter::once("start"))
+        .chain(flags.iter().map(String::as_str));
 
-    // Add RPC
-    flags.push(format!("--rpc.addr=0.0.0.0:{APP_RPC_DEFAULT_PORT}"));
-
-    // Add runtime
-    flags.push("--runtime.flavor=single-threaded".to_string());
-
-    // Enable value sync by default
-    flags.push("--value-sync".to_string());
-
-    if let Some(addr) = suggested_fee_recipient {
-        flags.push(format!("--suggested-fee-recipient={addr}"));
-    }
-
-    if let Some(node) = node {
-        let cl = &node.cl_config;
-
-        // Always set log level and format to ensure consistent logs for testing, debugging, and log collection.
-        flags.push(format!("--log-level={}", cl.logging.log_level));
-        flags.push(format!("--log-format={}", cl.logging.log_format));
-
-        // Add persistent-peers-only if enabled
-        if node.cl_persistent_peers_only {
-            flags.push("--p2p.persistent-peers-only".to_string());
-        }
-
-        // Add gossipsub flags
-        if node.cl_gossipsub.explicit_peering {
-            flags.push("--gossipsub.explicit-peering".to_string());
-        }
-        if node.cl_gossipsub.mesh_prioritization {
-            flags.push("--gossipsub.mesh-prioritization".to_string());
-        }
-        if let Some(ref load) = node.cl_gossipsub.load {
-            flags.push(format!("--gossipsub.load={load}"));
-        }
-
-        // Translate cl.config.* typed fields to CLI flags.
-        // Defaults come from the CL CLI itself (StartCmd) so we only emit
-        // flags whose values differ from what the binary would use anyway.
-        let cli_defaults = StartCmd::default();
-
-        let discovery = &cl.consensus.p2p.discovery;
-        if discovery.enabled {
-            flags.push("--discovery".to_string());
-        }
-        if discovery.num_outbound_peers != cli_defaults.discovery_num_outbound_peers {
-            flags.push(format!(
-                "--discovery.num-outbound-peers={}",
-                discovery.num_outbound_peers
-            ));
-        }
-        if discovery.num_inbound_peers != cli_defaults.discovery_num_inbound_peers {
-            flags.push(format!(
-                "--discovery.num-inbound-peers={}",
-                discovery.num_inbound_peers
-            ));
-        }
-
-        if !cl.consensus.enabled {
-            flags.push("--no-consensus".to_string());
-        } else if node.node_type == manifest::NodeType::Validator {
-            flags.push("--validator".to_string());
-        }
-
-        if node.remote_signer.is_some() {
-            flags.push(format!(
-                "--signing.remote=http://{name}-signer-proxy:{REMOTE_SIGNER_PROXY_PORT}"
-            ));
-        }
-
-        if cl.execution.persistence_backpressure {
-            flags.push("--execution-persistence-backpressure".to_string());
-            flags.push(format!(
-                "--execution-persistence-backpressure-threshold={}",
-                cl.execution.persistence_backpressure_threshold,
-            ));
-        }
-
-        // Pruning: explicit distance/before from cl.config wins over cl_prune_preset.
-        let prune = &cl.prune;
-        if prune.certificates_distance > 0 {
-            flags.push(format!(
-                "--prune.certificates.distance={}",
-                prune.certificates_distance
-            ));
-        } else if prune.certificates_before > arc_consensus_types::Height::new(0) {
-            flags.push(format!(
-                "--prune.certificates.before={}",
-                prune.certificates_before
-            ));
-        } else if let Some(preset) = node.cl_prune_preset {
-            flags.push(preset.to_string());
-        }
-
-        // Follow mode
-        if node.follow {
-            flags.push("--follow".to_string());
-            for url in follow_endpoint_urls {
-                flags.push(format!("--follow.endpoint={url}"));
-            }
-        }
-    } else {
-        flags.push("--log-level=debug".to_string());
-        flags.push("--log-format=plaintext".to_string());
-    }
-
-    flags
+    Args::try_parse_from(trial_args).map_err(|e| {
+        eyre!(
+            "Generated CL flags are invalid — a flag may be missing from StartCmd \
+             or have an incompatible value: {e}"
+        )
+    })?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -1408,9 +1422,9 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_includes_required_flags() {
-        let flags =
-            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
+    fn generate_consensus_cli_flags_includes_required_flags() {
+        let flags = generate_consensus_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[])
+            .unwrap();
 
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--moniker"));
@@ -1420,10 +1434,11 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_with_cl_persistent_peers() {
+    fn generate_consensus_cli_flags_with_cl_persistent_peers() {
         let peers = vec!["172.19.0.6".to_string(), "172.19.0.7".to_string()];
         let flags =
-            generate_node_cli_flags("validator-1", None, "172.19.0.5", &peers, None, &[], None);
+            generate_consensus_cli_flags("validator-1", None, "172.19.0.5", &peers, None, &[])
+                .unwrap();
 
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--p2p.persistent-peers"));
@@ -1432,9 +1447,9 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_without_persistent_peers() {
-        let flags =
-            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
+    fn generate_consensus_cli_flags_without_persistent_peers() {
+        let flags = generate_consensus_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[])
+            .unwrap();
 
         let flags_str = flags.join(" ");
         // Should not contain persistent peers flag when empty
@@ -1442,9 +1457,9 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_includes_metrics() {
-        let flags =
-            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
+    fn generate_consensus_cli_flags_includes_metrics() {
+        let flags = generate_consensus_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[])
+            .unwrap();
 
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--metrics"));
@@ -1452,9 +1467,9 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_includes_rpc() {
-        let flags =
-            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
+    fn generate_consensus_cli_flags_includes_rpc() {
+        let flags = generate_consensus_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[])
+            .unwrap();
 
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--rpc.addr"));
@@ -1462,89 +1477,87 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_includes_value_sync() {
-        let flags =
-            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
+    fn generate_consensus_cli_flags_omits_default_value_sync() {
+        // value_sync defaults to true in StartCmd, so the flag is not emitted
+        // (the binary uses it by default). Only emitted when explicitly disabled.
+        let flags = generate_consensus_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[])
+            .unwrap();
 
         let flags_str = flags.join(" ");
-        assert!(flags_str.contains("--value-sync"));
+        assert!(!flags_str.contains("--value-sync"));
     }
 
     #[test]
-    fn generate_node_cli_flags_logging_defaults_when_no_node() {
-        let flags =
-            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
-
-        let flags_str = flags.join(" ");
-        assert!(flags_str.contains("--log-level=debug"));
-        assert!(flags_str.contains("--log-format=plaintext"));
-    }
-
-    #[test]
-    fn generate_node_cli_flags_logging_from_node_config() {
-        use malachitebft_config::{LogFormat, LogLevel};
-
-        let mut node = manifest::Node::default();
-        node.cl_config.logging.log_level = LogLevel::Info;
-        node.cl_config.logging.log_format = LogFormat::Json;
-
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            None,
-        );
-
-        let flags_str = flags.join(" ");
-        assert!(flags_str.contains("--log-level=info"));
-        assert!(flags_str.contains("--log-format=json"));
-    }
-
-    #[test]
-    fn generate_node_cli_flags_emits_suggested_fee_recipient() {
+    fn generate_consensus_cli_flags_emits_suggested_fee_recipient() {
         use alloy_primitives::address;
         let recipient = address!("0x98e503f35D0a019cB0a251aD243a4cCFCF371F46");
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            None,
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            Some(recipient),
+        let node = manifest::Node {
+            cl_suggested_fee_recipient: Some(recipient),
+            ..Default::default()
+        };
+        let flags =
+            generate_consensus_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
+        let flags_str = flags.join(" ").to_lowercase();
+        assert!(
+            flags_str
+                .contains("--suggested-fee-recipient=0x98e503f35d0a019cb0a251ad243a4ccfcf371f46"),
+            "missing suggested-fee-recipient: {flags_str}"
         );
-        let flags_str = flags.join(" ");
-        assert!(flags_str.contains(&format!("--suggested-fee-recipient={recipient}")));
     }
 
     #[test]
-    fn generate_node_cli_flags_omits_suggested_fee_recipient_when_none() {
-        let flags =
-            generate_node_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[], None);
+    fn generate_consensus_cli_flags_omits_suggested_fee_recipient_when_none() {
+        let flags = generate_consensus_cli_flags("validator-1", None, "172.19.0.5", &[], None, &[])
+            .unwrap();
         let flags_str = flags.join(" ");
         assert!(!flags_str.contains("--suggested-fee-recipient"));
     }
 
     #[test]
-    fn generate_node_cli_flags_with_remote_signer() {
+    fn generate_consensus_cli_flags_falls_back_to_default_for_validator_without_recipient() {
+        let node = manifest::Node {
+            node_type: manifest::NodeType::Validator,
+            ..Default::default()
+        };
+        let flags =
+            generate_consensus_cli_flags("val-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
+        let flags_str = flags.join(" ").to_lowercase();
+        let expected =
+            format!("--suggested-fee-recipient={QUAKE_DEFAULT_FEE_RECIPIENT}").to_lowercase();
+        assert!(
+            flags_str.contains(&expected),
+            "expected default fee recipient fallback for validator: {flags_str}"
+        );
+    }
+
+    #[test]
+    fn generate_consensus_cli_flags_no_fallback_for_non_validator_without_recipient() {
+        let node = manifest::Node {
+            node_type: manifest::NodeType::NonValidator,
+            ..Default::default()
+        };
+        let flags = generate_consensus_cli_flags("fn-1", Some(&node), "172.19.0.5", &[], None, &[])
+            .unwrap();
+        let flags_str = flags.join(" ");
+        assert!(
+            !flags_str.contains("--suggested-fee-recipient"),
+            "should not emit flag for non-validator without explicit recipient: {flags_str}"
+        );
+    }
+
+    #[test]
+    fn generate_consensus_cli_flags_with_remote_signer() {
         let node = manifest::Node {
             node_type: manifest::NodeType::Validator,
             remote_signer: Some(manifest::RemoteKeyId::new(1).unwrap()),
             ..Default::default()
         };
 
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            None,
-        );
+        let flags =
+            generate_consensus_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
 
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--signing.remote"));
@@ -1552,59 +1565,47 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_without_remote_signer() {
+    fn generate_consensus_cli_flags_without_remote_signer() {
         let node = manifest::Node::default();
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            None,
-        );
+        let flags =
+            generate_consensus_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(!flags_str.contains("--signing.remote"));
     }
 
     #[test]
-    fn generate_node_cli_flags_with_persistent_peers_only() {
+    fn generate_consensus_cli_flags_with_persistent_peers_only() {
         let node = manifest::Node {
             cl_persistent_peers_only: true,
             ..Default::default()
         };
         let peers = vec!["172.19.0.6".to_string()];
-        let flags = generate_node_cli_flags(
+        let flags = generate_consensus_cli_flags(
             "validator-1",
             Some(&node),
             "172.19.0.5",
             &peers,
             None,
             &[],
-            None,
-        );
+        )
+        .unwrap();
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--p2p.persistent-peers-only"));
     }
 
     #[test]
-    fn generate_node_cli_flags_without_persistent_peers_only() {
+    fn generate_consensus_cli_flags_without_persistent_peers_only() {
         let node = manifest::Node::default();
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            None,
-        );
+        let flags =
+            generate_consensus_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(!flags_str.contains("--p2p.persistent-peers-only"));
     }
 
     #[test]
-    fn generate_node_cli_flags_with_gossipsub_explicit_peering() {
+    fn generate_consensus_cli_flags_with_gossipsub_explicit_peering() {
         let node = manifest::Node {
             cl_gossipsub: manifest::ClGossipSubConfig {
                 explicit_peering: true,
@@ -1612,21 +1613,15 @@ mod tests {
             },
             ..Default::default()
         };
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            None,
-        );
+        let flags =
+            generate_consensus_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--gossipsub.explicit-peering"));
     }
 
     #[test]
-    fn generate_node_cli_flags_with_gossipsub_mesh_prioritization() {
+    fn generate_consensus_cli_flags_with_gossipsub_mesh_prioritization() {
         let node = manifest::Node {
             cl_gossipsub: manifest::ClGossipSubConfig {
                 mesh_prioritization: true,
@@ -1634,21 +1629,15 @@ mod tests {
             },
             ..Default::default()
         };
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            None,
-        );
+        let flags =
+            generate_consensus_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--gossipsub.mesh-prioritization"));
     }
 
     #[test]
-    fn generate_node_cli_flags_with_gossipsub_load() {
+    fn generate_consensus_cli_flags_with_gossipsub_load() {
         let node = manifest::Node {
             cl_gossipsub: manifest::ClGossipSubConfig {
                 load: Some("high".to_string()),
@@ -1656,31 +1645,19 @@ mod tests {
             },
             ..Default::default()
         };
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            None,
-        );
+        let flags =
+            generate_consensus_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(flags_str.contains("--gossipsub.load=high"));
     }
 
     #[test]
-    fn generate_node_cli_flags_without_gossipsub_overrides() {
+    fn generate_consensus_cli_flags_without_gossipsub_overrides() {
         let node = manifest::Node::default();
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            None,
-        );
+        let flags =
+            generate_consensus_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(!flags_str.contains("--gossipsub.explicit-peering"));
         assert!(!flags_str.contains("--gossipsub.mesh-prioritization"));
@@ -1792,18 +1769,17 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_includes_pruning_distance() {
-        let mut node = manifest::Node::default();
-        node.cl_config.prune.certificates_distance = 500;
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            None,
-        );
+    fn generate_consensus_cli_flags_includes_pruning_distance() {
+        let node = manifest::Node {
+            cl_config: manifest::NodeClConfig::Modern(StartCmd {
+                prune_certificates_distance: 500,
+                ..StartCmd::default()
+            }),
+            ..Default::default()
+        };
+        let flags =
+            generate_consensus_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--prune.certificates.distance=500"),
@@ -1816,18 +1792,17 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_includes_pruning_before() {
-        let mut node = manifest::Node::default();
-        node.cl_config.prune.certificates_before = arc_consensus_types::Height::new(100);
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            None,
-        );
+    fn generate_consensus_cli_flags_includes_pruning_before() {
+        let node = manifest::Node {
+            cl_config: manifest::NodeClConfig::Modern(StartCmd {
+                prune_certificates_before: 100,
+                ..StartCmd::default()
+            }),
+            ..Default::default()
+        };
+        let flags =
+            generate_consensus_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--prune.certificates.before=100"),
@@ -1840,7 +1815,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_no_prune_when_none_set() {
+    fn generate_consensus_cli_flags_no_prune_when_none_set() {
         for node_type in [
             manifest::NodeType::Validator,
             manifest::NodeType::NonValidator,
@@ -1849,15 +1824,15 @@ mod tests {
                 node_type,
                 ..Default::default()
             };
-            let flags = generate_node_cli_flags(
+            let flags = generate_consensus_cli_flags(
                 "validator-1",
                 Some(&node),
                 "172.19.0.5",
                 &[],
                 None,
                 &[],
-                None,
-            );
+            )
+            .unwrap();
             let flags_str = flags.join(" ");
             assert!(
                 !flags_str.contains("--prune.certificates.distance"),
@@ -1879,18 +1854,17 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_prune_distance_emitted() {
-        let mut node = manifest::Node::default();
-        node.cl_config.prune.certificates_distance = 500;
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            None,
-        );
+    fn generate_consensus_cli_flags_prune_distance_emitted() {
+        let node = manifest::Node {
+            cl_config: manifest::NodeClConfig::Modern(StartCmd {
+                prune_certificates_distance: 500,
+                ..StartCmd::default()
+            }),
+            ..Default::default()
+        };
+        let flags =
+            generate_consensus_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--prune.certificates.distance=500"),
@@ -1899,39 +1873,40 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_returns_empty_for_old_version() {
-        let flags = generate_node_cli_flags(
+    fn generate_consensus_cli_flags_returns_empty_for_old_version() {
+        let flags = generate_consensus_cli_flags(
             "validator-1",
             None,
             "172.19.0.5",
             &[],
             Some("arc_consensus:v0.4.0"),
             &[],
-            None,
-        );
+        )
+        .unwrap();
 
         assert!(flags.is_empty());
     }
 
     #[test]
-    fn generate_node_cli_flags_returns_flags_for_new_version() {
-        let flags = generate_node_cli_flags(
+    fn generate_consensus_cli_flags_returns_flags_for_new_version() {
+        let flags = generate_consensus_cli_flags(
             "validator-1",
             None,
             "172.19.0.5",
             &[],
             Some("arc_consensus:v0.5.0"),
             &[],
-            None,
-        );
+        )
+        .unwrap();
 
         assert!(!flags.is_empty());
         assert!(flags.contains(&"--moniker=validator-1".to_string()));
     }
 
     #[test]
-    fn generate_node_cli_flags_includes_follow_mode() {
+    fn generate_consensus_cli_flags_includes_follow_mode() {
         let node = manifest::Node {
+            node_type: manifest::NodeType::NonValidator,
             follow: true,
             ..Default::default()
         };
@@ -1939,15 +1914,9 @@ mod tests {
             "http://validator-1_el:8545".to_string(),
             "http://validator-2_el:8545".to_string(),
         ];
-        let flags = generate_node_cli_flags(
-            "rpc-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &endpoints,
-            None,
-        );
+        let flags =
+            generate_consensus_cli_flags("rpc-1", Some(&node), "172.19.0.5", &[], None, &endpoints)
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--follow"),
@@ -1964,18 +1933,12 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_no_follow_when_not_enabled() {
+    fn generate_consensus_cli_flags_no_follow_when_not_enabled() {
         let node = manifest::Node::default();
         let endpoints = vec!["http://validator-1_el:8545".to_string()];
-        let flags = generate_node_cli_flags(
-            "rpc-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &endpoints,
-            None,
-        );
+        let flags =
+            generate_consensus_cli_flags("rpc-1", Some(&node), "172.19.0.5", &[], None, &endpoints)
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(
             !flags_str.contains("--follow"),
@@ -1984,11 +1947,18 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_includes_no_consensus() {
-        let mut node = manifest::Node::default();
-        node.cl_config.consensus.enabled = false;
+    fn generate_consensus_cli_flags_includes_no_consensus() {
+        let node = manifest::Node {
+            node_type: manifest::NodeType::NonValidator,
+            cl_config: manifest::NodeClConfig::Modern(StartCmd {
+                no_consensus: true,
+                ..StartCmd::default()
+            }),
+            ..Default::default()
+        };
         let flags =
-            generate_node_cli_flags("rpc-1", Some(&node), "172.19.0.5", &[], None, &[], None);
+            generate_consensus_cli_flags("rpc-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--no-consensus"),
@@ -1997,13 +1967,14 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_includes_validator_for_validator_nodes() {
+    fn generate_consensus_cli_flags_includes_validator_for_validator_nodes() {
         let node = manifest::Node {
             node_type: manifest::NodeType::Validator,
             ..Default::default()
         };
         let flags =
-            generate_node_cli_flags("val-1", Some(&node), "172.19.0.5", &[], None, &[], None);
+            generate_consensus_cli_flags("val-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--validator"),
@@ -2012,13 +1983,13 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_omits_validator_for_non_validator_nodes() {
+    fn generate_consensus_cli_flags_omits_validator_for_non_validator_nodes() {
         let node = manifest::Node {
             node_type: manifest::NodeType::NonValidator,
             ..Default::default()
         };
-        let flags =
-            generate_node_cli_flags("fn-1", Some(&node), "172.19.0.5", &[], None, &[], None);
+        let flags = generate_consensus_cli_flags("fn-1", Some(&node), "172.19.0.5", &[], None, &[])
+            .unwrap();
         let flags_str = flags.join(" ");
         assert!(
             !flags_str.contains("--validator"),
@@ -2027,13 +1998,14 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_includes_cl_prune_preset() {
+    fn generate_consensus_cli_flags_includes_cl_prune_preset() {
         let node = manifest::Node {
             cl_prune_preset: Some(manifest::ClPruningPreset::Full),
             ..Default::default()
         };
         let flags =
-            generate_node_cli_flags("val-1", Some(&node), "172.19.0.5", &[], None, &[], None);
+            generate_consensus_cli_flags("val-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--full"),
@@ -2042,21 +2014,18 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_cli_flags_prune_distance_overrides_preset() {
-        let mut node = manifest::Node {
+    fn generate_consensus_cli_flags_prune_distance_overrides_preset() {
+        let node = manifest::Node {
             cl_prune_preset: Some(manifest::ClPruningPreset::Minimal),
+            cl_config: manifest::NodeClConfig::Modern(StartCmd {
+                prune_certificates_distance: 500,
+                ..StartCmd::default()
+            }),
             ..Default::default()
         };
-        node.cl_config.prune.certificates_distance = 500;
-        let flags = generate_node_cli_flags(
-            "validator-1",
-            Some(&node),
-            "172.19.0.5",
-            &[],
-            None,
-            &[],
-            None,
-        );
+        let flags =
+            generate_consensus_cli_flags("validator-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
         let flags_str = flags.join(" ");
         assert!(
             flags_str.contains("--prune.certificates.distance=500"),
@@ -2066,6 +2035,12 @@ mod tests {
             !flags_str.contains("--minimal"),
             "preset should not be emitted when explicit config is present: {flags_str}"
         );
+    }
+
+    #[test]
+    fn validate_generated_cl_flags_rejects_unknown_flags() {
+        let result = validate_generated_cl_flags(&["--nonexistent-flag".to_string()]);
+        assert!(result.is_err());
     }
 
     #[test]

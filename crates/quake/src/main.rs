@@ -31,15 +31,15 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use clean::{clean_scope, CleanScope};
-use perturb::Perturbation;
-use testnet::{Testnet, TestnetError};
-
 use crate::infra::export;
 use crate::infra::{BuildProfile, INFRA_DATA_FILENAME};
 use crate::manifest::{generate_manifests, EngineApiConnection};
 use crate::perturb::{PERTURB_MAX_TIME_OFF, PERTURB_MIN_TIME_OFF};
 use crate::valset::ValidatorPowerUpdate;
+
+use clean::{clean_scope, CleanScope};
+use perturb::Perturbation;
+use testnet::{Testnet, TestnetError};
 
 mod build;
 mod clean;
@@ -178,20 +178,32 @@ enum Commands {
     /// Send transaction load to the testnet (backpressure mode: waits for each
     /// response and only advances the nonce on success).
     /// Use --mix to blend transaction types (e.g., --mix transfer=70,erc20=30).
-    #[command(verbatim_doc_comment)]
+    ///
+    /// If `--targets` is omitted, all manifest nodes are used. Each target may
+    /// be an exact node name or a manifest node group such as `ALL_VALIDATORS`.
+    #[command(
+        verbatim_doc_comment,
+        after_long_help = "Examples:\n  quake load --rate 200 --time 60\n  quake load --targets validator1,ALL_VALIDATORS --rate 200 --time 60\n"
+    )]
     Load {
-        /// Names of the nodes to send transactions to (all nodes if not specified)
-        target_nodes: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        targets: Option<Vec<String>>,
         #[command(flatten)]
         args: SpammerArgs,
     },
     /// Send transaction load to the testnet (fire-and-forget mode: pushes
     /// transactions into a buffer and sends without waiting for responses).
     /// Use --mix to blend transaction types (e.g., --mix transfer=70,erc20=30).
-    #[command(verbatim_doc_comment)]
+    ///
+    /// If `--targets` is omitted, all manifest nodes are used. Each target may
+    /// be an exact node name or a manifest node group such as `ALL_VALIDATORS`.
+    #[command(
+        verbatim_doc_comment,
+        after_long_help = "Examples:\n  quake spam --rate 200 --time 60\n  quake spam --targets validator1,ALL_VALIDATORS --rate 200 --time 60\n"
+    )]
     Spam {
-        /// Names of the nodes to send transactions to (all nodes if not specified)
-        target_nodes: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        targets: Option<Vec<String>>,
         #[command(flatten)]
         args: SpammerArgs,
     },
@@ -546,14 +558,16 @@ pub(crate) enum RemoteSubcommand {
         /// Command to run on the node or CC server; if not provided, will open an interactive shell
         command: Vec<String>,
     },
-    /// Send transaction load to the nodes by running `quake load` from the Control Center
-    /// (backpressure mode).
+    /// Send transaction load to the nodes by running `quake load` from the Control
+    /// Center (backpressure mode).
     ///
     /// It accepts the same arguments as the `load` command.
     ///
     /// Examples:
-    ///   Local network:   `./quake load -- validator1 validator2 -r 200 -t 60 --pools`
-    ///   Remote network:  `./quake remote load -- validator1 validator2 -r 200 -t 60 --pools`
+    ///   Local network:
+    ///   `./quake load --targets validator1,validator2 -r 200 -t 60`
+    ///   Remote network:
+    ///   `./quake remote load -- --targets validator1,validator2 -r 200 -t 60`
     #[command(verbatim_doc_comment)]
     Load { args: Vec<String> },
     /// Send transaction load to the nodes by running `quake spam` from the Control Center
@@ -561,8 +575,10 @@ pub(crate) enum RemoteSubcommand {
     ///
     /// It accepts the same arguments as the `spam` command.
     /// Example:
-    ///   Local network:   `./quake spam -- validator1 validator2 -r 200 -t 60 --pools`
-    ///   Remote network:  `./quake remote spam -- validator1 validator2 -r 200 -t 60 --pools`
+    ///   Local network:
+    ///   `./quake spam --targets validator1,validator2 -r 200 -t 60`
+    ///   Remote network:
+    ///   `./quake remote spam -- --targets validator1,validator2 -r 200 -t 60`
     #[command(verbatim_doc_comment)]
     Spam { args: Vec<String> },
     /// Export a JSON file with everything needed for another user to access this remote testnet
@@ -832,20 +848,22 @@ async fn main() -> Result<()> {
         Commands::Logs { names, follow } => testnet.logs(names, follow).await?,
         Commands::Info { command } => testnet.info(command).await?,
         Commands::Remote { command } => testnet.remote(command).await?,
-        Commands::Load { target_nodes, args } => {
+        Commands::Load { targets, args } => {
             if testnet.is_remote() {
                 bail!("Remote infrastructure does not support the `load` command. Please run `remote load` instead.");
             }
             let config = args.to_config(cli.verbosity.is_silent(), false);
             config.validate()?;
+            let target_nodes = targets.unwrap_or_default();
             testnet.load(target_nodes, &config).await?;
         }
-        Commands::Spam { target_nodes, args } => {
+        Commands::Spam { targets, args } => {
             if testnet.is_remote() {
                 bail!("Remote infrastructure does not support the `spam` command. Please run `remote spam` instead.");
             }
             let config = args.to_config(cli.verbosity.is_silent(), true);
             config.validate()?;
+            let target_nodes = targets.unwrap_or_default();
             testnet.load(target_nodes, &config).await?;
         }
         Commands::ValSet { updates } => testnet.valset_update(updates).await?,
@@ -958,4 +976,45 @@ async fn pre_start(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn cli_parses_load_targets() {
+        let cli = Cli::try_parse_from([
+            "quake",
+            "load",
+            "--rate",
+            "42",
+            "--targets",
+            "validator1,ALL_VALIDATORS",
+        ])
+        .expect("parsing load with --targets");
+
+        match cli.command {
+            Commands::Load { targets, args } => {
+                assert_eq!(
+                    targets,
+                    Some(vec!["validator1".to_string(), "ALL_VALIDATORS".to_string(),])
+                );
+                assert_eq!(args.rate, 42);
+            }
+            _ => panic!("expected load command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_positional_load_targets() {
+        let err = match Cli::try_parse_from(["quake", "load", "validator1"]) {
+            Ok(_) => panic!("positional load targets must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("validator1"));
+    }
 }

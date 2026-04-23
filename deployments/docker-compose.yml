@@ -1,0 +1,114 @@
+# Docker Compose for running an Arc node in follow mode.
+#
+# Start:  docker compose up -d    (first run downloads ~84 GB of snapshots)
+# Stop:   docker compose down
+# Logs:   docker compose logs -f
+#
+# Required environment variables (see docs/running-an-arc-node-docker.md):
+#   ARC_EXECUTION_IMAGE  — EL Docker image (e.g. docker.cloudsmith.io/circle/arc-network/arc-execution:0.6.0)
+#   ARC_CONSENSUS_IMAGE  — CL Docker image (e.g. docker.cloudsmith.io/circle/arc-network/arc-consensus:0.6.0)
+#   ARC_HOME             — data directory on the host (e.g. ~/.arc)
+
+services:
+  # --- Initialization (runs once, then exits) ---
+
+  # Download EL and CL snapshots (the CLI skips if data already exists)
+  arc-snapshots:
+    image: ${ARC_EXECUTION_IMAGE:?ARC_EXECUTION_IMAGE must be set}
+    entrypoint: ["/usr/local/bin/arc-snapshots"]
+    command:
+      - download
+      - --chain=arc-testnet
+      - --execution-path=/data/execution
+      - --consensus-path=/data/consensus
+    volumes:
+      - ${ARC_HOME:?ARC_HOME must be set}:/data
+
+  # Initialize consensus layer private key
+  arc-consensus-init:
+    image: ${ARC_CONSENSUS_IMAGE:?ARC_CONSENSUS_IMAGE must be set}
+    command:
+      - init
+      - --home=/data/consensus
+    depends_on:
+      arc-snapshots:
+        condition: service_completed_successfully
+    volumes:
+      - ${ARC_HOME}/consensus:/data/consensus
+
+  # Set ownership on the shared sockets volume so the EL (UID 999) can write
+  arc-sockets-init:
+    image: debian:bookworm-slim
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["rm -f /sockets/*.ipc && chown 999:999 /sockets"]
+    volumes:
+      - arc-sockets:/sockets
+    depends_on:
+      arc-consensus-init:
+        condition: service_completed_successfully
+
+  # --- Long-running services ---
+
+  # Execution Layer (EL)
+  arc-execution:
+    image: ${ARC_EXECUTION_IMAGE}
+    command:
+      - node
+      - --chain=arc-testnet
+      - --datadir=/data/execution
+      - --full
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=eth,net,web3,txpool,trace,debug
+      - --auth-ipc
+      - --auth-ipc.path=/sockets/auth.ipc
+      - --ipcpath=/sockets/reth.ipc
+      - --metrics=0.0.0.0:9001
+      - --disable-discovery
+      - --enable-arc-rpc
+      - --rpc.forwarder=https://rpc.quicknode.testnet.arc.network/
+      - --log.file.directory=/data/execution/logs
+    volumes:
+      - ${ARC_HOME}/execution:/data/execution
+      - arc-sockets:/sockets
+    ports:
+      - "127.0.0.1:8545:8545"
+      - "127.0.0.1:9001:9001"
+    depends_on:
+      arc-sockets-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Consensus Layer (CL)
+  arc-consensus:
+    image: ${ARC_CONSENSUS_IMAGE}
+    command:
+      - start
+      - --home=/data/consensus
+      - --eth-socket=/sockets/reth.ipc
+      - --execution-socket=/sockets/auth.ipc
+      - --rpc.addr=0.0.0.0:31000
+      - --follow
+      - --follow.endpoint=https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network
+      - --follow.endpoint=https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network
+      - --follow.endpoint=https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network/websocket
+      - --full
+      - --execution-persistence-backpressure
+      - --execution-persistence-backpressure-threshold=50
+      - --metrics=0.0.0.0:29000
+    volumes:
+      - ${ARC_HOME}/consensus:/data/consensus
+      - arc-sockets:/sockets
+    ports:
+      - "127.0.0.1:31000:31000"
+      - "127.0.0.1:29000:29000"
+    depends_on:
+      arc-consensus-init:
+        condition: service_completed_successfully
+      arc-execution:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  arc-sockets:

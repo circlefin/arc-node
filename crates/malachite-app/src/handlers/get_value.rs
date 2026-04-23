@@ -39,6 +39,7 @@ use crate::payload::{
 };
 use crate::proposal_parts::{prepare_stream, stream_proposal};
 use crate::state::State;
+use crate::store::repositories::UndecidedBlocksRepository;
 use crate::store::Store;
 use crate::utils::pretty::PrettyPayload;
 
@@ -298,12 +299,12 @@ pub async fn build_block(
 /// We assume this implementation is not byzantine and we are the proposer for the given height and round.
 /// Therefore there must be a single block for the rounds where we are the proposer, with the proposer address matching our own.
 async fn get_previously_built_block(
-    store: &Store,
+    undecided_blocks: impl UndecidedBlocksRepository,
     proposer: Address,
     height: Height,
     round: Round,
 ) -> eyre::Result<Option<ConsensusBlock>> {
-    let blocks = store.get_undecided_blocks(height, round).await?;
+    let blocks = undecided_blocks.get_by_round(height, round).await?;
     let block = blocks.into_iter().find(|p| p.proposer == proposer);
     Ok(block)
 }

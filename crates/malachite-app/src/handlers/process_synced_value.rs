@@ -171,7 +171,7 @@ async fn on_process_synced_value(
 
     let proposal = ProposedValue::from(&block);
 
-    undecided_blocks_repo.store(block).await.wrap_err_with(|| {
+    undecided_blocks_repo.store_undecided_block(block).await.wrap_err_with(|| {
         format!(
             "Failed to store undecided block {} synced from the network for height={}, round={}, proposer={}",
             block_hash, height, round, proposer,
@@ -232,7 +232,7 @@ mod tests {
 
         let mut undecided = MockUndecidedBlocksRepository::new();
         undecided
-            .expect_store()
+            .expect_store_undecided_block()
             .withf(move |block| {
                 block.height == height && block.round == round && block.proposer == proposer
             })
@@ -290,7 +290,7 @@ mod tests {
         // Expectation: If bytes are invalid, we should NOT validate the payload
         // and definitely NOT store the block.
         engine.expect_validate_payload().times(0);
-        undecided.expect_store().times(0);
+        undecided.expect_store_undecided_block().times(0);
         invalid.expect_append().times(1).returning(|_| Ok(()));
 
         let height = Height::new(1);
@@ -334,7 +334,7 @@ mod tests {
             .returning(|_| Err(io::Error::other("Simulated engine error").into()));
 
         let mut undecided = MockUndecidedBlocksRepository::new();
-        undecided.expect_store().times(0);
+        undecided.expect_store_undecided_block().times(0);
 
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid.expect_append().times(0);
@@ -365,7 +365,7 @@ mod tests {
         engine.expect_validate_payload().times(0);
 
         let mut undecided = MockUndecidedBlocksRepository::new();
-        undecided.expect_store().times(0);
+        undecided.expect_store_undecided_block().times(0);
 
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid
@@ -405,7 +405,7 @@ mod tests {
 
         let mut undecided = MockUndecidedBlocksRepository::new();
         undecided
-            .expect_store()
+            .expect_store_undecided_block()
             .times(1)
             .returning(|_| Err(io::Error::other("Simulated store error")));
 
@@ -444,7 +444,10 @@ mod tests {
             .returning(|_| Ok(PayloadValidationResult::Valid));
 
         let mut undecided = MockUndecidedBlocksRepository::new();
-        undecided.expect_store().times(1).returning(|_| Ok(()));
+        undecided
+            .expect_store_undecided_block()
+            .times(1)
+            .returning(|_| Ok(()));
 
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid.expect_append().times(0);
@@ -491,7 +494,10 @@ mod tests {
         });
 
         let mut undecided = MockUndecidedBlocksRepository::new();
-        undecided.expect_store().times(1).returning(|_| Ok(()));
+        undecided
+            .expect_store_undecided_block()
+            .times(1)
+            .returning(|_| Ok(()));
 
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid.expect_append().times(1).returning(|_| Ok(()));
@@ -532,7 +538,10 @@ mod tests {
             .returning(|_| Ok(PayloadValidationResult::Valid));
 
         let mut undecided = MockUndecidedBlocksRepository::new();
-        undecided.expect_store().times(1).returning(|_| Ok(()));
+        undecided
+            .expect_store_undecided_block()
+            .times(1)
+            .returning(|_| Ok(()));
 
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid.expect_append().times(0);

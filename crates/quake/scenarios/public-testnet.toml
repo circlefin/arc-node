@@ -2,10 +2,10 @@ name = "testnet"
 description = "A reproduction of the testnet configuration with latency emulation enabled."
 
 # Global config
-cl.config.logging.log_level = "debug"
+cl.config.log_level = "debug"
 
-cl.config.consensus.p2p.discovery.num_inbound_peers = 50
-cl.config.consensus.p2p.discovery.num_outbound_peers = 50
+cl.config.discovery_num_inbound_peers = 50
+cl.config.discovery_num_outbound_peers = 50
 
 latency_emulation = true
 engine_api_connection = "rpc"

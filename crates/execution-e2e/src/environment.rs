@@ -16,7 +16,7 @@
 
 //! Arc test environment for e2e tests.
 
-use alloy_primitives::{BlockHash, TxHash};
+use alloy_primitives::{Address, BlockHash, TxHash};
 use arc_evm_node::node::ArcNode;
 use reth_e2e_test_utils::{wallet::Wallet, NodeHelperType};
 use reth_node_builder::NodeTypesWithDBAdapter;
@@ -61,6 +61,11 @@ pub struct ArcEnvironment {
     wallet: Option<Wallet>,
     /// Named transaction hashes for test assertions.
     tx_hashes: HashMap<String, TxHash>,
+    /// Named addresses (e.g., deployed contract addresses) for test reference.
+    addresses: HashMap<String, Address>,
+    /// Per-wallet-index nonce counter. Index 0 is seeded from `wallet.inner_nonce`
+    /// during setup; other indices start at 0.
+    wallet_nonces: HashMap<usize, u64>,
 }
 
 impl Default for ArcEnvironment {
@@ -77,6 +82,8 @@ impl ArcEnvironment {
             current_block: None,
             wallet: None,
             tx_hashes: HashMap::new(),
+            addresses: HashMap::new(),
+            wallet_nonces: HashMap::new(),
         }
     }
 
@@ -86,7 +93,10 @@ impl ArcEnvironment {
     }
 
     /// Sets the wallet. Called by `ArcSetup::apply()`.
+    ///
+    /// Seeds the nonce counter for index 0 from the wallet's starting nonce.
     pub(crate) fn set_wallet(&mut self, wallet: Wallet) {
+        self.wallet_nonces.insert(0, wallet.inner_nonce);
         self.wallet = Some(wallet);
     }
 
@@ -141,5 +151,35 @@ impl ArcEnvironment {
     /// Gets a transaction hash by name.
     pub fn get_tx_hash(&self, name: &str) -> Option<&TxHash> {
         self.tx_hashes.get(name)
+    }
+
+    /// Stores a named address (e.g., deployed contract address).
+    pub fn insert_address(&mut self, name: String, address: Address) -> eyre::Result<()> {
+        if let Some(existing) = self.addresses.get(&name) {
+            return Err(eyre::eyre!(
+                "Address '{}' is already in use (existing address: {}). \
+                 Each address must have a unique name.",
+                name,
+                existing
+            ));
+        }
+        self.addresses.insert(name, address);
+        Ok(())
+    }
+
+    /// Gets a named address.
+    pub fn get_address(&self, name: &str) -> Option<&Address> {
+        self.addresses.get(name)
+    }
+
+    /// Gets and increments the nonce for a wallet at the given index.
+    ///
+    /// All indices use the same `wallet_nonces` map. Index 0 is seeded from
+    /// `wallet.inner_nonce` during `set_wallet`; other indices default to 0.
+    pub fn next_nonce_for_wallet(&mut self, wallet_index: usize) -> eyre::Result<u64> {
+        let nonce = self.wallet_nonces.entry(wallet_index).or_insert(0);
+        let current = *nonce;
+        *nonce += 1;
+        Ok(current)
     }
 }

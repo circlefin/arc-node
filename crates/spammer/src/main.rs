@@ -20,15 +20,18 @@
     clippy::unwrap_used
 )]
 
+use std::{collections::HashMap, fs, io::IsTerminal};
+
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
 use color_eyre::eyre::{self, Context, Result};
 use serde::Deserialize;
-use std::{collections::HashMap, fs, io::IsTerminal};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
 use spammer::{Spammer, SpammerArgs};
+
+const DEFAULT_WS_TARGET: &str = "127.0.0.1:8546";
 
 #[derive(Parser)]
 #[command(
@@ -62,19 +65,18 @@ struct Cli {
 enum TargetCommand {
     /// Target nodes by directly specifying their WebSocket endpoints
     #[command(
-        after_long_help = "Examples:\n  spammer ws 127.0.0.1:8546\n  spammer ws ws://127.0.0.1:8546 ws://127.0.0.1:9546\n"
+        after_long_help = "Examples:\n  spammer ws\n  spammer ws --targets ws://127.0.0.1:8546,ws://127.0.0.1:9546\n"
     )]
     Ws {
-        /// List of nodes to send transactions to, as WebSocket endpoints (formatted
-        /// as IP:PORT or ws://URL)
-        #[arg(default_value = "127.0.0.1:8546")]
-        target_nodes: Vec<String>,
+        /// Explicit targets for this command.
+        #[arg(long, value_delimiter = ',')]
+        targets: Option<Vec<String>>,
     },
     /// Target nodes by name, using a nodes metadata file.
     ///
     /// If no node names are provided, all nodes from the file are used.
     #[command(
-        after_long_help = "Examples:\n  spammer nodes --nodes-path some/path/nodes.json\n  spammer nodes --nodes-path some/path/nodes.json validator1 validator2\n"
+        after_long_help = "Examples:\n  spammer nodes --nodes-path some/path/nodes.json\n  spammer nodes --nodes-path some/path/nodes.json --targets validator1,validator2\n"
     )]
     Nodes {
         /// File with node metadata used to resolve node names to WebSocket
@@ -84,8 +86,9 @@ enum TargetCommand {
         /// `quake setup` command.
         #[arg(short = 'f', long, required = true)]
         nodes_path: String,
-        /// List of node names to target (absent means all nodes from the file)
-        target_nodes: Option<Vec<String>>,
+        /// Explicit targets for this command.
+        #[arg(long, value_delimiter = ',')]
+        targets: Option<Vec<String>>,
     },
 }
 
@@ -122,11 +125,17 @@ async fn main() -> Result<()> {
 
     // Build the WebSocket URLs of the target nodes
     let target_ws_urls = match cli.command {
-        TargetCommand::Ws { target_nodes } => ws_urls_from_strings(target_nodes),
+        TargetCommand::Ws { targets } => {
+            let target_nodes = targets.unwrap_or_else(|| vec![DEFAULT_WS_TARGET.to_string()]);
+            ws_urls_from_strings(target_nodes)
+        }
         TargetCommand::Nodes {
             nodes_path,
-            target_nodes,
-        } => ws_urls_from_file(&nodes_path, target_nodes.unwrap_or_default())?,
+            targets,
+        } => {
+            let target_nodes = targets.unwrap_or_default();
+            ws_urls_from_file(&nodes_path, target_nodes)?
+        }
     };
 
     let spammer = Spammer::new(target_ws_urls, &config).await?;
@@ -199,6 +208,7 @@ struct ExecutionContainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
     use std::path::PathBuf;
 
     fn write_temp_nodes_json(contents: &str) -> PathBuf {
@@ -287,29 +297,23 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_ws_subcommand_with_default_target() {
-        let cli = Cli::try_parse_from(["spammer", "ws"]).expect("parsing ws subcommand");
-        match cli.command {
-            TargetCommand::Ws { target_nodes } => {
-                assert_eq!(target_nodes, vec!["127.0.0.1:8546".to_string()]);
-            }
-            _ => panic!("expected ws subcommand"),
-        }
-    }
-
-    #[test]
-    fn cli_parses_ws_subcommand_with_explicit_targets() {
-        let cli = Cli::try_parse_from(["spammer", "ws", "127.0.0.1:8546", "ws://127.0.0.1:9546"])
-            .expect("parsing ws subcommand with explicit targets");
+    fn cli_parses_ws_subcommand_with_targets_flag() {
+        let cli = Cli::try_parse_from([
+            "spammer",
+            "ws",
+            "--targets",
+            "127.0.0.1:8546,ws://127.0.0.1:9546",
+        ])
+        .expect("parsing ws subcommand with --targets");
 
         match cli.command {
-            TargetCommand::Ws { target_nodes } => {
+            TargetCommand::Ws { targets } => {
                 assert_eq!(
-                    target_nodes,
-                    vec![
+                    targets,
+                    Some(vec![
                         "127.0.0.1:8546".to_string(),
-                        "ws://127.0.0.1:9546".to_string()
-                    ]
+                        "ws://127.0.0.1:9546".to_string(),
+                    ])
                 );
             }
             _ => panic!("expected ws subcommand"),
@@ -317,42 +321,36 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_nodes_subcommand_without_target_nodes() {
-        let cli = Cli::try_parse_from(["spammer", "nodes", "--nodes-path", "nodes.json"])
-            .expect("parsing nodes subcommand without providing target nodes");
+    fn cli_rejects_ws_positional_targets() {
+        let err = match Cli::try_parse_from(["spammer", "ws", "127.0.0.1:8546"]) {
+            Ok(_) => panic!("positional ws targets must be rejected"),
+            Err(err) => err,
+        };
 
-        match cli.command {
-            TargetCommand::Nodes {
-                nodes_path,
-                target_nodes,
-            } => {
-                assert_eq!(nodes_path, "nodes.json");
-                assert_eq!(target_nodes, None);
-            }
-            _ => panic!("expected nodes subcommand"),
-        }
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("127.0.0.1:8546"));
     }
 
     #[test]
-    fn cli_parses_nodes_subcommand_with_target_nodes() {
+    fn cli_parses_nodes_subcommand_with_targets_flag() {
         let cli = Cli::try_parse_from([
             "spammer",
             "nodes",
             "--nodes-path",
             "nodes.json",
-            "validator1",
-            "validator2",
+            "--targets",
+            "validator1,validator2",
         ])
-        .expect("parsing nodes subcommand with target nodes");
+        .expect("parsing nodes subcommand with --targets");
 
         match cli.command {
             TargetCommand::Nodes {
                 nodes_path,
-                target_nodes,
+                targets,
             } => {
                 assert_eq!(nodes_path, "nodes.json");
                 assert_eq!(
-                    target_nodes,
+                    targets,
                     Some(vec!["validator1".to_string(), "validator2".to_string()])
                 );
             }
@@ -361,18 +359,31 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_shared_flags_after_subcommand() {
-        let cli = Cli::try_parse_from(["spammer", "ws", "127.0.0.1:8546", "--rate", "42"])
-            .expect("parsing shared flags after ws subcommand");
-        assert_eq!(cli.args.rate, 42);
-
-        let cli = Cli::try_parse_from([
+    fn cli_rejects_nodes_positional_targets() {
+        let err = match Cli::try_parse_from([
             "spammer",
             "nodes",
             "--nodes-path",
             "nodes.json",
             "validator1",
-            "validator2",
+        ]) {
+            Ok(_) => panic!("positional node targets must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("validator1"));
+    }
+
+    #[test]
+    fn cli_accepts_shared_flags_after_nodes_subcommand() {
+        let cli = Cli::try_parse_from([
+            "spammer",
+            "nodes",
+            "--nodes-path",
+            "nodes.json",
+            "--targets",
+            "validator1,validator2",
             "--rate",
             "42",
         ])
@@ -395,7 +406,8 @@ mod tests {
         let cli = Cli::try_parse_from([
             "spammer",
             "ws",
-            "127.0.0.1:8546",
+            "--targets",
+            "127.0.0.1:8546,ws://127.0.0.1:9546",
             "--fire-and-forget",
             "--rate",
             "500",

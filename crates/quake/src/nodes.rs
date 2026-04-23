@@ -100,7 +100,10 @@ impl NodesMetadata {
                 .filter_map(|endpoint_name| node_to_el_url.get(endpoint_name).cloned())
                 .collect();
 
-            let consensus_enabled = manifest_node.cl_config.consensus.enabled;
+            let consensus_enabled = match &manifest_node.cl_config {
+                crate::manifest::NodeClConfig::Modern(cmd) => !cmd.no_consensus,
+                crate::manifest::NodeClConfig::Legacy(cfg) => cfg.consensus.enabled,
+            };
 
             let mut node = match infra_data.infra_type {
                 InfraType::Local => {

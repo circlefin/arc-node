@@ -34,8 +34,12 @@ use arc_node_consensus::store::migrations::MigrationCoordinator;
 use arc_node_consensus_cli::{
     args::{Args, Commands},
     cmd::{
-        db::DbCommands, db::MigrateCmd, download::DownloadCmd, init::InitCmd, key::KeyCmd,
-        start::StartCmd,
+        db::DbCommands,
+        db::MigrateCmd,
+        download::DownloadCmd,
+        init::InitCmd,
+        key::KeyCmd,
+        start::{StartCmd, RUNTIME_MULTI_THREADED, RUNTIME_SINGLE_THREADED},
     },
     config, logging, runtime,
 };
@@ -48,7 +52,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(feature = "pprof")]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
-pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
 
 /// Main entry point for the application
 ///
@@ -64,9 +68,14 @@ fn main() -> Result<()> {
     // Load command-line arguments and possible configuration file.
     let args = Args::new();
 
+    // StartCmd log_level/log_format take precedence over Args-level (for backwards compat).
+    let (start_cmd_log_level, start_cmd_log_format) = match &args.command {
+        Commands::Start(cmd) => (cmd.log_level, cmd.log_format),
+        _ => (None, None),
+    };
     let logging = config::LoggingConfig {
-        log_level: args.log_level,
-        log_format: args.log_format,
+        log_level: start_cmd_log_level.unwrap_or(args.log_level),
+        log_format: start_cmd_log_format.unwrap_or(args.log_format),
     };
 
     // This is a drop guard responsible for flushing any remaining logs when the program terminates.
@@ -144,12 +153,14 @@ fn build_config_from_cli(cmd: &StartCmd, logging: config::LoggingConfig) -> Resu
     };
 
     let runtime = match cmd.runtime_flavor.as_str() {
-        "single-threaded" => RuntimeConfig::single_threaded(),
-        "multi-threaded" => RuntimeConfig::multi_threaded(cmd.worker_threads.unwrap_or(0)),
+        RUNTIME_SINGLE_THREADED => RuntimeConfig::single_threaded(),
+        RUNTIME_MULTI_THREADED => RuntimeConfig::multi_threaded(cmd.worker_threads.unwrap_or(0)),
         _ => {
             return Err(eyre!(
-                "Invalid runtime flavor: {}. Must be 'single-threaded' or 'multi-threaded'",
-                cmd.runtime_flavor
+                "Invalid runtime flavor: {}. Must be '{}' or '{}'",
+                cmd.runtime_flavor,
+                RUNTIME_SINGLE_THREADED,
+                RUNTIME_MULTI_THREADED,
             ));
         }
     };
@@ -228,6 +239,7 @@ fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<
         execution_ws_endpoint: cmd.execution_ws_endpoint.clone(),
         execution_jwt: cmd.execution_jwt.clone(),
         pprof_bind_address: Some(cmd.pprof_addr.parse()?),
+        pprof_heap_prof: cmd.pprof_heap_prof,
         suggested_fee_recipient: cmd.suggested_fee_recipient,
         skip_db_upgrade: cmd.skip_db_upgrade,
         validator: cmd.validator,
@@ -627,7 +639,7 @@ mod tests {
     #[test]
     fn build_config_from_cli_multi_threaded_runtime_with_threads() {
         let mut cmd = minimal_start_cmd();
-        cmd.runtime_flavor = "multi-threaded".to_string();
+        cmd.runtime_flavor = RUNTIME_MULTI_THREADED.to_string();
         cmd.worker_threads = Some(8);
 
         let logging = test_logging_config();
@@ -640,7 +652,7 @@ mod tests {
     #[test]
     fn build_config_from_cli_single_threaded_runtime() {
         let mut cmd = minimal_start_cmd();
-        cmd.runtime_flavor = "single-threaded".to_string();
+        cmd.runtime_flavor = RUNTIME_SINGLE_THREADED.to_string();
 
         let logging = test_logging_config();
         let config = build_config_from_cli(&cmd, logging).unwrap();

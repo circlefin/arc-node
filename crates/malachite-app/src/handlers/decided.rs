@@ -143,7 +143,7 @@ async fn decide(
     // NOTE: here the node searches for the block with maching value_id from any round
     // It needs to read the complete undecided blocks table, but the expectation is it should be small.
     let block = match undecided_blocks
-        .get_first(height, value_id.block_hash())
+        .get_by_hash(height, value_id.block_hash())
         .await
     {
         Ok(Some(block)) => block,
@@ -416,7 +416,7 @@ mod tests {
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
         undecided_blocks
-            .expect_get_first()
+            .expect_get_by_hash()
             .with(eq(Height::new(height)), eq(block_hash))
             .return_once(move |_, _| Ok(Some(consensus_block.clone())));
 
@@ -479,7 +479,7 @@ mod tests {
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
         undecided_blocks
-            .expect_get_first()
+            .expect_get_by_hash()
             .with(eq(Height::new(height)), eq(block_hash))
             .return_once(|_, _| Ok(None));
 
@@ -514,7 +514,7 @@ mod tests {
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
         undecided_blocks
-            .expect_get_first()
+            .expect_get_by_hash()
             .with(eq(Height::new(height)), eq(block_hash))
             .return_once(|_, _| Err(std::io::Error::other("Database error")));
 
@@ -551,7 +551,7 @@ mod tests {
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
         undecided_blocks
-            .expect_get_first()
+            .expect_get_by_hash()
             .with(eq(Height::new(height)), eq(block_hash))
             .return_once(move |_, _| Ok(Some(consensus_block.clone())));
 

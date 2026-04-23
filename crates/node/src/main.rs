@@ -27,7 +27,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(feature = "pprof")]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
-pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
 
 use arc_evm_node::node::{ArcNode, ArcRpcConfig};
 use arc_execution_config::addresses_denylist::{
@@ -260,6 +260,18 @@ struct ArcExtraCli {
         help_heading = "Profiling"
     )]
     pprof_addr: String,
+
+    /// Activate jemalloc heap profiling at startup.
+    ///
+    /// When built with the `pprof` feature, heap profiling infrastructure is
+    /// always available but inactive by default. This flag activates it so
+    /// that the `/debug/pprof/allocs` endpoint returns meaningful data.
+    #[arg(
+        long = "pprof.heap-prof",
+        default_value_t = false,
+        help_heading = "Profiling"
+    )]
+    pprof_heap_prof: bool,
 }
 
 /// Build [`AddressesDenylistConfig`] from CLI flags.
@@ -463,7 +475,7 @@ fn main() {
                 .launch_with_debug_capabilities()
                 .await?;
 
-            spawn_pprof_server(ext.pprof_addr.parse()?);
+            spawn_pprof_server(ext.pprof_addr.parse()?, ext.pprof_heap_prof);
 
             #[cfg(unix)]
             install_sigterm_handler(handle.node.add_ons_handle.engine_shutdown.clone());
@@ -541,7 +553,16 @@ fn install_sigterm_handler(engine_shutdown: reth_node_builder::rpc::EngineShutdo
 fn install_sigterm_handler(_engine_shutdown: reth_node_builder::rpc::EngineShutdown) {}
 
 #[cfg(feature = "pprof")]
-fn spawn_pprof_server(bind_address: std::net::SocketAddr) {
+fn spawn_pprof_server(bind_address: std::net::SocketAddr, heap_prof: bool) {
+    if heap_prof {
+        // SAFETY: writing a bool to a well-known jemalloc mallctl key.
+        if let Err(e) = unsafe { tikv_jemalloc_ctl::raw::write(b"prof.active\0", true) } {
+            tracing::error!(error = %e, "failed to activate jemalloc heap profiling; /debug/pprof/allocs will return empty profiles");
+        } else {
+            tracing::info!("jemalloc heap profiling activated");
+        }
+    }
+
     tokio::spawn(async move {
         if let Err(e) =
             pprof_hyper_server::serve(bind_address, pprof_hyper_server::Config::default()).await
@@ -555,7 +576,7 @@ fn spawn_pprof_server(bind_address: std::net::SocketAddr) {
 }
 
 #[cfg(not(feature = "pprof"))]
-fn spawn_pprof_server(_bind_address: std::net::SocketAddr) {}
+fn spawn_pprof_server(_bind_address: std::net::SocketAddr, _heap_prof: bool) {}
 
 #[cfg(test)]
 mod tests {
@@ -945,6 +966,27 @@ mod tests {
                 node_cmd.ext.arc_hide_pending_txs,
                 "--arc.hide-pending-txs should enable filtering"
             );
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_pprof_heap_prof_default_is_false() {
+        let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert!(!node_cmd.ext.pprof_heap_prof);
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_pprof_heap_prof_when_set() {
+        let cli =
+            ArcCli::try_parse_from(["arc-node-execution", "node", "--pprof.heap-prof"]).unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert!(node_cmd.ext.pprof_heap_prof);
         } else {
             panic!("Expected Node command");
         }

@@ -1,5 +1,5 @@
 # Global config
-cl.config.logging.log_level = "info"
+cl.config.log_level = "info"
 
 [nodes.validator1]
 [nodes.validator2]
@@ -16,4 +16,3 @@ start_at = 20
 
 [nodes.full3]
 start_at = 10
-

@@ -23,35 +23,33 @@ use arc_consensus_types::block::ConsensusBlock;
 pub trait UndecidedBlocksRepository {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Get the undecided block for the given height, round, and block hash.
-    ///
-    /// # Arguments
-    /// - `height`: The height to get the undecided block for.
-    /// - `round`: The round to get the undecided block for.
-    async fn get(
+    /// Gets the undecided block with the given height, round, and block hash.
+    /// Returns `None` if no such block exists.
+    async fn get_by_round_and_hash(
         &self,
         height: Height,
         round: Round,
         block_hash: BlockHash,
     ) -> Result<Option<ConsensusBlock>, Self::Error>;
 
-    /// Get the undecided block for the given height and block hash (ignoring round).
-    /// Returns the first undecided block found that matches the height and block hash.
-    ///
-    /// # Arguments
-    /// - `height`: The height to get the undecided block for.
-    /// - `block_hash`: The block hash to get the undecided block for.
-    async fn get_first(
+    /// Gets all undecided blocks for the given height and round.
+    async fn get_by_round(
+        &self,
+        height: Height,
+        round: Round,
+    ) -> Result<Vec<ConsensusBlock>, Self::Error>;
+
+    /// Gets the undecided block with the given height and block hash.
+    /// Scans across all rounds, returning the first match found.
+    /// Returns `None` if no such block exists.
+    async fn get_by_hash(
         &self,
         height: Height,
         block_hash: BlockHash,
     ) -> Result<Option<ConsensusBlock>, Self::Error>;
 
-    /// Store the undecided block.
-    ///
-    /// # Arguments
-    /// - `block`: The block to store.
-    async fn store(&self, block: ConsensusBlock) -> Result<(), Self::Error>;
+    /// Stores the undecided block.
+    async fn store_undecided_block(&self, block: ConsensusBlock) -> Result<(), Self::Error>;
 }
 
 impl<T> UndecidedBlocksRepository for &'_ T
@@ -60,32 +58,42 @@ where
 {
     type Error = T::Error;
 
-    async fn get(
+    async fn get_by_round_and_hash(
         &self,
         height: Height,
         round: Round,
         block_hash: BlockHash,
     ) -> Result<Option<ConsensusBlock>, Self::Error> {
-        (*self).get(height, round, block_hash).await
+        (*self)
+            .get_by_round_and_hash(height, round, block_hash)
+            .await
     }
 
-    async fn get_first(
+    async fn get_by_round(
+        &self,
+        height: Height,
+        round: Round,
+    ) -> Result<Vec<ConsensusBlock>, Self::Error> {
+        (*self).get_by_round(height, round).await
+    }
+
+    async fn get_by_hash(
         &self,
         height: Height,
         block_hash: BlockHash,
     ) -> Result<Option<ConsensusBlock>, Self::Error> {
-        (*self).get_first(height, block_hash).await
+        (*self).get_by_hash(height, block_hash).await
     }
 
-    async fn store(&self, block: ConsensusBlock) -> Result<(), Self::Error> {
-        (*self).store(block).await
+    async fn store_undecided_block(&self, block: ConsensusBlock) -> Result<(), Self::Error> {
+        (*self).store_undecided_block(block).await
     }
 }
 
 impl UndecidedBlocksRepository for Store {
     type Error = StoreError;
 
-    async fn get(
+    async fn get_by_round_and_hash(
         &self,
         height: Height,
         round: Round,
@@ -94,7 +102,15 @@ impl UndecidedBlocksRepository for Store {
         self.get_undecided_block(height, round, block_hash).await
     }
 
-    async fn get_first(
+    async fn get_by_round(
+        &self,
+        height: Height,
+        round: Round,
+    ) -> Result<Vec<ConsensusBlock>, Self::Error> {
+        self.get_undecided_blocks(height, round).await
+    }
+
+    async fn get_by_hash(
         &self,
         height: Height,
         block_hash: BlockHash,
@@ -103,7 +119,7 @@ impl UndecidedBlocksRepository for Store {
             .await
     }
 
-    async fn store(&self, block: ConsensusBlock) -> Result<(), Self::Error> {
+    async fn store_undecided_block(&self, block: ConsensusBlock) -> Result<(), Self::Error> {
         self.store_undecided_block(block).await
     }
 }

@@ -197,29 +197,31 @@ using subcommands.
 
 ### `spammer ws`
 
-Target nodes by directly specifying their WebSocket endpoints (as `IP:PORT` or `ws://...`).
-If no endpoints are provided, it defaults to `127.0.0.1:8546`.
+Target nodes by directly specifying their WebSocket endpoints with
+`--targets` as a comma-separated list (each target may be `IP:PORT` or
+`ws://...`). If `--targets` is omitted, it defaults to `127.0.0.1:8546`.
 
 Examples:
 
 ```bash
-spammer ws 127.0.0.1:8546
-spammer ws ws://127.0.0.1:8546 ws://127.0.0.1:9546
+spammer ws --targets 127.0.0.1:8546
+spammer ws --targets ws://127.0.0.1:8546,ws://127.0.0.1:9546
 ```
 
 ### `spammer nodes`
 
-Target nodes by name using a nodes metadata file (for example a Quake-generated
-`.quake/<testnet-name>/nodes.json`).
+Target nodes by name using a nodes metadata file (for example a
+Quake-generated `.quake/<testnet-name>/nodes.json`). `--targets` takes a
+comma-separated list of node names.
 
-- If no node names are provided, all nodes from the file are targeted.
+- If `--targets` is omitted, all nodes from the file are targeted.
 - `--nodes-path` is required.
 
 Examples:
 
 ```bash
 spammer nodes --nodes-path ./.quake/5nodes/nodes.json
-spammer nodes --nodes-path ./.quake/5nodes/nodes.json validator1 validator2
+spammer nodes --nodes-path ./.quake/5nodes/nodes.json --targets validator1,validator2
 ```
 
 ## Main parameters
@@ -291,7 +293,7 @@ Examples:
 
 ```bash
 # WebSocket endpoints directly
-spammer ws ws://127.0.0.1:8546 --guzzler-fn-weights hash-loop=100@2000,storage-write=0,storage-read=0,guzzle=0,guzzle2=0 -r 20 -t 30
+spammer ws --targets ws://127.0.0.1:8546 --guzzler-fn-weights hash-loop=100@2000,storage-write=0,storage-read=0,guzzle=0,guzzle2=0 -r 20 -t 30
 
 # Nodes by name from a Quake-generated nodes.json
 spammer nodes --nodes-path ./.quake/5nodes/nodes.json --guzzler-fn-weights hash-loop=0,storage-write=100@500,storage-read=0,guzzle=0,guzzle2=0 -r 50 -t 60
@@ -330,16 +332,16 @@ Examples:
 
 ```bash
 # 100% ERC-20 transfers (default function)
-spammer ws ws://127.0.0.1:8546 --mix erc20=100 -r 100 -t 30
+spammer ws --targets ws://127.0.0.1:8546 --mix erc20=100 -r 100 -t 30
 
 # 70% EIP-1559 transfers, 30% legacy transfers
-spammer ws ws://127.0.0.1:8546 --mix transfer=70,legacy=30 -r 100 -t 30
+spammer ws --targets ws://127.0.0.1:8546 --mix transfer=70,legacy=30 -r 100 -t 30
 
 # 70% native transfers, 30% ERC-20
-spammer ws ws://127.0.0.1:8546 --mix transfer=70,erc20=30 -r 100 -t 30
+spammer ws --targets ws://127.0.0.1:8546 --mix transfer=70,erc20=30 -r 100 -t 30
 
 # All three types: 50% transfer, 20% ERC-20, 30% GasGuzzler (hashLoop)
-spammer ws ws://127.0.0.1:8546 --mix transfer=50,erc20=20,guzzler=30 --guzzler-fn-weights hash-loop=100@2000 -r 100 -t 30
+spammer ws --targets ws://127.0.0.1:8546 --mix transfer=50,erc20=20,guzzler=30 --guzzler-fn-weights hash-loop=100@2000 -r 100 -t 30
 ```
 
 ### ERC-20 Function Mix
@@ -370,13 +372,13 @@ Examples:
 
 ```bash
 # ERC-20 with mixed functions: 60% transfer, 30% approve, 10% transferFrom
-spammer ws ws://127.0.0.1:8546 --mix erc20=100 --erc20-fn-weights transfer=60,approve=30,transfer-from=10 -r 100 -t 30
+spammer ws --targets ws://127.0.0.1:8546 --mix erc20=100 --erc20-fn-weights transfer=60,approve=30,transfer-from=10 -r 100 -t 30
 
 # Stress approve-heavy workload
-spammer ws ws://127.0.0.1:8546 --mix erc20=100 --erc20-fn-weights approve=100 -r 100 -t 30
+spammer ws --targets ws://127.0.0.1:8546 --mix erc20=100 --erc20-fn-weights approve=100 -r 100 -t 30
 
 # Mixed workload: native transfers plus diverse ERC-20 functions
-spammer ws ws://127.0.0.1:8546 --mix transfer=50,erc20=50 --erc20-fn-weights transfer=70,approve=30 -r 100 -t 30
+spammer ws --targets ws://127.0.0.1:8546 --mix transfer=50,erc20=50 --erc20-fn-weights transfer=70,approve=30 -r 100 -t 30
 ```
 
 ## Transaction Latency Tracking
@@ -402,13 +404,13 @@ Add the `--tx-latency` flag to any spammer command:
 
 ```bash
 # With WebSocket endpoints
-spammer ws ws://127.0.0.1:8546 --tx-latency -r 100 -t 30
+spammer ws --targets ws://127.0.0.1:8546 --tx-latency -r 100 -t 30
 
 # With nodes from a Quake-generated file
 spammer nodes --nodes-path ./.quake/5nodes/nodes.json --tx-latency -r 1000 -t 60
 
 # Write the CSV to a specific directory
-spammer ws ws://127.0.0.1:8546 --tx-latency --csv-dir /tmp/results -r 100 -t 30
+spammer ws --targets ws://127.0.0.1:8546 --tx-latency --csv-dir /tmp/results -r 100 -t 30
 ```
 
 ### How it works

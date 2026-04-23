@@ -19,11 +19,9 @@
 /// It generates a manifest file with random configuration for the testnet based on the seed.
 /// Manifest parameters are generated based on a predefined per-parameter distributions.
 /// This is the minimal implementation that serves as a baseline for future randomization.
-use arc_consensus_types::{
-    Config as ClConfigOverride, ConsensusConfig, Height, LogFormat, LogLevel, LoggingConfig,
-    PruningConfig, RpcConfig, RuntimeConfig, ValueSyncConfig,
+use arc_node_consensus_cli::cmd::start::{
+    StartCmd, RUNTIME_MULTI_THREADED, RUNTIME_SINGLE_THREADED,
 };
-use std::time::Duration;
 
 use crate::latency::{Region, AWS_LATENCY_MATRIX};
 use crate::manifest::subnets::Subnets;
@@ -238,7 +236,7 @@ impl Manifest {
             .context("Failed to apply region strategy")?;
 
         for (_name, node) in nodes.iter_mut() {
-            node.cl_config = Self::random_cl_node_config(&mut rng);
+            node.cl_config = Self::random_cl_node_config(&mut rng, &node.node_type);
             node.el_config = Self::random_el_node_config(&mut rng);
         }
 
@@ -264,25 +262,23 @@ impl Manifest {
             subnets: Subnets::new(&node_subnets),
             images: DockerImages::default(),
             nodes,
+            node_groups: IndexMap::new(),
             el_init_hardfork,
         })
     }
 
     /// Build random per-node CL (Consensus Layer) config.
-    fn random_cl_node_config(rng: &mut StdRng) -> ClConfigOverride {
-        let parallel_requests = if rng.gen_bool(0.7) {
-            5
-        } else {
-            rng.gen_range(1..=20)
-        };
+    fn random_cl_node_config(rng: &mut StdRng, node_type: &NodeType) -> manifest::NodeClConfig {
+        use malachitebft_config::{LogFormat, LogLevel};
 
         // Runtime: 30% single_threaded, 70% multi_threaded; worker_threads 1-16 when multi.
-        let runtime = if rng.gen_bool(0.7) {
-            RuntimeConfig::MultiThreaded {
-                worker_threads: rng.gen_range(1..=16),
-            }
+        let (runtime_flavor, worker_threads) = if rng.gen_bool(0.7) {
+            (
+                RUNTIME_MULTI_THREADED.to_string(),
+                Some(rng.gen_range(1..=16)),
+            )
         } else {
-            RuntimeConfig::SingleThreaded
+            (RUNTIME_SINGLE_THREADED.to_string(), None)
         };
 
         let distance: u64 = match rng.gen_range(0..100) {
@@ -290,41 +286,40 @@ impl Manifest {
             30..=69 => rng.gen_range(100..=1000),
             _ => rng.gen_range(1000..=10000),
         };
-        let min_height: u64 = if rng.gen_bool(0.8) {
-            0
-        } else {
+
+        // prune.certificates.distance and prune.certificates.before are mutually
+        // exclusive on the CLI; only randomize `before` when `distance` is unset.
+        let before: u64 = if distance == 0 && rng.gen_bool(0.2) {
             rng.gen_range(1..=1000)
+        } else {
+            0
         };
 
-        ClConfigOverride {
-            logging: LoggingConfig {
-                log_level: LogLevel::Debug,
-                log_format: LogFormat::Plaintext,
-            },
-            consensus: ConsensusConfig {
-                enabled: true,
-                ..Default::default()
-            },
-            value_sync: ValueSyncConfig {
-                enabled: true,
-                parallel_requests,
-                batch_size: rng.gen_range(1..=1000),
-                request_timeout: Duration::from_secs(rng.gen_range(5..=30)),
-                status_update_interval: Duration::from_secs(rng.gen_range(0..=10)),
-                ..Default::default()
-            },
-            runtime,
-            prune: PruningConfig {
-                certificates_distance: distance,
-                certificates_before: Height::new(min_height),
-            },
-            rpc: RpcConfig {
-                // RPC: always enabled so quake wait height and test can query block height
-                enabled: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+        let log_level = [
+            LogLevel::Trace,
+            LogLevel::Debug,
+            LogLevel::Info,
+            LogLevel::Warn,
+            LogLevel::Error,
+        ]
+        .choose(rng)
+        .copied();
+
+        let log_format = [LogFormat::Plaintext, LogFormat::Json].choose(rng).copied();
+
+        // Only non-validators can skip consensus; setting this on a validator would break liveness.
+        let no_consensus = matches!(node_type, NodeType::NonValidator) && rng.gen_bool(0.1);
+
+        manifest::NodeClConfig::Modern(StartCmd {
+            runtime_flavor,
+            worker_threads,
+            prune_certificates_distance: distance,
+            prune_certificates_before: before,
+            log_level,
+            log_format,
+            no_consensus,
+            ..StartCmd::default()
+        })
     }
 
     /// Build random per-node EL (Execution Layer) config override.
@@ -623,22 +618,8 @@ mod tests {
                         height_strategy,
                         region_strategy,
                     };
-                    let mut manifest = Manifest::generate_random(42, &config).unwrap();
-                    // Manifest→RawManifest serialization emits cl_config as cl.config.* TOML.
-                    // Set a pre-v0.5.0 image so the safeguard allows cl.config.* on re-parse.
-                    // TODO: refactor RawManifest::try_from(Manifest) to emit explicit fields
-                    // instead of cl.config.*, then this workaround can be removed.
-                    manifest.images.cl = Some("arc_consensus:v0.4.0".to_string());
+                    let manifest = Manifest::generate_random(42, &config).unwrap();
 
-                    // TODO: ByteSize v1.3 has an issue - the serializer produces lossy output.
-                    //       This is fixed in a newer version; the dependency should be upgraded upstream first.
-                    for (_name, node) in manifest.nodes.iter_mut() {
-                        node.cl_config.value_sync.max_request_size = bytesize::ByteSize::kib(1000);
-                        node.cl_config.value_sync.max_response_size = bytesize::ByteSize::kib(1000);
-                        node.cl_config.consensus.p2p.rpc_max_size = bytesize::ByteSize::kib(1000);
-                        node.cl_config.consensus.p2p.pubsub_max_size =
-                            bytesize::ByteSize::kib(1000);
-                    }
                     manifest
                         .validate()
                         .context("Failed to validate manifest")
@@ -875,45 +856,63 @@ mod tests {
         let manifest = Manifest::generate_random(100, &config).unwrap();
 
         for (node_id, node) in &manifest.nodes {
-            let g = &node.cl_config;
+            let manifest::NodeClConfig::Modern(cmd) = &node.cl_config else {
+                panic!("node {node_id}: expected Modern cl_config");
+            };
+
             assert!(
-                g != &ClConfigOverride::default(),
+                cmd != &StartCmd::default(),
                 "node {node_id} cl_config should not be default/empty"
             );
 
-            // Logging: fixed debug, plaintext
-            assert_eq!(g.logging.log_level, LogLevel::Debug);
-            assert_eq!(g.logging.log_format, LogFormat::Plaintext);
+            // ValueSync: enabled
+            assert!(cmd.value_sync, "node {node_id}: value_sync should be true");
 
-            // Consensus: always enabled
-            assert!(g.consensus.enabled);
-
-            // ValueSync: enabled, parallel_requests and batch_size in spec ranges
-            assert!(g.value_sync.enabled);
-            let pr = g.value_sync.parallel_requests as i64;
-            assert!((1..=20).contains(&pr), "parallel_requests = {pr}");
-            let bs = g.value_sync.batch_size as i64;
-            assert!((1..=1000).contains(&bs), "batch_size = {bs}");
-
-            // Runtime: single_threaded or multi_threaded with 1-16 worker threads
-            match g.runtime {
-                RuntimeConfig::SingleThreaded => {}
-                RuntimeConfig::MultiThreaded { worker_threads } => {
-                    assert!(
-                        (1..=16).contains(&worker_threads),
-                        "worker_threads = {worker_threads}"
-                    );
+            // Runtime: single-threaded or multi-threaded with 1-16 worker threads
+            match cmd.runtime_flavor.as_str() {
+                RUNTIME_SINGLE_THREADED => {}
+                RUNTIME_MULTI_THREADED => {
+                    if let Some(wt) = cmd.worker_threads {
+                        assert!(
+                            (1..=16).contains(&wt),
+                            "node {node_id}: worker_threads = {wt}"
+                        );
+                    }
                 }
+                other => panic!("node {node_id}: unexpected runtime_flavor: {other}"),
             }
 
-            // Prune: certificates_distance and certificates_before in spec ranges
-            let bi = g.prune.certificates_distance;
-            assert!(bi <= 10000, "certificates_distance = {bi}");
-            let mh = g.prune.certificates_before.as_u64();
-            assert!(mh <= 1000, "certificates_before = {mh}");
+            // Prune: certificates_distance in spec range
+            assert!(
+                cmd.prune_certificates_distance <= 10000,
+                "node {node_id}: certificates_distance = {}",
+                cmd.prune_certificates_distance
+            );
 
-            // RPC: always enabled
-            assert!(g.rpc.enabled);
+            // Prune: certificates_before in spec range
+            assert!(
+                cmd.prune_certificates_before <= 1000,
+                "node {node_id}: certificates_before = {}",
+                cmd.prune_certificates_before
+            );
+
+            // Prune: distance and before are mutually exclusive on the CLI
+            assert!(
+                cmd.prune_certificates_distance == 0 || cmd.prune_certificates_before == 0,
+                "node {node_id}: prune distance ({}) and before ({}) cannot both be set",
+                cmd.prune_certificates_distance,
+                cmd.prune_certificates_before
+            );
+
+            // Logging: log_level and log_format randomized per node
+            assert!(
+                cmd.log_level.is_some(),
+                "node {node_id}: log_level should be set"
+            );
+            assert!(
+                cmd.log_format.is_some(),
+                "node {node_id}: log_format should be set"
+            );
         }
     }
 

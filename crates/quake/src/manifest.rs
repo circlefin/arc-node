@@ -13,24 +13,25 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 use alloy_primitives::Address;
-use color_eyre::eyre::{bail, Context, Result};
-use indexmap::IndexMap;
-use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
+
+use color_eyre::eyre::{bail, Context, Result};
+use indexmap::{IndexMap, IndexSet};
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+use arc_consensus_types::Config as ClConfigOverride;
+use arc_node_consensus_cli::cmd::start::StartCmd;
 
 use crate::infra;
 use crate::latency;
-use crate::testnet;
-use arc_consensus_types::Config as ClConfigOverride;
-
 use crate::manifest::raw::RawManifest;
 use crate::node::NodeName;
 use crate::node::SubnetName;
+use crate::testnet;
 
 mod flags;
 mod generate;
@@ -453,6 +454,9 @@ pub(crate) struct Manifest {
     pub images: DockerImages,
     /// Map of node name to node metadata
     pub nodes: IndexMap<String, Node>,
+    /// Custom node groups from the manifest, preserved in the order they are
+    /// defined in the manifest.
+    pub node_groups: IndexMap<String, Vec<String>>,
     /// Execution layer initial hardfork name for the network (e.g. "zero3", "zero4", "zero5")
     pub el_init_hardfork: Option<String>,
 }
@@ -508,13 +512,29 @@ pub struct ClGossipSubConfig {
     pub load: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
+/// CL configuration for a node, version-dependent.
+///
+/// - `Modern`: for CL >= v0.5.0, maps directly to CLI flags via [`StartCmd`].
+/// - `Legacy`: for CL < v0.5.0, serializes to `config.toml` via [`ClConfigOverride`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeClConfig {
+    Modern(StartCmd),
+    Legacy(ClConfigOverride),
+}
+
+impl Default for NodeClConfig {
+    fn default() -> Self {
+        Self::Modern(StartCmd::default())
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Node {
     /// The type of the node
     pub node_type: NodeType,
 
-    /// Consensus layer configuration
-    pub cl_config: ClConfigOverride,
+    /// Consensus layer configuration (version-dependent)
+    pub cl_config: NodeClConfig,
 
     /// Execution layer (Reth) CLI flags for this node
     pub el_config: ElConfigOverride,
@@ -526,24 +546,19 @@ pub struct Node {
     pub region: Option<String>,
 
     /// Persistent peers for the node
-    #[serde(default)]
     pub cl_persistent_peers: Option<Vec<String>>,
 
     /// Only allow connections to/from persistent peers on the consensus layer
-    #[serde(default)]
     pub cl_persistent_peers_only: bool,
 
     /// GossipSub configuration overrides
-    #[serde(default)]
     pub cl_gossipsub: ClGossipSubConfig,
 
     /// Execution layer (Reth) trusted peers: node names or group names, resolved to enodes for --trusted-peers.
-    #[serde(default)]
     pub el_trusted_peers: Option<Vec<String>>,
 
     /// Use the remote signing service for this node
     /// using the predefined key with the corresponding index.
-    #[serde(default)]
     pub remote_signer: Option<RemoteKeyId>,
 
     /// Enable follow mode (fetch blocks via RPC instead of P2P consensus)
@@ -558,11 +573,9 @@ pub struct Node {
 
     /// CL pruning preset — emitted as `--full` or `--minimal` on the CL binary.
     /// Mutually exclusive with explicit `cl.config.prune.*` values.
-    #[serde(default)]
     pub cl_prune_preset: Option<ClPruningPreset>,
 
     /// Address to receive transaction fees and block rewards (--suggested-fee-recipient).
-    #[serde(default)]
     pub cl_suggested_fee_recipient: Option<Address>,
 
     /// Mark this node as external (operated by a third party).
@@ -666,6 +679,50 @@ impl Manifest {
             .filter(|(_, node)| node.node_type == NodeType::Validator)
             .map(|(name, _)| name.clone())
             .collect()
+    }
+
+    /// Build the runtime node-group map, including predefined groups
+    /// (ALL_NODES, ALL_VALIDATORS, ALL_NON_VALIDATORS).
+    pub(crate) fn runtime_node_groups(&self) -> IndexMap<String, Vec<String>> {
+        let node_names = self.nodes.keys().cloned().collect::<Vec<_>>();
+        raw::build_node_groups(&node_names, &self.node_groups)
+    }
+
+    /// Resolve Quake load/spam target selectors to explicit node names.
+    ///
+    /// A selector is one `--targets` value supplied by the user to commands
+    /// such as `quake load` or `quake spam`. Each selector must be
+    /// either:
+    /// - an exact node name from the manifest, such as `validator1`
+    /// - an exact node-group name, such as `ALL_VALIDATORS` or `TRUSTED`
+    ///
+    /// The returned vector contains only concrete node names. Group selectors
+    /// are expanded, duplicate nodes are removed while preserving the first-seen
+    /// order, and wildcard selectors like `val*` are rejected.
+    pub(crate) fn resolve_node_selectors(&self, selectors: &[String]) -> Result<Vec<NodeName>> {
+        let node_groups = self.runtime_node_groups();
+        let mut resolved = IndexSet::new();
+
+        for selector in selectors {
+            if selector.contains('*') {
+                // TODO: support wildcards.
+                bail!("Wildcard selectors are not supported for load/spam targets: '{selector}'");
+            }
+
+            if let Some(group) = node_groups.get(selector) {
+                resolved.extend(group.iter().cloned());
+                continue;
+            }
+
+            if self.nodes.contains_key(selector) {
+                resolved.insert(selector.clone());
+                continue;
+            }
+
+            bail!("Unknown node or node group '{selector}'");
+        }
+
+        Ok(resolved.into_iter().collect())
     }
 
     /// Collects explicit voting powers from validators, or `None` if none are set.
@@ -1031,6 +1088,15 @@ mod tests {
     use malachitebft_config::LogLevel;
     use std::env;
 
+    /// Extract the inner `ClConfigOverride` from a `NodeClConfig::Legacy` variant.
+    /// Panics if the variant is `Modern`.
+    fn unwrap_legacy(cl_config: &NodeClConfig) -> &ClConfigOverride {
+        match cl_config {
+            NodeClConfig::Legacy(cfg) => cfg,
+            NodeClConfig::Modern(_) => panic!("expected NodeClConfig::Legacy, got Modern"),
+        }
+    }
+
     // Check number of nodes, names, types, and order of declaration in the manifest
     fn validate_nodes(
         nodes: &IndexMap<String, Node>,
@@ -1115,27 +1181,16 @@ mod tests {
         ];
         validate_nodes(&manifest.nodes, expected_node_names, expected_types);
 
-        // Check nodes individual config
-        assert_eq!(
-            manifest.nodes["validator1"].cl_config.logging.log_level,
-            LogLevel::Info
-        );
-        assert_eq!(
-            manifest.nodes["validator2"].cl_config.logging.log_level,
-            LogLevel::Warn
-        );
-        assert_eq!(
-            manifest.nodes["validator2"]
-                .cl_config
-                .consensus
-                .p2p
-                .rpc_max_size,
-            bytesize::ByteSize::kb(123),
-        );
-        assert_eq!(
-            manifest.nodes["validator3"].cl_config.logging.log_level,
-            LogLevel::Warn
-        );
+        // Check nodes individual config (Legacy variant because image_cl is v0.4.0)
+        let v1 = unwrap_legacy(&manifest.nodes["validator1"].cl_config);
+        assert_eq!(v1.logging.log_level, LogLevel::Info);
+
+        let v2 = unwrap_legacy(&manifest.nodes["validator2"].cl_config);
+        assert_eq!(v2.logging.log_level, LogLevel::Warn);
+        assert_eq!(v2.consensus.p2p.rpc_max_size, bytesize::ByteSize::kb(123));
+
+        let v3 = unwrap_legacy(&manifest.nodes["validator3"].cl_config);
+        assert_eq!(v3.logging.log_level, LogLevel::Warn);
     }
 
     #[test]
@@ -1250,8 +1305,9 @@ mod tests {
         cl.config = {}  # explicitly empty
     "#;
         let result = Manifest::from_string(str).unwrap();
-        // Verify the node inherited global config
-        assert!(!result.nodes["validator-0"].cl_config.consensus.enabled);
+        // Verify the node inherited global config (Legacy variant because image_cl is v0.4.0)
+        let cfg = unwrap_legacy(&result.nodes["validator-0"].cl_config);
+        assert!(!cfg.consensus.enabled);
     }
 
     #[test]
@@ -1989,6 +2045,135 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_node_groups_include_predefined_and_custom() {
+        let str = r#"
+        [node_groups]
+        FULL_NODES = ["full1", "full2"]
+        TRUSTED = ["ALL_VALIDATORS", "FULL_NODES", "other_node"]
+
+        [nodes.validator1]
+        [nodes.validator2]
+        [nodes.full1]
+        [nodes.full2]
+        [nodes.other_node]
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+        let runtime_groups = manifest.runtime_node_groups();
+
+        assert_eq!(
+            runtime_groups["ALL_NODES"],
+            vec![
+                "validator1".to_string(),
+                "validator2".to_string(),
+                "full1".to_string(),
+                "full2".to_string(),
+                "other_node".to_string(),
+            ]
+        );
+        assert_eq!(
+            runtime_groups["ALL_VALIDATORS"],
+            vec!["validator1".to_string(), "validator2".to_string(),]
+        );
+        assert_eq!(
+            runtime_groups["ALL_NON_VALIDATORS"],
+            vec![
+                "full1".to_string(),
+                "full2".to_string(),
+                "other_node".to_string(),
+            ]
+        );
+        assert_eq!(
+            runtime_groups["FULL_NODES"],
+            vec!["full1".to_string(), "full2".to_string(),]
+        );
+        assert_eq!(
+            runtime_groups["TRUSTED"],
+            vec![
+                "validator1".to_string(),
+                "validator2".to_string(),
+                "full1".to_string(),
+                "full2".to_string(),
+                "other_node".to_string(),
+            ]
+        );
+    }
+
+    // Test deduplication across the final list of nodes after resolving groups.
+    #[test]
+    fn test_resolve_node_selectors_dedupes_after_expansion() {
+        let str = r#"
+        [node_groups]
+        FULL_NODES = ["full1", "full2"]
+        TRUSTED = ["ALL_VALIDATORS", "FULL_NODES", "other_node"]
+
+        [nodes.validator1]
+        [nodes.validator2]
+        [nodes.full1]
+        [nodes.full2]
+        [nodes.sentry]
+        [nodes.other_node]
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+        let selectors = vec![
+            "TRUSTED".to_string(),
+            "full1".to_string(),
+            "ALL_NON_VALIDATORS".to_string(),
+        ];
+
+        assert_eq!(
+            manifest.resolve_node_selectors(&selectors).unwrap(),
+            vec![
+                "validator1".to_string(),
+                "validator2".to_string(),
+                "full1".to_string(),
+                "full2".to_string(),
+                "other_node".to_string(),
+                "sentry".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_node_group_forward_reference_rejected() {
+        let str = r#"
+        [node_groups]
+        TRUSTED = ["FULL_NODES", "validator1"]
+        FULL_NODES = ["full1", "full2"]
+
+        [nodes.validator1]
+        [nodes.full1]
+        [nodes.full2]
+        "#;
+
+        let err = Manifest::from_string(str).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid node name 'FULL_NODES'"),
+            "forward references to later-defined groups should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_node_selectors_rejects_unknown_names_and_wildcards() {
+        let str = r#"
+        [nodes.validator1]
+        [nodes.validator2]
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+
+        let unknown = manifest
+            .resolve_node_selectors(&["missing".to_string()])
+            .unwrap_err();
+        assert!(unknown.to_string().contains("Unknown node or node group"));
+
+        let wildcard = manifest
+            .resolve_node_selectors(&["val*".to_string()])
+            .unwrap_err();
+        assert!(wildcard
+            .to_string()
+            .contains("Wildcard selectors are not supported"));
+    }
+
+    #[test]
     fn test_node_group_with_non_existing_node() {
         let str = r#"
         [node_groups]
@@ -1998,6 +2183,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // Test deduplication within a group definition
     #[test]
     fn test_node_group_with_repeated_elements() {
         let str = r#"
@@ -2018,15 +2204,6 @@ mod tests {
     }
 
     #[test]
-    fn test_node_with_predefined_group_name() {
-        let str = r#"
-        [nodes.ALL_NODES]
-        "#;
-        let result = Manifest::from_string(str);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_node_with_group_name() {
         let str = r#"
         [node_groups]
@@ -2035,6 +2212,52 @@ mod tests {
         "#;
         let result = Manifest::from_string(str);
         assert!(result.is_err());
+
+        // predefined group names should also not be allowed as node name
+        let str = r#"
+        [nodes.ALL_NODES]
+        "#;
+        let result = Manifest::from_string(str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reserved_node_group_names_are_rejected() {
+        struct Case {
+            group_name: &'static str,
+        }
+
+        let cases = [
+            Case {
+                group_name: raw::NODE_GROUP_ALL,
+            },
+            Case {
+                group_name: raw::NODE_GROUP_VALIDATORS,
+            },
+            Case {
+                group_name: raw::NODE_GROUP_NON_VALIDATORS,
+            },
+        ];
+
+        for case in cases {
+            let toml = format!(
+                r#"
+                [node_groups]
+                {group_name} = ["full1"]
+
+                [nodes.validator1]
+                [nodes.full1]
+                "#,
+                group_name = case.group_name,
+            );
+
+            let err = Manifest::from_string(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains("reserved built-in group name"),
+                "group '{}' should be rejected: {err}",
+                case.group_name,
+            );
+        }
     }
 
     #[test]

@@ -108,7 +108,7 @@ async fn get_block_to_restream(
     block_hash: BlockHash,
 ) -> eyre::Result<Option<ConsensusBlock>> {
     let block = undecided_blocks
-        .get_first(height, block_hash)
+        .get_by_hash(height, block_hash)
         .await
         .wrap_err_with(|| {
             format!(
@@ -122,7 +122,7 @@ async fn get_block_to_restream(
         block.valid_round = valid_round;
 
         undecided_blocks
-            .store(block.clone())
+            .store_undecided_block(block.clone())
             .await
             .wrap_err_with(|| {
                 format!(
@@ -179,13 +179,13 @@ mod tests {
         let original_block = create_dummy_block(height, Round::new(0), Round::Nil);
 
         mock_repo
-            .expect_get_first()
+            .expect_get_by_hash()
             .with(eq(height), eq(block_hash))
             .times(1)
             .returning(move |_, _| Ok(Some(original_block.clone())));
 
         mock_repo
-            .expect_store()
+            .expect_store_undecided_block()
             .withf(move |b| b.round == round && b.valid_round == valid_round)
             .times(1)
             .returning(|_| Ok(()));
@@ -208,7 +208,7 @@ mod tests {
         let block_hash = BlockHash::default();
 
         mock_repo
-            .expect_get_first()
+            .expect_get_by_hash()
             .with(eq(height), eq(block_hash))
             .times(1)
             .returning(|_, _| Ok(None));
@@ -227,7 +227,7 @@ mod tests {
         let valid_round = Round::Nil;
 
         mock_repo
-            .expect_get_first()
+            .expect_get_by_hash()
             .returning(|_, _| Err(std::io::Error::other("DB connection failed")));
 
         let result =

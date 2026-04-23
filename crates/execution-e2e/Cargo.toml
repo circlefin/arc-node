@@ -19,6 +19,8 @@ alloy-network.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-eth.workspace = true
+alloy-rpc-types-trace.workspace = true
+alloy-sol-types.workspace = true
 arc-evm-node = { path = "../evm-node" }
 # Arc crates
 arc-execution-config = { path = "../execution-config", features = ["test-utils"] }
@@ -47,15 +49,16 @@ reth-rpc-api.workspace = true
 reth-rpc-server-types.workspace = true
 reth-tasks.workspace = true
 reth-transaction-pool.workspace = true
+serde_json.workspace = true
 
 # Async
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 
 [dev-dependencies]
-alloy-sol-types.workspace = true
 arc-precompiles = { path = "../precompiles", features = ["test-utils"] }
 reth-tracing.workspace = true
+revm-bytecode.workspace = true
 rstest.workspace = true
 
 [lints]
