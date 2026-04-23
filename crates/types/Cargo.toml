@@ -43,6 +43,7 @@ malachitebft-sync = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive", "rc"] }
+serde_with = { workspace = true, features = ["macros", "base64"] }
 sha3 = { workspace = true }
 signature = { workspace = true }
 thiserror = { workspace = true }

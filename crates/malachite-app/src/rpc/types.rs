@@ -28,6 +28,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::error;
 
 use arc_consensus_types::{
+    commit_http::HttpCommitSignature,
     evidence::{DoubleProposal, DoubleVote, StoredMisbehaviorEvidence, ValidatorEvidence},
     signing::PublicKey,
     Address, ArcContext, BlockHash, Height, Validator, ValidatorSet, Value, ValueId,
@@ -41,7 +42,7 @@ use malachitebft_app_channel::ConsensusRequest;
 use malachitebft_app_channel::ConsensusRequestError;
 use malachitebft_app_channel::NetworkRequest;
 use malachitebft_core_state_machine::state::{RoundValue, State as MState};
-use malachitebft_core_types::{CommitSignature, NilOrVal, VoteType};
+use malachitebft_core_types::{NilOrVal, VoteType};
 use malachitebft_network::PersistentPeerError;
 
 use crate::request::{AppRequestError, CommitCertificateInfo, Status, TxAppReq};
@@ -353,29 +354,12 @@ struct RpcPendingProposalParts {
     count: usize,
 }
 
-#[serde_as]
-#[derive(Serialize)]
-struct RpcCommitSignature {
-    address: Address,
-    #[serde_as(as = "Base64")]
-    signature: Vec<u8>,
-}
-
-impl From<CommitSignature<ArcContext>> for RpcCommitSignature {
-    fn from(sig: CommitSignature<ArcContext>) -> Self {
-        RpcCommitSignature {
-            address: sig.address,
-            signature: sig.signature.to_bytes().to_vec(),
-        }
-    }
-}
-
 #[derive(Serialize)]
 pub(crate) struct RpcCommitCertificate {
     height: u64,
     round: i64,
     block_hash: ValueId,
-    signatures: Vec<RpcCommitSignature>,
+    signatures: Vec<HttpCommitSignature>,
     proposer: Address,
     extended: bool,
 }

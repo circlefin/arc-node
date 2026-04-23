@@ -31,71 +31,18 @@ use alloy_rpc_types_eth::Block;
 use bytes::Bytes;
 use eyre::Context;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
-use serde_with::{base64::Base64, serde_as};
 use tracing::debug;
 use url::Url;
 
 use malachitebft_core_types::utils::height::HeightRangeExt;
-use malachitebft_core_types::{CommitCertificate, CommitSignature, Round};
+use malachitebft_core_types::CommitCertificate;
 
-use arc_consensus_types::signing::Signature;
-use arc_consensus_types::{Address, ArcContext, Height, ValueId};
+use arc_consensus_types::commit_http::HttpCommitCertificate;
+use arc_consensus_types::{ArcContext, Height};
 
 use crate::utils::pretty::Pretty;
-
-/// RPC representation of a commit certificate
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RpcCommitCertificate {
-    pub height: u64,
-    pub round: i64,
-    pub block_hash: ValueId,
-    pub signatures: Vec<RpcCommitSignature>,
-}
-
-/// RPC representation of a commit signature
-#[serde_as]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RpcCommitSignature {
-    pub address: Address,
-    #[serde_as(as = "Base64")]
-    pub signature: Vec<u8>,
-}
-
-impl RpcCommitCertificate {
-    /// Convert to internal CommitCertificate type
-    pub fn into_commit_certificate(self) -> eyre::Result<CommitCertificate<ArcContext>> {
-        let signatures: eyre::Result<Vec<CommitSignature<ArcContext>>> =
-            self.signatures
-                .into_iter()
-                .map(|sig| {
-                    let sig_bytes: [u8; 64] = sig.signature.try_into().map_err(|v: Vec<u8>| {
-                        eyre::eyre!("Invalid signature length: {}", v.len())
-                    })?;
-                    Ok(CommitSignature {
-                        address: sig.address,
-                        signature: Signature::from_bytes(sig_bytes),
-                    })
-                })
-                .collect();
-
-        let round_u32: u32 = self.round.try_into().map_err(|e| {
-            eyre::eyre!(
-                "Invalid round value {}, cannot convert to u32: {}",
-                self.round,
-                e
-            )
-        })?;
-
-        Ok(CommitCertificate {
-            height: Height::new(self.height),
-            round: Round::new(round_u32),
-            value_id: self.block_hash,
-            commit_signatures: signatures?,
-        })
-    }
-}
 
 /// A block with its associated data (certificate + payload)
 #[derive(Debug, Clone)]
@@ -176,7 +123,7 @@ impl RpcSyncClient {
         let start = Instant::now();
 
         let (cert_result, payload_result) = tokio::join!(
-            self.send_batch_request::<RpcCommitCertificate>(endpoint, &cert_requests),
+            self.send_batch_request::<HttpCommitCertificate>(endpoint, &cert_requests),
             self.send_batch_request::<Block>(endpoint, &block_requests),
         );
 
@@ -231,7 +178,7 @@ impl RpcSyncClient {
             }
 
             let certificate = rpc_cert
-                .into_commit_certificate()
+                .try_into_commit_certificate()
                 .wrap_err_with(|| format!("Failed to convert certificate at height {height}"))?;
 
             // Convert Block to ExecutionPayloadV3, verifying hash consistency
