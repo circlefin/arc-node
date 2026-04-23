@@ -17,7 +17,7 @@
 //! getCertificate RPC API implementation
 
 use crate::rpc::common::{codes, invalid_params};
-use arc_consensus_types::{Address, ValueId};
+pub use arc_consensus_types::commit_http::HttpCommitCertificate as RpcCommitCertificate;
 use async_trait::async_trait;
 use backon::{ExponentialBuilder, Retryable};
 use jsonrpsee::{
@@ -25,33 +25,11 @@ use jsonrpsee::{
     types::{ErrorCode, ErrorObjectOwned},
 };
 use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
-use serde_with::{base64::Base64, serde_as};
 use std::time::Duration;
 use tracing::error;
 
 /// Default maximum retry attempts for upstream certificate HTTP fetches.
 const HTTP_MAX_RETRIES: usize = 3;
-
-//TODO: These are copied from malachite-app, should we move them to types?
-/// Signature entry within a commit certificate (base64 encoded signature bytes).
-#[serde_as]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RpcCommitSignature {
-    pub address: Address,
-    #[serde_as(as = "Base64")]
-    pub signature: Vec<u8>,
-}
-
-/// Commit certificate returned by `arc_getCertificate`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RpcCommitCertificate {
-    pub height: u64,
-    pub round: i64,
-    pub block_hash: ValueId,
-    #[serde(rename = "signatures")]
-    pub signatures: Vec<RpcCommitSignature>,
-}
 
 /// Core logic for the `arc_getCertificate` method: validates params, performs fetch, maps errors.
 pub async fn rpc_get_certificate(

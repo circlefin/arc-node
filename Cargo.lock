@@ -1086,6 +1086,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "serde_with",
  "sha3 0.10.8",
  "signature 2.2.0",
  "thiserror 2.0.18",
