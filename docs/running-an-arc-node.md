@@ -198,6 +198,15 @@ The `result` field represents the next block height, in hexadecimal
 It should increase over time.
 If it remains `0x0`, check the logs of the consensus layer for errors.
 
+For real-time logs, run these commands in separate terminals:
+
+```sh
+# Consensus layer logs (most useful for sync issues)
+sudo journalctl -u arc-consensus -f
+
+# Execution layer logs
+sudo journalctl -u arc-execution -f
+
 > Notice that this command queries the execution layer's HTTP server offering
 > a local JSON-RPC API.
 > If the address and port of the HTTP endpoint are configured differently than
