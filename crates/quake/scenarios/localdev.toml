@@ -1,6 +1,6 @@
 # Enable persistence backpressure in CI to exercise the feature until it is
 # enabled by default.
-cl.config.execution.persistence_backpressure = true
+cl.config.execution_persistence_backpressure = true
 
 # All 5 validators use 0x65E0a200006D4FF91bD59F9694220dafc49dbBC1 (LOCALDEV_FEE_RECIPIENT) as
 # cl_suggested_fee_recipient so tests can hard-code a single known beneficiary address.

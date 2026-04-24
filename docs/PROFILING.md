@@ -90,7 +90,8 @@ the Control Center to route pprof requests to individual nodes.
 ## Running
 
 When built with `--features pprof`, the pprof HTTP server starts
-automatically on the default port. No extra flags are needed.
+automatically on the default port. No extra flags are needed for CPU
+profiling.
 
 | Binary                     | Default pprof port |
 | -------------------------- | ------------------ |
@@ -98,6 +99,21 @@ automatically on the default port. No extra flags are needed.
 | `arc-node-execution` (EL)  | 6061               |
 
 Override with `--pprof.addr=0.0.0.0:<port>`.
+
+### Heap profiling activation
+
+Jemalloc heap profiling infrastructure is compiled in but **inactive by
+default** to avoid runtime overhead when profiling is not needed. To
+activate it, pass `--pprof.heap-prof`:
+
+```bash
+arc-node-execution node --pprof.heap-prof
+arc-node-consensus start --pprof.heap-prof
+```
+
+Without this flag the `/debug/pprof/allocs` endpoint will return an
+empty profile. CPU profiling (`/debug/pprof/profile`) is always
+available regardless of this flag.
 
 ## Collecting profiles
 

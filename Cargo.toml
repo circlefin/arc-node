@@ -205,6 +205,7 @@ reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", tag = "v1
 
 # revm
 revm = { version = "34.0.0", default-features = false }
+revm-bytecode = { version = "8.0.0", default-features = false }
 revm-context-interface = { version = "14.0.0", default-features = false }
 revm-database = { version = "10.0.0", default-features = false }
 revm-inspector = { version = "15.0.0", default-features = false }

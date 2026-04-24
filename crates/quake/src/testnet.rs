@@ -14,15 +14,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use color_eyre::eyre::{self, bail, eyre, Context, Result};
-use indexmap::IndexMap;
-use itertools::Itertools;
-use rand::Rng;
-use spammer::{self, Spammer};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs};
+
+use color_eyre::eyre::{self, bail, eyre, Context, Result};
+use indexmap::IndexMap;
+use itertools::Itertools;
+use rand::Rng;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -40,6 +40,7 @@ use crate::valset::ValidatorPowerUpdate;
 use crate::wait::{check_ws_connectable, wait_for_nodes, wait_for_nodes_sync, wait_for_rounds};
 use crate::{build, genesis, info as info_mod, latency, monitor, setup, shell};
 use crate::{DownloadSubcommand, InfoSubcommand, RemoteSubcommand, SSMSubcommand};
+use spammer::{self, Spammer};
 
 pub(crate) const QUAKE_DIR: &str = ".quake";
 pub(crate) const LAST_MANIFEST_FILENAME: &str = ".last_manifest";
@@ -437,15 +438,14 @@ impl Testnet {
                         .collect();
 
                     // Generate CL CLI flags including persistent peers
-                    let cl_cli_flags = setup::generate_node_cli_flags(
+                    let cl_cli_flags = setup::generate_consensus_cli_flags(
                         node_name,
                         Some(node),
                         "0.0.0.0", // Remote nodes listen on all interfaces
                         &peers_ips,
                         Some(self.images.cl.as_str()),
                         &follow_endpoint_urls,
-                        None,
-                    );
+                    )?;
 
                     let compose_data = setup::ComposeTemplateDataRemote {
                         compose_project_name: COMPOSE_PROJECT_NAME.to_string(),
@@ -571,13 +571,6 @@ impl Testnet {
                     Ok(output) => info!(%output, "✅ Monitoring started on CC"),
                     Err(err) => warn!("⚠️ Failed to start monitoring on CC: {err:#}"),
                 }
-            }
-        }
-
-        if let Ok(remote_infra) = self.remote_infra() {
-            match remote_infra.start_monitoring() {
-                Ok(output) => info!(%output, "✅ Monitoring started on CC"),
-                Err(err) => warn!("⚠️ Failed to start monitoring on CC: {err:#}"),
             }
         }
 
@@ -1121,25 +1114,11 @@ impl Testnet {
                 }
             }
             RemoteSubcommand::Load { args } => {
-                // Run `spammer` from the Control Center server (backpressure mode, the default)
-                let cmd = ["./spammer.sh", "nodes", "--nodes-path", "nodes.json"];
-                let mut cmd: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
-                cmd.extend(args);
-
+                let cmd = build_remote_spammer_cmd(&self.manifest, &args, false)?;
                 infra.ssh_cc(&cmd.join(" "), false)
             }
             RemoteSubcommand::Spam { args } => {
-                // Run `spammer` from the Control Center server (fire-and-forget mode)
-                let cmd = [
-                    "./spammer.sh",
-                    "nodes",
-                    "--nodes-path",
-                    "nodes.json",
-                    "--fire-and-forget",
-                ];
-                let mut cmd: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
-                cmd.extend(args);
-
+                let cmd = build_remote_spammer_cmd(&self.manifest, &args, true)?;
                 infra.ssh_cc(&cmd.join(" "), false)
             }
             RemoteSubcommand::Export {
@@ -1201,15 +1180,7 @@ impl Testnet {
 
     /// Generate and send transaction load to a node
     pub async fn load(&self, target_nodes: Vec<NodeName>, config: &spammer::Config) -> Result<()> {
-        // Validate arguments
-        self.manifest.contain_nodes(&target_nodes)?;
-
-        let mut target_nodes = self.nodes_metadata.expand_to_nodes_list(&target_nodes)?;
-
-        // If no target nodes are provided, use all nodes
-        if target_nodes.is_empty() {
-            target_nodes = self.nodes_metadata.node_names();
-        }
+        let target_nodes = resolve_load_target_nodes(&self.manifest, &target_nodes)?;
 
         // Build EL WebSocket URLs of target nodes
         let target_ws_urls = self.nodes_metadata.to_execution_ws_urls(&target_nodes);
@@ -1337,30 +1308,26 @@ impl Testnet {
                 })
                 .unwrap_or_default();
 
-            let fee_recipient = node_config.and_then(|nc| nc.cl_suggested_fee_recipient);
-
             // Generate CLI flags for the consensus layer
-            let cli_flags = setup::generate_node_cli_flags(
+            let cli_flags = setup::generate_consensus_cli_flags(
                 name,
                 node_config,
                 &listen_ip,
                 &peers_ips,
                 Some(self.images.cl.as_str()),
                 &follow_endpoint_urls,
-                fee_recipient,
-            );
+            )?;
             node_metadata.consensus.set_cli_flags(cli_flags);
 
             // Generate CLI flags for the consensus layer after upgrade
-            let cli_flags = setup::generate_node_cli_flags(
+            let cli_flags = setup::generate_consensus_cli_flags(
                 name,
                 node_config,
                 &listen_ip,
                 &peers_ips,
                 self.images.cl_upgrade.as_deref(),
                 &follow_endpoint_urls,
-                fee_recipient,
-            );
+            )?;
             node_metadata.consensus.set_cli_flags_upgraded(cli_flags);
         }
 
@@ -1377,5 +1344,377 @@ impl Testnet {
             println!("               http://localhost:{RPC_PROXY_SSM_PORT}/nodes, http://localhost:{RPC_PROXY_SSM_PORT}/health");
             println!("  - Pprof proxy: http://localhost:{PPROF_PROXY_SSM_PORT}/nodes, http://localhost:{PPROF_PROXY_SSM_PORT}/health");
         }
+    }
+}
+
+/// Resolve local `quake load` and `quake spam` targets to concrete node names.
+///
+/// This helper keeps load/spam selector semantics aligned with the manifest:
+/// an empty selector list means "all nodes", while a non-empty list may
+/// contain exact node names or manifest node-group names.
+///
+/// Explicit selectors must resolve to at least one node. Load generation
+/// against an empty target set is treated as an error.
+fn resolve_load_target_nodes(manifest: &Manifest, selectors: &[NodeName]) -> Result<Vec<NodeName>> {
+    if selectors.is_empty() {
+        return Ok(manifest.nodes.keys().cloned().collect());
+    }
+
+    let target_nodes = manifest.resolve_node_selectors(selectors)?;
+    if target_nodes.is_empty() {
+        bail!("load/spam targets resolved to no nodes");
+    }
+
+    Ok(target_nodes)
+}
+
+/// Split remote `quake load/spam...` args into spammer flags and targets.
+///
+/// Quake only modifies the `--targets` segment. All other args are passed through
+/// to the remote `spammer` process unchanged.
+///
+/// Examples:
+/// - `["--rate", "42", "--targets", "validator1,RPC_NODES"]` becomes:
+///   - forwarded args: `["--rate", "42"]`
+///   - target selectors: `["validator1", "RPC_NODES"]`
+/// - `["--targets=validator1,RPC_NODES", "--time", "5"]` becomes:
+///   - forwarded args: `["--time", "5"]`
+///   - target selectors: `["validator1", "RPC_NODES"]`
+/// - `["--targets", "validator1", "--time", "5"]` becomes:
+///   - forwarded args: `["--time", "5"]`
+///   - target selectors: `["validator1"]`
+///
+/// The returned selectors are later expanded against the manifest, and the final
+/// remote spammer command gets a normalized
+/// `--targets <expanded-node>...` segment appended at the end.
+fn split_remote_targets(args: &[String]) -> Result<(Vec<String>, Vec<NodeName>)> {
+    let mut forwarded_args = Vec::new();
+    let mut target_selectors = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+
+        if arg != "--targets" && !arg.starts_with("--targets=") {
+            forwarded_args.push(arg.clone());
+            index += 1;
+            continue;
+        }
+
+        let targets = if let Some(args_targets) = arg.strip_prefix("--targets=") {
+            if args_targets.is_empty() {
+                bail!("remote load/spam `--targets` requires a comma-separated target list");
+            }
+            index += 1;
+            args_targets.to_string()
+        } else {
+            index += 1;
+            // covers both the case where `--targets` is the last arg, and the case
+            // where it's followed by another flag (e.g. `--time`) without a value
+            // (e.g. `--targets --time 5`)
+            if index >= args.len() || args[index].starts_with('-') {
+                bail!("remote load/spam `--targets` requires a comma-separated target list");
+            }
+            let args_targets = args[index].clone();
+            index += 1;
+            // covers the case where `--targets` is followed by more than one value
+            // (e.g. `--targets val1,val2 val3`), which is incorrect.
+            // Notice the space between `val2` and `val3`, but `val3` is not a flag,
+            // and should be attached to the `--targets` value with a comma instead.
+            // An example of valid syntax is `--targets val1,val2 --time 5`.
+            if index < args.len() && !args[index].starts_with('-') {
+                bail!("remote load/spam `--targets` must use one comma-separated target list");
+            }
+            args_targets
+        };
+
+        for target in targets.split(',') {
+            if target.is_empty() {
+                bail!("remote load/spam `--targets` requires non-empty target values");
+            }
+            target_selectors.push(target.to_string());
+        }
+    }
+
+    Ok((forwarded_args, target_selectors))
+}
+
+/// Build the `spammer nodes` command for remote `quake load/spam`.
+///
+/// Strips only the `--targets` segment to expand manifest node groups
+/// locally, and appends explicit node names as one comma-delimited
+/// `--targets` value.
+fn build_remote_spammer_cmd(
+    manifest: &Manifest,
+    args: &[String],
+    fire_and_forget: bool,
+) -> Result<Vec<String>> {
+    let (forwarded_args, target_selectors) = split_remote_targets(args)?;
+    let mut cmd = vec![
+        "./spammer.sh".to_string(),
+        "nodes".to_string(),
+        "--nodes-path".to_string(),
+        "nodes.json".to_string(),
+    ];
+
+    if fire_and_forget {
+        cmd.push("--fire-and-forget".to_string());
+    }
+
+    cmd.extend(forwarded_args);
+
+    if !target_selectors.is_empty() {
+        let target_nodes = resolve_load_target_nodes(manifest, &target_selectors)?;
+        cmd.push("--targets".to_string());
+        cmd.push(target_nodes.join(","));
+    }
+
+    Ok(cmd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::{Node, NodeType};
+    use indexmap::IndexMap;
+
+    fn remote_manifest() -> Manifest {
+        let mut nodes = IndexMap::new();
+        nodes.insert("validator1".to_string(), Node::default());
+        nodes.insert("validator2".to_string(), Node::default());
+        nodes.insert(
+            "full1".to_string(),
+            Node {
+                node_type: NodeType::NonValidator,
+                ..Node::default()
+            },
+        );
+
+        let mut node_groups = IndexMap::new();
+        node_groups.insert(
+            "TRUSTED".to_string(),
+            vec!["ALL_VALIDATORS".to_string(), "full1".to_string()],
+        );
+
+        Manifest {
+            nodes,
+            node_groups,
+            ..Manifest::default()
+        }
+    }
+
+    fn validators_only_manifest() -> Manifest {
+        let mut nodes = IndexMap::new();
+        nodes.insert("validator1".to_string(), Node::default());
+        nodes.insert("validator2".to_string(), Node::default());
+
+        Manifest {
+            nodes,
+            ..Manifest::default()
+        }
+    }
+
+    #[test]
+    fn split_remote_targets_success_cases() {
+        struct Case {
+            name: &'static str,
+            args: Vec<&'static str>,
+            expected_forwarded: Vec<&'static str>,
+            expected_targets: Vec<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "no targets flag",
+                args: vec!["--rate", "42", "--time", "5"],
+                expected_forwarded: vec!["--rate", "42", "--time", "5"],
+                expected_targets: vec![],
+            },
+            Case {
+                name: "targets in middle of argv",
+                args: vec![
+                    "--rate",
+                    "42",
+                    "--targets",
+                    "validator1,ALL_VALIDATORS",
+                    "--mix",
+                    "transfer=70,erc20=30",
+                ],
+                expected_forwarded: vec!["--rate", "42", "--mix", "transfer=70,erc20=30"],
+                expected_targets: vec!["validator1", "ALL_VALIDATORS"],
+            },
+            Case {
+                name: "targets at beginning of argv",
+                args: vec!["--targets", "validator1,TRUSTED", "--rate", "42"],
+                expected_forwarded: vec!["--rate", "42"],
+                expected_targets: vec!["validator1", "TRUSTED"],
+            },
+            Case {
+                name: "inline targets in middle of argv",
+                args: vec![
+                    "--rate",
+                    "42",
+                    "--targets=validator1,ALL_VALIDATORS",
+                    "--time",
+                    "5",
+                ],
+                expected_forwarded: vec!["--rate", "42", "--time", "5"],
+                expected_targets: vec!["validator1", "ALL_VALIDATORS"],
+            },
+        ];
+
+        for case in cases {
+            let args: Vec<String> = case.args.iter().map(|s| s.to_string()).collect();
+            let (forwarded, targets) =
+                split_remote_targets(&args).expect("split_remote_targets should succeed");
+            assert_eq!(
+                forwarded, case.expected_forwarded,
+                "case '{}': forwarded args mismatch",
+                case.name,
+            );
+            assert_eq!(
+                targets, case.expected_targets,
+                "case '{}': target selectors mismatch",
+                case.name,
+            );
+        }
+    }
+
+    #[test]
+    fn split_remote_targets_err_cases() {
+        struct Case {
+            name: &'static str,
+            args: Vec<&'static str>,
+            expected_message: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "standalone targets flag last arg without value",
+                args: vec!["--rate", "42", "--targets"],
+                expected_message: "`--targets` requires a comma-separated target list",
+            },
+            Case {
+                name: "inline targets flag without value",
+                args: vec!["--rate", "42", "--targets="],
+                expected_message: "`--targets` requires a comma-separated target list",
+            },
+            Case {
+                name: "space-separated targets are rejected",
+                args: vec!["--rate", "42", "--targets", "val1,val2", "val3"],
+                expected_message: "`--targets` must use one comma-separated target list",
+            },
+        ];
+
+        for case in cases {
+            let args: Vec<String> = case.args.iter().map(|s| s.to_string()).collect();
+            let err = split_remote_targets(&args).unwrap_err();
+            assert!(
+                err.to_string().contains(case.expected_message),
+                "case '{}': unexpected error: {err}",
+                case.name,
+            );
+        }
+    }
+
+    #[test]
+    fn build_remote_spammer_cmd_expands_group_targets() {
+        struct Case<'a> {
+            name: &'a str,
+            args: &'a [&'a str],
+            fire_and_forget: bool,
+            expected_cmd: &'a [&'a str],
+        }
+
+        let manifest = remote_manifest();
+        let cases = vec![
+            Case {
+                name: "no targets flag",
+                args: &["--rate", "42", "--time", "5"],
+                fire_and_forget: false,
+                expected_cmd: &[
+                    "./spammer.sh",
+                    "nodes",
+                    "--nodes-path",
+                    "nodes.json",
+                    "--rate",
+                    "42",
+                    "--time",
+                    "5",
+                ],
+            },
+            Case {
+                name: "standalone targets flag",
+                args: &["--rate", "42", "--targets", "TRUSTED", "--time", "5"],
+                fire_and_forget: true,
+                expected_cmd: &[
+                    "./spammer.sh",
+                    "nodes",
+                    "--nodes-path",
+                    "nodes.json",
+                    "--fire-and-forget",
+                    "--rate",
+                    "42",
+                    "--time",
+                    "5",
+                    "--targets",
+                    "validator1,validator2,full1",
+                ],
+            },
+            Case {
+                name: "inline targets flag",
+                args: &["--rate", "42", "--targets=TRUSTED", "--time", "5"],
+                fire_and_forget: false,
+                expected_cmd: &[
+                    "./spammer.sh",
+                    "nodes",
+                    "--nodes-path",
+                    "nodes.json",
+                    "--rate",
+                    "42",
+                    "--time",
+                    "5",
+                    "--targets",
+                    "validator1,validator2,full1",
+                ],
+            },
+        ];
+
+        for case in cases {
+            let args: Vec<String> = case.args.iter().map(|s| s.to_string()).collect();
+            let cmd = build_remote_spammer_cmd(&manifest, &args, case.fire_and_forget)
+                .expect("build_remote_spammer_cmd should succeed");
+            assert_eq!(
+                cmd, case.expected_cmd,
+                "case '{}': remote spammer command mismatch",
+                case.name,
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_load_target_nodes_rejects_empty_expansion() {
+        let manifest = validators_only_manifest();
+        let selectors = vec!["ALL_NON_VALIDATORS".to_string()];
+
+        let err = resolve_load_target_nodes(&manifest, &selectors).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("load/spam targets resolved to no nodes"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn build_remote_spammer_cmd_rejects_empty_expansion() {
+        let manifest = validators_only_manifest();
+        let args = vec!["--targets".to_string(), "ALL_NON_VALIDATORS".to_string()];
+
+        let err = build_remote_spammer_cmd(&manifest, &args, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("load/spam targets resolved to no nodes"),
+            "unexpected error: {err}",
+        );
     }
 }

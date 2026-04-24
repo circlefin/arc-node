@@ -17,7 +17,7 @@ image_cl_upgrade="arc_consensus:latest"
 image_el_upgrade="arc_execution:latest"
 
 # Global config
-cl.config.logging.log_level = "info"
+cl.config.log_level = "info"
 
 # 5 validators ensures BFT consensus continues during single node upgrade
 # Byzantine fault tolerance: f = (n-1)/3, so with 5 nodes we can tolerate 1 failure

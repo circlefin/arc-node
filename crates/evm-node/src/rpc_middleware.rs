@@ -108,6 +108,8 @@ where
     }
 
     fn batch<'a>(&self, req: Batch<'a>) -> impl Future<Output = Self::BatchResponse> + Send + 'a {
+        // Pending-block filtering is intentionally skipped for batch requests.
+        // --rpc.pending-block=none (binary default) + network topology make this unexploitable.
         let batch = req
             .into_iter()
             .map(
@@ -448,7 +450,7 @@ mod tests {
     // -- batch requests --
     //
     // Pending-tx subscription/filter are blocked in batch.
-    // Pending block interception is NOT applied in batch; falls back to
+    // Pending block interception is intentionally NOT applied in batch; falls back to
     // --rpc.pending-block=none.
 
     #[tokio::test]

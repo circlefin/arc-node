@@ -124,4 +124,25 @@ contract ProtocolConfigManagementTest is Test {
         assertEq(_feeParams.alpha, 0);
         assertEq(_feeParams.kRate, 0);
     }
+
+    function test_UpdateRewardBeneficiary_Succeeds() public {
+        vm.setEnv("CONTROLLER_KEY", vm.toString(controllerPk));
+
+        address newBeneficiary = makeAddr("newBeneficiary");
+        script.updateRewardBeneficiary(newBeneficiary);
+
+        assertEq(protocolConfig.rewardBeneficiary(), newBeneficiary);
+    }
+
+    function test_UpdateRewardBeneficiary_AcceptsZeroAddress() public {
+        vm.setEnv("CONTROLLER_KEY", vm.toString(controllerPk));
+
+        // Seed a non-zero beneficiary first so we can observe the clear.
+        address seedBeneficiary = makeAddr("seedBeneficiary");
+        script.updateRewardBeneficiary(seedBeneficiary);
+        assertEq(protocolConfig.rewardBeneficiary(), seedBeneficiary);
+
+        script.updateRewardBeneficiary(address(0));
+        assertEq(protocolConfig.rewardBeneficiary(), address(0));
+    }
 }

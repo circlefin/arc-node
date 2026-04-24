@@ -14,7 +14,7 @@
 
 # libp2p sync-only full node (no consensus/gossip, only sync protocol)
 [nodes.full_p2p]
-cl.config.consensus.enabled = false
+cl.config.no_consensus = true
 
 # Follow full nodes
 [nodes.full1]

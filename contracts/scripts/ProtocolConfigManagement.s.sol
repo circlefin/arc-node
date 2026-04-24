@@ -384,8 +384,6 @@ contract ProtocolConfigManagement is Script {
      * @dev Requires CONTROLLER_KEY env var and controller role on ProtocolConfig
      */
     function updateRewardBeneficiary(address newBeneficiary) public {
-        require(newBeneficiary != address(0), "beneficiary cannot be zero address");
-
         uint256 controllerKey = _getControllerKey();
 
         vm.startBroadcast(controllerKey);
@@ -394,4 +392,37 @@ contract ProtocolConfigManagement is Script {
     }
 }
 
-
+/// @title ProtocolConfigState
+/// @notice Preserved-state hash helper used by upgrade/rollback scripts under
+///         `contracts/deployments/<date>-protocol-config-*/scripts/`.
+///
+///         Aggregates every field an upgrade/rollback must preserve byte-for-byte and returns a
+///         single hash. Pre-boundary and post-boundary calls should produce equal hashes; any
+///         divergence indicates a storage-slot collision, accidental overwrite, or layout drift
+///         between old and new implementations.
+///
+///         Validity condition: valid only when the struct definitions returned by the getters
+///         (`FeeParams`, `ConsensusParams`) are unchanged between old and new impl. A struct
+///         layout change would make `abi.encode` produce different bytes for the same logical
+///         state — when that happens, replace this helper with field-by-field comparison on
+///         the surviving fields.
+///
+///         `pauser` / `paused` are intentionally excluded. Their ERC-7201 slot may move across
+///         a given upgrade, and during the upgrade window the value can be read from different
+///         slots pre-vs-post boundary. Those fields belong in explicit specific-value
+///         assertions at the call sites, not in this hash.
+library ProtocolConfigState {
+    function hash(address proxy) internal view returns (bytes32) {
+        IProtocolConfig.FeeParams memory fee = ProtocolConfig(proxy).feeParams();
+        IProtocolConfig.ConsensusParams memory cons = ProtocolConfig(proxy).consensusParams();
+        return keccak256(
+            abi.encode(
+                fee,
+                cons,
+                ProtocolConfig(proxy).rewardBeneficiary(),
+                ProtocolConfig(proxy).owner(),
+                ProtocolConfig(proxy).controller()
+            )
+        );
+    }
+}

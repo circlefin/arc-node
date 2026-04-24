@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use arc_consensus_types::rpc_sync::SyncEndpointUrl;
 use clap::Parser;
 use color_eyre::eyre;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 use url::Url;
 
@@ -29,14 +30,28 @@ use malachitebft_app::consensus::Multiaddr;
 use crate::file::save_priv_validator_key;
 use crate::new::generate_private_keys;
 
+/// Tokio single-threaded runtime flavor.
+pub const RUNTIME_SINGLE_THREADED: &str = "single-threaded";
+
+/// Tokio multi-threaded runtime flavor.
+pub const RUNTIME_MULTI_THREADED: &str = "multi-threaded";
+
 /// Start command to run a node.
-#[derive(Parser, Debug, Clone, PartialEq)]
+///
+/// Derives `clap::Parser` for CLI parsing and `serde::Serialize` /
+/// `serde::Deserialize` for TOML-based deserialization by external
+/// tooling. Deployment-specific fields are marked `#[serde(skip)]`, so
+/// TOML cannot set them. They inherit their values from
+/// `StartCmd::default()` via the container-level `#[serde(default)]`.
+#[derive(Parser, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct StartCmd {
     // ===== Node Identity =====
     /// A custom human-readable name for this node.
     ///
     /// If not provided, a random moniker will be generated.
     #[clap(long, value_name = "NAME")]
+    #[serde(skip)]
     pub moniker: Option<String>,
 
     // ===== P2P Networking =====
@@ -48,12 +63,14 @@ pub struct StartCmd {
         value_name = "MULTIADDR",
         default_value = "/ip4/0.0.0.0/tcp/27000"
     )]
+    #[serde(skip)]
     pub p2p_addr: Multiaddr,
 
     /// Comma-separated list of persistent peer multiaddrs to connect to
     ///
     /// Example: /ip4/172.19.0.21/tcp/27000,/ip4/172.19.0.22/tcp/27000
     #[clap(long = "p2p.persistent-peers", value_delimiter = ',', num_args = 0..)]
+    #[serde(skip)]
     pub p2p_persistent_peers: Vec<Multiaddr>,
 
     /// Only allow connections to/from persistent peers.
@@ -62,6 +79,7 @@ pub struct StartCmd {
     /// in the persistent peers list. Useful for sentry node setups where
     /// a validator should only communicate with known trusted peers.
     #[clap(long = "p2p.persistent-peers-only")]
+    #[serde(skip)]
     pub p2p_persistent_peers_only: bool,
 
     /// Enable gossipsub explicit peering for persistent peers.
@@ -70,6 +88,7 @@ pub struct StartCmd {
     /// meaning a node always sends and forwards messages to its explicit peers,
     /// regardless of mesh membership.
     #[clap(long = "gossipsub.explicit-peering", help_heading = "GossipSub")]
+    #[serde(skip)]
     pub gossipsub_explicit_peering: bool,
 
     /// Enable gossipsub mesh peer scoring / prioritization.
@@ -77,6 +96,7 @@ pub struct StartCmd {
     /// When enabled, peers are scored and prioritized based on their type
     /// during mesh formation.
     #[clap(long = "gossipsub.mesh-prioritization", help_heading = "GossipSub")]
+    #[serde(skip)]
     pub gossipsub_mesh_prioritization: bool,
 
     /// Gossipsub network load profile controlling mesh size and bandwidth.
@@ -90,7 +110,17 @@ pub struct StartCmd {
         help_heading = "GossipSub",
         value_parser = ["low", "average", "high"]
     )]
+    #[serde(skip)]
     pub gossipsub_load: Option<String>,
+
+    // ===== Logging =====
+    /// Log level
+    #[clap(long, value_name = "LOG_LEVEL")]
+    pub log_level: Option<malachitebft_config::LogLevel>,
+
+    /// Log format
+    #[clap(long, value_name = "LOG_FORMAT")]
+    pub log_format: Option<malachitebft_config::LogFormat>,
 
     // ===== Discovery =====
     /// Enable peer discovery
@@ -126,16 +156,27 @@ pub struct StartCmd {
     ///
     /// When set, the node loads its consensus signing key,
     /// signs a validator proof (ADR-006), and advertises a
-    /// validator identity on the P2P network.
+    /// validator identity on the P2P network. Requires
+    /// `--suggested-fee-recipient` so tips and rewards go to
+    /// an explicit address rather than being silently burned.
     ///
     /// Without this flag the node runs as a full node: it
     /// participates in gossip but does not sign votes or proposals.
-    #[clap(long, conflicts_with_all = ["no_consensus", "follow"])]
+    #[clap(
+        long,
+        conflicts_with_all = ["no_consensus", "follow"],
+        requires = "suggested_fee_recipient",
+    )]
     pub validator: bool,
 
     // ===== Value Sync =====
     /// Enable value sync
-    #[clap(long, default_value = "true")]
+    #[clap(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
     pub value_sync: bool,
 
     // ===== Execution Layer Connection =====
@@ -145,6 +186,7 @@ pub struct StartCmd {
     ///
     /// This is recommended option if the consensus and execution layers are colocated on the same machine.
     #[clap(long, value_name = "PATH")]
+    #[serde(skip)]
     pub eth_socket: Option<String>,
 
     /// The path to the execution engine socket. To enable this in reth, you
@@ -152,6 +194,7 @@ pub struct StartCmd {
     ///
     /// This is recommended option if the consensus and execution layers are colocated on the same machine.
     #[clap(long, value_name = "PATH")]
+    #[serde(skip)]
     pub execution_socket: Option<String>,
 
     /// The URL of the Ethereum JSON-RPC API. If the Ethereum full node is
@@ -161,6 +204,7 @@ pub struct StartCmd {
     ///
     /// Use this option if the consensus and executation layer are on different machines.
     #[clap(long, value_name = "URL")]
+    #[serde(skip)]
     pub eth_rpc_endpoint: Option<Url>,
 
     /// The URL of the execution engine API. If the execution engine is running
@@ -169,6 +213,7 @@ pub struct StartCmd {
     ///
     /// Use this option if the consensus and executation layer are on different machines.
     #[clap(long, value_name = "URL")]
+    #[serde(skip)]
     pub execution_endpoint: Option<Url>,
 
     /// The WebSocket URL of the execution engine. Used for subscribing to
@@ -179,6 +224,7 @@ pub struct StartCmd {
     ///
     /// Example: ws://localhost:8546
     #[clap(long, value_name = "URL")]
+    #[serde(skip)]
     pub execution_ws_endpoint: Option<Url>,
 
     /// Enable persistence backpressure during startup replay. When enabled,
@@ -208,6 +254,7 @@ pub struct StartCmd {
     ///
     /// Use this option if the consensus and executation layer are on different machines.
     #[clap(long, value_name = "PATH")]
+    #[serde(skip)]
     pub execution_jwt: Option<String>,
 
     // ===== Metrics =====
@@ -218,6 +265,7 @@ pub struct StartCmd {
     ///
     /// Example: 0.0.0.0:29000
     #[clap(long, value_name = "ADDR")]
+    #[serde(skip)]
     pub metrics: Option<SocketAddr>,
 
     // ===== RPC =====
@@ -228,6 +276,7 @@ pub struct StartCmd {
     ///
     /// Example: 0.0.0.0:31000
     #[clap(long = "rpc.addr", value_name = "ADDR")]
+    #[serde(skip)]
     pub rpc_addr: Option<SocketAddr>,
 
     // ===== Runtime =====
@@ -235,8 +284,8 @@ pub struct StartCmd {
     #[clap(
         long = "runtime.flavor",
         value_name = "FLAVOR",
-        default_value = "multi-threaded",
-        value_parser = ["single-threaded", "multi-threaded"]
+        default_value = RUNTIME_MULTI_THREADED,
+        value_parser = [RUNTIME_SINGLE_THREADED, RUNTIME_MULTI_THREADED]
     )]
     pub runtime_flavor: String,
 
@@ -258,6 +307,7 @@ pub struct StartCmd {
         conflicts_with_all = &["minimal", "prune_certificates_distance", "prune_certificates_before"],
         help_heading = "Arc pruning presets"
     )]
+    #[serde(skip)]
     pub full: bool,
 
     /// Minimal-storage pruning preset. Sets --prune.certificates.distance 237600.
@@ -270,6 +320,7 @@ pub struct StartCmd {
         conflicts_with_all = &["full", "prune_certificates_distance", "prune_certificates_before"],
         help_heading = "Arc pruning presets"
     )]
+    #[serde(skip)]
     pub minimal: bool,
 
     // ===== Pruning =====
@@ -311,6 +362,7 @@ pub struct StartCmd {
     /// Default: {home_dir}/config/priv_validator_key.json
     /// where `home_dir` is the directory provided with the `--home` global option
     #[clap(long, value_name = "PATH")]
+    #[serde(skip)]
     pub private_key: Option<PathBuf>,
 
     /// Profiling server bind address
@@ -319,15 +371,26 @@ pub struct StartCmd {
         value_name = "ADDR",
         default_value = "0.0.0.0:6060"
     )]
+    #[serde(skip)]
     pub pprof_addr: String,
+
+    /// Activate jemalloc heap profiling at startup.
+    ///
+    /// When built with the `pprof` feature, heap profiling infrastructure is
+    /// always available but inactive by default. This flag activates it so
+    /// that the `/debug/pprof/allocs` endpoint returns meaningful data.
+    #[clap(long = "pprof.heap-prof", default_value_t = false)]
+    pub pprof_heap_prof: bool,
 
     /// 20-byte ethereum-style address to receive tips (transactions' priority fee)
     /// and rewards.
     ///
     /// The execution layer deposits fees and rewards to this address whenever the
-    /// validator successfully proposes a new block. Not setting it to a valid
-    /// address will result in losing the tips/rewards.
-    #[clap(long, value_name = "ADDRESS")]
+    /// validator successfully proposes a new block. The zero address is rejected
+    /// because rewards credited to it bypass the native-coin blocklist and are
+    /// unrecoverable.
+    #[clap(long, value_name = "ADDRESS", value_parser = parse_non_zero_address)]
+    #[serde(skip)]
     pub suggested_fee_recipient: Option<Address>,
 
     /// Skip database schema upgrade on startup.
@@ -335,6 +398,7 @@ pub struct StartCmd {
     /// WARNING: This flag should only be used when a database upgrade failed.
     /// Not upgrading the database may lead to errors or data corruption.
     #[clap(long = "db.skip-upgrade")]
+    #[serde(skip)]
     pub skip_db_upgrade: bool,
 
     // ===== Signing =====
@@ -351,6 +415,7 @@ pub struct StartCmd {
         value_name = "ENDPOINT",
         requires = "validator"
     )]
+    #[serde(skip)]
     pub signing_remote: Option<String>,
 
     /// Path to TLS certificate for remote signing
@@ -362,6 +427,7 @@ pub struct StartCmd {
         value_name = "PATH",
         requires = "signing_remote"
     )]
+    #[serde(skip)]
     pub signing_tls_cert_path: Option<String>,
 
     /// Enable RPC sync mode (follow with verification).
@@ -373,6 +439,7 @@ pub struct StartCmd {
     /// When no --follow.endpoint is provided, a default endpoint is resolved
     /// from the chain ID at startup.
     #[clap(long = "follow")]
+    #[serde(skip)]
     pub follow: bool,
 
     /// RPC endpoint to fetch blocks from in RPC sync mode.
@@ -398,7 +465,20 @@ pub struct StartCmd {
     ///   https://example.com,wss=ws.example.com
     ///   https://example.com,wss=ws.example.com:1212
     #[clap(long = "follow.endpoint", value_name = "ENDPOINT", requires = "follow")]
+    #[serde(skip)]
     pub follow_endpoints: Vec<SyncEndpointUrl>,
+}
+
+fn parse_non_zero_address(s: &str) -> Result<Address, String> {
+    let addr: Address = s.parse().map_err(|e| format!("invalid address: {e}"))?;
+    if addr.to_alloy_address().is_zero() {
+        return Err(
+            "must not be the zero address; rewards credited to 0x0 bypass the \
+             native-coin blocklist and are unrecoverable"
+                .to_string(),
+        );
+    }
+    Ok(addr)
 }
 
 impl Default for StartCmd {
@@ -411,6 +491,8 @@ impl Default for StartCmd {
             gossipsub_explicit_peering: false,
             gossipsub_mesh_prioritization: false,
             gossipsub_load: None,
+            log_level: None,
+            log_format: None,
             discovery: false,
             discovery_num_outbound_peers: 20,
             discovery_num_inbound_peers: 20,
@@ -427,7 +509,7 @@ impl Default for StartCmd {
             execution_jwt: None,
             metrics: None,
             rpc_addr: None,
-            runtime_flavor: "multi-threaded".to_string(),
+            runtime_flavor: RUNTIME_MULTI_THREADED.to_string(),
             worker_threads: None,
             full: false,
             minimal: false,
@@ -435,6 +517,7 @@ impl Default for StartCmd {
             prune_certificates_before: 0,
             private_key: None,
             pprof_addr: "0.0.0.0:6060".to_string(),
+            pprof_heap_prof: false,
             suggested_fee_recipient: None,
             skip_db_upgrade: false,
             signing_remote: None,
@@ -446,6 +529,118 @@ impl Default for StartCmd {
 }
 
 impl StartCmd {
+    /// Generate CLI flag strings for all non-default, manifest-configurable fields.
+    ///
+    /// Each field maps 1:1 to its `#[clap(long = "...")]` name. Only fields
+    /// whose values differ from `StartCmd::default()` are emitted. Deployment-
+    /// specific fields (marked `#[serde(skip)]`) are included here because
+    /// callers populate these before invoking.
+    pub fn to_cli_flags(&self) -> Vec<String> {
+        let defaults = Self::default();
+        let mut flags = Vec::new();
+
+        macro_rules! push_each {
+            ($flag:literal, $items:expr) => {
+                for item in $items {
+                    flags.push(format!(concat!("--", $flag, "={}"), item));
+                }
+            };
+        }
+        macro_rules! push_if_some {
+            ($flag:literal, $opt:expr) => {
+                if let Some(ref v) = $opt {
+                    flags.push(format!(concat!("--", $flag, "={}"), v));
+                }
+            };
+        }
+        macro_rules! push_if {
+            ($flag:literal, $cond:expr) => {
+                if $cond {
+                    flags.push(concat!("--", $flag).to_string());
+                }
+            };
+        }
+        macro_rules! push_if_non_default {
+            ($flag:literal, $field:ident) => {
+                if self.$field != defaults.$field {
+                    flags.push(format!(concat!("--", $flag, "={}"), self.$field));
+                }
+            };
+        }
+
+        // --- Deployment-specific fields (set by quake at runtime) ---
+
+        push_if_some!("moniker", self.moniker);
+        push_if_non_default!("p2p.addr", p2p_addr);
+        if !self.p2p_persistent_peers.is_empty() {
+            let peers: Vec<String> = self
+                .p2p_persistent_peers
+                .iter()
+                .map(|p| p.to_string())
+                .collect();
+            flags.push(format!("--p2p.persistent-peers={}", peers.join(",")));
+        }
+        push_if!("p2p.persistent-peers-only", self.p2p_persistent_peers_only);
+        push_if!(
+            "gossipsub.explicit-peering",
+            self.gossipsub_explicit_peering
+        );
+        push_if!(
+            "gossipsub.mesh-prioritization",
+            self.gossipsub_mesh_prioritization
+        );
+        push_if_some!("gossipsub.load", self.gossipsub_load);
+
+        // --- Manifest-configurable fields ---
+
+        push_if_some!("log-level", self.log_level);
+        push_if_some!("log-format", self.log_format);
+        push_if!("discovery", self.discovery);
+        push_if_non_default!("discovery.num-outbound-peers", discovery_num_outbound_peers);
+        push_if_non_default!("discovery.num-inbound-peers", discovery_num_inbound_peers);
+        push_if!("no-consensus", self.no_consensus);
+        push_if!("validator", self.validator);
+        push_if_non_default!("value-sync", value_sync);
+        push_if!(
+            "execution-persistence-backpressure",
+            self.execution_persistence_backpressure
+        );
+        push_if_non_default!(
+            "execution-persistence-backpressure-threshold",
+            execution_persistence_backpressure_threshold
+        );
+        push_if_non_default!("runtime.flavor", runtime_flavor);
+        push_if_some!("runtime.worker-threads", self.worker_threads);
+        push_if_non_default!("prune.certificates.distance", prune_certificates_distance);
+        push_if_non_default!("prune.certificates.before", prune_certificates_before);
+
+        // --- Deployment-specific fields (set by quake, continued) ---
+
+        push_if_some!("eth-socket", self.eth_socket);
+        push_if_some!("execution-socket", self.execution_socket);
+        push_if_some!("eth-rpc-endpoint", self.eth_rpc_endpoint);
+        push_if_some!("execution-endpoint", self.execution_endpoint);
+        push_if_some!("execution-ws-endpoint", self.execution_ws_endpoint);
+        push_if_some!("execution-jwt", self.execution_jwt);
+        push_if_some!("metrics", self.metrics);
+        push_if_some!("rpc.addr", self.rpc_addr);
+        push_if!("full", self.full);
+        push_if!("minimal", self.minimal);
+        if let Some(ref path) = self.private_key {
+            flags.push(format!("--private-key={}", path.display()));
+        }
+        push_if_non_default!("pprof.addr", pprof_addr);
+        push_if!("pprof.heap-prof", self.pprof_heap_prof);
+        push_if_some!("suggested-fee-recipient", self.suggested_fee_recipient);
+        push_if!("db.skip-upgrade", self.skip_db_upgrade);
+        push_if_some!("signing.remote", self.signing_remote);
+        push_if_some!("signing.tls-cert-path", self.signing_tls_cert_path);
+        push_if!("follow", self.follow);
+        push_each!("follow.endpoint", &self.follow_endpoints);
+
+        flags
+    }
+
     /// Validates that conflicting options are not provided simultaneously.
     ///
     /// This method ensures that users don't specify both IPC and RPC options
@@ -560,6 +755,8 @@ mod tests {
     use super::*;
     use std::fs::File;
     use tempfile::tempdir;
+
+    const TEST_FEE_RECIPIENT: &str = "0xf97e180c050e5ab072211ad2c213eb5aee4df134";
 
     fn new_start_cmd() -> StartCmd {
         StartCmd {
@@ -808,6 +1005,7 @@ mod tests {
         ];
         let cmd = StartCmd::try_parse_from(args).unwrap();
         assert_eq!(cmd.pprof_addr, "0.0.0.0:6060");
+        assert!(!cmd.pprof_heap_prof);
         assert_eq!(cmd.prune_certificates_distance, 0);
         assert_eq!(cmd.prune_certificates_before, 0);
         assert_eq!(cmd.discovery_num_outbound_peers, 20);
@@ -815,6 +1013,20 @@ mod tests {
         assert!(cmd.value_sync);
         assert!(!cmd.discovery);
         assert!(!cmd.validator);
+    }
+
+    #[test]
+    fn pprof_heap_prof_when_set() {
+        let args = vec![
+            "arc-node-consensus",
+            "--moniker",
+            "test",
+            "--p2p.addr",
+            "/ip4/127.0.0.1/tcp/27000",
+            "--pprof.heap-prof",
+        ];
+        let cmd = StartCmd::try_parse_from(args).unwrap();
+        assert!(cmd.pprof_heap_prof);
     }
 
     #[test]
@@ -887,6 +1099,8 @@ mod tests {
             "--p2p.addr",
             "/ip4/127.0.0.1/tcp/27000",
             "--validator",
+            "--suggested-fee-recipient",
+            TEST_FEE_RECIPIENT,
             "--signing.remote",
             "http://signer:10340",
         ];
@@ -904,6 +1118,8 @@ mod tests {
             "--p2p.addr",
             "/ip4/127.0.0.1/tcp/27000",
             "--validator",
+            "--suggested-fee-recipient",
+            TEST_FEE_RECIPIENT,
             "--signing.remote",
             "http://signer:10340",
             "--signing.tls-cert-path",
@@ -1326,6 +1542,72 @@ mod tests {
         assert_eq!(cmd.gossipsub_load.as_deref(), Some("high"));
     }
 
+    // to_cli_flags tests
+    #[test]
+    fn to_cli_flags_empty_for_defaults() {
+        assert!(StartCmd::default().to_cli_flags().is_empty());
+    }
+
+    #[test]
+    fn to_cli_flags_round_trip_preserves_all_fields() {
+        let original = StartCmd {
+            moniker: Some("validator-01".to_string()),
+            p2p_addr: "/ip4/10.0.0.1/tcp/27001".parse().unwrap(),
+            p2p_persistent_peers: vec![
+                "/ip4/10.0.0.2/tcp/27000".parse().unwrap(),
+                "/ip4/10.0.0.3/tcp/27000".parse().unwrap(),
+            ],
+            p2p_persistent_peers_only: true,
+            gossipsub_explicit_peering: true,
+            gossipsub_mesh_prioritization: true,
+            gossipsub_load: Some("high".to_string()),
+            log_level: None,
+            log_format: None,
+            discovery: true,
+            discovery_num_outbound_peers: 30,
+            discovery_num_inbound_peers: 40,
+            no_consensus: true,
+            validator: false,
+            value_sync: false,
+            eth_socket: Some("/tmp/reth.ipc".to_string()),
+            execution_socket: Some("/tmp/reth-auth.ipc".to_string()),
+            eth_rpc_endpoint: None,
+            execution_endpoint: None,
+            execution_ws_endpoint: None,
+            execution_persistence_backpressure: true,
+            execution_persistence_backpressure_threshold: 32,
+            execution_jwt: None,
+            metrics: Some("127.0.0.1:9000".parse().unwrap()),
+            rpc_addr: Some("127.0.0.1:31000".parse().unwrap()),
+            runtime_flavor: RUNTIME_SINGLE_THREADED.to_string(),
+            worker_threads: Some(8),
+            full: false,
+            minimal: false,
+            prune_certificates_distance: 1000,
+            prune_certificates_before: 0,
+            private_key: Some(PathBuf::from("/etc/arc/key.json")),
+            pprof_addr: "127.0.0.1:7070".to_string(),
+            pprof_heap_prof: true,
+            suggested_fee_recipient: Some(
+                "0x0000000000000000000000000000000000000042"
+                    .parse()
+                    .unwrap(),
+            ),
+            skip_db_upgrade: true,
+            signing_remote: Some("http://signer:10340".to_string()),
+            signing_tls_cert_path: Some("/etc/arc/signer.pem".to_string()),
+            follow: true,
+            follow_endpoints: vec!["http://rpc-1:8545,ws=8546".parse().unwrap()],
+        };
+
+        let args = std::iter::once("arc-node-consensus".to_string())
+            .chain(original.to_cli_flags())
+            .collect::<Vec<_>>();
+        let parsed = StartCmd::try_parse_from(args).expect("emitted flags should parse");
+
+        assert_eq!(parsed, original);
+    }
+
     // Validator flag tests
     #[test]
     fn validator_defaults_to_false() {
@@ -1342,9 +1624,47 @@ mod tests {
             "--p2p.addr",
             "/ip4/127.0.0.1/tcp/27000",
             "--validator",
+            "--suggested-fee-recipient",
+            TEST_FEE_RECIPIENT,
         ];
         let cmd = StartCmd::try_parse_from(args).unwrap();
         assert!(cmd.validator);
+    }
+
+    #[test]
+    fn validator_requires_suggested_fee_recipient() {
+        let args = vec![
+            "arc-node-consensus",
+            "--moniker",
+            "test",
+            "--p2p.addr",
+            "/ip4/127.0.0.1/tcp/27000",
+            "--validator",
+        ];
+        let err = StartCmd::try_parse_from(args).unwrap_err().to_string();
+        assert!(
+            err.contains("--suggested-fee-recipient"),
+            "expected error to mention --suggested-fee-recipient, got: {err}"
+        );
+    }
+
+    #[test]
+    fn suggested_fee_recipient_rejects_zero_address() {
+        let args = vec![
+            "arc-node-consensus",
+            "--moniker",
+            "test",
+            "--p2p.addr",
+            "/ip4/127.0.0.1/tcp/27000",
+            "--validator",
+            "--suggested-fee-recipient",
+            "0x0000000000000000000000000000000000000000",
+        ];
+        let err = StartCmd::try_parse_from(args).unwrap_err().to_string();
+        assert!(
+            err.contains("zero address"),
+            "expected zero-address rejection, got: {err}"
+        );
     }
 
     #[test]
@@ -1356,6 +1676,8 @@ mod tests {
             "--p2p.addr",
             "/ip4/127.0.0.1/tcp/27000",
             "--validator",
+            "--suggested-fee-recipient",
+            TEST_FEE_RECIPIENT,
             "--no-consensus",
         ];
         assert!(StartCmd::try_parse_from(args).is_err());
@@ -1370,6 +1692,8 @@ mod tests {
             "--p2p.addr",
             "/ip4/127.0.0.1/tcp/27000",
             "--validator",
+            "--suggested-fee-recipient",
+            TEST_FEE_RECIPIENT,
             "--follow",
             "--follow.endpoint",
             "http://localhost:8545",

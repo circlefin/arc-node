@@ -4,17 +4,21 @@ description = "DB upgrade testing scenario with 3 validators. Tests upgrade of a
 # Use RPC connection for Engine API
 engine_api_connection = "rpc"
 
-# Starting versions (what the testnet begins with)
+# Starting versions (what the testnet begins with).
+# Both starting and upgrade images must be Modern (>= v0.5.0) — the upgrade
+# path does not currently regenerate CLI flags when crossing the legacy/modern
+# boundary, so Legacy-to-Modern upgrades would start the new binary with no
+# flags.
 # IMAGE_REGISTRY_URL should be defined as an environment variable or in the .env file.
-image_cl="${IMAGE_REGISTRY_URL}/arc-consensus:0.3.1"
-image_el="${IMAGE_REGISTRY_URL}/arc-execution:0.3.1"
+image_cl="${IMAGE_REGISTRY_URL}/arc-consensus:0.5.0"
+image_el="${IMAGE_REGISTRY_URL}/arc-execution:0.5.0"
 
 # Upgrade versions (what we upgrade to during the test)
 image_cl_upgrade="arc_consensus:latest"
 image_el_upgrade="arc_execution:latest"
 
 # Global config
-cl.config.logging.log_level = "info"
+cl.config.log_level = "info"
 
 [nodes.validator1]
 [nodes.validator2]

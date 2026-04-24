@@ -133,16 +133,16 @@ modify the generated configuration files before starting the nodes.
 ./quake perturb pause val*_cl
 
 # Send 1000 transactions per second during 30 seconds to one validator node
-./quake load -t 30 -r 1000 validator1
+./quake load -t 30 -r 1000 --targets validator1
 
 # Mixed EIP-1559 and legacy transfer load (70/30 split)
-./quake load -t 30 -r 1000 --mix transfer=70,legacy=30 validator1
+./quake load -t 30 -r 1000 --mix transfer=70,legacy=30 --targets validator1
 
 # Mixed ERC-20 and native transfer load (70/30 split)
-./quake load -t 30 -r 1000 --mix transfer=70,erc20=30 validator1
+./quake load -t 30 -r 1000 --mix transfer=70,erc20=30 --targets validator1
 
 # ERC-20 with mixed functions: 60% transfer, 30% approve, 10% transferFrom
-./quake load -t 30 -r 1000 --mix erc20=100 --erc20-fn-weights transfer=60,approve=30,transfer-from=10 validator1
+./quake load -t 30 -r 1000 --mix erc20=100 --erc20-fn-weights transfer=60,approve=30,transfer-from=10 --targets validator1
 
 # Stop one node (both CL and EL containers)
 ./quake stop val*3
@@ -280,9 +280,11 @@ You can customize the timeout and number of retries for transient RPC failures:
 ```
 
 > [!TIP]
-> When a node name is required as parameter, we can use a wildcard '*'. For
-> example, `val*_cl` will expand to the names of all consensus layer containers
-> of validator nodes (`validator1_cl`, `validator2_cl`, etc.).
+> When a command takes node or container names directly, we can use a
+> wildcard `*`. For example, `val*_cl` expands to the names of all
+> consensus-layer containers of validator nodes (`validator1_cl`,
+> `validator2_cl`, etc.). This does not apply to `load` or `spam`
+> `--targets`, which accept exact node names and manifest node groups.
 
 Apply a pause of 300ms to the consensus layer containers of all validators:
 ```bash
@@ -293,17 +295,17 @@ of time. For more on perturbations, see below.
 
 Send 1000 transactions per second during 30 seconds to one validator node:
 ```bash
-./quake load -t 30 -r 1000 validator1
+./quake load -t 30 -r 1000 --targets validator1
 ```
 
 Send a mixed workload (ERC-20 and native transfers) at 500 TPS:
 ```bash
-./quake load -t 60 -r 500 --mix transfer=50,erc20=50 validator1
+./quake load -t 60 -r 500 --mix transfer=50,erc20=50 --targets validator1
 ```
 
 Send ERC-20 traffic with diverse function calls (approve, transferFrom alongside transfer):
 ```bash
-./quake load -t 60 -r 500 --mix erc20=100 --erc20-fn-weights transfer=60,approve=30,transfer-from=10 validator1
+./quake load -t 60 -r 500 --mix erc20=100 --erc20-fn-weights transfer=60,approve=30,transfer-from=10 --targets validator1
 ```
 
 Stop the nodes
@@ -357,21 +359,27 @@ while still using optimistic nonces; expect multiple `nonce too low` errors to b
 Both commands support blending transaction types with `--mix`:
 ```bash
 # 1000 TPS of native transfers for 30 seconds (backpressure)
-./quake load -t 30 -r 1000 validator1
+./quake load -t 30 -r 1000 --targets validator1
 
 # Same workload in fire-and-forget mode
-./quake spam -t 30 -r 1000 validator1
+./quake spam -t 30 -r 1000 --targets validator1
 
 # Mixed workload: 70% native transfers, 30% ERC-20
-./quake load -t 60 -r 500 --mix transfer=70,erc20=30 validator1
+./quake load -t 60 -r 500 --mix transfer=70,erc20=30 --targets validator1
 
 # Gas-intensive workload with diverse guzzler functions
 ./quake load -t 60 -r 200 --mix guzzler=100 \
-  --guzzler-fn-weights hash-loop=70@2000,storage-write=30@600 validator1
+  --guzzler-fn-weights hash-loop=70@2000,storage-write=30@600 \
+  --targets validator1
 
 # Fire-and-forget at high throughput, targeting all nodes
 ./quake spam -t 120 -r 5000
 ```
+
+`--targets` accepts a comma-separated list of explicit node names or manifest
+node groups such as `ALL_VALIDATORS`, `ALL_NON_VALIDATORS`, `ALL_NODES`, or
+custom groups defined under `[node_groups]`. If `--targets` is omitted,
+transactions are sent to all manifest nodes.
 
 Common flags (see `./quake load --help` for the full list):
 
@@ -384,8 +392,6 @@ Common flags (see `./quake load --help` for the full list):
 | `--mix` | | `transfer=100` | Transaction type blend: `transfer`, `erc20`, `guzzler` |
 | `--tx-latency` | | `false` | Record submit-to-finalized latency to CSV |
 
-If no target nodes are specified, transactions are sent to all nodes.
-
 #### Latency tracking (`--tx-latency`)
 
 The `--tx-latency` flag measures end-to-end transaction latency: the wall-clock
@@ -394,8 +400,8 @@ See the [spammer README](../spammer/README.md#transaction-latency-tracking) for
 full details on the tracking architecture, CSV output format, and analysis tools.
 
 ```bash
-./quake load -t 30 -r 1000 --tx-latency validator1
-./quake load -t 30 -r 1000 --tx-latency --csv-dir .quake/results validator1
+./quake load -t 30 -r 1000 --tx-latency --targets validator1
+./quake load -t 30 -r 1000 --tx-latency --csv-dir .quake/results --targets validator1
 ```
 
 **Recording behavior by mode:**
@@ -808,24 +814,46 @@ Nodes are defined as individual TOML sections with names starting with `validato
 
 ### Node Configuration
 
-- The configuration of the Malachite application (Consensus Layer) is defined in
-`crates/types/src/config.rs`. It can be set globally or for each node by
-prefixing the config field with `cl.config.`.
-- The default configuration of Reth (Execution Layer) is defined in `crates/quake/src/manifest.rs`.
-It can be set globally or for each node by prefixing the config field with `el.config.`.
+Consensus Layer (CL) configuration is set under `cl.config.*` keys. The
+schema depends on the CL image version (`image_cl`):
 
-For example:
+- **Modern CL (>= v0.5.0)**: the schema matches the `StartCmd` struct in
+  [`crates/malachite-cli/src/cmd/start.rs`](../malachite-cli/src/cmd/start.rs).
+  Keys are flat and map 1:1 to the `arc-node-consensus start` CLI flags
+  (e.g. `cl.config.log_level = "debug"` → `--log-level=debug`). Quake
+  translates the merged config into CLI flags at setup time and the node is
+  launched with no `config.toml`.
+- **Legacy CL (< v0.5.0)**: the schema matches the `Config` struct in
+  [`crates/types/src/config.rs`](../types/src/config.rs). Keys are nested
+  (e.g. `cl.config.logging.log_level = "debug"`) and the merged config is
+  written to `config.toml` at setup time. Legacy mode is scheduled for
+  deprecation.
+
+Quake detects which schema to use by parsing the `image_cl` tag; `latest`,
+missing tags, and unparseable tags are treated as Modern. The two formats
+are not interchangeable — `cl.config.log_level` on a Legacy image (and
+`cl.config.logging.log_level` on a Modern image) will fail to parse.
+Upgrading a running testnet across the legacy/modern boundary with
+`perturb upgrade` is **not supported**: the upgraded binary would start
+with no CLI flags. For upgrade scenarios, start the testnet on a Modern
+version.
+
+The default configuration of Reth (Execution Layer) is defined in
+[`crates/quake/src/manifest.rs`](src/manifest.rs). It can be set globally
+or for each node by prefixing the config field with `el.config.`.
+
+For example (Modern CL):
 
 ```toml
 # Global settings that apply to all nodes
 engine_api_connection = "rpc"  # or "ipc" (default)
-cl.config.logging.log_level = "debug"
+cl.config.log_level = "debug"
 el.config.disable-discovery = true
 
 [[nodes]]
 [validator1]
 # Node-specific settings
-cl.config.consensus.p2p.rpc_max_size = "1Mb"
+cl.config.discovery_num_outbound_peers = 30
 [validator2]
 # Node-specific settings
 el.config.builder.deadline = 5
@@ -1026,6 +1054,9 @@ You can define custom groups of nodes and use them to configure peer connections
 - `ALL_VALIDATORS` - All validator nodes, that is, nodes with names starting with `val` (e.g., `validator1`, `val2`)
 - `ALL_NON_VALIDATORS` - All nodes that are not validators
 
+These names are reserved built-ins and cannot be redefined under
+`[node_groups]`.
+
 **Custom node groups** are defined in the `[node_groups]` section. Groups can reference individual node names, pre-defined groups, or other groups previously declared:
 
 ```toml
@@ -1053,6 +1084,15 @@ In this example:
 - `validator1` will have persistent peers: `validator2`, `validator3`, `validator4`, `full1`, `full2`, `other_node` (the `TRUSTED` group, excluding itself)
 - `full1` will connect to all non-validators: `full2`, `sentry`, `other_node`
 - `sentry` will connect to all nodes except itself
+
+The same group names can also be used as `quake load` and `quake spam`
+targets. For example:
+
+```bash
+./quake load -t 60 -r 500 --targets ALL_VALIDATORS
+./quake spam -t 30 -r 1000 --targets TRUSTED
+./quake remote load -- --targets FULL_NODES -r 1000 -t 60
+```
 
 To distinguish group references from individual nodes in peer lists, by convention we use lowercase for node names and uppercase for node group names.
 
@@ -1568,9 +1608,12 @@ stop.
 
 Send transaction load:
 ```sh
-./quake remote load -- -r 1000 -t 60 validator1 validator2
+./quake remote load -- --targets validator1,validator2 -r 1000 -t 60
 ```
 Under the hood, this commands calls Spammer from CC. All Spammer options are supported.
+`--targets` accepts the same comma-separated selectors as `quake load` on a
+local testnet, including manifest node groups such as `ALL_VALIDATORS` or
+custom `[node_groups]`.
 
 Download diagnostic artifacts from the remote testnet:
 ```bash

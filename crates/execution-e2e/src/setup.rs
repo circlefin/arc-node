@@ -172,8 +172,10 @@ impl ArcSetup {
             .ok_or_else(|| eyre::eyre!("Genesis header not found"))?;
         let genesis_block = BlockInfo::new(genesis, 0, genesis_header.timestamp);
 
+        // Generate 10 wallets to match localdev genesis allocations.
+        // Index 7 is the operator (minter role on NativeFiatToken).
         let wallet =
-            reth_e2e_test_utils::wallet::Wallet::default().with_chain_id(chain_spec.chain().id());
+            reth_e2e_test_utils::wallet::Wallet::new(10).with_chain_id(chain_spec.chain().id());
 
         Ok((node, wallet, genesis_block))
     }

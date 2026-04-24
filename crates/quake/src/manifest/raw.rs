@@ -24,7 +24,7 @@ use tracing::warn;
 use crate::manifest::subnets::Subnets;
 use crate::manifest::{
     default_subnet_singleton, ClGossipSubConfig, ClPruningPreset, DockerImages, ElConfigOverride,
-    EngineApiConnection, Manifest, Node, NodeType, RemoteKeyId,
+    EngineApiConnection, Manifest, Node, NodeClConfig, NodeType, RemoteKeyId,
 };
 use crate::node::SubnetName;
 use crate::setup::supports_cli_flags;
@@ -34,9 +34,16 @@ use crate::util::merge_toml_values;
 const VALIDATOR_PREFIX: &str = "val";
 
 /// Pre-defined node groups.
-const NODE_GROUP_ALL: &str = "ALL_NODES";
-const NODE_GROUP_VALIDATORS: &str = "ALL_VALIDATORS";
-const NODE_GROUP_NON_VALIDATORS: &str = "ALL_NON_VALIDATORS";
+pub(crate) const NODE_GROUP_ALL: &str = "ALL_NODES";
+pub(crate) const NODE_GROUP_VALIDATORS: &str = "ALL_VALIDATORS";
+pub(crate) const NODE_GROUP_NON_VALIDATORS: &str = "ALL_NON_VALIDATORS";
+
+fn is_reserved_node_group_name(name: &str) -> bool {
+    matches!(
+        name,
+        NODE_GROUP_ALL | NODE_GROUP_VALIDATORS | NODE_GROUP_NON_VALIDATORS
+    )
+}
 
 /// Wrapper for execution layer configuration in TOML.
 ///
@@ -201,6 +208,18 @@ pub struct RawManifest {
     image_el_upgrade: Option<String>,
 }
 
+impl RawManifest {
+    /// Build the `DockerImages` referenced by this raw manifest.
+    pub fn images(&self) -> DockerImages {
+        DockerImages {
+            cl: self.image_cl.clone(),
+            el: self.image_el.clone(),
+            cl_upgrade: self.image_cl_upgrade.clone(),
+            el_upgrade: self.image_el_upgrade.clone(),
+        }
+    }
+}
+
 impl Default for RawManifest {
     fn default() -> Self {
         Self {
@@ -239,62 +258,6 @@ fn collect_toml_keys(table: &toml::Table, prefix: &str, out: &mut Vec<String>) {
     }
 }
 
-/// cl.config.* TOML paths that Quake can translate to CL CLI flags.
-/// For v0.5.0+ images, any cl.config path NOT in this list will be rejected
-/// to prevent silent ignores (config.toml is not read by v0.5.0+).
-///
-/// TODO: Derive this list dynamically.
-const CL_CONFIG_TRANSLATABLE: &[&str] = &[
-    "logging.log_level",
-    "consensus.enabled",
-    "consensus.p2p.discovery.enabled",
-    "consensus.p2p.discovery.num_inbound_peers",
-    "consensus.p2p.discovery.num_outbound_peers",
-    "prune.certificates_distance",
-    "prune.certificates_before",
-    "execution.persistence_backpressure",
-    "execution.persistence_backpressure_threshold",
-];
-
-/// For v0.5.0+ CL images, reject any cl.config.* paths that cannot be translated
-/// to CLI flags. Pre-v0.5.0 images read config.toml directly so all paths are fine.
-fn validate_cl_config(raw: &RawManifest) -> Result<()> {
-    if !supports_cli_flags(raw.image_cl.as_deref()) {
-        return Ok(());
-    }
-
-    reject_untranslatable_cl_config(&raw.cl.config, "global")?;
-    for (node_name, raw_node) in &raw.nodes {
-        reject_untranslatable_cl_config(&raw_node.cl.config, node_name)?;
-    }
-    Ok(())
-}
-
-/// Walk all leaf keys in a cl.config table and bail if any are not in `CL_CONFIG_TRANSLATABLE`.
-fn reject_untranslatable_cl_config(table: &toml::Table, scope: &str) -> Result<()> {
-    let mut keys = Vec::new();
-    collect_toml_keys(table, "", &mut keys);
-
-    let untranslatable: Vec<&String> = keys
-        .iter()
-        .filter(|k| !CL_CONFIG_TRANSLATABLE.contains(&k.as_str()))
-        .collect();
-
-    if !untranslatable.is_empty() {
-        bail!(
-            "{scope}: cl.config.* settings have no CLI flag equivalent and will be \
-             silently ignored by CL v0.5.0+: [{}]. \
-             Remove these settings or request CLI flag support from the CL team.",
-            untranslatable
-                .iter()
-                .map(|k| format!("cl.config.{k}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    Ok(())
-}
-
 /// Reject manifests where a node sets both `cl_prune_preset` and `cl.config.prune.*`.
 /// These are mutually exclusive: the preset is a named shortcut while explicit prune
 /// config overrides individual knobs. Allowing both would make precedence ambiguous.
@@ -326,26 +289,19 @@ impl TryFrom<RawManifest> for Manifest {
             warn!("arc_image_tag and arc_image_registry are deprecated; use image_cl/image_el with full image references instead");
         }
 
-        // Validate CL config consistency before converting
-        validate_cl_config(&raw)?;
         validate_prune_exclusivity(&raw)?;
 
+        // Build Docker images (needed early to determine CL config format)
+        let images = raw.images();
+
         let node_names = raw.nodes.keys().cloned().collect::<Vec<_>>();
-
-        // Add pre-defined node groups
-        let mut node_groups = IndexMap::new();
-        node_groups.insert(NODE_GROUP_ALL.to_string(), node_names.clone());
-        let (validators, non_validators): (Vec<_>, Vec<_>) = node_names
-            .clone()
-            .into_iter()
-            .partition(|name| is_validator(name));
-        node_groups.insert(NODE_GROUP_VALIDATORS.to_string(), validators);
-        node_groups.insert(NODE_GROUP_NON_VALIDATORS.to_string(), non_validators);
-
-        // Build node groups map from raw node groups, while expanding already declared group names to node names
-        for (key, raw_node_group) in raw.node_groups {
-            node_groups.insert(key, expand_node_group_names(&raw_node_group, &node_groups));
+        let custom_node_groups = raw.node_groups.clone();
+        for group_name in custom_node_groups.keys() {
+            if is_reserved_node_group_name(group_name) {
+                bail!("Node group '{group_name}' uses a reserved built-in group name");
+            }
         }
+        let node_groups = build_node_groups(&node_names, &custom_node_groups);
 
         // Check that node names are not used as node group names
         for node_group in node_groups.keys() {
@@ -365,22 +321,20 @@ impl TryFrom<RawManifest> for Manifest {
 
         // Merge default CL and EL configs with manifest's global config.
         // Precedence: defaults < manifest global < per-node
-
-        let default_cl = toml::Value::try_from(ClConfigOverride::default())?;
+        // The CL default depends on the image version: Modern uses StartCmd,
+        // Legacy uses ClConfigOverride.
+        let is_modern = supports_cli_flags(images.cl.as_deref());
+        let default_cl = if is_modern {
+            toml::Value::try_from(arc_node_consensus_cli::cmd::start::StartCmd::default())?
+        } else {
+            toml::Value::try_from(ClConfigOverride::default())?
+        };
         let manifest_cl = toml::Value::Table(raw.cl.config.clone());
         let global_cl_config = merge_toml_values(default_cl, manifest_cl)?;
 
         let default_el = toml::Value::try_from(ElConfigOverride::default())?;
         let manifest_el = toml::Value::Table(raw.el.config.clone());
         let global_el_config = merge_toml_values(default_el, manifest_el)?;
-
-        // Build Docker images
-        let images = DockerImages {
-            cl: raw.image_cl,
-            el: raw.image_el,
-            cl_upgrade: raw.image_cl_upgrade,
-            el_upgrade: raw.image_el_upgrade,
-        };
 
         // Build nodes map from raw nodes
         let mut nodes = IndexMap::new();
@@ -396,7 +350,7 @@ impl TryFrom<RawManifest> for Manifest {
             // Expand node group names in persistent peers list and remove self from
             // the list
             let cl_persistent_peers = raw_node.cl_persistent_peers.map(|peers| {
-                expand_node_group_names(&peers, &node_groups)
+                expand_node_group(&peers, &node_groups)
                     .into_iter()
                     .filter(|n| *n != key)
                     .collect()
@@ -404,7 +358,14 @@ impl TryFrom<RawManifest> for Manifest {
 
             // Merge node-specific CL config with global CL config
             let node_cl_config = toml::Value::Table(raw_node.cl.config);
-            let cl_config = merge_toml_values(global_cl_config.clone(), node_cl_config)?;
+            let cl_config_toml = merge_toml_values(global_cl_config.clone(), node_cl_config)?;
+
+            // Version-branched deserialization
+            let cl_config = if is_modern {
+                NodeClConfig::Modern(cl_config_toml.try_into()?)
+            } else {
+                NodeClConfig::Legacy(cl_config_toml.try_into()?)
+            };
 
             // Merge global el.config with node-specific el.config as TOML
             let node_el_config = toml::Value::Table(raw_node.el.config);
@@ -417,7 +378,7 @@ impl TryFrom<RawManifest> for Manifest {
             let el_trusted_peers = if !el_config.trusted_peers.is_empty() {
                 let names = el_config.trusted_peers;
                 el_config.trusted_peers = vec![];
-                let peers: Vec<String> = expand_node_group_names(&names, &node_groups)
+                let peers: Vec<String> = expand_node_group(&names, &node_groups)
                     .into_iter()
                     .filter(|n| *n != key)
                     .collect();
@@ -436,7 +397,7 @@ impl TryFrom<RawManifest> for Manifest {
                 key,
                 Node {
                     node_type,
-                    cl_config: cl_config.try_into()?,
+                    cl_config,
                     el_config,
                     start_at: raw_node.start_at,
                     region: raw_node.region,
@@ -469,6 +430,7 @@ impl TryFrom<RawManifest> for Manifest {
             subnets: Subnets::new(&node_subnets),
             images,
             nodes,
+            node_groups: custom_node_groups,
             el_init_hardfork: raw.el_init_hardfork,
         })
     }
@@ -478,10 +440,7 @@ impl TryFrom<Manifest> for RawManifest {
     type Error = color_eyre::eyre::Error;
 
     fn try_from(manifest: Manifest) -> Result<Self> {
-        // The `Manifest` struct does not retain node group information after expansion.
-        // Attempting to reconstruct it can lead to conflicts and incorrect manifests.
-        // Serializing with an empty `node_groups` is the safe approach.
-        let node_groups = IndexMap::new();
+        let node_groups = manifest.node_groups.clone();
 
         Ok(Self {
             name: manifest.name,
@@ -530,15 +489,27 @@ impl RawNode {
     ) -> Result<Self> {
         let mut el_config = node.el_config.clone();
         el_config.trusted_peers = trusted_peers.unwrap_or_default();
-        let node_cl_table = toml::Table::try_from(node.cl_config)?;
         let node_el_table = toml::Table::try_from(el_config)?;
-
-        let default_cl_config: toml::Table = toml::Table::try_from(ClConfigOverride::default())?;
         let default_el_config: toml::Table = toml::Table::try_from(ElConfigOverride::default())?;
+
+        // Serialize cl_config to TOML based on variant
+        let cl_config_table = match &node.cl_config {
+            NodeClConfig::Modern(start_cmd) => {
+                let table = toml::Table::try_from(start_cmd)?;
+                let default_table =
+                    toml::Table::try_from(arc_node_consensus_cli::cmd::start::StartCmd::default())?;
+                Self::config_diff(&table, &default_table)
+            }
+            NodeClConfig::Legacy(config) => {
+                let table = toml::Table::try_from(config)?;
+                let default_table = toml::Table::try_from(ClConfigOverride::default())?;
+                Self::config_diff(&table, &default_table)
+            }
+        };
 
         Ok(Self {
             cl: ClConfig {
-                config: Self::config_diff(&node_cl_table, &default_cl_config),
+                config: cl_config_table,
             },
             el: ElConfig {
                 config: Self::config_diff(&node_el_table, &default_el_config),
@@ -592,16 +563,45 @@ impl RawNode {
     }
 }
 
+/// Build the runtime node-group map from manifest node names and custom groups.
+///
+/// The returned map always contains the predefined groups
+/// `ALL_NODES`, `ALL_VALIDATORS`, and `ALL_NON_VALIDATORS`, followed by the
+/// custom groups in declaration order. Custom groups from the manifest are expanded
+/// against the groups already present in the map, so a later custom group may
+/// reference an earlier one or a predefined group.
+pub(crate) fn build_node_groups(
+    node_names: &[String],
+    custom_node_groups: &IndexMap<String, Vec<String>>,
+) -> IndexMap<String, Vec<String>> {
+    let mut resolved_groups = IndexMap::new();
+    resolved_groups.insert(NODE_GROUP_ALL.to_string(), node_names.to_vec());
+
+    let (validators, non_validators): (Vec<_>, Vec<_>) = node_names
+        .iter()
+        .cloned()
+        .partition(|name| is_validator(name));
+    resolved_groups.insert(NODE_GROUP_VALIDATORS.to_string(), validators);
+    resolved_groups.insert(NODE_GROUP_NON_VALIDATORS.to_string(), non_validators);
+
+    for (group_name, group_members) in custom_node_groups {
+        let expanded_group = expand_node_group(group_members, &resolved_groups);
+        resolved_groups.insert(group_name.clone(), expanded_group);
+    }
+
+    resolved_groups
+}
+
 /// Expand the group names in the list using the existing node group definitions.
-fn expand_node_group_names(
+pub(crate) fn expand_node_group(
     names: &[String],
     existing_node_groups: &IndexMap<String, Vec<String>>,
 ) -> Vec<String> {
     // Use an IndexSet to avoid duplicates while preserving order
     let mut expanded_names = IndexSet::new();
     for name in names {
-        if let Some(node_names) = existing_node_groups.get(name) {
-            expanded_names.extend(node_names.iter().cloned());
+        if let Some(group_members) = existing_node_groups.get(name) {
+            expanded_names.extend(group_members.iter().cloned());
         } else {
             expanded_names.insert(name.clone());
         }
@@ -616,7 +616,8 @@ pub(crate) fn is_validator(node_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use malachitebft_config::{LogLevel, LoggingConfig};
+    use arc_node_consensus_cli::cmd::start::StartCmd;
+    use malachitebft_config::LogLevel;
 
     use crate::manifest::ElTxpoolConfig;
 
@@ -699,6 +700,54 @@ mod tests {
         assert_eq!(manifest2.nodes["val2"].el_trusted_peers, None);
     }
 
+    #[test]
+    fn test_custom_node_groups_roundtrip() {
+        let toml = r#"
+        image_cl = "arc_consensus:v0.4.0"
+        [node_groups]
+        FULL_NODES = ["full1", "full2"]
+        TRUSTED = ["ALL_VALIDATORS", "FULL_NODES", "other_node"]
+
+        [nodes.validator1]
+        [nodes.validator2]
+        [nodes.full1]
+        [nodes.full2]
+        [nodes.other_node]
+        "#;
+        let expected_custom_groups = IndexMap::from([
+            (
+                "FULL_NODES".to_string(),
+                vec!["full1".to_string(), "full2".to_string()],
+            ),
+            (
+                "TRUSTED".to_string(),
+                vec![
+                    "ALL_VALIDATORS".to_string(),
+                    "FULL_NODES".to_string(),
+                    "other_node".to_string(),
+                ],
+            ),
+        ]);
+
+        let manifest1 = Manifest::from_string(toml).unwrap();
+        assert_eq!(manifest1.node_groups, expected_custom_groups);
+
+        let raw1 = RawManifest::try_from(manifest1).unwrap();
+        assert_eq!(raw1.node_groups, expected_custom_groups);
+
+        let serialized_raw = toml::to_string(&raw1).unwrap();
+        assert!(
+            serialized_raw.contains("[node_groups]"),
+            "custom node_groups must be present in serialized TOML"
+        );
+
+        let raw2: RawManifest = toml::from_str(&serialized_raw).unwrap();
+        assert_eq!(raw2.node_groups, expected_custom_groups);
+
+        let manifest2 = Manifest::from_string(&serialized_raw).unwrap();
+        assert_eq!(manifest2.node_groups, expected_custom_groups);
+    }
+
     /// el.config.trusted_peers must be an array; a scalar value should return an error.
     #[test]
     fn test_el_trusted_peers_wrong_type_returns_error() {
@@ -713,102 +762,6 @@ mod tests {
         assert!(
             msg.contains("Failed to merge toml values: array and string"),
             "unexpected error: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_validate_cl_config_allows_translatable_key_with_new_image() {
-        let toml_str = r#"
-            image_cl = "ghcr.io/org/arc-consensus:latest"
-            cl.config.logging.log_level = "debug"
-            [nodes.val1]
-        "#;
-        let raw: RawManifest = toml::from_str(toml_str).unwrap();
-        let result = Manifest::try_from(raw);
-        assert!(
-            result.is_ok(),
-            "translatable cl.config path should be allowed for v0.5.0+: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn test_validate_cl_config_rejects_untranslatable_key_with_new_image() {
-        let toml_str = r#"
-            image_cl = "ghcr.io/org/arc-consensus:v0.5.0"
-            cl.config.consensus.p2p.rpc_max_size = "42 Mib"
-            [nodes.val1]
-        "#;
-        let raw: RawManifest = toml::from_str(toml_str).unwrap();
-        let result = Manifest::try_from(raw);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("no CLI flag equivalent"),
-            "should mention no CLI equivalent: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_validate_cl_config_allows_old_image_with_any_cl_config() {
-        let toml_str = r#"
-            image_cl = "ghcr.io/org/arc-consensus:v0.4.0"
-            cl.config.logging.log_level = "debug"
-            cl.config.consensus.p2p.rpc_max_size = "42 Mib"
-            [nodes.val1]
-        "#;
-        let raw: RawManifest = toml::from_str(toml_str).unwrap();
-        let result = Manifest::try_from(raw);
-        assert!(
-            result.is_ok(),
-            "old image should allow all cl.config.*: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn test_validate_cl_config_rejects_untranslatable_when_no_image() {
-        let toml_str = r#"
-            cl.config.value_sync.max_request_size = "10 Mib"
-            [nodes.val1]
-        "#;
-        let raw: RawManifest = toml::from_str(toml_str).unwrap();
-        let result = Manifest::try_from(raw);
-        assert!(
-            result.is_err(),
-            "no image_cl should assume v0.5.0+ and reject untranslatable cl.config"
-        );
-    }
-
-    #[test]
-    fn test_validate_cl_config_rejects_per_node_untranslatable_key() {
-        let toml_str = r#"
-            image_cl = "ghcr.io/org/arc-consensus:latest"
-            [nodes.val1]
-            cl.config.consensus.p2p.rpc_max_size = "42 Mib"
-            [nodes.val2]
-        "#;
-        let raw: RawManifest = toml::from_str(toml_str).unwrap();
-        let result = Manifest::try_from(raw);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("val1"), "error should name the node: {msg}");
-    }
-
-    #[test]
-    fn test_validate_cl_config_allows_per_node_translatable_key() {
-        let toml_str = r#"
-            image_cl = "ghcr.io/org/arc-consensus:latest"
-            [nodes.val1]
-            cl.config.execution.persistence_backpressure = true
-            [nodes.val2]
-        "#;
-        let raw: RawManifest = toml::from_str(toml_str).unwrap();
-        let result = Manifest::try_from(raw);
-        assert!(
-            result.is_ok(),
-            "translatable per-node cl.config should succeed: {:?}",
-            result.err()
         );
     }
 
@@ -897,13 +850,10 @@ rpc_max_size = "42 Mib"
     #[test]
     fn test_default_manifest_serialization() {
         let node = Node {
-            cl_config: ClConfigOverride {
-                logging: LoggingConfig {
-                    log_level: LogLevel::Info,
-                    ..LoggingConfig::default()
-                },
-                ..ClConfigOverride::default()
-            },
+            cl_config: NodeClConfig::Modern(StartCmd {
+                log_level: Some(LogLevel::Info),
+                ..StartCmd::default()
+            }),
             el_config: ElConfigOverride {
                 txpool: crate::manifest::ElTxpoolConfig {
                     pending_max_count: Some(2),
@@ -931,7 +881,7 @@ rpc_max_size = "42 Mib"
         // serializes nodes as table sections [nodes.val0] rather than inline.
         assert_eq!(
             serialized,
-            "[nodes.val0.cl.config.logging]\nlog_level = \"info\"\n\n[nodes.val0.el.config.txpool]\npending_max_count = 2\n\n[nodes.val1]\n"
+            "[nodes.val0.cl.config]\nlog_level = \"info\"\n\n[nodes.val0.el.config.txpool]\npending_max_count = 2\n\n[nodes.val1]\n"
         );
     }
 }

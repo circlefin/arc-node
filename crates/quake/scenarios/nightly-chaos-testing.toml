@@ -1,7 +1,7 @@
 name = "nightly-chaos-testing"
 
 # Global config
-cl.config.logging.log_level = "debug"
+cl.config.log_level = "debug"
 
 latency_emulation = true
 engine_api_connection = "rpc"

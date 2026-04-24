@@ -42,6 +42,7 @@ use crate::node::ConsensusIdentity;
 use crate::request::Status;
 use crate::spec::{ChainId, ConsensusSpec, NetworkId};
 use crate::stats::Stats;
+use crate::store::repositories::UndecidedBlocksRepository;
 use crate::store::Store;
 use crate::streaming::PartStreamsMap;
 use crate::utils::sync_state::SyncState;
@@ -446,11 +447,12 @@ impl State {
         height: Height,
         round: Round,
     ) -> eyre::Result<Vec<ConsensusBlock>> {
-        self
-            .store
-            .get_undecided_blocks(height, round)
+        self.store
+            .get_by_round(height, round)
             .await
-            .wrap_err_with(||format!("Failed to get undecided blocks for height {height} and round {round} from the database"))
+            .wrap_err_with(|| {
+                format!("Failed to get undecided blocks for height {height} and round {round} from the database")
+            })
     }
 
     /// Move to the next height, updating the previous block, validator set, and consensus params.

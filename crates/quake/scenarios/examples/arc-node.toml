@@ -27,7 +27,7 @@ el.config.prune.preset = "minimal"
 el.config.prune.bodies.distance = 100
 el.config.prune.block-interval = 5
 
-cl.config.prune.certificates_distance = 100
+cl.config.prune_certificates_distance = 100
 
 # Trusted perimeter: only propagate txs to trusted peers.
 # Validators, full-p2p, and snapshot gossip freely among themselves;
@@ -51,7 +51,7 @@ el.config.arc.hide_pending_txs = true
 # libp2p sync-only full node — --full profile (snapshot source + follow target)
 [nodes.snapshot]
 start_at = 10
-cl.config.consensus.enabled = false
+cl.config.no_consensus = true
 el.config.prune.preset = "full"
 
 # RPC follow node — quake starts it at block 11, script stops it immediately,
