@@ -936,17 +936,6 @@ describe('NativeFiatToken', () => {
 
       // Blocklist the predicted contract address
       await USDC.attach(operator).write.blacklist([predictedAddress]).then(ReceiptVerifier.waitSuccess)
-    })
-
-    it('execution frames blocklist: CREATE from EOA succeeds when created address is blocklisted and no value is transferred', async () => {
-      const { client, operator, sender } = await clients()
-
-      // Calculate the address that will be created
-      const nonce = await client.getTransactionCount({ address: sender.account.address })
-      const predictedAddress = getCreateAddress({ from: sender.account.address, nonce: BigInt(nonce) })
-
-      // Blocklist the predicted contract address
-      await USDC.attach(operator).write.blacklist([predictedAddress]).then(ReceiptVerifier.waitSuccess)
 
       // Verify the predicted address is blocklisted
       const isBlocklisted = await NativeCoinControl.isBlocklisted(client, predictedAddress)
