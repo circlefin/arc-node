@@ -21,6 +21,7 @@
 mod address;
 mod aliases;
 mod certificate;
+pub mod commit_http;
 mod config;
 mod consensus_params;
 mod context;
