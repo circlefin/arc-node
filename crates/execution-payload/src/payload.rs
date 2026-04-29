@@ -575,7 +575,11 @@ where
         }
 
         // ensure we still have capacity for this transaction
-        if block_gas_limit < cumulative_gas_used.checked_add(pool_tx.gas_limit()).expect("total gas shouldn't overflow") {
+        if block_gas_limit
+            < cumulative_gas_used
+                .checked_add(pool_tx.gas_limit())
+                .expect("total gas shouldn't overflow")
+        {
             // we can't fit this transaction into the block, so we need to mark it as invalid
             // which also removes all dependent transaction from the iterator before we can
             // continue
@@ -662,7 +666,9 @@ where
         {
             total_fees += U256::from(miner_fee) * U256::from(gas_used);
         }
-        cumulative_gas_used = cumulative_gas_used.checked_add(gas_used).expect("total gas shouldn't overflow");
+        cumulative_gas_used = cumulative_gas_used
+            .checked_add(gas_used)
+            .expect("total gas shouldn't overflow");
     }
 
     PayloadBuildMetrics::record_stage_tx_execution(loop_started.elapsed());
