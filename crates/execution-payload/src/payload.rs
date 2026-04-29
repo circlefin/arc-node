@@ -662,13 +662,7 @@ where
         {
             total_fees += U256::from(miner_fee) * U256::from(gas_used);
         }
-        cumulative_gas_used = cumulative_gas_used
-            .checked_add(gas_used)
-            .ok_or_else(|| {
-                PayloadBuilderError::other(eyre::eyre!(
-                    "cumulative_gas_used overflow: {cumulative_gas_used} + {gas_used}"
-                ))
-            })?;
+        cumulative_gas_used = cumulative_gas_used.checked_add(gas_used).expect("total gas shouldn't overflow");
     }
 
     PayloadBuildMetrics::record_stage_tx_execution(loop_started.elapsed());
