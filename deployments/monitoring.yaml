@@ -23,7 +23,7 @@ services:
     image: grafana/grafana-oss
     # if you are running as root then set it to 0
     # else find the right id with the id -u command
-    user: '501'
+    user: '472'
     ports:
       - 127.0.0.1:3000:3000
     volumes:
