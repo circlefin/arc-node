@@ -83,8 +83,8 @@ describe('NativeFiatToken', () => {
     const receipt = await USDC.attach(sender)
       .write.transfer([receiver.account.address, amount])
       .then(ReceiptVerifier.waitSuccess)
-    // Zero5: EIP-2929 warm/cold gas pricing
-    receipt.verifyGasUsedApproximately(54638n).verifyEvents((ev) => {
+    // Zero6: EIP-2929 warm/cold account-load pricing
+    receipt.verifyGasUsedApproximately(51038n).verifyEvents((ev) => {
       ev.expectNativeTransfer({ from: sender, to: receiver, amount: USDC.toNative(amount) })
         .expectUSDCTransfer({ from: sender, to: receiver, value: amount })
         .expectAllEventsMatched()

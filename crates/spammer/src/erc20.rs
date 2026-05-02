@@ -20,7 +20,7 @@ use alloy_sol_types::{sol, SolCall};
 use color_eyre::eyre::Result;
 
 use crate::config::Erc20Function;
-use crate::generator::{TxGenerator, TESTNET_CHAIN_ID};
+use crate::generator::{TxGenerator, MAX_FEE_PER_GAS, MAX_PRIORITY_FEE_PER_GAS, TESTNET_CHAIN_ID};
 use crate::ws::WsClient;
 
 /// TestToken ERC-20 contract address (deterministic deployment in genesis).
@@ -70,8 +70,8 @@ pub(crate) async fn prepare_erc20_tx(
     Ok(TxEip1559 {
         chain_id: TESTNET_CHAIN_ID,
         nonce,
-        max_priority_fee_per_gas: 1_000_000_000, // 1 gwei
-        max_fee_per_gas: 2_000_000_000,          // 2 gwei
+        max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS,
+        max_fee_per_gas: MAX_FEE_PER_GAS,
         gas_limit,
         to: Some(TEST_TOKEN_ADDRESS).into(),
         value: U256::ZERO,

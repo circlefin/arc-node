@@ -307,11 +307,10 @@ pub struct ElArcBuilderConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct ElArcConfig {
     pub denylist: ElArcDenylistConfig,
-    /// When true, passes `--arc.hide-pending-txs` which enables the
-    /// pending-tx subscription filter and pending-block interception
-    /// middleware. Set to true on externally-exposed nodes for MEV protection.
+    /// When true, passes `--arc.expose-pending-txs` to disable the pending-tx
+    /// RPC filter. Default false (hidden); flip only on trusted/internal nodes.
     #[serde(default)]
-    pub hide_pending_txs: bool,
+    pub expose_pending_txs: bool,
     pub builder: ElArcBuilderConfig,
 }
 
@@ -1980,6 +1979,60 @@ mod tests {
             .el_cli_flags()
             .unwrap()
             .contains(&"--arc.builder.wait-for-payload=true".to_string()));
+    }
+
+    #[test]
+    fn test_arc_expose_pending_txs_parses_and_emits_flag() {
+        let str = r#"
+        [nodes.validator1]
+        el.config.arc.expose_pending_txs = true
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+
+        assert!(
+            manifest.nodes["validator1"]
+                .el_config
+                .arc
+                .expose_pending_txs
+        );
+        assert!(manifest.nodes["validator1"]
+            .el_cli_flags()
+            .unwrap()
+            .contains(&"--arc.expose-pending-txs".to_string()));
+    }
+
+    #[test]
+    fn test_arc_expose_pending_txs_omitted_when_unset() {
+        let str = r#"
+        [nodes.validator1]
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+
+        assert!(
+            !manifest.nodes["validator1"]
+                .el_config
+                .arc
+                .expose_pending_txs
+        );
+        assert!(!manifest.nodes["validator1"]
+            .el_cli_flags()
+            .unwrap()
+            .iter()
+            .any(|f| f.contains("expose-pending-txs")));
+    }
+
+    #[test]
+    fn test_arc_hide_pending_txs_stale_field_rejected() {
+        let str = r#"
+        [nodes.validator1]
+        el.config.arc.hide_pending_txs = true
+        "#;
+        let err = Manifest::from_string(str).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("hide_pending_txs") || msg.contains("unknown field"),
+            "stale field should trigger deny_unknown_fields error, got: {msg}"
+        );
     }
 
     #[test]

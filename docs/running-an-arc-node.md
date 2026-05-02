@@ -153,6 +153,11 @@ The `--rpc.forwarder` parameter routes requests not served locally to an existin
 The `arc-node-execution` binary accepts all parameters of a `reth` node.
 Refer to its [documentation](https://reth.rs/cli/reth/node/) for details.
 
+For externally-reachable nodes, consider adding `--public-api`. It
+enforces hiding of pending-tx RPCs (a potential MEV vector) and warns if
+`--http.api` / `--ws.api` exposes namespaces beyond the safe set
+(`eth`, `net`, `web3`, `rpc`).
+
 ### Start consensus layer
 
 After starting the [execution layer](#start-execution-layer), in a different terminal, start the consensus layer:

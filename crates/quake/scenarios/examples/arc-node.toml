@@ -40,13 +40,14 @@ el.config.tx_propagation_policy = "Trusted"
 [nodes.validator3]
 [nodes.validator4]
 
-# full-p2p is the only externally-exposed node, enable MEV protection
-# and restrict RPC surface. arc-node forwards transactions here via --rpc.forwarder.
+# full-p2p is the only externally-exposed node; narrow the RPC surface to
+# the safe set for MEV protection. Pending-tx hiding is the default, so no
+# explicit flag is needed. arc-node forwards transactions here via
+# --rpc.forwarder.
 [nodes.full-p2p]
 el.config.tx_propagation_policy = "Trusted"
 el.config.http.api = ["eth", "net", "web3"]
 el.config.ws.api = ["eth", "net", "web3"]
-el.config.arc.hide_pending_txs = true
 
 # libp2p sync-only full node — --full profile (snapshot source + follow target)
 [nodes.snapshot]

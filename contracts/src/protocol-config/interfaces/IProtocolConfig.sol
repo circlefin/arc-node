@@ -50,9 +50,6 @@ interface IProtocolConfig {
     /// @dev Emitted each time the controller updates consensus parameters.
     event ConsensusParamsUpdated(ConsensusParams params);
 
-    /// @dev Emitted when the reward beneficiary is reassigned.
-    event RewardBeneficiaryUpdated(address indexed beneficiary);
-
     /* READ-ONLY API */
 
     /// @notice Returns the latest fee parameters.
@@ -60,9 +57,6 @@ interface IProtocolConfig {
 
     /// @notice Returns the latest consensus parameters.
     function consensusParams() external view returns (ConsensusParams memory params);
-
-    /// @notice Returns the current reward beneficiary.
-    function rewardBeneficiary() external view returns (address beneficiary);
 
     /* MUTATIVE API */
 
@@ -81,14 +75,6 @@ interface IProtocolConfig {
      * @param newParams       Complete parameter bundle.
      */
     function updateConsensusParams(ConsensusParams calldata newParams) external;
-
-    /**
-     * @notice Change the reward beneficiary address.
-     * @dev    Access – `onlyController` in implementation.
-     * @dev    Access - `whenNotPaused` in implementation.
-     * @param newBeneficiary The new beneficiary address.
-     */
-    function updateRewardBeneficiary(address newBeneficiary) external;
 
     /**
      * @notice Update only the blockGasLimit in fee params.

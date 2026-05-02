@@ -16,7 +16,7 @@
 
 import fs from 'fs'
 import { z } from 'zod'
-import { parseEther, parseGwei, toHex, zeroAddress } from 'viem'
+import { parseEther, parseGwei, toHex } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { createBuilderContext, buildGenesis, GenesisConfig, schemaGenesisConfig, localdevFeeRecipient } from '../../scripts/genesis'
 import { bigintReplacer } from '../../scripts/genesis/types'
@@ -104,8 +104,6 @@ const build = async (options: z.infer<typeof localBuilderOptionsSchema>) => {
       owner: admin.address,
       controller: admin.address,
       pauser: admin.address,
-      // Zero = unset; EL honors CL-provided --suggested-fee-recipient per validator.
-      beneficiary: zeroAddress,
       feeParams: {
         alpha: 20n, // 20%
         kRate: 200n, // 2%

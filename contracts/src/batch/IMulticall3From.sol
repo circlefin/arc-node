@@ -21,6 +21,14 @@ pragma solidity ^0.8.29;
 ///         contract that routes subcalls through the callFrom precompile.
 ///         Mirrors the original Multicall3 API but without value-forwarding
 ///         methods and without payable modifiers.
+/// @dev EOA-only: aggregate-family entrypoints invoke the callFrom precompile,
+///      which requires the sender argument (`msg.sender` of Multicall3From)
+///      to equal the precompile caller or `tx.origin`. A contract caller is
+///      neither, so callFrom reverts and the entire batch reverts regardless
+///      of `requireSuccess` / `allowFailure`.
+///
+///      Target-contract reverts are captured per-call in the `(success,
+///      returnData)` tuple and gated by `requireSuccess` / `allowFailure`.
 interface IMulticall3From {
     struct Call {
         address target;
@@ -40,24 +48,29 @@ interface IMulticall3From {
 
     /// @notice Aggregates calls, requiring all to succeed. Returns block
     ///         number and an array of return data.
+    /// @dev EOA-only. See {IMulticall3From}.
     function aggregate(Call[] calldata calls) external returns (uint256 blockNumber, bytes[] memory returnData);
 
     /// @notice Aggregates calls with per-call failure flags.
+    /// @dev EOA-only. See {IMulticall3From}.
     function aggregate3(Call3[] calldata calls) external returns (Result[] memory returnData);
 
     /// @notice Aggregates calls, requiring all to succeed. Returns block
     ///         number, block hash, and results.
+    /// @dev EOA-only. See {IMulticall3From}.
     function blockAndAggregate(Call[] calldata calls)
         external
         returns (uint256 blockNumber, bytes32 blockHash, Result[] memory returnData);
 
     /// @notice Aggregates calls, with opt-in success requirement.
+    /// @dev EOA-only. See {IMulticall3From}.
     function tryAggregate(bool requireSuccess, Call[] calldata calls)
         external
         returns (Result[] memory returnData);
 
     /// @notice Aggregates calls with opt-in success requirement, returning
     ///         block number, block hash, and results.
+    /// @dev EOA-only. See {IMulticall3From}.
     function tryBlockAndAggregate(bool requireSuccess, Call[] calldata calls)
         external
         returns (uint256 blockNumber, bytes32 blockHash, Result[] memory returnData);

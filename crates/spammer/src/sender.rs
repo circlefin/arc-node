@@ -209,6 +209,11 @@ impl TxSender {
             };
             if let Some(tx) = tx {
                 self.send(tx, wait_response).await?;
+                if !wait_response {
+                    for client in &mut self.ws_clients {
+                        client.drain_one().await;
+                    }
+                }
             } else {
                 break;
             }
@@ -308,7 +313,7 @@ impl TxSender {
         tx.encode_2718(&mut buf);
 
         let tx_hash = compute_tx_hash(&buf);
-        let payload = hex::encode(buf);
+        let payload = format!("0x{}", hex::encode(buf));
         let tx_len = tx_len as u64;
 
         let len = self.ws_clients.len();

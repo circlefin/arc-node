@@ -28,6 +28,9 @@ import {IMulticall3From} from "./IMulticall3From.sol";
 ///      callFrom precompile does not support value forwarding on Arc.
 ///      Reentrancy is safe: the contract holds no state that could be
 ///      corrupted by a reentrant call.
+/// @dev EOA-only: contract callers hit the callFrom sender-spoofing
+///      constraint and the entire batch reverts regardless of
+///      `requireSuccess` / `allowFailure`. See {IMulticall3From}.
 contract Multicall3From is IMulticall3From {
     ICallFrom public constant CALL_FROM = ICallFrom(Precompiles.CALL_FROM);
 

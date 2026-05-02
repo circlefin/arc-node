@@ -23,7 +23,6 @@ import { getChain } from '../../scripts/hardhat/viem-helper'
 import { ProtocolConfig } from '../helpers'
 import { loadGenesisConfig } from '../helpers'
 import { parseAbi, Address, decodeFunctionResult, Hex } from 'viem'
-import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
 import fs from 'fs'
 
 /**
@@ -140,11 +139,7 @@ describe('ProtocolConfig upgrade simulation', () => {
           targetBlockTimeMs: currentConsensusParams.targetBlockTimeMs + 1,
         }
 
-        // Generate a random address for new beneficiary
-        const randomAccount = privateKeyToAccount(generatePrivateKey())
-        const newBeneficiary = randomAccount.address
-
-        // Simulate: Upgrade + Update FeeParams + Update ConsensusParams + Update Beneficiary + Read to verify
+        // Simulate: Upgrade + Update FeeParams + Update ConsensusParams + Read to verify
         const result = await client.simulateBlocks({
           blocks: [
             {
@@ -173,15 +168,7 @@ describe('ProtocolConfig upgrade simulation', () => {
                   functionName: 'updateConsensusParams',
                   args: [newConsensusParams],
                 },
-                // 4. Update reward beneficiary (verify beneficiary update works)
-                {
-                  account: controller,
-                  to: protocolConfig.address,
-                  abi: protocolConfig.abi,
-                  functionName: 'updateRewardBeneficiary',
-                  args: [newBeneficiary],
-                },
-                // 5. Read fee params back (verify read works)
+                // 4. Read fee params back (verify read works)
                 {
                   account: controller,
                   to: protocolConfig.address,
@@ -189,20 +176,12 @@ describe('ProtocolConfig upgrade simulation', () => {
                   functionName: 'feeParams',
                   args: [],
                 },
-                // 6. Read consensus params back (verify read works)
+                // 5. Read consensus params back (verify read works)
                 {
                   account: controller,
                   to: protocolConfig.address,
                   abi: protocolConfig.abi,
                   functionName: 'consensusParams',
-                  args: [],
-                },
-                // 7. Read reward beneficiary back (verify read works)
-                {
-                  account: controller,
-                  to: protocolConfig.address,
-                  abi: protocolConfig.abi,
-                  functionName: 'rewardBeneficiary',
                   args: [],
                 },
               ],
@@ -215,28 +194,20 @@ describe('ProtocolConfig upgrade simulation', () => {
         expect(calls[0].status).to.equal('success', 'Upgrade failed')
         expect(calls[1].status).to.equal('success', 'Update fee params failed after upgrade')
         expect(calls[2].status).to.equal('success', 'Update consensus params failed after upgrade')
-        expect(calls[3].status).to.equal('success', 'Update reward beneficiary failed after upgrade')
-        expect(calls[4].status).to.equal('success', 'Read fee params failed after upgrade')
-        expect(calls[5].status).to.equal('success', 'Read consensus params failed after upgrade')
-        expect(calls[6].status).to.equal('success', 'Read reward beneficiary failed after upgrade')
+        expect(calls[3].status).to.equal('success', 'Read fee params failed after upgrade')
+        expect(calls[4].status).to.equal('success', 'Read consensus params failed after upgrade')
 
         // Verify the returned values match the new params
         const returnedFeeParams: any = decodeFunctionResult({
           abi: protocolConfig.abi,
           functionName: 'feeParams',
-          data: calls[4].data,
+          data: calls[3].data,
         })
 
         const returnedConsensusParams: any = decodeFunctionResult({
           abi: protocolConfig.abi,
           functionName: 'consensusParams',
-          data: calls[5].data,
-        })
-
-        const returnedBeneficiary: any = decodeFunctionResult({
-          abi: protocolConfig.abi,
-          functionName: 'rewardBeneficiary',
-          data: calls[6].data,
+          data: calls[4].data,
         })
 
         // Verify fee params were updated
@@ -283,9 +254,6 @@ describe('ProtocolConfig upgrade simulation', () => {
           newConsensusParams.targetBlockTimeMs,
           'targetBlockTimeMs not updated',
         )
-
-        // Verify reward beneficiary was updated
-        expect(returnedBeneficiary).to.equal(newBeneficiary, 'Reward beneficiary not updated')
       })
     },
   )
