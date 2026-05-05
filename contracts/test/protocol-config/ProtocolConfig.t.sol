@@ -45,7 +45,6 @@ contract ProtocolConfigTest is Test {
     event PauserChanged(address indexed newAddress);
     event FeeParamsUpdated(IProtocolConfig.FeeParams params);
     event ConsensusParamsUpdated(IProtocolConfig.ConsensusParams params);
-    event RewardBeneficiaryUpdated(address indexed beneficiary);
     event Pause();
     event Unpause();
 
@@ -84,11 +83,8 @@ contract ProtocolConfigTest is Test {
             targetBlockTimeMs: 3000
         });
 
-        // Default reward beneficiary
-        address defaultRewardBeneficiary = makeAddr("defaultRewardBeneficiary");
-
         return deployProtocolConfig(
-            _owner, _controller, _pauser, defaultFeeParams, defaultConsensusParams, defaultRewardBeneficiary
+            _owner, _controller, _pauser, defaultFeeParams, defaultConsensusParams
         );
     }
 
@@ -98,8 +94,7 @@ contract ProtocolConfigTest is Test {
         address _controller,
         address _pauser,
         IProtocolConfig.FeeParams memory _feeParams,
-        IProtocolConfig.ConsensusParams memory _consensusParams,
-        address _rewardBeneficiary
+        IProtocolConfig.ConsensusParams memory _consensusParams
     ) internal returns (ProtocolConfig) {
         // Deploy implementation contract
         implementation = new ProtocolConfig();
@@ -116,7 +111,7 @@ contract ProtocolConfigTest is Test {
 
         // Simulate genesis file initialization by directly setting storage using calculated indices
         _simulateGenesisStorageInitialization(
-            deployedConfig, _owner, _controller, _pauser, _feeParams, _consensusParams, _rewardBeneficiary
+            deployedConfig, _owner, _controller, _pauser, _feeParams, _consensusParams
         );
 
         return deployedConfig;
@@ -129,8 +124,7 @@ contract ProtocolConfigTest is Test {
         address _controller,
         address _pauser,
         IProtocolConfig.FeeParams memory _feeParams,
-        IProtocolConfig.ConsensusParams memory _consensusParams,
-        address _rewardBeneficiary
+        IProtocolConfig.ConsensusParams memory _consensusParams
     ) internal {
         // This simulates how genesis file would set storage slots directly
 
@@ -164,8 +158,8 @@ contract ProtocolConfigTest is Test {
         // - minBaseFee (uint256) takes next slot
         // - maxBaseFee (uint256) takes next slot
         // - blockGasLimit (uint256) takes next slot
+        // - deprecated address placeholder (slot +4) takes next slot
         // Then ConsensusParams struct takes next slots
-        // Then rewardBeneficiary (address) takes next slot
 
         // Slot 0x668f09ce856848ead6cb1ddee963f15ef833cea8958030868f867aec84385200: packed alpha|kRate|inverseElasticityMultiplier
         bytes32 packedSlot0 = bytes32(
@@ -189,8 +183,8 @@ contract ProtocolConfigTest is Test {
         //   timeoutRebroadcastMs (uint16), targetBlockTimeMs (uint16)
         //   pack into one slot (8 * 16 = 128 bits, fits in one slot)
 
-        // Slot 0x668f09ce856848ead6cb1ddee963f15ef833cea8958030868f867aec84385204: rewardBeneficiary
-        vm.store(address(config), bytes32(uint256(baseSlot) + 4), bytes32(uint256(uint160(_rewardBeneficiary))));
+        // Slot 0x668f09ce856848ead6cb1ddee963f15ef833cea8958030868f867aec84385204: deprecated address placeholder
+        // placeholder (slot retained, type preserved as address, no migration). Tests leave at 0x0.
 
         // Slot 0x668f09ce856848ead6cb1ddee963f15ef833cea8958030868f867aec84385205: packed consensus params
         bytes32 packedConsensusSlot = bytes32(
@@ -219,8 +213,7 @@ contract ProtocolConfigTest is Test {
         address _controller,
         address _pauser,
         IProtocolConfig.FeeParams memory _feeParams,
-        IProtocolConfig.ConsensusParams memory _consensusParams,
-        address _rewardBeneficiary
+        IProtocolConfig.ConsensusParams memory _consensusParams
     ) public pure {
         // Log each storage slot individually to avoid stack too deep
 
@@ -277,11 +270,8 @@ contract ProtocolConfigTest is Test {
             _toHexStringBytes32(bytes32(_feeParams.blockGasLimit))
         );
 
-        console.log("// rewardBeneficiary (base slot + 4)");
-        console.log(
-            '"0x668f09ce856848ead6cb1ddee963f15ef833cea8958030868f867aec84385204": "0x%s",',
-            _toHexStringAddress(_rewardBeneficiary)
-        );
+        // Slot +4 is the deprecated address placeholder — intentionally omitted from
+        // the example allocation (genesis leaves it zero).
 
         console.log("// consensus params (base slot + 5)");
         bytes32 packedConsensusValue = bytes32(
@@ -307,7 +297,6 @@ contract ProtocolConfigTest is Test {
         address exampleOwner = makeAddr("exampleOwner");
         address exampleController = makeAddr("exampleController");
         address examplePauser = makeAddr("examplePauser");
-        address exampleRewardBeneficiary = makeAddr("exampleRewardBeneficiary");
 
         IProtocolConfig.FeeParams memory exampleFeeParams = IProtocolConfig.FeeParams({
             alpha: 50,
@@ -335,8 +324,7 @@ contract ProtocolConfigTest is Test {
             exampleController,
             examplePauser,
             exampleFeeParams,
-            exampleConsensusParams,
-            exampleRewardBeneficiary
+            exampleConsensusParams
         );
     }
 
@@ -394,9 +382,6 @@ contract ProtocolConfigTest is Test {
         assertEq(consensusParams.timeoutPrecommitDeltaMs, 100);
         assertEq(consensusParams.timeoutRebroadcastMs, 2000);
         assertEq(consensusParams.targetBlockTimeMs, 3000);
-
-        // Verify reward beneficiary is set to the default value
-        assertEq(protocolConfig.rewardBeneficiary(), makeAddr("defaultRewardBeneficiary"));
     }
 
     function test_implementationContractState() public {
@@ -417,7 +402,6 @@ contract ProtocolConfigTest is Test {
         assertEq(params.minBaseFee, 0);
         assertEq(params.maxBaseFee, 0);
         assertEq(params.blockGasLimit, 0);
-        assertEq(impl.rewardBeneficiary(), address(0));
     }
 
     function test_storageLayoutCalculation() public {
@@ -434,8 +418,6 @@ contract ProtocolConfigTest is Test {
             blockGasLimit: type(uint256).max // Max uint256
         });
 
-        address extremeBeneficiary = address(type(uint160).max); // Max address
-
         // Deploy with extreme values
         IProtocolConfig.ConsensusParams memory extremeConsensusParams = IProtocolConfig.ConsensusParams({
             timeoutProposeMs: 2000,
@@ -448,7 +430,7 @@ contract ProtocolConfigTest is Test {
             targetBlockTimeMs: 3000
         });
         ProtocolConfig extremeConfig =
-            deployProtocolConfig(owner, controller, pauser, extremeParams, extremeConsensusParams, extremeBeneficiary);
+            deployProtocolConfig(owner, controller, pauser, extremeParams, extremeConsensusParams);
 
         // Verify extreme values are stored and retrieved correctly
         IProtocolConfig.FeeParams memory retrievedParams = extremeConfig.feeParams();
@@ -458,7 +440,6 @@ contract ProtocolConfigTest is Test {
         assertEq(retrievedParams.minBaseFee, 1);
         assertEq(retrievedParams.maxBaseFee, type(uint256).max);
         assertEq(retrievedParams.blockGasLimit, type(uint256).max);
-        assertEq(extremeConfig.rewardBeneficiary(), extremeBeneficiary);
     }
 
     function test_directStorageAccess() public {
@@ -482,13 +463,14 @@ contract ProtocolConfigTest is Test {
         bytes32 minBaseFeeSlot = vm.load(address(protocolConfig), bytes32(uint256(baseSlot) + 1));
         bytes32 maxBaseFeeSlot = vm.load(address(protocolConfig), bytes32(uint256(baseSlot) + 2));
         bytes32 blockGasLimitSlot = vm.load(address(protocolConfig), bytes32(uint256(baseSlot) + 3));
-        bytes32 rewardBeneficiarySlot = vm.load(address(protocolConfig), bytes32(uint256(baseSlot) + 4));
+        bytes32 reservedSlot4 = vm.load(address(protocolConfig), bytes32(uint256(baseSlot) + 4));
         bytes32 consensusParamsSlot = vm.load(address(protocolConfig), bytes32(uint256(baseSlot) + 5));
 
         assertEq(uint256(minBaseFeeSlot), 1000);
         assertEq(uint256(maxBaseFeeSlot), 2000);
         assertEq(uint256(blockGasLimitSlot), 30000000);
-        assertEq(address(uint160(uint256(rewardBeneficiarySlot))), makeAddr("defaultRewardBeneficiary"));
+        // Deprecated address placeholder — helper leaves it zeroed.
+        assertEq(uint256(reservedSlot4), 0);
 
         // Verify consensus params are packed correctly
         uint16 storedTimeoutProposeMs = uint16(uint256(consensusParamsSlot));
@@ -983,39 +965,6 @@ contract ProtocolConfigTest is Test {
     }
 
     // ============================================================================
-    // REWARD BENEFICIARY TESTS
-    // ============================================================================
-    // Tests for updateRewardBeneficiary functionality and validation
-
-    function test_updateRewardBeneficiary__ValidAddress() public {
-        // Deploy contract
-        protocolConfig = deployProtocolConfig(owner, controller, pauser);
-
-        address newBeneficiary = makeAddr("newBeneficiary");
-
-        // Should succeed when called by controller
-        vm.prank(controller);
-        vm.expectEmit(true, true, true, true);
-        emit RewardBeneficiaryUpdated(newBeneficiary);
-        protocolConfig.updateRewardBeneficiary(newBeneficiary);
-
-        // Verify the beneficiary was updated
-        assertEq(protocolConfig.rewardBeneficiary(), newBeneficiary);
-    }
-
-    function test_updateRewardBeneficiary__ZeroAddress() public {
-        // Deploy contract
-        protocolConfig = deployProtocolConfig(owner, controller, pauser);
-
-        // Should allow setting beneficiary to zero address
-        vm.prank(controller);
-        protocolConfig.updateRewardBeneficiary(address(0));
-
-        // Verify the beneficiary was updated
-        assertEq(protocolConfig.rewardBeneficiary(), address(0));
-    }
-
-    // ============================================================================
     // PAUSE FUNCTIONALITY TESTS
     // ============================================================================
     // Tests for pause/unpause behavior and whenNotPaused modifier
@@ -1103,8 +1052,6 @@ contract ProtocolConfigTest is Test {
         assertEq(params.minBaseFee, 1000);
         assertEq(params.maxBaseFee, 2000);
         assertEq(params.blockGasLimit, 30000000);
-
-        assertEq(protocolConfig.rewardBeneficiary(), makeAddr("defaultRewardBeneficiary"));
 
         // Also verify initialized state
         assertEq(protocolConfig.owner(), owner);
@@ -1199,18 +1146,11 @@ contract ProtocolConfigTest is Test {
         assertEq(protocolConfig.controller(), controller);
         assertEq(protocolConfig.pauser(), pauser);
         assertFalse(protocolConfig.paused());
-        assertEq(protocolConfig.rewardBeneficiary(), makeAddr("defaultRewardBeneficiary")); // Set to default value
 
         // Verify fee params are set to default values
         IProtocolConfig.FeeParams memory params = protocolConfig.feeParams();
         assertEq(params.alpha, 50);
         assertEq(params.blockGasLimit, 30000000);
-
-        // Test state transitions work correctly
-        address newBeneficiary = makeAddr("beneficiary");
-        vm.prank(controller);
-        protocolConfig.updateRewardBeneficiary(newBeneficiary);
-        assertEq(protocolConfig.rewardBeneficiary(), newBeneficiary);
 
         // Test pause state transition
         vm.prank(pauser);
@@ -1274,43 +1214,6 @@ contract ProtocolConfigTest is Test {
         protocolConfig.updateFeeParams(invalidExtremeParams);
     }
 
-    function test_updateRewardBeneficiary_OnlyController() public {
-        protocolConfig = deployProtocolConfig(owner, controller, pauser);
-
-        address newBeneficiary = makeAddr("newBeneficiary");
-
-        // Controller should be able to update beneficiary
-        vm.prank(controller);
-        vm.expectEmit(true, true, true, true);
-        emit RewardBeneficiaryUpdated(newBeneficiary);
-        protocolConfig.updateRewardBeneficiary(newBeneficiary);
-        assertEq(protocolConfig.rewardBeneficiary(), newBeneficiary);
-
-        // Should fail - unauthorized user
-        vm.prank(unauthorizedUser);
-        vm.expectRevert(Controller.CallerIsNotController.selector);
-        protocolConfig.updateRewardBeneficiary(newBeneficiary);
-
-        // Should fail - owner is not controller
-        vm.prank(owner);
-        vm.expectRevert(Controller.CallerIsNotController.selector);
-        protocolConfig.updateRewardBeneficiary(newBeneficiary);
-
-        // Should fail - pauser is not controller
-        vm.prank(pauser);
-        vm.expectRevert(Controller.CallerIsNotController.selector);
-        protocolConfig.updateRewardBeneficiary(newBeneficiary);
-    }
-
-    function test_updateRewardBeneficiary_ZeroAddressValidation() public {
-        protocolConfig = deployProtocolConfig(owner, controller, pauser);
-
-        // Validation logic should work properly
-        vm.prank(controller);
-        protocolConfig.updateRewardBeneficiary(address(0));
-        assertEq(protocolConfig.rewardBeneficiary(), address(0));
-    }
-
     function test_pauseBehaviorAccess() public {
         protocolConfig = deployProtocolConfig(owner, controller, pauser);
 
@@ -1359,10 +1262,6 @@ contract ProtocolConfigTest is Test {
         vm.prank(controller);
         protocolConfig.updateFeeParams(params);
 
-        address newBeneficiary = makeAddr("newBeneficiary");
-        vm.prank(controller);
-        protocolConfig.updateRewardBeneficiary(newBeneficiary);
-
         // Now pause the contract
         vm.prank(pauser);
         protocolConfig.pause();
@@ -1372,10 +1271,6 @@ contract ProtocolConfigTest is Test {
         vm.prank(controller);
         vm.expectRevert(Pausable.ContractPaused.selector);
         protocolConfig.updateFeeParams(params);
-
-        vm.prank(controller);
-        vm.expectRevert(Pausable.ContractPaused.selector);
-        protocolConfig.updateRewardBeneficiary(newBeneficiary);
 
         // Unpause and operations should work again
         vm.prank(pauser);
@@ -1449,7 +1344,8 @@ contract ProtocolConfigTest is Test {
 
         // The storage struct should have:
         // - FeeParams feeParams (first field, multiple slots)
-        // - address rewardBeneficiary (after FeeParams)
+        // - slot +4: deprecated address placeholder
+        // - ConsensusParams consensusParams
 
         // Test initial values are zero (default)
         IProtocolConfig.FeeParams memory params = newContract.feeParams();
@@ -1459,6 +1355,5 @@ contract ProtocolConfigTest is Test {
         assertEq(params.minBaseFee, 0);
         assertEq(params.maxBaseFee, 0);
         assertEq(params.blockGasLimit, 0);
-        assertEq(newContract.rewardBeneficiary(), address(0));
     }
 }

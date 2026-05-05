@@ -29,7 +29,7 @@ export const callFromAddress = '0x1800000000000000000000000000000000000003' as c
 // predeployed contracts
 export const deterministicDeployerProxyAddress = '0x4e59b44847b379578588920ca78fbf26c0b4956c' as const
 export const multicall3Address = '0xcA11bde05977b3631167028862bE2a173976CA11' as const
-export const multicall3FromAddress = '0x825F535677d346626cDE45D64cf89C2a426467e0' as const
+export const multicall3FromAddress = '0xA3E6c63b16321E39a61551Dc1A38689b04d62E42' as const
 
 // Denylist proxy address. Deterministic CREATE2-derived with prefix 0x360.
 // Init-code: AdminUpgradeableProxy bytecode + abi.encode(implementation, proxyAdmin, initData).
@@ -39,8 +39,11 @@ export const multicall3FromAddress = '0x825F535677d346626cDE45D64cf89C2a426467e0
 //
 // Salt: 0x2e8184e0b708cc70e9f829091612c4c8efef8006ee7527c73bdbbd70b64c36c8
 export const denylistAddress = '0x360Eb67EDbA456Bbe01512679f36c2717AA65121' as const
-export const memoAddress = '0xe4aa7Ed3585AEf598179f873086F75Fcd6D4b755' as const
+export const memoAddress = '0x5294E9927c3306DcBaDb03fe70b92e01cCede505' as const
 export const gasGuzzlerAddress = '0x45a834A6bB86F516D4157a8cBcc60f2F35F8398C' as const
 export const testTokenAddress = '0x298122B4bF05CC897662e535C18417f44C7f274b' as const
 
+// Genesis block coinbase on localdev and devnet; also Quake's default
+// `cl_suggested_fee_recipient` fallback (`QUAKE_DEFAULT_FEE_RECIPIENT` in
+// `crates/quake/src/setup.rs`).
 export const localdevFeeRecipient = '0x65E0a200006D4FF91bD59F9694220dafc49dbBC1' as const

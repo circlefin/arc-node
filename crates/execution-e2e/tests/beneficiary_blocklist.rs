@@ -16,7 +16,7 @@
 
 //! E2E test covering beneficiary blocklist enforcement during payload validation.
 
-use alloy_primitives::{address, Address};
+use alloy_primitives::address;
 use alloy_rpc_types_engine::PayloadStatusEnum;
 use arc_execution_e2e::{
     actions::{build_payload_for_next_block, set_payload_override_and_rehash, submit_payload},
@@ -34,7 +34,7 @@ async fn test_proposer_selected_blocklisted_beneficiary_is_invalid() -> Result<(
     reth_tracing::init_test_tracing();
 
     let blocklisted_beneficiary = address!("0xbad0000000000000000000000000000000000001");
-    let chain_spec = localdev_with_storage_override(Address::ZERO, Some(blocklisted_beneficiary));
+    let chain_spec = localdev_with_storage_override(Some(blocklisted_beneficiary));
 
     let mut env = ArcEnvironment::new();
     ArcSetup::new()

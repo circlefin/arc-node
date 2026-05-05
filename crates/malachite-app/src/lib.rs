@@ -39,5 +39,4 @@ pub mod node;
 pub mod request;
 pub mod rpc;
 pub mod rpc_sync;
-pub mod spec;
 pub use arc_consensus_db as store;

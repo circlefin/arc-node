@@ -20,7 +20,7 @@ import hre from 'hardhat'
 import * as localdev from './localdev'
 import { schemaGenesisConfig } from '../../../scripts/genesis'
 
-export { LOCALDEV_FEE_RECIPIENT } from './localdev'
+export { LOCALDEV_FEE_RECIPIENT, LOCALDEV_FEE_RECIPIENTS } from './localdev'
 
 /**
  * Get the clients for the current network

@@ -185,14 +185,14 @@ async fn process_pending_proposal_parts(
         }
 
         // NOTE: The block is initially assigned a default validity status
-        // (i.e., `Validity::VALID`), even though it has not yet been validated
+        // (i.e., `Validity::Valid`), even though it has not yet been validated
         // by the execution client.
         // By inserting this block into the undecided blocks table, we are
         // temporarily violating the assumption that all blocks in that table
         // have been validated at least once by the execution client.
         // This temporary inconsistency is acceptable here because all blocks
-        // in the undecided table are immediately validated right after this
-        // call, in `AppMsg::StartedRound` (see `app.rs`).
+        // in the undecided table are immediately validated by the subsequent
+        // `validate_undecided_blocks` in `AppMsg::StartedRound` handler.
         match assemble_block_from_parts(&parts) {
             Ok(block) => {
                 info!(%height, %round, %proposer, "Added pending block to undecided");
@@ -226,6 +226,9 @@ async fn process_pending_proposal_parts(
 /// The second case addresses the EL "amnesia" issue, where the execution client may
 /// have forgotten previously validated payloads that were only stored in memory and
 /// lost after a restart.
+///
+/// After each block is validated, the engine's verdict is persisted back to the
+/// undecided blocks table.
 async fn validate_undecided_blocks(
     height: Height,
     round: Round,
@@ -260,8 +263,18 @@ async fn validate_undecided_blocks(
                 }
             };
 
-        // Update the block validity
         block.validity = validity;
+
+        // Persist the engine's verdict before returning the block to consensus.
+        undecided_blocks
+            .store_undecided_block(block.clone())
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "Failed to persist validated undecided block {block_hash} \
+                     at height={height} round={round}"
+                )
+            })?;
 
         validated_blocks.push(block);
 
@@ -306,6 +319,8 @@ mod tests {
         MockInvalidPayloadsRepository, MockUndecidedBlocksRepository,
     };
 
+    use std::sync::{Arc, Mutex};
+
     use alloy_rpc_types_engine::ExecutionPayloadV3;
     use arbitrary::{Arbitrary, Unstructured};
     use malachitebft_core_types::Validity;
@@ -338,6 +353,11 @@ mod tests {
         undecided
             .expect_get_by_round()
             .returning(move |_, _| Ok(blocks.clone()));
+        undecided
+            .expect_store_undecided_block()
+            .times(2)
+            .withf(|b| b.validity == Validity::Valid)
+            .returning(|_| Ok(()));
 
         let mut validator = MockPayloadValidator::new();
         validator
@@ -370,6 +390,17 @@ mod tests {
             .expect_get_by_round()
             .returning(move |_, _| Ok(blocks.clone()));
 
+        // Record the validity of every block persisted, in call order.
+        let persisted = Arc::new(Mutex::new(Vec::<Validity>::new()));
+        let persisted_clone = Arc::clone(&persisted);
+        undecided
+            .expect_store_undecided_block()
+            .times(2)
+            .returning(move |b| {
+                persisted_clone.lock().unwrap().push(b.validity);
+                Ok(())
+            });
+
         let mut call_count = 0usize;
         let mut validator = MockPayloadValidator::new();
         validator
@@ -396,6 +427,11 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].validity, Validity::Valid);
         assert_eq!(result[1].validity, Validity::Invalid);
+        assert_eq!(
+            *persisted.lock().unwrap(),
+            vec![Validity::Valid, Validity::Invalid],
+            "persisted validity should match engine verdict, not the placeholder"
+        );
     }
 
     #[tokio::test]
@@ -452,6 +488,13 @@ mod tests {
         undecided
             .expect_get_by_round()
             .returning(move |_, _| Ok(blocks.clone()));
+        // Only the block that successfully validated should be persisted, the
+        // errored block must be skipped entirely.
+        undecided
+            .expect_store_undecided_block()
+            .times(1)
+            .withf(|b| b.validity == Validity::Valid)
+            .returning(|_| Ok(()));
 
         let mut call_count = 0usize;
         let mut validator = MockPayloadValidator::new();
@@ -477,5 +520,41 @@ mod tests {
         // First block errored and was skipped, only second block returned
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].validity, Validity::Valid);
+    }
+
+    #[tokio::test]
+    async fn validate_undecided_blocks_propagates_persist_error() {
+        let height = Height::new(1);
+        let round = Round::new(0);
+
+        let block = create_dummy_block(height, round, 0x33);
+        let blocks = vec![block];
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided
+            .expect_get_by_round()
+            .returning(move |_, _| Ok(blocks.clone()));
+        undecided
+            .expect_store_undecided_block()
+            .times(1)
+            .returning(|_| Err(std::io::Error::other("disk full")));
+
+        let mut validator = MockPayloadValidator::new();
+        validator
+            .expect_validate_payload()
+            .times(1)
+            .returning(|_| Ok(PayloadValidationResult::Valid));
+
+        let invalid = MockInvalidPayloadsRepository::new();
+
+        let err = validate_undecided_blocks(height, round, &undecided, &validator, &invalid)
+            .await
+            .expect_err("persist error should propagate");
+
+        assert!(
+            err.to_string()
+                .contains("Failed to persist validated undecided block"),
+            "error should describe the persist failure, got: {err}",
+        );
     }
 }

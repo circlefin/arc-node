@@ -162,8 +162,8 @@ security find-certificate -p -c '<cert name>' > deployments/certs/<cert name>.cr
 Interact with the testnet:
 
 ```bash
-# Spam transactions
-make testnet-spam
+# Send tx load (usage: make testnet-load RATE=1000 TIME=60)
+make testnet-load
 
 # Stop the testnet
 make testnet-down

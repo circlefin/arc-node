@@ -23,7 +23,7 @@ use crate::helpers::{
     record_cost_or_out_of_gas, PrecompileErrorOrRevert, ERR_EXECUTION_REVERTED,
     PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY,
 };
-use crate::stateful;
+use crate::precompile;
 use alloy_primitives::{address, Address};
 use alloy_sol_types::{sol, SolCall, SolValue};
 use reth_ethereum::evm::revm::precompile::PrecompileOutput;
@@ -35,7 +35,10 @@ pub const PQ_ADDRESS: Address = address!("18000000000000000000000000000000000000
 
 /// Base gas for SLH-DSA-SHA2-128s verification.
 ///
-/// Covers ~1,500 SHA256 operations for FORS/WOTS+/Merkle tree verification.
+/// Conservative relative to the SHA-256 precompile's per-word work anchor. See
+/// `crates/precompiles/benches/pq.rs` for the benchmark context comparing this
+/// price against SLH-DSA-SHA2-128s verification and 64-byte SHA-256 / KECCAK256
+/// work.
 const VERIFY_BASE_GAS: u64 = 230_000;
 
 /// Dynamic gas cost per 32-byte word of message input.
@@ -49,11 +52,11 @@ sol! {
     interface IPQ {
         /// Verify an SLH-DSA-SHA2-128s signature
         /// Gas cost: 230,000 base + 6 per 32-byte word of message (same as KECCAK256)
-        function verifySlhDsaSha2128s(bytes vk, bytes msg, bytes sig) external returns (bool isValid);
+        function verifySlhDsaSha2128s(bytes calldata vk, bytes calldata msg, bytes calldata sig) external returns (bool isValid);
     }
 }
 
-stateful!(run_pq, precompile_input, hardfork_flags; {
+precompile!(run_pq, precompile_input, hardfork_flags; {
     IPQ::verifySlhDsaSha2128sCall => |input| {
         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
             let _ = hardfork_flags;

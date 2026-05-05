@@ -72,7 +72,8 @@ contract ProtocolConfig is Controller, Pausable, IProtocolConfig {
     /// @custom:storage-location erc7201:arc.storage.ProtocolConfig
     struct ProtocolConfigStorage {
         FeeParams feeParams;
-        address rewardBeneficiary;
+        /// @custom:oz-renamed-from rewardBeneficiary
+        address _deprecatedSlot;
         ConsensusParams consensusParams;
     }
 
@@ -125,15 +126,6 @@ contract ProtocolConfig is Controller, Pausable, IProtocolConfig {
         return $.consensusParams;
     }
 
-    /**
-     * @notice Returns the current reward beneficiary address
-     * @return The address of the current reward beneficiary
-     */
-    function rewardBeneficiary() external view override returns (address) {
-        ProtocolConfigStorage storage $ = _getProtocolConfigStorage();
-        return $.rewardBeneficiary;
-    }
-
     // ============ Mutative Functions ============
 
     /**
@@ -172,17 +164,6 @@ contract ProtocolConfig is Controller, Pausable, IProtocolConfig {
         ProtocolConfigStorage storage $ = _getProtocolConfigStorage();
         $.consensusParams = newParams;
         emit ConsensusParamsUpdated(newParams);
-    }
-
-    /**
-     * @notice Updates the reward beneficiary address
-     * @dev Only callable by controller when not paused
-     * @param newBeneficiary The new reward beneficiary address
-     */
-    function updateRewardBeneficiary(address newBeneficiary) external override onlyController whenNotPaused {
-        ProtocolConfigStorage storage $ = _getProtocolConfigStorage();
-        $.rewardBeneficiary = newBeneficiary;
-        emit RewardBeneficiaryUpdated(newBeneficiary);
     }
 
     /**

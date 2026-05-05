@@ -43,6 +43,7 @@ use testnet::{Testnet, TestnetError};
 
 mod build;
 mod clean;
+mod cli_version;
 mod genesis;
 mod info;
 mod infra;

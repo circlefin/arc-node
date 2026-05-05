@@ -27,7 +27,7 @@ use crate::helpers::{
     PRECOMPILE_SSTORE_GAS_COST,
 };
 use crate::native_coin_control::{compute_is_blocklisted_storage_slot, UNBLOCKLISTED_STATUS};
-use crate::stateful;
+use crate::precompile;
 use crate::NATIVE_COIN_CONTROL_ADDRESS;
 use alloy_evm::EvmInternals;
 use alloy_primitives::{address, Address, StorageKey, U256};
@@ -196,7 +196,7 @@ fn is_blocklisted(
     Ok(!U256::from_be_slice(&storage_output).eq(&UNBLOCKLISTED_STATUS))
 }
 
-stateful!(run_native_coin_authority, precompile_input, hardfork_flags; {
+precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
     INativeCoinAuthority::mintCall => |input| {
         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
             let mut gas_counter = Gas::new(precompile_input.gas);
@@ -243,7 +243,7 @@ stateful!(run_native_coin_authority, precompile_input, hardfork_flags; {
             check_delegatecall(
                 NATIVE_COIN_AUTHORITY_ADDRESS,
                 &precompile_input,
-                &mut gas_counter,
+                &gas_counter,
             )?;
 
             // Reject minting to zero address (Zero5+)
@@ -288,8 +288,7 @@ stateful!(run_native_coin_authority, precompile_input, hardfork_flags; {
             )?;
 
             // Update account balance
-            balance_incr(&mut precompile_input.internals, args.to, args.amount, &mut gas_counter,
-               hardfork_flags.is_active(ArcHardfork::Zero5))?;
+            balance_incr(&mut precompile_input.internals, args.to, args.amount, &mut gas_counter, hardfork_flags)?;
 
             // Emit event: ERC-20 Transfer(0x0, to) under Zero5, NativeCoinMinted otherwise.
             // Address::ZERO as `from` follows the ERC-20 convention for minting. This is
@@ -353,7 +352,7 @@ stateful!(run_native_coin_authority, precompile_input, hardfork_flags; {
             check_delegatecall(
                 NATIVE_COIN_AUTHORITY_ADDRESS,
                 &precompile_input,
-                &mut gas_counter,
+                &gas_counter,
             )?;
 
             // Reject burning from zero address (Zero5+)
@@ -372,7 +371,7 @@ stateful!(run_native_coin_authority, precompile_input, hardfork_flags; {
             }
 
             // Check balance and burn tokens
-            balance_decr(&mut precompile_input.internals, args.from, args.amount, &mut gas_counter)?;
+            balance_decr(&mut precompile_input.internals, args.from, args.amount, &mut gas_counter, hardfork_flags)?;
 
             // Adjust total supply
             let total_supply_output = read(
@@ -465,7 +464,7 @@ stateful!(run_native_coin_authority, precompile_input, hardfork_flags; {
             check_delegatecall(
                 NATIVE_COIN_AUTHORITY_ADDRESS,
                 &precompile_input,
-                &mut gas_counter,
+                &gas_counter,
             )?;
 
             // Reject transfers involving zero address (Zero5+)
@@ -491,8 +490,7 @@ stateful!(run_native_coin_authority, precompile_input, hardfork_flags; {
                 // functionally correct and intentionally kept to preserve identical gas costs
                 // across the Zero5 hardfork boundary — skipping the balance ops would reduce
                 // gas consumption and break the "gas cost unchanged" invariant.
-                transfer(&mut precompile_input.internals, args.from, args.to, args.amount, &mut gas_counter, false,
-                     hardfork_flags.is_active(ArcHardfork::Zero5))?;
+                transfer(&mut precompile_input.internals, args.from, args.to, args.amount, &mut gas_counter, hardfork_flags)?;
 
                 // Emit event: ERC-20 Transfer under Zero5, NativeCoinTransferred otherwise.
                 // EIP-7708: self-transfers (from == to) do not emit a log.
@@ -523,8 +521,7 @@ stateful!(run_native_coin_authority, precompile_input, hardfork_flags; {
             let mut gas_counter = Gas::new(precompile_input.gas);
             let mut precompile_input = precompile_input;
 
-            // Validate the input is correct
-            if !input.is_empty() {
+            if !hardfork_flags.is_active(ArcHardfork::Zero6) && !input.is_empty() {
                 return Err(PrecompileErrorOrRevert::new_reverted_with_penalty(
                     gas_counter, PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED));
             }
@@ -641,6 +638,9 @@ mod tests {
         pre_zero5_gas_limit: Option<u64>,
         /// If set, overrides gas_limit when EIP-7708 (Zero5) is active (different event costs)
         eip7708_gas_limit: Option<u64>,
+        /// If set, overrides gas_limit when Zero5 and Zero6 are both active.
+        /// Needed when Zero6's warm-account discount shifts the OOG boundary.
+        zero6_gas_limit: Option<u64>,
         expected_revert_str: Option<&'static str>,
         expected_result: InstructionResult,
         return_data: Option<Bytes>,
@@ -650,6 +650,8 @@ mod tests {
         pre_zero5_gas_used: Option<u64>,
         /// If set, overrides gas_used when EIP-7708 (Zero5) is active.
         eip7708_gas_used: Option<u64>,
+        /// If set, overrides gas_used when Zero5 and Zero6 are both active.
+        zero6_gas_used: Option<u64>,
         target_address: Address,
         bytecode_address: Address,
         /// If true, skip this test case for hardfork combinations without Zero5 (EIP-7708).
@@ -669,6 +671,7 @@ mod tests {
                 gas_limit: 0,
                 pre_zero5_gas_limit: None,
                 eip7708_gas_limit: None,
+                zero6_gas_limit: None,
                 expected_revert_str: None,
                 expected_result: InstructionResult::Stop,
                 return_data: None,
@@ -676,6 +679,7 @@ mod tests {
                 gas_used: 0,
                 pre_zero5_gas_used: None,
                 eip7708_gas_used: None,
+                zero6_gas_used: None,
                 target_address: Address::ZERO,
                 bytecode_address: Address::ZERO,
                 eip7708_only: false,
@@ -732,8 +736,15 @@ mod tests {
                     );
                 }
 
-                // Resolve expected gas based on hardfork: Zero5 enables EIP-7708 events.
-                let expected_gas_used = if hardfork_flags.is_active(ArcHardfork::Zero5) {
+                // Resolve expected gas per hardfork combination. Zero5 changes auth / event
+                // shape (EIP-7708). Zero6 changes account-load pricing inside the balance
+                // helpers. Zero6 is cumulative (implies Zero5), so the {!Zero5, Zero6} cell
+                // is filtered out by the test loop.
+                let expected_gas_used = if hardfork_flags.is_active(ArcHardfork::Zero6) {
+                    tc.zero6_gas_used
+                        .or(tc.eip7708_gas_used)
+                        .unwrap_or(tc.gas_used)
+                } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
                     tc.eip7708_gas_used.unwrap_or(tc.gas_used)
                 } else {
                     tc.pre_zero5_gas_used.unwrap_or(tc.gas_used)
@@ -821,7 +832,11 @@ mod tests {
 
     /// Returns the appropriate gas limit based on hardfork
     fn get_gas_limit(tc: &NativeCoinAuthorityTest, hardfork_flags: ArcHardforkFlags) -> u64 {
-        if hardfork_flags.is_active(ArcHardfork::Zero5) {
+        if hardfork_flags.is_active(ArcHardfork::Zero6) {
+            tc.zero6_gas_limit
+                .or(tc.eip7708_gas_limit)
+                .unwrap_or(tc.gas_limit)
+        } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
             tc.eip7708_gas_limit.unwrap_or(tc.gas_limit)
         } else {
             tc.pre_zero5_gas_limit.unwrap_or(tc.gas_limit)
@@ -1040,6 +1055,7 @@ mod tests {
                 gas_used: 8681,
                 pre_zero5_gas_used: Some(MINT_GAS_COST),
                 eip7708_gas_used: Some(9056),
+                zero6_gas_used: Some(9556),
                 target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 ..Default::default()
@@ -1129,6 +1145,7 @@ mod tests {
                 blocklisted_addresses: None,
                 gas_used: 4200, // blocklist cold + balance check fixed
                 pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST * 3),
+                zero6_gas_used: Some(2200),
                 target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 ..Default::default()
@@ -1239,6 +1256,7 @@ mod tests {
                 gas_used: 8681,
                 pre_zero5_gas_used: Some(BURN_GAS_COST),
                 eip7708_gas_used: Some(9056),
+                zero6_gas_used: Some(7056),
                 target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 ..Default::default()
@@ -1308,6 +1326,8 @@ mod tests {
                 blocklisted_addresses: None,
                 gas_used: 6300, // 2 blocklist cold SLOADs (4200) + balance check (2100)
                 pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST * 4),
+                // Zero6: warm from-account load (100) replaces fixed 2100
+                zero6_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST * 2 + 100),
                 target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 ..Default::default()
@@ -1323,9 +1343,11 @@ mod tests {
                 .abi_encode()
                 .into(),
                 // Zero5: 15956 gas needed for success, use 15955 to trigger OOG
+                // Zero5 + Zero6: warm-from discount drops success to 14456, use 14455
                 // Pre-Zero5: uses early gas check with TRANSFER_GAS_COST - PRECOMPILE_SLOAD_GAS_COST - 1
                 gas_limit: 15955,
                 pre_zero5_gas_limit: Some(TRANSFER_GAS_COST - PRECOMPILE_SLOAD_GAS_COST - 1),
+                zero6_gas_limit: Some(14455),
                 expected_revert_str: None,
                 expected_result: InstructionResult::PrecompileOOG,
                 return_data: None,
@@ -1488,6 +1510,7 @@ mod tests {
                 blocklisted_addresses: None,
                 gas_used: 15956,
                 pre_zero5_gas_used: Some(TRANSFER_GAS_COST),
+                zero6_gas_used: Some(14456),
                 target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 ..Default::default()
@@ -1513,6 +1536,7 @@ mod tests {
                 pre_zero5_gas_used: Some(
                     PRECOMPILE_SLOAD_GAS_COST * 4 + PRECOMPILE_SSTORE_GAS_COST,
                 ),
+                zero6_gas_used: Some(7200),
                 target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 ..Default::default()
@@ -1537,6 +1561,7 @@ mod tests {
                 blocklisted_addresses: None,
                 gas_used: 15956,
                 pre_zero5_gas_used: Some(TRANSFER_GAS_COST),
+                zero6_gas_used: Some(14456),
                 target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 ..Default::default()
@@ -1642,6 +1667,7 @@ mod tests {
                 gas_used: 8681,
                 pre_zero5_gas_used: Some(MINT_GAS_COST),
                 eip7708_gas_used: Some(9056),
+                zero6_gas_used: Some(9556),
                 target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
                 ..Default::default()
@@ -1718,6 +1744,12 @@ mod tests {
 
         for tc in cases {
             for hardfork_flags in ArcHardforkFlags::all_combinations() {
+                // ZeroX hardforks are cumulative; Zero6 implies Zero5.
+                if hardfork_flags.is_active(ArcHardfork::Zero6)
+                    && !hardfork_flags.is_active(ArcHardfork::Zero5)
+                {
+                    continue;
+                }
                 if tc.eip7708_only && !hardfork_flags.is_active(ArcHardfork::Zero5) {
                     continue;
                 }
@@ -2246,17 +2278,25 @@ mod tests {
                 // Zero5 + EIP-7708: self-transfers do not emit a log
                 assert_eq!(logs.len(), 0, "Zero5: self-transfer should not emit a log");
 
-                // Gas accounting: self-transfer still executes the full transfer path
-                // (balance_decr + balance_incr) to preserve gas invariants across the
-                // hardfork boundary — only the event emission is suppressed.
-                //
-                // Breakdown:
-                //   blocklist(from) cold SLOAD:  2100
-                //   blocklist(to)  warm SLOAD:    100  (same address, slot already warm)
-                //   transfer() fixed:           10000  (2 SLOADs + 2 SSTOREs)
-                //   event: skipped (from == to)
-                let expected_gas =
-                    2100 + 100 + 2 * PRECOMPILE_SLOAD_GAS_COST + 2 * PRECOMPILE_SSTORE_GAS_COST;
+                // Self-transfer still executes the full transfer path (balance_decr +
+                // balance_incr) to preserve gas invariants across the Zero5 boundary —
+                // only event emission is suppressed. Under Zero6, the transfer() helper
+                // uses warm/cold account-load pricing: ADDRESS_A is pre-warmed by the
+                // test setup, so both account loads hit the warm path.
+                let (from_account_load, to_account_load) =
+                    if hardfork_flags.is_active(ArcHardfork::Zero6) {
+                        (
+                            revm_interpreter::gas::WARM_STORAGE_READ_COST,
+                            revm_interpreter::gas::WARM_STORAGE_READ_COST,
+                        )
+                    } else {
+                        (PRECOMPILE_SLOAD_GAS_COST, PRECOMPILE_SLOAD_GAS_COST)
+                    };
+                let expected_gas = 2100
+                    + 100
+                    + from_account_load
+                    + to_account_load
+                    + 2 * PRECOMPILE_SSTORE_GAS_COST;
                 assert_eq!(
                     result.gas.used(),
                     expected_gas,
@@ -2279,10 +2319,17 @@ mod tests {
                 .encode_log_data();
                 assert_eq!(log.data, expected_log);
 
-                // Gas accounting: auth SLOAD + 2 blocklist SLOADs + transfer + event
+                // Gas accounting: auth SLOAD + 2 blocklist SLOADs + transfer + event.
+                // Under Zero6, transfer()'s account loads use warm/cold pricing —
+                // ADDRESS_A is pre-warmed by setup, so both loads hit the warm path.
+                let zero6_account_load_delta = if hardfork_flags.is_active(ArcHardfork::Zero6) {
+                    2 * (PRECOMPILE_SLOAD_GAS_COST - revm_interpreter::gas::WARM_STORAGE_READ_COST)
+                } else {
+                    0
+                };
                 assert_eq!(
                     result.gas.used(),
-                    TRANSFER_GAS_COST,
+                    TRANSFER_GAS_COST - zero6_account_load_delta,
                     "Pre-Zero5: self-transfer gas should match TRANSFER_GAS_COST (flags={hardfork_flags:?})",
                 );
             }
@@ -2475,5 +2522,92 @@ mod tests {
             bytes_to_revert_message(result.output.as_ref()),
             Some(ERR_SELFDESTRUCTED_BALANCE_INCREASED.to_string())
         );
+    }
+
+    fn total_supply_calldata_with_trailing_bytes() -> Bytes {
+        let mut calldata = Vec::with_capacity(4 + 32);
+        calldata.extend_from_slice(&INativeCoinAuthority::totalSupplyCall::SELECTOR);
+        calldata.extend_from_slice(&[0u8; 32]);
+        calldata.into()
+    }
+
+    #[test]
+    fn total_supply_rejects_extra_input_pre_zero6() {
+        for hardfork_flags in ArcHardforkFlags::all_combinations() {
+            if hardfork_flags.is_active(ArcHardfork::Zero6) {
+                continue;
+            }
+
+            let mut ctx = mock_context(hardfork_flags);
+            let inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+                bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+                known_bytecode: None,
+                caller: ADDRESS_A,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(total_supply_calldata_with_trailing_bytes()),
+                gas_limit: 100_000,
+                is_static: false,
+                return_memory_offset: 0..0,
+            };
+
+            let result = call_native_coin_authority(&mut ctx, &inputs, hardfork_flags)
+                .expect("call should not error")
+                .expect("result should be Some");
+
+            assert_eq!(
+                result.result,
+                InstructionResult::Revert,
+                "({hardfork_flags:?}): expected Revert with trailing calldata pre-Zero6",
+            );
+            assert_eq!(
+                bytes_to_revert_message(result.output.as_ref()).as_deref(),
+                Some(ERR_EXECUTION_REVERTED),
+                "({hardfork_flags:?}): expected execution reverted message",
+            );
+        }
+    }
+
+    #[test]
+    fn total_supply_accepts_extra_input_with_zero6() {
+        let mock_initial_supply = U256::from(1_000_000_000);
+
+        for hardfork_flags in ArcHardforkFlags::all_combinations() {
+            if !hardfork_flags.is_active(ArcHardfork::Zero6) {
+                continue;
+            }
+
+            let mut ctx = mock_context(hardfork_flags);
+            setup_initial_state(&mut ctx, mock_initial_supply);
+
+            let inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+                bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+                known_bytecode: None,
+                caller: ADDRESS_A,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(total_supply_calldata_with_trailing_bytes()),
+                gas_limit: 100_000,
+                is_static: false,
+                return_memory_offset: 0..0,
+            };
+
+            let result = call_native_coin_authority(&mut ctx, &inputs, hardfork_flags)
+                .expect("call should not error")
+                .expect("result should be Some");
+
+            assert_eq!(
+                result.result,
+                InstructionResult::Return,
+                "({hardfork_flags:?}): expected Return with trailing calldata under Zero6",
+            );
+            let returned = U256::abi_decode(result.output.as_ref()).expect("decode total supply");
+            assert_eq!(
+                returned, mock_initial_supply,
+                "({hardfork_flags:?}): expected initial supply returned",
+            );
+        }
     }
 }

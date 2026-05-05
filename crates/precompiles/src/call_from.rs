@@ -62,7 +62,7 @@ sol! {
     /// CallFrom precompile interface.
     interface ICallFrom {
         /// Execute a call to `target` with `data` as calldata, preserving `sender` as msg.sender.
-        function callFrom(address sender, address target, bytes data) external returns (bool success, bytes memory returnData);
+        function callFrom(address sender, address target, bytes calldata data) external returns (bool success, bytes memory returnData);
     }
 }
 

@@ -14,42 +14,85 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// Macro for creating stateful precompiles with automatic ABI decoding and gas accounting.
+/// Macro for creating stateful precompiles with function-selector dispatch and revert
+/// conversion. Gas accounting and ABI decoding are the arm body's responsibility.
 ///
 /// # Syntax
 /// ```rust,ignore
-/// stateful!(function_name, context, inputs, gas_limit; {
-///     Interface::functionCall => |decoded_args| {
-///         // Your implementation here
-///         // Must return Result<(PrecompileOutput, u64), PrecompileError>
+/// precompile!(fn_name, precompile_input, hardfork_flags; {
+///     Interface::functionCall => |calldata_bytes| {
+///         // Must evaluate to Result<PrecompileOutput, PrecompileErrorOrRevert>.
+///         // `calldata_bytes` is the input after the 4-byte selector.
 ///     },
 ///     // Additional functions...
 /// });
 /// ```
 ///
+/// The generated function takes `(PrecompileInput, ArcHardforkFlags)` and returns
+/// `Result<PrecompileOutput, PrecompileError>`. Arms that return
+/// `PrecompileErrorOrRevert::Revert(...)` are converted into an `Ok(PrecompileOutput)`
+/// carrying the revert payload; `PrecompileErrorOrRevert::Error(...)` becomes `Err`.
+/// If the calldata is shorter than 4 bytes or the selector is unknown, the macro
+/// charges `PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY` and returns a revert.
+///
 /// # Example
 /// ```rust,ignore
-/// stateful!(run_counter_precompile, context, inputs, gas_limit; {
-///     ICounter::incrementCall => |_call| {
-///         let (current_output, gas_counter) = read(context, ADDRESS, KEY, gas_limit)?;
-///         let current = U256::from_be_slice(&current_output.bytes);
-///         let new_value = current + U256::from(1);
-///         write(context, ADDRESS, KEY, &new_value.to_be_bytes_vec(), gas_counter)
+/// precompile!(run_counter_precompile, precompile_input, hardfork_flags; {
+///     ICounter::incrementCall => |_input| {
+///         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
+///             let mut gas_counter = Gas::new(precompile_input.gas);
+///             let mut precompile_input = precompile_input;
+///
+///             let output = read(
+///                 &mut precompile_input.internals,
+///                 ADDRESS,
+///                 KEY,
+///                 &mut gas_counter,
+///                 hardfork_flags,
+///             )?;
+///             let new_value = U256::from_be_slice(&output) + U256::from(1);
+///
+///             write(
+///                 &mut precompile_input.internals,
+///                 ADDRESS,
+///                 KEY,
+///                 &new_value.to_be_bytes_vec(),
+///                 &mut gas_counter,
+///                 hardfork_flags,
+///             )?;
+///
+///             Ok(PrecompileOutput::new(gas_counter.used(), new_value.abi_encode().into()))
+///         })()
 ///     },
-///     ICounter::getCountCall => |_call| {
-///         read(context, ADDRESS, KEY, gas_limit)
+///     ICounter::getCountCall => |_input| {
+///         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
+///             let mut gas_counter = Gas::new(precompile_input.gas);
+///             let mut precompile_input = precompile_input;
+///
+///             let output = read(
+///                 &mut precompile_input.internals,
+///                 ADDRESS,
+///                 KEY,
+///                 &mut gas_counter,
+///                 hardfork_flags,
+///             )?;
+///
+///             Ok(PrecompileOutput::new(gas_counter.used(), output))
+///         })()
 ///     },
 /// });
 /// ```
 ///
 /// The macro handles:
 /// - Function selector matching
-/// - ABI decoding of inputs
-/// - Gas accounting
-/// - Error conversion
-/// - Output formatting
+/// - Fallback revert (with gas penalty) for unknown selectors or truncated input
+/// - Conversion of `PrecompileErrorOrRevert` into the final `Result`
+///
+/// ABI decoding, gas accounting, and output encoding remain the arm body's job; call
+/// `<$fn_call>::abi_decode_raw` on the supplied calldata bytes when you need the
+/// decoded arguments.
 #[macro_export]
-macro_rules! stateful {
+macro_rules! precompile {
     ($fn_name:ident, $precompile_input:ident, $hardfork_flags:ident; {
         $(
             $fn_call:path => |$arg:ident| $body:expr
@@ -89,69 +132,6 @@ macro_rules! stateful {
                     $crate::helpers::PrecompileErrorOrRevert::Error(error) => Err(error),
                 },
             }
-        }
-    };
-}
-
-/// Macro for creating stateless precompiles with automatic ABI encoding/decoding.
-///
-/// # Syntax
-/// ```rust,ignore
-/// stateless!(function_name, input, gas_limit; {
-///     Interface::functionCall => |decoded_call| {
-///         // Your implementation here
-///         // Must return a value that implements SolValue
-///     },
-///     // Additional functions...
-/// });
-/// ```
-///
-/// # Example
-/// ```rust,ignore
-/// stateless!(math_precompile_fn, input, gas_limit; {
-///     IMath::addCall => |call| {
-///         call.a + call.b
-///     },
-///     IMath::multiplyCall => |call| {
-///         call.a * call.b
-///     },
-/// });
-/// ```
-///
-/// The macro handles:
-/// - Function selector matching
-/// - ABI decoding of inputs
-/// - ABI encoding of outputs
-/// - Error handling
-/// - Gas consumption (uses all provided gas)
-#[macro_export]
-macro_rules! stateless {
-    ($fn_name:ident, $input:ident, $gas_limit:ident; {
-        $(
-            $fn_call:path => |$call:ident| $handler:expr
-        ),* $(,)?
-    }) => {
-        pub(crate) fn $fn_name($input: &[u8], $gas_limit: u64) -> PrecompileResult {
-            if $input.len() < 4 {
-                return Err(PrecompileError::Other("Input too short".into()));
-            }
-
-            let selector = &$input[0..4];
-
-            let output = match selector {
-                $(
-                    sel if sel == <$fn_call>::SELECTOR => {
-                        let $call = <$fn_call>::abi_decode($input).map_err(|e| {
-                            PrecompileError::Other(format!("ABI decode error: {e:?}").into())
-                        })?;
-                        let result = $handler;
-                        result.abi_encode()
-                    }
-                )*
-                _ => return Err(PrecompileError::Other("Invalid selector".into())),
-            };
-
-            Ok(PrecompileOutput::new($gas_limit, output.into()))
         }
     };
 }

@@ -14,10 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Consensus-layer chain spec: activation conditions (height / time) per fork, per network.
+//! Consensus-layer chain spec: per-fork activation conditions (by block height) per network.
 //!
 //! Used to branch logic for BLS commit certificates, ExecutionPayloadV4, etc., so that from a
-//! given height or timestamp all validators use the new behavior.
+//! given height all validators use the new behavior.
 
 use core::fmt;
 use std::str::FromStr;
@@ -26,7 +26,7 @@ use alloy_rlp::RlpEncodable;
 use eyre::Context;
 use thiserror::Error;
 
-use arc_consensus_types::{BlockHash, BlockTimestamp, Height, B256};
+use crate::{BlockHash, Height, B256};
 
 pub use arc_shared::chain_ids;
 
@@ -92,30 +92,23 @@ fn parse_chain_id(s: &str) -> eyre::Result<u64> {
 /// Consensus-layer fork version (0 = genesis, bump by 1 for each new fork).
 pub type ForkVersion = u32;
 
-/// Activation condition for a consensus fork (by block height, timestamp, or both).
+/// Activation condition for a consensus fork (by block height).
+///
+/// Consensus-layer forks activate by block height only. This keeps `fork_version_at(height)` a
+/// pure function of the argument — required so any two nodes resolve the same fork version for
+/// the same height regardless of wall-clock state. Timestamp-based activation would require
+/// block-timestamp lookups at every sign/verify site to stay consensus-safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkCondition {
     /// Active when block number >= height.
     Block(Height),
-    /// Active when block timestamp >= timestamp.
-    Timestamp(BlockTimestamp),
-    /// Active when both block number >= height and block timestamp >= timestamp.
-    BlockAndTime {
-        height: Height,
-        timestamp: BlockTimestamp,
-    },
 }
 
 impl ForkCondition {
-    /// Returns true if this fork is active at the given block height and timestamp.
-    pub fn active_at(&self, height: Height, timestamp: BlockTimestamp) -> bool {
+    /// Returns true if this fork is active at the given block height.
+    pub fn active_at(&self, height: Height) -> bool {
         match self {
             ForkCondition::Block(h) => height >= *h,
-            ForkCondition::Timestamp(t) => timestamp >= *t,
-            ForkCondition::BlockAndTime {
-                height: h,
-                timestamp: t,
-            } => height >= *h && timestamp >= *t,
         }
     }
 }
@@ -170,23 +163,27 @@ impl fmt::Display for NetworkId {
 /// Genesis fork version (version 0).
 pub const GENESIS_FORK_VERSION: ForkVersion = 0;
 
-/// Consensus-layer chain spec: holds activation conditions for each fork per network.
+/// A consensus-layer fork and the condition that activates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsensusFork {
+    /// Fork version used for consensus-signature domain separation.
+    pub version: ForkVersion,
+    /// Activation condition for this fork.
+    pub condition: ForkCondition,
+}
+
+/// Consensus-layer chain spec: holds an ordered fork history per network.
 ///
-/// `current_fork_version` is the active version before the next fork. When `next_fork_condition`
-/// is met at (height, timestamp), the effective fork version becomes `current_fork_version + 1`.
-/// When you add a new CL fork, set `current_fork_version` to the version we're on now and
-/// `next_fork_condition` to the new fork's activation. Individual `is_*_fork_activated` functions
-/// duplicate the condition checks for convenience.
+/// The schedule must include every fork from genesis onward. When adding a CL fork, append a new
+/// entry instead of replacing the active version. That keeps historical signature verification
+/// stable because `fork_version_at(old_height)` continues to resolve the fork version that was
+/// active when the message was signed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsensusSpec {
     /// Chain ID for this spec.
     pub chain_id: ChainId,
-    /// Version we're on before the next fork (0 = genesis). When `next_fork_condition` is met we
-    /// transition to `current_fork_version + 1`.
-    pub current_fork_version: ForkVersion,
-    /// When this condition is active, we transition to `current_fork_version + 1`. Before that we
-    /// stay at `current_fork_version`. Set when scheduling the next fork.
-    pub next_fork_condition: Option<ForkCondition>,
+    /// Ordered fork history. Entries must be sorted by activation height, starting with genesis.
+    pub forks: &'static [ConsensusFork],
     // Example fork condition
     // /// From this block/height we use aggregated BLS in commit certificates (gossip + RPC).
     // pub bls_commit_certificate: Option<ForkCondition>,
@@ -203,30 +200,37 @@ impl ConsensusSpec {
         }
     }
 
-    /// Returns the consensus-layer fork version active at the given block height and timestamp.
-    /// When `next_fork_condition` is met, returns `current_fork_version + 1`; otherwise
-    /// `current_fork_version`.
-    pub fn fork_version_at(&self, height: Height, timestamp: BlockTimestamp) -> ForkVersion {
-        match &self.next_fork_condition {
-            None => self.current_fork_version,
-            // Fork versions increment once per hardfork; u32::MAX is unreachable
-            #[allow(clippy::arithmetic_side_effects)]
-            Some(cond) if cond.active_at(height, timestamp) => self.current_fork_version + 1,
-            Some(_) => self.current_fork_version,
+    /// Returns the consensus-layer fork version active at the given block height.
+    pub fn fork_version_at(&self, height: Height) -> ForkVersion {
+        let mut active_version = GENESIS_FORK_VERSION;
+
+        for fork in self.forks {
+            if !fork.condition.active_at(height) {
+                break;
+            }
+
+            active_version = fork.version;
         }
+
+        active_version
     }
 
-    /// Returns the condition for the next fork (for handshakes or display). When this is met we
-    /// transition to `current_fork_version + 1`.
-    pub fn next_fork_condition(&self) -> Option<ForkCondition> {
-        self.next_fork_condition
+    /// Returns the condition for the next scheduled fork after the given height.
+    pub fn next_fork_condition_after(&self, height: Height) -> Option<ForkCondition> {
+        for fork in self.forks {
+            if !fork.condition.active_at(height) {
+                return Some(fork.condition);
+            }
+        }
+
+        None
     }
 
     // Example fork condition check
-    // /// Returns true if the BLS commit certificate fork is active at the given height and timestamp.
-    // pub fn is_bls_fork_activated(&self, height: Height, timestamp: BlockTimestamp) -> bool {
+    // /// Returns true if the BLS commit certificate fork is active at the given height.
+    // pub fn is_bls_fork_activated(&self, height: Height) -> bool {
     //     self.bls_commit_certificate
-    //         .is_some_and(|c| c.active_at(height, timestamp))
+    //         .is_some_and(|c| c.active_at(height))
     // }
 }
 
@@ -236,33 +240,82 @@ impl From<ChainId> for ConsensusSpec {
     }
 }
 
+/// Validates that a fork history is well-formed. Panics in `const` context if:
+/// - the slice is empty,
+/// - the first entry is not genesis (height 0, `GENESIS_FORK_VERSION`),
+/// - activation heights are not non-decreasing, or
+/// - fork versions are not strictly increasing.
+///
+/// Intended for `const _: () = validate_fork_history(SPEC.forks);` so malformed
+/// schedules fail the build rather than waiting for a test run.
+// `i` starts at 1, only increments, and the loop exits at `i == forks.len() <= isize::MAX`,
+// so `i - 1` is always `>= 0` and `i + 1` cannot overflow.
+#[allow(clippy::arithmetic_side_effects)]
+const fn validate_fork_history(forks: &[ConsensusFork]) {
+    assert!(!forks.is_empty(), "fork history must not be empty");
+
+    let ForkCondition::Block(genesis_height) = forks[0].condition;
+    assert!(
+        genesis_height.as_u64() == 0,
+        "first fork must activate at height 0 (genesis)"
+    );
+    assert!(
+        forks[0].version == GENESIS_FORK_VERSION,
+        "first fork must use GENESIS_FORK_VERSION"
+    );
+
+    let mut i = 1;
+    while i < forks.len() {
+        let ForkCondition::Block(prev_h) = forks[i - 1].condition;
+        let ForkCondition::Block(curr_h) = forks[i].condition;
+
+        assert!(
+            curr_h.as_u64() >= prev_h.as_u64(),
+            "fork activation heights must be non-decreasing"
+        );
+        assert!(
+            forks[i].version > forks[i - 1].version,
+            "fork versions must be strictly increasing"
+        );
+
+        i += 1;
+    }
+}
+
+/// Consensus-layer genesis fork history.
+pub const GENESIS_FORKS: &[ConsensusFork] = &[ConsensusFork {
+    version: GENESIS_FORK_VERSION,
+    condition: ForkCondition::Block(Height::new(0)),
+}];
+
 /// Default / devnet consensus spec (genesis fork only).
 pub const DEVNET: ConsensusSpec = ConsensusSpec {
     chain_id: ChainId::Devnet,
-    current_fork_version: GENESIS_FORK_VERSION,
-    next_fork_condition: None,
+    forks: GENESIS_FORKS,
 };
 
-/// Testnet consensus spec (genesis fork only; set next_fork_condition when activation is scheduled).
+/// Testnet consensus spec (genesis fork only; append a fork when activation is scheduled).
 pub const TESTNET: ConsensusSpec = ConsensusSpec {
     chain_id: ChainId::Testnet,
-    current_fork_version: GENESIS_FORK_VERSION,
-    next_fork_condition: None,
+    forks: GENESIS_FORKS,
 };
 
-/// Mainnet consensus spec (genesis fork only; set next_fork_condition when activation is scheduled).
+/// Mainnet consensus spec (genesis fork only; append a fork when activation is scheduled).
 pub const MAINNET: ConsensusSpec = ConsensusSpec {
     chain_id: ChainId::Mainnet,
-    current_fork_version: GENESIS_FORK_VERSION,
-    next_fork_condition: None,
+    forks: GENESIS_FORKS,
 };
 
-/// Localdev consensus spec (genesis fork only; set next_fork_condition when activation is scheduled).
+/// Localdev consensus spec (genesis fork only; append a fork when activation is scheduled).
 pub const LOCALDEV: ConsensusSpec = ConsensusSpec {
     chain_id: ChainId::Localdev,
-    current_fork_version: GENESIS_FORK_VERSION,
-    next_fork_condition: None,
+    forks: GENESIS_FORKS,
 };
+
+const _: () = validate_fork_history(MAINNET.forks);
+const _: () = validate_fork_history(TESTNET.forks);
+const _: () = validate_fork_history(DEVNET.forks);
+const _: () = validate_fork_history(LOCALDEV.forks);
 
 /// Error returned when the chain ID is not recognized.
 #[derive(Debug, Error)]
@@ -279,71 +332,160 @@ mod tests {
         Height::new(n)
     }
 
-    fn ts(secs: u64) -> BlockTimestamp {
-        secs
-    }
-
     #[test]
     fn fork_condition_block() {
         let cond = ForkCondition::Block(h(100));
-        assert!(!cond.active_at(h(99), ts(0)));
-        assert!(cond.active_at(h(100), ts(0)));
-        assert!(cond.active_at(h(101), ts(0)));
+        assert!(!cond.active_at(h(99)));
+        assert!(cond.active_at(h(100)));
+        assert!(cond.active_at(h(101)));
     }
 
     #[test]
-    fn fork_condition_timestamp() {
-        let cond = ForkCondition::Timestamp(ts(1000));
-        assert!(!cond.active_at(h(0), ts(999)));
-        assert!(cond.active_at(h(0), ts(1000)));
-        assert!(cond.active_at(h(0), ts(1001)));
+    fn validate_fork_history_accepts_well_formed_schedule() {
+        const FORKS: &[ConsensusFork] = &[
+            ConsensusFork {
+                version: GENESIS_FORK_VERSION,
+                condition: ForkCondition::Block(Height::new(0)),
+            },
+            ConsensusFork {
+                version: 1,
+                condition: ForkCondition::Block(Height::new(100)),
+            },
+            ConsensusFork {
+                version: 2,
+                condition: ForkCondition::Block(Height::new(100)),
+            },
+        ];
+        const _: () = validate_fork_history(FORKS);
+        validate_fork_history(FORKS);
     }
 
     #[test]
-    fn fork_condition_block_and_time() {
-        let cond = ForkCondition::BlockAndTime {
-            height: h(50),
-            timestamp: ts(500),
+    #[should_panic(expected = "fork history must not be empty")]
+    fn validate_fork_history_rejects_empty() {
+        validate_fork_history(&[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "first fork must activate at height 0")]
+    fn validate_fork_history_rejects_non_zero_genesis_height() {
+        validate_fork_history(&[ConsensusFork {
+            version: GENESIS_FORK_VERSION,
+            condition: ForkCondition::Block(Height::new(1)),
+        }]);
+    }
+
+    #[test]
+    #[should_panic(expected = "first fork must use GENESIS_FORK_VERSION")]
+    fn validate_fork_history_rejects_non_genesis_first_version() {
+        validate_fork_history(&[ConsensusFork {
+            version: 1,
+            condition: ForkCondition::Block(Height::new(0)),
+        }]);
+    }
+
+    #[test]
+    #[should_panic(expected = "fork activation heights must be non-decreasing")]
+    fn validate_fork_history_rejects_decreasing_heights() {
+        validate_fork_history(&[
+            ConsensusFork {
+                version: GENESIS_FORK_VERSION,
+                condition: ForkCondition::Block(Height::new(0)),
+            },
+            ConsensusFork {
+                version: 1,
+                condition: ForkCondition::Block(Height::new(100)),
+            },
+            ConsensusFork {
+                version: 2,
+                condition: ForkCondition::Block(Height::new(50)),
+            },
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "fork versions must be strictly increasing")]
+    fn validate_fork_history_rejects_non_increasing_versions() {
+        validate_fork_history(&[
+            ConsensusFork {
+                version: GENESIS_FORK_VERSION,
+                condition: ForkCondition::Block(Height::new(0)),
+            },
+            ConsensusFork {
+                version: GENESIS_FORK_VERSION,
+                condition: ForkCondition::Block(Height::new(100)),
+            },
+        ]);
+    }
+
+    #[test]
+    fn fork_version_at_returns_genesis_when_only_genesis_is_scheduled() {
+        let spec = ConsensusSpec {
+            chain_id: ChainId::Localdev,
+            forks: GENESIS_FORKS,
         };
-        assert!(!cond.active_at(h(49), ts(500)));
-        assert!(!cond.active_at(h(50), ts(499)));
-        assert!(cond.active_at(h(50), ts(500)));
-        assert!(cond.active_at(h(51), ts(501)));
+        assert_eq!(spec.fork_version_at(h(0)), GENESIS_FORK_VERSION);
+        assert_eq!(spec.fork_version_at(h(1_000_000)), GENESIS_FORK_VERSION);
     }
 
     #[test]
     fn fork_version_at() {
-        // No next fork: always current_fork_version
+        const FORKS: &[ConsensusFork] = &[
+            ConsensusFork {
+                version: 0,
+                condition: ForkCondition::Block(Height::new(0)),
+            },
+            ConsensusFork {
+                version: 1,
+                condition: ForkCondition::Block(Height::new(100)),
+            },
+            ConsensusFork {
+                version: 2,
+                condition: ForkCondition::Block(Height::new(200)),
+            },
+        ];
         let spec = ConsensusSpec {
             chain_id: ChainId::Localdev,
-            current_fork_version: 0,
-            next_fork_condition: None,
+            forks: FORKS,
         };
-        assert_eq!(spec.fork_version_at(h(0), ts(0)), 0);
 
-        // Next fork at block 100, current = 0: before 100 -> 0, at/after 100 -> 1
-        let spec = ConsensusSpec {
-            chain_id: ChainId::Localdev,
-            current_fork_version: 0,
-            next_fork_condition: Some(ForkCondition::Block(h(100))),
-        };
-        assert_eq!(spec.fork_version_at(h(0), ts(0)), 0);
-        assert_eq!(spec.fork_version_at(h(99), ts(0)), 0);
-        assert_eq!(spec.fork_version_at(h(100), ts(0)), 1);
-        assert_eq!(spec.fork_version_at(h(200), ts(0)), 1);
+        assert_eq!(spec.fork_version_at(h(0)), 0);
+        assert_eq!(spec.fork_version_at(h(99)), 0);
+        assert_eq!(spec.fork_version_at(h(100)), 1);
+        assert_eq!(spec.fork_version_at(h(199)), 1);
+        assert_eq!(spec.fork_version_at(h(200)), 2);
+        assert_eq!(spec.fork_version_at(h(1_000_000)), 2);
     }
 
     #[test]
-    fn next_fork_condition() {
+    fn next_fork_condition_after() {
+        const FORKS: &[ConsensusFork] = &[
+            ConsensusFork {
+                version: 0,
+                condition: ForkCondition::Block(Height::new(0)),
+            },
+            ConsensusFork {
+                version: 1,
+                condition: ForkCondition::Block(Height::new(100)),
+            },
+            ConsensusFork {
+                version: 2,
+                condition: ForkCondition::Block(Height::new(200)),
+            },
+        ];
         let spec = ConsensusSpec {
             chain_id: ChainId::Localdev,
-            current_fork_version: 0,
-            next_fork_condition: Some(ForkCondition::Block(h(100))),
+            forks: FORKS,
         };
         assert_eq!(
-            spec.next_fork_condition(),
+            spec.next_fork_condition_after(h(0)),
             Some(ForkCondition::Block(h(100)))
         );
+        assert_eq!(
+            spec.next_fork_condition_after(h(100)),
+            Some(ForkCondition::Block(h(200)))
+        );
+        assert_eq!(spec.next_fork_condition_after(h(200)), None);
     }
 
     #[test]
@@ -397,16 +539,15 @@ mod tests {
     // fn is_bls_fork_activated() {
     //     let spec = ConsensusSpec {
     //         chain_id: None,
-    //         current_fork_version: 0,
-    //         next_fork_condition: None,
+    //         forks: GENESIS_FORKS,
     //         // bls_commit_certificate: Some(ForkCondition::Block(h(50))),
     //     };
-    //     assert!(!spec.is_bls_fork_activated(h(49), ts(0)));
-    //     assert!(spec.is_bls_fork_activated(h(50), ts(0)));
-    //     assert!(spec.is_bls_fork_activated(h(51), ts(0)));
+    //     assert!(!spec.is_bls_fork_activated(h(49)));
+    //     assert!(spec.is_bls_fork_activated(h(50)));
+    //     assert!(spec.is_bls_fork_activated(h(51)));
     //
     //     let spec_no_bls = ConsensusSpec::default();
-    //     assert!(!spec_no_bls.is_bls_fork_activated(h(0), ts(0)));
+    //     assert!(!spec_no_bls.is_bls_fork_activated(h(0)));
     // }
 
     #[test]

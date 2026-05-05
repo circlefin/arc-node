@@ -1048,4 +1048,26 @@ mod tests {
             "Non-zero beneficiary should pass: {result:?}"
         );
     }
+
+    #[test]
+    fn test_beneficiary_nonzero_skipped_before_zero6() {
+        use alloy_primitives::Address;
+
+        let mut inner = ChainSpecBuilder::mainnet().build();
+        inner
+            .hardforks
+            .insert(ArcHardfork::Zero6, ForkCondition::Block(100));
+        let spec = Arc::new(ArcChainSpec::new(inner));
+
+        let header = Header {
+            number: 99,
+            beneficiary: Address::ZERO,
+            ..Default::default()
+        };
+        let result = arc_validate_beneficiary_nonzero(&header, spec.as_ref());
+        assert!(
+            result.is_ok(),
+            "Before Zero6, zero beneficiary should be allowed: {result:?}"
+        );
+    }
 }

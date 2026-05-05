@@ -54,7 +54,7 @@ use malachitebft_app_channel::app::config::{GossipSubConfig, PubSubProtocol};
 
 use arc_consensus_types::codec::{network::NetCodec, wal::WalCodec};
 use arc_consensus_types::signing::PublicKey;
-use arc_consensus_types::{Address, ArcContext, Config, SigningConfig};
+use arc_consensus_types::{Address, ArcContext, ChainId, Config, ConsensusSpec, SigningConfig};
 use arc_eth_engine::engine::Engine;
 use arc_eth_engine::json_structures::ExecutionBlock;
 use arc_node_consensus_cli::metrics;
@@ -65,7 +65,6 @@ use crate::env_config::EnvConfig;
 use crate::hardcoded_config::{GossipLoad, GossipMeshParams};
 use crate::metrics::{AppMetrics, DbMetrics, ProcessMetrics};
 use crate::request::AppRequest;
-use crate::spec::{ChainId, ConsensusSpec};
 use crate::state::State;
 use crate::store::Store;
 use crate::utils::HaltAndWait;

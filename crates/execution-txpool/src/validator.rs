@@ -307,11 +307,21 @@ where
             return Ok(None);
         }
 
-        let addresses = std::iter::once(transaction.sender()).chain(transaction.to());
+        let auth_authorities: Vec<Address> = transaction
+            .authorization_list()
+            .into_iter()
+            .flatten()
+            .filter_map(|auth| auth.recover_authority().ok())
+            .collect();
+
+        let addresses = std::iter::once(transaction.sender())
+            .chain(transaction.to())
+            .chain(auth_authorities);
+
         for address in addresses {
             match is_denylisted(state_provider, &self.addresses_denylist_config, address) {
                 Ok(true) => return Ok(Some(address)),
-                Ok(false) => {} // continue to next address
+                Ok(false) => {}
                 Err(DenylistError::StorageReadFailed(e)) => return Err(e),
             }
         }
@@ -327,6 +337,7 @@ where
         state_provider: &dyn StateProvider,
     ) -> ProviderResult<Option<Address>> {
         let has_value = !transaction.value().is_zero();
+
         let addresses =
             std::iter::once(transaction.sender()).chain(transaction.to().filter(|_| has_value));
 
@@ -726,6 +737,191 @@ mod tests {
                 "expected DenylistedAddressError({denylisted_address}) for {name}, got {inner:?}"
             );
         }
+    }
+
+    /// Creates a signed EIP-7702 authorization with a fresh key.
+    /// Returns `(authority_address, SignedAuthorization)`.
+    fn create_signed_authorization(
+        chain_id: u64,
+        delegate_address: Address,
+        nonce: u64,
+    ) -> (Address, alloy_eips::eip7702::SignedAuthorization) {
+        use alloy_eips::eip7702::Authorization;
+        use alloy_primitives::Signature;
+        use k256::ecdsa::SigningKey;
+
+        let key_byte = delegate_address.0[0] | 1; // deterministic, non-zero
+        let key_bytes: [u8; 32] = [key_byte; 32];
+        let signing_key = SigningKey::from_bytes((&key_bytes).into()).expect("fixed key is valid");
+        let auth = Authorization {
+            chain_id: U256::from(chain_id),
+            address: delegate_address,
+            nonce,
+        };
+        let sig_hash = auth.signature_hash();
+        let (sig, recid) = signing_key
+            .sign_prehash_recoverable(sig_hash.as_ref())
+            .expect("signing must succeed");
+        let alloy_sig = Signature::new(
+            U256::from_be_slice(&sig.r().to_bytes()),
+            U256::from_be_slice(&sig.s().to_bytes()),
+            recid.is_y_odd(),
+        );
+        let signed_auth = auth.into_signed(alloy_sig);
+        let authority = signed_auth
+            .recover_authority()
+            .expect("authority recovery must succeed");
+        (authority, signed_auth)
+    }
+
+    const DENYLIST_CONTRACT: Address = Address::new([0x36u8; 20]);
+
+    fn eip7702_tx_with_auths(
+        auth_list: Vec<alloy_eips::eip7702::SignedAuthorization>,
+    ) -> MockTransaction {
+        // 100_000 gas covers EIP-7702 intrinsic (21_000 + 12_500 per auth)
+        let mut tx = MockTransaction::eip7702()
+            .with_gas_limit(100_000)
+            .with_gas_price(1_000_000_000);
+        tx.set_authorization_list(auth_list);
+        tx
+    }
+
+    fn provider_with_funded_accounts(tx: &MockTransaction) -> MockEthProvider {
+        let provider = MockEthProvider::default();
+        // Post-Prague timestamp so the inner validator accepts EIP-7702 transactions
+        let mut block = reth_ethereum_primitives::Block::default();
+        block.header.timestamp = 2_000_000_000;
+        provider.add_block(B256::ZERO, block);
+        provider.add_account(tx.sender(), ExtendedAccount::new(0, U256::MAX));
+        provider.add_account(tx.to().unwrap(), ExtendedAccount::new(0, U256::MAX));
+        provider
+    }
+
+    fn add_denylisted_address(provider: &MockEthProvider, address: Address) {
+        let slot = compute_denylist_storage_slot(address, DEFAULT_DENYLIST_ERC7201_BASE_SLOT);
+        let mut storage = std::collections::HashMap::new();
+        storage.insert(slot, U256::from(1));
+        provider.add_account(
+            DENYLIST_CONTRACT,
+            ExtendedAccount::new(0, U256::ZERO).extend_storage(storage),
+        );
+    }
+
+    fn denylist_config(exclusions: Vec<Address>) -> AddressesDenylistConfig {
+        AddressesDenylistConfig::try_new(
+            true,
+            Some(DENYLIST_CONTRACT),
+            Some(DEFAULT_DENYLIST_ERC7201_BASE_SLOT),
+            exclusions,
+        )
+        .unwrap()
+    }
+
+    async fn validate_eip7702(
+        tx: MockTransaction,
+        provider: MockEthProvider,
+        config: AddressesDenylistConfig,
+    ) -> TransactionValidationOutcome<MockTransaction> {
+        let blob_store = InMemoryBlobStore::default();
+        let eth_validator = EthTransactionValidatorBuilder::new(provider, EthEvmConfig::mainnet())
+            .no_eip4844()
+            .build(blob_store);
+        let arc_validator = ArcTransactionValidator::new(eth_validator, None, config);
+        arc_validator
+            .validate_one_with_state(TransactionOrigin::External, tx, &mut None)
+            .await
+    }
+
+    fn assert_denylist_rejected(
+        outcome: &TransactionValidationOutcome<MockTransaction>,
+        expected_addr: Address,
+    ) {
+        let TransactionValidationOutcome::Invalid(_, err) = outcome else {
+            panic!("expected Invalid outcome, got {outcome:?}");
+        };
+        let inner: &ArcTransactionValidatorError = err
+            .downcast_other_ref::<ArcTransactionValidatorError>()
+            .unwrap();
+        assert!(
+            matches!(inner, ArcTransactionValidatorError::DenylistedAddressError(addr) if *addr == expected_addr),
+            "expected DenylistedAddressError({expected_addr}), got {inner:?}"
+        );
+    }
+
+    fn assert_valid(outcome: &TransactionValidationOutcome<MockTransaction>) {
+        assert!(
+            matches!(outcome, TransactionValidationOutcome::Valid { .. }),
+            "expected Valid outcome, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eip7702_denylisted_authority_rejected() {
+        let (authority, signed_auth) = create_signed_authorization(1, Address::from([0xAA; 20]), 0);
+        let tx = eip7702_tx_with_auths(vec![signed_auth]);
+        let provider = provider_with_funded_accounts(&tx);
+        add_denylisted_address(&provider, authority);
+
+        let outcome = validate_eip7702(tx, provider, denylist_config(Vec::new())).await;
+        assert_denylist_rejected(&outcome, authority);
+    }
+
+    #[tokio::test]
+    async fn eip7702_multiple_auths_second_denylisted_rejected() {
+        let (_clean, clean_auth) = create_signed_authorization(1, Address::from([0xAA; 20]), 0);
+        let (denylisted, denylisted_auth) =
+            create_signed_authorization(1, Address::from([0xBB; 20]), 0);
+        let tx = eip7702_tx_with_auths(vec![clean_auth, denylisted_auth]);
+        let provider = provider_with_funded_accounts(&tx);
+        add_denylisted_address(&provider, denylisted);
+
+        let outcome = validate_eip7702(tx, provider, denylist_config(Vec::new())).await;
+        assert_denylist_rejected(&outcome, denylisted);
+    }
+
+    #[tokio::test]
+    async fn eip7702_denylisted_authority_excluded_passes() {
+        let (authority, signed_auth) = create_signed_authorization(1, Address::from([0xEE; 20]), 0);
+        let tx = eip7702_tx_with_auths(vec![signed_auth]);
+        let provider = provider_with_funded_accounts(&tx);
+        add_denylisted_address(&provider, authority);
+
+        let outcome = validate_eip7702(tx, provider, denylist_config(vec![authority])).await;
+        assert_valid(&outcome);
+    }
+
+    #[tokio::test]
+    async fn eip7702_non_denylisted_authority_passes_denylist_check() {
+        let (_authority, signed_auth) =
+            create_signed_authorization(1, Address::from([0xBB; 20]), 0);
+        let tx = eip7702_tx_with_auths(vec![signed_auth]);
+        let provider = provider_with_funded_accounts(&tx);
+        provider.add_account(DENYLIST_CONTRACT, ExtendedAccount::new(0, U256::ZERO));
+
+        let outcome = validate_eip7702(tx, provider, denylist_config(Vec::new())).await;
+        assert_valid(&outcome);
+    }
+
+    #[tokio::test]
+    async fn eip7702_invalid_auth_signature_skipped() {
+        // y_parity=2 forces SignatureError::InvalidParity, making recover_authority() return Err
+        let invalid_auth = alloy_eips::eip7702::SignedAuthorization::new_unchecked(
+            alloy_eips::eip7702::Authorization {
+                chain_id: U256::from(1),
+                address: Address::from([0xCC; 20]),
+                nonce: 0,
+            },
+            2,
+            U256::from(1),
+            U256::from(1),
+        );
+        let tx = eip7702_tx_with_auths(vec![invalid_auth]);
+        let provider = provider_with_funded_accounts(&tx);
+        provider.add_account(DENYLIST_CONTRACT, ExtendedAccount::new(0, U256::ZERO));
+
+        let outcome = validate_eip7702(tx, provider, denylist_config(Vec::new())).await;
+        assert_valid(&outcome);
     }
 
     static HITS: AtomicU64 = AtomicU64::new(0);

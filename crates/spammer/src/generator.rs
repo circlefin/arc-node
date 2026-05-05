@@ -37,6 +37,16 @@ use crate::ws::{WsClient, WsClientBuilder};
 use crate::erc20::TEST_TOKEN_ADDRESS;
 
 pub(crate) const TESTNET_CHAIN_ID: u64 = 1337;
+
+/// Max fee per gas (in wei) used for all generated transactions.
+///
+/// Sized for 2x headroom over the testnet `maxBaseFee` ceiling (20,000 gwei) so
+/// the spammer keeps submitting when the base fee pegs at the ceiling.
+pub(crate) const MAX_FEE_PER_GAS: u128 = 40_000 * 1_000_000_000;
+
+/// Max priority fee per gas (tip) in wei.
+pub(crate) const MAX_PRIORITY_FEE_PER_GAS: u128 = 1_000_000_000;
+
 const GUZZLER_ADDRESS: Address = address!("45a834A6bB86F516D4157a8cBcc60f2F35F8398C");
 
 /// Generates and signs transactions from a pool of pre-funded genesis accounts.
@@ -659,8 +669,8 @@ impl TxGenerator {
         TxEip1559 {
             chain_id: TESTNET_CHAIN_ID,
             nonce,
-            max_priority_fee_per_gas: 1_000_000_000, // 1 gwei
-            max_fee_per_gas: 2_000_000_000,          // 2 gwei
+            max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS,
+            max_fee_per_gas: MAX_FEE_PER_GAS,
             gas_limit: 30_000 + input_gas, // base tx + input gas, Arc requires ~26k for transfers (blocklist check)
             to: Address::left_padding_from(&(nonce.wrapping_add(0x1000)).to_be_bytes()).into(), // avoid zero address and Ethereum precompile addresses
             value: U256::from(1e16), // 0.01 ETH
@@ -677,7 +687,7 @@ impl TxGenerator {
         TxLegacy {
             chain_id: Some(TESTNET_CHAIN_ID),
             nonce,
-            gas_price: 2_000_000_000, // 2 gwei
+            gas_price: MAX_FEE_PER_GAS,
             gas_limit: 30_000 + input_gas,
             to: Address::left_padding_from(&(nonce.wrapping_add(0x1000)).to_be_bytes()).into(),
             value: U256::from(1e16), // 0.01 ETH
@@ -697,8 +707,8 @@ impl TxGenerator {
         TxEip1559 {
             chain_id: TESTNET_CHAIN_ID,
             nonce,
-            max_priority_fee_per_gas: 1_000_000_000, // 1 gwei
-            max_fee_per_gas: 2_000_000_000,          // 2 gwei
+            max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS,
+            max_fee_per_gas: MAX_FEE_PER_GAS,
             gas_limit,
             to: Some(addr).into(),
             value: U256::ZERO,
