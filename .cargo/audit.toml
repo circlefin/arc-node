@@ -24,4 +24,13 @@ ignore = [
     # to 0.9+ requires a major-version API migration and transitive deps (yamux, libp2p)
     # still require rand 0.8.x
     "RUSTSEC-2026-0097",
+
+    # hickory-proto 0.25.2 - NSEC3 closest-encloser proof unbounded loop; no fixed version
+    # available yet. Transitive dependency via reth-dns-discovery (reth v1.11.3) and
+    # libp2p-mdns (libp2p 0.56.0) — cannot be updated without bumping reth/libp2p.
+    "RUSTSEC-2026-0118",
+    # hickory-proto 0.25.2 - O(n²) name compression CPU exhaustion; fix requires >=0.26.1.
+    # Transitive dependency via reth-dns-discovery (reth v1.11.3) and libp2p-mdns
+    # (libp2p 0.56.0) — both pin hickory-proto to 0.25.x; cannot update without bumping reth.
+    "RUSTSEC-2026-0119",
 ]

@@ -21,13 +21,13 @@ use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::cli_version::supports_cli_flags;
 use crate::manifest::subnets::Subnets;
 use crate::manifest::{
     default_subnet_singleton, ClGossipSubConfig, ClPruningPreset, DockerImages, ElConfigOverride,
     EngineApiConnection, Manifest, Node, NodeClConfig, NodeType, RemoteKeyId,
 };
 use crate::node::SubnetName;
-use crate::setup::supports_cli_flags;
 use crate::util::merge_toml_values;
 
 /// Node name prefix that indicates a validator node.

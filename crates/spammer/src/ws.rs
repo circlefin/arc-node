@@ -230,6 +230,19 @@ impl WsClient {
         Err(eyre::eyre!("timeout waiting for notification"))
     }
 
+    /// Non-blockingly drain one pending inbound message.
+    ///
+    /// In fire-and-forget mode the sender never reads responses, so the TCP
+    /// receive buffer fills and eventually stalls the send path via flow control.
+    /// Calling this after each send keeps the pipe clear.
+    pub(crate) async fn drain_one(&mut self) {
+        tokio::select! {
+            biased;
+            _ = self.ws.next() => {}
+            _ = std::future::ready(()) => {}
+        }
+    }
+
     /// Reconnect the WebSocket connection.
     /// This is useful when the connection breaks and needs to be re-established.
     pub async fn reconnect(&mut self) -> Result<()> {

@@ -497,6 +497,9 @@ where
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(Box::new(e)))
             })?;
 
+        // BalanceIncrements is semantically imprecise (this is a storage write, not a balance
+        // change), but it's the least-wrong variant available in the upstream enum, and functionally
+        // equivalent to others.
         self.system_caller.on_state(
             StateChangeSource::PostBlock(StateChangePostBlockSource::BalanceIncrements),
             &state,

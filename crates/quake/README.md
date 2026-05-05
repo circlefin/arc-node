@@ -740,7 +740,7 @@ quake generate -o target/manifests
 
 **Nightly CI**
 
-A [nightly workflow](../../.github/workflows/nightly-random-manifests.yml) runs daily at 3 AM UTC and can be triggered:
+A nightly workflow runs daily at 3 AM UTC and can be triggered:
 - **Scheduled/PR runs**: Use seed `42` for reproducibility.
 - **Manual dispatch** (`workflow_dispatch`): Optionally specify a base seed (must be a non-negative integer; leave blank to use `42`) and a per-job count (positive integer ≤ 50; leave blank to use `3`).
 
@@ -830,13 +830,28 @@ schema depends on the CL image version (`image_cl`):
   deprecation.
 
 Quake detects which schema to use by parsing the `image_cl` tag; `latest`,
-missing tags, and unparseable tags are treated as Modern. The two formats
+missing tags, and unparsable tags are treated as Modern. The two formats
 are not interchangeable — `cl.config.log_level` on a Legacy image (and
 `cl.config.logging.log_level` on a Modern image) will fail to parse.
 Upgrading a running testnet across the legacy/modern boundary with
 `perturb upgrade` is **not supported**: the upgraded binary would start
 with no CLI flags. For upgrade scenarios, start the testnet on a Modern
 version.
+
+#### Matching Flags to the Target Image Version
+
+Upgrade scenarios can pin an older `arc_consensus` image tag (e.g.
+`v0.6.0`). Quake derives CLI flags from the `StartCmd` definition
+compiled into its own binary, which may have gained, renamed, or removed
+flags since that image shipped. Before handing the flags to the
+container, Quake rewrites them to match the target version, i.e., older
+images receive a compatible subset, and `"latest"`, missing, or
+unparsable tags pass through unchanged.
+
+If pinning an older image fails with `unexpected argument`, that version
+likely needs a new compatible entry. See `apply_version_compat` in
+[`src/cli_version.rs`](src/cli_version.rs) for the rustdoc describing
+how to add one.
 
 The default configuration of Reth (Execution Layer) is defined in
 [`crates/quake/src/manifest.rs`](src/manifest.rs). It can be set globally

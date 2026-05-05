@@ -97,8 +97,11 @@ pub struct ArcNode {
     /// When true, `on_missing_payload` waits for the in-flight build instead of
     /// racing an empty block.
     pub wait_for_payload: bool,
-    /// When true (default), pending-tx RPCs are restricted (`eth_subscribe("newPendingTransactions")`, `eth_newPendingTransactionFilter`).
-    /// When false, all requests are forwarded.
+    /// When true (default), pending-tx RPCs are restricted
+    /// (`eth_subscribe("newPendingTransactions")`, `eth_newPendingTransactionFilter`,
+    /// and `eth_getBlockByNumber("pending")`). When false, all requests are forwarded.
+    /// CLI users opt out of the default via `--arc.expose-pending-txs`.
+    /// `--public-api` also forces this to `true` (and conflicts with `--arc.expose-pending-txs`).
     pub filter_pending_txs: bool,
     /// Interval between tx rebroadcast rounds. Zero disables rebroadcast.
     pub rebroadcast_interval: std::time::Duration,

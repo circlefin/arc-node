@@ -32,13 +32,23 @@ const PENDING_BLOCK_TAG: &str = "pending";
 const PENDING_TX_SUBSCRIPTION_ERROR_CODE: i32 = -32001;
 
 /// Adds Arc-specific RPC middlewares
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ArcRpcLayer {
-    /// When true, `eth_subscribe("newPendingTransactions")`,
+    /// When true (default), `eth_subscribe("newPendingTransactions")`,
     /// `eth_newPendingTransactionFilter`, and `eth_getBlockByNumber("pending")`
-    /// are blocked. When false (default), the filter is bypassed and these are
-    /// allowed. Opt-in via `--arc.hide-pending-txs`.
+    /// are blocked. When false, the filter is bypassed and these are allowed.
+    /// CLI users opt out of the default via `--arc.expose-pending-txs`.
     pub filter_pending_txs: bool,
+}
+
+impl Default for ArcRpcLayer {
+    /// Defaults to the secure configuration: pending-tx RPCs blocked.
+    /// CLI callers opt out via `--arc.expose-pending-txs`.
+    fn default() -> Self {
+        Self {
+            filter_pending_txs: true,
+        }
+    }
 }
 
 impl ArcRpcLayer {
@@ -66,7 +76,7 @@ where
 }
 
 /// RPC middleware that prevents websocket subscriptions and HTTP filters for pending transactions.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct NoPendingTransactionsRpcMiddleware<S> {
     service: S,
 }
@@ -278,12 +288,12 @@ mod tests {
         Request::owned(method.to_string(), Some(params), Id::Number(id))
     }
 
-    // ── Middleware active (--arc.hide-pending-txs) ──────────────────────
+    // ── Middleware active (default) ─────────────────────────────────────
     //
     // When active, the middleware intercepts pending-state RPCs:
     // subscriptions, filters, and block queries.
-    // The binary default is --arc.hide-pending-txs=false (middleware OFF).
-    // Set --arc.hide-pending-txs on hardened nodes to activate.
+    // The binary default is middleware ON; users opt out via
+    // --arc.expose-pending-txs on trusted/internal nodes.
 
     // -- pending txs: blocked --
 
@@ -528,7 +538,7 @@ mod tests {
         assert_eq!(responses[1]["result"], "success");
     }
 
-    // ── Middleware disabled (default, --arc.hide-pending-txs not set) ────
+    // ── Middleware disabled (--arc.expose-pending-txs) ──────────────────
     //
     // The middleware is bypassed entirely. All requests pass through.
 
@@ -582,11 +592,11 @@ mod tests {
     // ── ArcRpcLayer::default() ──────────────────────────────────────────
 
     #[test]
-    fn test_arc_rpc_layer_default_has_filter_disabled() {
+    fn test_arc_rpc_layer_default_has_filter_enabled() {
         let layer = ArcRpcLayer::default();
         assert!(
-            !layer.filter_pending_txs,
-            "Default ArcRpcLayer should have filter disabled (opt-in via --arc.hide-pending-txs)"
+            layer.filter_pending_txs,
+            "Default ArcRpcLayer should have filter enabled (opt out via --arc.expose-pending-txs)"
         );
     }
 }

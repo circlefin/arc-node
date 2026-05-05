@@ -34,13 +34,40 @@ use crate::rate_limiter::RateLimiter;
 use crate::result_tracker::ResultTracker;
 use crate::sender::TxSender;
 use crate::ws::WsClientBuilder;
-use crate::Config;
+use crate::{Config, ResumeConfig};
 
 /// Mnemonic for wallet generation.
 ///
 /// This must match the mnemonic used in the genesis file to ensure the generated
 /// accounts have pre-funded balances.
 pub const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
+
+const LATENCY_CHANNEL_CAPACITY: usize = 100_000;
+
+/// Captured generator state from a completed spammer run.
+pub struct SpammerState {
+    generators: Vec<TxGenerator>,
+}
+
+impl SpammerState {
+    /// Re-query on-chain pending nonces for all generators in parallel.
+    ///
+    /// Called automatically by [`Spammer::new_resuming`]. Exposed here so
+    /// callers can trigger a resync before constructing the next phase if needed.
+    pub async fn resync_nonces(&mut self) -> Result<()> {
+        let mut handles = Vec::with_capacity(self.generators.len());
+        for mut tx_gen in self.generators.drain(..) {
+            handles.push(tokio::spawn(async move {
+                tx_gen.resync_nonces().await?;
+                Ok::<TxGenerator, eyre::Error>(tx_gen)
+            }));
+        }
+        for handle in handles {
+            self.generators.push(handle.await??);
+        }
+        Ok(())
+    }
+}
 
 /// Transaction load generator orchestrator.
 ///
@@ -102,7 +129,7 @@ impl Spammer {
         }
 
         let (tx_latency_sender, latency_tracker) = if config.tx_latency {
-            let (sender, receiver) = mpsc::channel::<TxSubmitted>(100_000);
+            let (sender, receiver) = mpsc::channel::<TxSubmitted>(LATENCY_CHANNEL_CAPACITY);
             let csv_name = format!(
                 "tx_latency_{}.csv",
                 chrono::Utc::now().format("%Y%m%d_%H%M%S")
@@ -358,17 +385,20 @@ impl Spammer {
         Ok((vec![], tx_senders))
     }
 
-    pub async fn run(mut self) -> Result<()> {
+    /// Run the Spammer and return captured generator state for reuse in [`new_resuming`](Self::new_resuming).
+    /// Nonces cached during this run are preserved.
+    pub async fn run_capturing_state(mut self) -> Result<SpammerState> {
         let latency_handle = self
             .latency_tracker
             .map(|tracker| tokio::spawn(async move { tracker.run().await }));
 
-        // Fire-and-forget mode: spawn generator tasks and buffer before sending.
-        // Backpressure mode: generators are owned by senders, so this is empty.
-        let mut tx_gen_handles = Vec::new();
+        let mut tx_gen_handles: Vec<tokio::task::JoinHandle<Result<TxGenerator>>> = Vec::new();
         if !self.tx_generators.is_empty() {
             for mut tx_gen in self.tx_generators {
-                tx_gen_handles.push(tokio::spawn(async move { tx_gen.run().await }));
+                tx_gen_handles.push(tokio::spawn(async move {
+                    tx_gen.run().await?;
+                    Ok(tx_gen)
+                }));
             }
 
             time::sleep(Duration::from_millis(100)).await;
@@ -387,8 +417,9 @@ impl Spammer {
             handle.await??;
         }
 
+        let mut generators = Vec::new();
         for handle in tx_gen_handles {
-            handle.await??;
+            generators.push(handle.await??);
         }
 
         let _ = self.finish_sender.send(()).await;
@@ -398,6 +429,118 @@ impl Spammer {
             handle.await??;
         }
 
-        Ok(())
+        Ok(SpammerState { generators })
+    }
+
+    /// Create a spammer that reuses generators from a previous run.
+    pub async fn new_resuming(
+        target_ws_urls: Vec<(String, Url)>,
+        mut state: SpammerState,
+        config: &ResumeConfig,
+    ) -> Result<Self> {
+        if target_ws_urls.is_empty() {
+            eyre::bail!("No target nodes provided");
+        }
+
+        let mut ws_client_builders = Vec::new();
+        for (_, url) in &target_ws_urls {
+            ws_client_builders.push(
+                WsClientBuilder::new(url.clone(), Duration::from_secs(10))
+                    .with_connect_timeout(Duration::from_mins(30)),
+            );
+        }
+        for tx_gen in &mut state.generators {
+            tx_gen.update_ws_client_builders(ws_client_builders.clone());
+        }
+        state.resync_nonces().await?;
+
+        let num_generators = state.generators.len();
+        info!(
+            "Resuming spam generator for {} nodes, {} generators at {} TPS for {}s",
+            target_ws_urls.len(),
+            num_generators,
+            config.max_rate,
+            config.max_time,
+        );
+
+        let (result_sender, result_receiver) = mpsc::channel::<Result<u64>>(10000);
+        let (finish_sender, finish_receiver) = mpsc::channel::<()>(1);
+
+        let (tx_latency_sender, latency_tracker) = if config.tx_latency {
+            let (sender, receiver) = mpsc::channel::<TxSubmitted>(LATENCY_CHANNEL_CAPACITY);
+            let csv_name = format!(
+                "tx_latency_{}.csv",
+                chrono::Utc::now().format("%Y%m%d_%H%M%S")
+            );
+            let csv_path = match &config.csv_dir {
+                Some(dir) => dir.join(&csv_name),
+                None => PathBuf::from(csv_name),
+            };
+            if let Some(parent) = csv_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                create_dir_all(parent)?;
+            }
+            let ws_builder = ws_client_builders
+                .first()
+                .cloned()
+                .ok_or_else(|| eyre::eyre!("No RPC endpoints available"))?;
+            let tracker = LatencyTracker::new(ws_builder, receiver, csv_path).await?;
+            (Some(sender), Some(tracker))
+        } else {
+            (None, None)
+        };
+
+        let rate_limiter = Arc::new(RateLimiter::new(
+            config.max_rate,
+            config.max_num_txs,
+            num_generators,
+        ));
+
+        let mut tx_generators = Vec::new();
+        let mut tx_senders = Vec::new();
+        for (i, mut tx_gen) in state.generators.into_iter().enumerate() {
+            let (tx_channel_sender, tx_channel_receiver) = mpsc::channel::<TxEnvelope>(10000);
+            tx_gen.reset_tx_sender(tx_channel_sender);
+
+            let sender = TxSender::new_channel(
+                i,
+                ws_client_builders.clone(),
+                tx_channel_receiver,
+                result_sender.clone(),
+                rate_limiter.clone(),
+                crate::sender::TxSenderConfig {
+                    max_time: config.max_time,
+                    wait_response: config.wait_response,
+                    reconnect_attempts: config.reconnect_attempts,
+                    reconnect_period: config.reconnect_period,
+                    latency_sender: tx_latency_sender.clone(),
+                },
+            )
+            .await?;
+
+            tx_generators.push(tx_gen);
+            tx_senders.push(sender);
+        }
+
+        let result_tracker = ResultTracker::new(
+            ws_client_builders,
+            result_receiver,
+            finish_receiver,
+            config.silent,
+            config.show_pool_status,
+        )
+        .await?;
+
+        Ok(Self {
+            tx_generators,
+            tx_senders,
+            result_tracker,
+            latency_tracker,
+            finish_sender,
+        })
+    }
+
+    /// Run the spammer and discard captured state
+    pub async fn run(self) -> Result<()> {
+        self.run_capturing_state().await.map(|_| ())
     }
 }

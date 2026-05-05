@@ -31,7 +31,6 @@ import {
   parseAbi,
   parseGwei,
   toHex,
-  zeroAddress,
 } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import {
@@ -301,19 +300,16 @@ describe('genesis', () => {
     it('initial addresses', async () => {
       const { protocolConfig, expectAddr } = await clients()
 
-      const [admin, owner, controller, pauser, beneficiary] = await Promise.all([
+      const [admin, owner, controller, pauser] = await Promise.all([
         protocolConfig.admin(),
         protocolConfig.owner(),
         protocolConfig.controller(),
         protocolConfig.pauser(),
-        protocolConfig.rewardBeneficiary(),
       ])
       expect(admin).to.be.addressEqual(expectAddr.proxyAdmin)
       expect(owner.toLowerCase()).to.be.eq(expectAddr.admin)
       expect(controller.toLowerCase()).to.be.eq(expectAddr.admin)
       expect(pauser.toLowerCase()).to.be.eq(expectAddr.admin)
-      // Zero sentinel: EL honors the CL-provided --suggested-fee-recipient per validator.
-      expect(beneficiary.toLowerCase()).to.be.eq(zeroAddress)
     })
 
     it('fee params', async () => {

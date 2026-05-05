@@ -37,6 +37,16 @@ use crate::ws::{WsClient, WsClientBuilder};
 use crate::erc20::TEST_TOKEN_ADDRESS;
 
 pub(crate) const TESTNET_CHAIN_ID: u64 = 1337;
+
+/// Max fee per gas (in wei) used for all generated transactions.
+///
+/// Sized for 2x headroom over the testnet `maxBaseFee` ceiling (20,000 gwei) so
+/// the spammer keeps submitting when the base fee pegs at the ceiling.
+pub(crate) const MAX_FEE_PER_GAS: u128 = 40_000 * 1_000_000_000;
+
+/// Max priority fee per gas (tip) in wei.
+pub(crate) const MAX_PRIORITY_FEE_PER_GAS: u128 = 1_000_000_000;
+
 const GUZZLER_ADDRESS: Address = address!("45a834A6bB86F516D4157a8cBcc60f2F35F8398C");
 
 /// Generates and signs transactions from a pool of pre-funded genesis accounts.
@@ -180,6 +190,21 @@ impl TxGenerator {
     pub fn with_query_nonces_on_init(mut self, enabled: bool) -> Self {
         self.query_nonces_on_init = enabled;
         self
+    }
+
+    /// Replace the tx channel sender, used when reusing a generator across phases.
+    pub(crate) fn reset_tx_sender(&mut self, sender: Sender<TxEnvelope>) {
+        self.tx_sender = Some(sender);
+        // Clear stale connections so init() rebuilds them on the next run.
+        self.ws_clients = None;
+    }
+
+    /// Update the WebSocket client builders, used when reusing a generator
+    /// against a different set of target nodes. Clears cached connections so
+    /// they are rebuilt against the new URLs on the next run.
+    pub(crate) fn update_ws_client_builders(&mut self, builders: Vec<WsClientBuilder>) {
+        self.ws_client_builders = builders;
+        self.ws_clients = None;
     }
 
     async fn build_ws_clients(&self) -> Result<Vec<WsClient>> {
@@ -462,6 +487,52 @@ impl TxGenerator {
         self.skipped_accounts.insert(account_index);
     }
 
+    /// Re-query on-chain nonces for all accounts and overwrite cached values.
+    ///
+    /// Uses `eth_getTransactionCount` with "pending" to skip nonces already
+    /// accepted by the pool.
+    pub(crate) async fn resync_nonces(&mut self) -> Result<()> {
+        let size = self.signers_range.len();
+        info!(
+            "TxGenerator {}: resyncing nonces for {size} accounts...",
+            self.id
+        );
+
+        for i in 0..size {
+            if self.signers[i].is_none() {
+                let index = self.signers_range.start + i;
+                self.signers[i] = Some(self.account_builder.build(index)?);
+            }
+        }
+
+        let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, u64)>>> =
+            Vec::with_capacity(size);
+        for i in 0..size {
+            let address = self.signers[i].as_ref().expect("built above").address();
+            let cached = self.next_nonces[i];
+            let builders = self.ws_client_builders.clone();
+            handles.push(tokio::spawn(async move {
+                let mut ws_clients = {
+                    let mut clients = Vec::with_capacity(builders.len());
+                    for builder in builders {
+                        clients.push(builder.build().await?);
+                    }
+                    clients
+                };
+                Self::fetch_nonce(&mut ws_clients, address, cached)
+                    .await
+                    .map(|nonce| (i, nonce))
+            }));
+        }
+        for handle in handles {
+            let (i, nonce) = handle.await??;
+            self.next_nonces[i] = Some(nonce);
+        }
+
+        info!("TxGenerator {}: nonce resync complete", self.id);
+        Ok(())
+    }
+
     /// Re-query the latest nonce for the given account from the node.
     /// Used after a rejection to recover to the correct nonce.
     pub async fn refresh_nonce(&mut self, account_index: usize) -> Result<()> {
@@ -473,7 +544,7 @@ impl TxGenerator {
             .ws_clients
             .as_mut()
             .ok_or_else(|| eyre::eyre!("ws_clients not initialized"))?;
-        let nonce = Self::get_latest_nonce(ws_clients, address).await?;
+        let nonce = Self::fetch_nonce(ws_clients, address, None).await?;
         self.next_nonces[account_index] = Some(nonce);
         Ok(())
     }
@@ -613,6 +684,26 @@ impl TxGenerator {
         None
     }
 
+    /// Fetch the latest nonce for `address`, falling back to `cached` on failure.
+    ///
+    /// Pass `cached = None` to propagate errors (e.g. in `refresh_nonce`, where
+    /// the caller must obtain the correct nonce). Pass `cached = Some(n)` to
+    /// tolerate transient RPC failures by keeping the last known value.
+    async fn fetch_nonce(
+        ws_clients: &mut [WsClient],
+        address: Address,
+        cached: Option<u64>,
+    ) -> Result<u64> {
+        match (Self::get_latest_nonce(ws_clients, address).await, cached) {
+            (Ok(nonce), _) => Ok(nonce),
+            (Err(e), Some(c)) => {
+                warn!("Failed to fetch nonce for {address}: {e}; keeping cached {c}");
+                Ok(c)
+            }
+            (Err(e), None) => Err(e),
+        }
+    }
+
     /// Query all RPC endpoints to find the latest nonce (the highest
     /// value) used by the given address. Tolerates individual node
     /// failures and returns the highest nonce from any successful
@@ -659,8 +750,8 @@ impl TxGenerator {
         TxEip1559 {
             chain_id: TESTNET_CHAIN_ID,
             nonce,
-            max_priority_fee_per_gas: 1_000_000_000, // 1 gwei
-            max_fee_per_gas: 2_000_000_000,          // 2 gwei
+            max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS,
+            max_fee_per_gas: MAX_FEE_PER_GAS,
             gas_limit: 30_000 + input_gas, // base tx + input gas, Arc requires ~26k for transfers (blocklist check)
             to: Address::left_padding_from(&(nonce.wrapping_add(0x1000)).to_be_bytes()).into(), // avoid zero address and Ethereum precompile addresses
             value: U256::from(1e16), // 0.01 ETH
@@ -677,7 +768,7 @@ impl TxGenerator {
         TxLegacy {
             chain_id: Some(TESTNET_CHAIN_ID),
             nonce,
-            gas_price: 2_000_000_000, // 2 gwei
+            gas_price: MAX_FEE_PER_GAS,
             gas_limit: 30_000 + input_gas,
             to: Address::left_padding_from(&(nonce.wrapping_add(0x1000)).to_be_bytes()).into(),
             value: U256::from(1e16), // 0.01 ETH
@@ -697,8 +788,8 @@ impl TxGenerator {
         TxEip1559 {
             chain_id: TESTNET_CHAIN_ID,
             nonce,
-            max_priority_fee_per_gas: 1_000_000_000, // 1 gwei
-            max_fee_per_gas: 2_000_000_000,          // 2 gwei
+            max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS,
+            max_fee_per_gas: MAX_FEE_PER_GAS,
             gas_limit,
             to: Some(addr).into(),
             value: U256::ZERO,

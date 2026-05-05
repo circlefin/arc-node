@@ -130,7 +130,6 @@ task('query-state', 'query state for the network')
       cmp.eq('ProtocolConfig.owner', state, config)
       cmp.eq('ProtocolConfig.controller', state, config)
       cmp.eq('ProtocolConfig.pauser', state, config)
-      cmp.eq('ProtocolConfig.beneficiary', state, config)
       cmp.eq('ProtocolConfig.feeParams', state, config)
 
       // Verify ProtocolConfig bytecode
@@ -205,13 +204,12 @@ const queryProtocolConfig = async (
     client,
   }).read
 
-  const [admin, impl, owner, controller, pauser, beneficiary, feeParams, consensusParams] = await Promise.all([
+  const [admin, impl, owner, controller, pauser, feeParams, consensusParams] = await Promise.all([
     protocolConfig.admin(),
     protocolConfig.implementation(),
     protocolConfig.owner(),
     protocolConfig.controller(),
     protocolConfig.pauser(),
-    protocolConfig.rewardBeneficiary(),
     protocolConfig.feeParams(),
     protocolConfig.consensusParams().then((params) => ({
       timeoutProposeMs: BigInt(params.timeoutProposeMs),
@@ -231,7 +229,6 @@ const queryProtocolConfig = async (
     owner,
     controller,
     pauser,
-    beneficiary,
     feeParams,
     consensusParams,
   }

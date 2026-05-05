@@ -23,7 +23,6 @@ import {
   type FeeParams,
   type ConsensusParams,
 } from '../helpers'
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { Address, decodeFunctionResult, encodeFunctionData, parseAbi, zeroAddress } from 'viem'
 import { multicall3Address } from '../../scripts/genesis'
 import { schemaHex } from '../../scripts/genesis/types'
@@ -40,10 +39,9 @@ describe('ProtocolConfig simulation', () => {
       chain: getChain(hre),
     })
     const protocolConfig = ProtocolConfig.attach(client)
-    const randomWallet = privateKeyToAccount(generatePrivateKey())
     const extraAbi = parseAbi(['function upgradeTo(address newImplementation)'])
 
-    return { client, randomWallet, protocolConfig, extraAbi }
+    return { client, protocolConfig, extraAbi }
   }
 
   it('migrate contract', async () => {
@@ -118,57 +116,6 @@ describe('ProtocolConfig simulation', () => {
         data: schemaHex.parse(pauseRead),
       })
       expect(parsedPaused).to.equal(true, 'ProtocolConfig should report paused after pause()')
-    })
-
-    it('controller wallet from genesis config can update controller-only fields', async function () {
-      const controllerWallet = protocolConfigGenesis?.controller
-      expect(controllerWallet).to.not.be.undefined
-
-      const { client, protocolConfig, randomWallet } = await clients()
-      const [onchainController] = await Promise.all([
-        protocolConfig.read.controller(),
-        protocolConfig.read.rewardBeneficiary(),
-      ])
-      expect(onchainController).to.addressEqual(controllerWallet, 'on-chain controller differs from genesis config')
-
-      const beneficiaryReadCall = {
-        account: controllerWallet,
-        to: ProtocolConfig.address,
-        data: encodeFunctionData({ abi: protocolConfig.abi, functionName: 'rewardBeneficiary', args: [] }),
-      }
-
-      const calls = [
-        {
-          account: controllerWallet,
-          to: ProtocolConfig.address,
-          data: encodeFunctionData({
-            abi: protocolConfig.abi,
-            functionName: 'updateRewardBeneficiary',
-            args: [randomWallet.address],
-          }),
-        },
-        beneficiaryReadCall,
-      ]
-
-      const result = await client.simulateBlocks({ blocks: [{ calls }] })
-      const executedCalls = result[0]?.calls ?? []
-      expect(executedCalls.length).to.equal(calls.length)
-
-      executedCalls.forEach((call, idx) => {
-        expect(call.error).to.be.undefined
-        expect(call.status).to.equal('success', `call ${idx} should succeed`)
-      })
-
-      const benecifiaryRead = executedCalls[1]?.data
-      expect(benecifiaryRead).to.not.be.undefined
-
-      const newBeneficiary = decodeFunctionResult({
-        abi: protocolConfig.abi,
-        functionName: 'rewardBeneficiary',
-        data: schemaHex.parse(benecifiaryRead),
-      })
-
-      expect(newBeneficiary).to.addressEqual(randomWallet.address)
     })
 
     it('controller can push fee params near new upper bounds', async function () {

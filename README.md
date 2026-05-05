@@ -162,8 +162,8 @@ security find-certificate -p -c '<cert name>' > deployments/certs/<cert name>.cr
 Interact with the testnet:
 
 ```bash
-# Spam transactions
-make testnet-spam
+# Send tx load (usage: make testnet-load RATE=1000 TIME=60)
+make testnet-load
 
 # Stop the testnet
 make testnet-down
@@ -213,3 +213,4 @@ arc-node is open-source software, licensed under Apache 2.0, built from a number
 [Hardhat / Nomic Foundation](https://github.com/NomicFoundation/hardhat) - we thank the team for their continued development of the Hardhat toolchain. 
 
 [Viem](https://github.com/wevm/viem) - we thank the team for their continued development of Viem and other libraries.
+

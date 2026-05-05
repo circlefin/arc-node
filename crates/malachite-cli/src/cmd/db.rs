@@ -26,6 +26,10 @@ pub enum DbCommands {
 
     /// Compact the database to reclaim space. The node must be stopped before running this command.
     Compact,
+
+    /// Roll back the database by removing heights. Dry-run by default; pass --execute to commit.
+    #[clap(alias = "unwind")]
+    Rollback(RollbackCmd),
 }
 
 #[derive(Args, Clone, Debug, Default)]
@@ -33,4 +37,21 @@ pub struct MigrateCmd {
     /// Perform a dry-run without actually upgrading
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(Args, Clone, Debug, Default)]
+pub struct RollbackCmd {
+    /// Number of heights to remove from the tip of the consensus DB.
+    /// Mutually exclusive with --to-height.
+    #[arg(long, value_name = "COUNT", conflicts_with = "to_height")]
+    pub num_heights: Option<u64>,
+
+    /// Absolute height to roll back to. All data above this height is removed.
+    /// Mutually exclusive with --num-heights.
+    #[arg(long, value_name = "HEIGHT", conflicts_with = "num_heights")]
+    pub to_height: Option<u64>,
+
+    /// Actually execute the rollback. Without this flag the command is a dry run.
+    #[arg(long)]
+    pub execute: bool,
 }

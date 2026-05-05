@@ -43,7 +43,6 @@ contract ProtocolConfigProxyTest is Test {
     address public controller; // Controller role for ProtocolConfig
     address public pauser; // Pauser role for ProtocolConfig
     address public implementationOwner; // Owner of the ProtocolConfig implementation
-    address public rewardBeneficiary;
 
     // Default test parameters
     IProtocolConfig.FeeParams public defaultFeeParams = IProtocolConfig.FeeParams({
@@ -74,7 +73,6 @@ contract ProtocolConfigProxyTest is Test {
         controller = makeAddr("controller");
         pauser = makeAddr("pauser");
         implementationOwner = makeAddr("implementationOwner");
-        rewardBeneficiary = makeAddr("rewardBeneficiary");
 
         // Deploy implementation contract
         implementation = new ProtocolConfig();
@@ -91,7 +89,7 @@ contract ProtocolConfigProxyTest is Test {
 
         // Simulate genesis file initialization by directly setting storage
         _simulateGenesisStorageInitialization(
-            controller, pauser, defaultFeeParams, defaultConsensusParams, rewardBeneficiary
+            controller, pauser, defaultFeeParams, defaultConsensusParams
         );
 
         // Get the actual proxy admin address from ERC1967 storage
@@ -107,8 +105,7 @@ contract ProtocolConfigProxyTest is Test {
         address _controller,
         address _pauser,
         IProtocolConfig.FeeParams memory _feeParams,
-        IProtocolConfig.ConsensusParams memory _consensusParams,
-        address _rewardBeneficiary
+        IProtocolConfig.ConsensusParams memory _consensusParams
     ) internal {
         // === Set Controller storage ===
         // Controller.controller is in slot 0 (Ownable2StepUpgradeable uses ERC-7201 namespaced storage)
@@ -164,12 +161,7 @@ contract ProtocolConfigProxyTest is Test {
             bytes32(uint256(_feeParams.blockGasLimit))
         );
 
-        // Slot 4: rewardBeneficiary (address)
-        vm.store(
-            address(protocolConfig),
-            bytes32(uint256(PROTOCOL_CONFIG_STORAGE_LOCATION) + 4),
-            bytes32(uint256(uint160(_rewardBeneficiary)))
-        );
+        // Slot 4: deprecated address placeholder. Left zeroed.
 
         // ConsensusParams struct layout:
         // - timeoutProposeMs (uint16), timeoutProposeDeltaMs (uint16), timeoutPrevoteMs (uint16),
@@ -212,8 +204,6 @@ contract ProtocolConfigProxyTest is Test {
         assertEq(consensusParams.timeoutPrecommitDeltaMs, defaultConsensusParams.timeoutPrecommitDeltaMs);
         assertEq(consensusParams.timeoutRebroadcastMs, defaultConsensusParams.timeoutRebroadcastMs);
         assertEq(consensusParams.targetBlockTimeMs, defaultConsensusParams.targetBlockTimeMs);
-
-        assertEq(protocolConfig.rewardBeneficiary(), rewardBeneficiary);
     }
 
     function test_UpdateFeeParamsViaProxy() public {
@@ -264,15 +254,6 @@ contract ProtocolConfigProxyTest is Test {
         assertEq(updatedParams.timeoutPrecommitDeltaMs, 200);
         assertEq(updatedParams.timeoutRebroadcastMs, 4000);
         assertEq(updatedParams.targetBlockTimeMs, 6000);
-    }
-
-    function test_UpdateRewardBeneficiaryViaProxy() public {
-        address newBeneficiary = makeAddr("newBeneficiary");
-
-        vm.prank(controller);
-        protocolConfig.updateRewardBeneficiary(newBeneficiary);
-
-        assertEq(protocolConfig.rewardBeneficiary(), newBeneficiary);
     }
 
     function test_AccessControlViaProxy() public {
@@ -348,14 +329,9 @@ contract ProtocolConfigProxyTest is Test {
         vm.prank(controller);
         protocolConfig.updateFeeParams(modifiedParams);
 
-        address newBeneficiary = makeAddr("upgradeBeneficiary");
-        vm.prank(controller);
-        protocolConfig.updateRewardBeneficiary(newBeneficiary);
-
         // Verify state before upgrade
         IProtocolConfig.FeeParams memory paramsBeforeUpgrade = protocolConfig.feeParams();
         assertEq(paramsBeforeUpgrade.alpha, 77);
-        assertEq(protocolConfig.rewardBeneficiary(), newBeneficiary);
 
         // Deploy new implementation and upgrade
         ProtocolConfig newImplementation = new ProtocolConfig();
@@ -370,6 +346,5 @@ contract ProtocolConfigProxyTest is Test {
         assertEq(paramsAfterUpgrade.minBaseFee, 1111);
         assertEq(paramsAfterUpgrade.maxBaseFee, 2222);
         assertEq(paramsAfterUpgrade.blockGasLimit, 33333333);
-        assertEq(protocolConfig.rewardBeneficiary(), newBeneficiary);
     }
 }
