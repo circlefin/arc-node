@@ -25,7 +25,7 @@ use crate::helpers::{
     NATIVE_FIAT_TOKEN_ADDRESS, PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY, PRECOMPILE_SLOAD_GAS_COST,
     PRECOMPILE_SSTORE_GAS_COST,
 };
-use crate::stateful;
+use crate::precompile;
 use alloy_evm::EvmInternals;
 use alloy_primitives::{address, Address, StorageKey, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
@@ -131,7 +131,7 @@ pub fn compute_is_blocklisted_storage_slot(key: Address) -> StorageKey {
     StorageKey::new(native_coin_control_config::compute_is_blocklisted_storage_slot(key).0)
 }
 
-stateful!(run_native_coin_control, precompile_input, hardfork_flags; {
+precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
     INativeCoinControl::blocklistCall => |input| {
         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
             let mut gas_counter = Gas::new(precompile_input.gas);
@@ -181,7 +181,7 @@ stateful!(run_native_coin_control, precompile_input, hardfork_flags; {
             check_delegatecall(
                 NATIVE_COIN_CONTROL_ADDRESS,
                 &precompile_input,
-                &mut gas_counter,
+                &gas_counter,
             )?;
 
             // Add to blocklist
@@ -294,7 +294,7 @@ stateful!(run_native_coin_control, precompile_input, hardfork_flags; {
             check_delegatecall(
                 NATIVE_COIN_CONTROL_ADDRESS,
                 &precompile_input,
-                &mut gas_counter,
+                &gas_counter,
             )?;
 
             // Remove from blocklist

@@ -80,9 +80,11 @@ describe('ProtocolConfig Smoke Tests', function () {
     return { txHash, receipt, block }
   }
 
-  // Helper to send transaction, verify miner, and check balance changes
+  // Helper to send transaction, verify miner receives the full fee, and check balance changes.
+  // The miner is derived from the block (not passed in) so this works under both smoke
+  // scenarios — reth --dev always mines to the genesis coinbase, malachite rotates per
+  // proposer. The miner's fee delta is checked via block-granular historical balances.
   async function sendTransactionAndVerifyBalances(params: {
-    beneficiary: Address
     transferAmount?: bigint
     gasPrice?: bigint
     maxFeePerGas?: bigint
@@ -90,7 +92,6 @@ describe('ProtocolConfig Smoke Tests', function () {
     transactionType?: 'legacy' | 'eip1559'
   }) {
     const {
-      beneficiary,
       transferAmount = parseEther('0.01'), // Default transfer amount
       maxFeePerGas,
       maxPriorityFeePerGas,
@@ -128,9 +129,7 @@ describe('ProtocolConfig Smoke Tests', function () {
       }
     }
 
-    // Setup balance tracking
     const balances = await balancesSnapshot(publicClient, {
-      beneficiary,
       sender: sender.account.address,
       receiver: receiver.account.address,
     })
@@ -147,16 +146,21 @@ describe('ProtocolConfig Smoke Tests', function () {
     const receiptVerifier = ReceiptVerifier.build(receipt)
     const totalFee = receiptVerifier.totalFee()
 
-    // Verify block miner matches beneficiary
     if (!block.miner) {
       throw new Error('Block miner is undefined')
     }
-    expectAddressEq(block.miner, beneficiary, 'Block miner should match beneficiary')
 
-    // Verify balance changes
+    // Assert Arc's full-fee-to-miner invariant via block-boundary balance delta.
+    // This covers Arc's divergence from standard Ethereum (no base-fee burn) under
+    // both smoke-reth (fixed miner) and smoke-malachite (rotating miner).
+    const [minerBefore, minerAfter] = await Promise.all([
+      publicClient.getBalance({ address: block.miner, blockNumber: block.number - 1n }),
+      publicClient.getBalance({ address: block.miner, blockNumber: block.number }),
+    ])
+    expect(minerAfter - minerBefore, `miner ${block.miner} should receive full tx fee`).to.equal(totalFee)
+
     await balances
       .increase({
-        beneficiary: totalFee,
         receiver: transferAmount,
       })
       .decrease({
@@ -196,12 +200,16 @@ describe('ProtocolConfig Smoke Tests', function () {
   })
 
   describe('Core Integration', function () {
-    it('should use LOCALDEV_FEE_RECIPIENT as block miner', async function () {
-      // The mock CL propagates LOCALDEV_FEE_RECIPIENT as block.miner
-      const { block } = await sendTransactionAndGetBlock(parseEther('0.01'), 1000000000000n, 100000000n)
+    // Only holds under smoke-reth: reth --dev uses the genesis coinbase
+    // (= LOCALDEV_FEE_RECIPIENT) as block.miner. smoke-malachite rotates.
+    ;(process.env.ARC_SMOKE_SCENARIO !== 'malachite' ? it : it.skip)(
+      'should use LOCALDEV_FEE_RECIPIENT as block miner',
+      async function () {
+        const { block } = await sendTransactionAndGetBlock(parseEther('0.01'), 1000000000000n, 100000000n)
 
-      expectAddressEq(block.miner, LOCALDEV_FEE_RECIPIENT, 'Block miner should be LOCALDEV_FEE_RECIPIENT')
-    })
+        expectAddressEq(block.miner, LOCALDEV_FEE_RECIPIENT, 'Block miner should be LOCALDEV_FEE_RECIPIENT')
+      },
+    )
   })
 
   describe('Fee Distribution', function () {
@@ -228,7 +236,6 @@ describe('ProtocolConfig Smoke Tests', function () {
       const transferAmount = parseEther('0.05')
 
       const { receipt, totalFee } = await sendTransactionAndVerifyBalances({
-        beneficiary: LOCALDEV_FEE_RECIPIENT,
         transferAmount,
         transactionType: 'eip1559',
       })

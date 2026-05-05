@@ -41,6 +41,7 @@ pub mod proposer;
 pub mod proto;
 pub mod rpc_sync;
 pub mod signing;
+pub mod spec;
 pub mod ssz;
 pub mod sync;
 
@@ -56,6 +57,7 @@ pub use crate::height::*;
 pub use crate::proposal::*;
 pub use crate::proposal_part::*;
 pub use crate::proposal_parts::*;
+pub use crate::spec::*;
 pub use crate::validator_set::*;
 pub use crate::value::*;
 pub use crate::vote::*;

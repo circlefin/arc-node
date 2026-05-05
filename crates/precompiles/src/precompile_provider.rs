@@ -33,9 +33,8 @@ use revm_primitives::address;
 /// Custom precompile provider that extends Ethereum's standard precompiles
 /// with Arc functionality.
 ///
-/// This provider supports both:
-/// - **Stateless precompiles**: Added at compile time via `custom_stateless_precompiles()`
-/// - **Stateful precompiles**: Managed dynamically via the `stateful_precompiles` HashMap
+/// This provider supports:
+/// - **Stateful precompiles**: Registered dynamically via `set_precompile_lookup`
 #[derive(Debug)]
 pub struct ArcPrecompileProvider;
 

@@ -28,7 +28,8 @@ use malachitebft_app_channel::app::types::core::Round;
 use crate::streaming;
 
 use arc_consensus_types::{
-    Address, AlloyAddress, ArcContext, BlockHash, Config, ConsensusParams, Height, ValidatorSet,
+    Address, AlloyAddress, ArcContext, BlockHash, ChainId, Config, ConsensusParams, ConsensusSpec,
+    Height, NetworkId, ValidatorSet,
 };
 use arc_eth_engine::json_structures::ExecutionBlock;
 use arc_eth_engine::persistence_meter::{NoopPersistenceMeter, PersistenceMeter};
@@ -40,7 +41,6 @@ use crate::env_config::EnvConfig;
 use crate::metrics::app::AppMetrics;
 use crate::node::ConsensusIdentity;
 use crate::request::Status;
-use crate::spec::{ChainId, ConsensusSpec, NetworkId};
 use crate::stats::Stats;
 use crate::store::repositories::UndecidedBlocksRepository;
 use crate::store::Store;
@@ -140,7 +140,7 @@ pub struct State {
     /// Meters EL block persistence to apply backpressure during sync catch-up.
     persistence_meter: Box<dyn PersistenceMeter>,
 
-    /// Consensus-layer chain spec (fork activation by height/time).
+    /// Consensus-layer chain spec (fork activation by height).
     #[allow(dead_code)]
     pub spec: ConsensusSpec,
 
@@ -179,7 +179,7 @@ impl State {
         let network_id = NetworkId::new(
             spec.chain_id,
             genesis_block.block_hash,
-            spec.fork_version_at(initial_height, genesis_block.timestamp),
+            spec.fork_version_at(initial_height),
         );
 
         Self {
@@ -322,11 +322,7 @@ impl State {
     /// Recompute the network ID from the current chain ID, genesis hash, and fork version.
     #[must_use]
     fn recompute_network_id(&mut self) -> NetworkId {
-        let timestamp = self
-            .previous_block
-            .map(|b| b.timestamp)
-            .unwrap_or(self.genesis_block.timestamp);
-        let fork_version = self.spec.fork_version_at(self.current_height, timestamp);
+        let fork_version = self.spec.fork_version_at(self.current_height);
 
         self.network_id =
             NetworkId::new(self.chain_id(), self.genesis_block.block_hash, fork_version);

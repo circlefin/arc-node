@@ -1104,7 +1104,12 @@ impl Testnet {
                 SSMSubcommand::Stop => infra.ssm_tunnels.stop().await,
                 SSMSubcommand::List => infra.ssm_tunnels.list().await,
             },
-            RemoteSubcommand::Destroy { yes } => infra.terraform.destroy(yes),
+            RemoteSubcommand::Destroy { yes } => {
+                if let Err(err) = infra.ssm_tunnels.stop().await {
+                    warn!(%err, "⚠️ Failed to terminate SSM sessions before destroy");
+                }
+                infra.terraform.destroy(yes)
+            }
             RemoteSubcommand::Ssh {
                 node_or_cc,
                 command,

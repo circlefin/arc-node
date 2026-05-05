@@ -101,6 +101,7 @@ config             = { version = "0.14", features = ["toml"], default-features =
 # get the wrong path, update this when the workflow has been updated
 #
 # See: https://github.com/eira-fransham/crunchy/issues/13
+criterion = "0.7"
 crunchy = "=0.2.2"
 csv = "1.4"
 deranged = "0.5.5"
@@ -223,6 +224,7 @@ serde = { version = "1.0", default-features = false }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 serde_with = { version = "3", default-features = false, features = ["macros"] }
 serial_test = "3"
+sha2 = "0.10.9"
 sha3 = "0.10.5"
 signature          = "2.2.0"
 # Security fix for RUSTSEC-2025-0047

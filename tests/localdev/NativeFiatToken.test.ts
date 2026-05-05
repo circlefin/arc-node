@@ -20,7 +20,6 @@ import {
   NativeCoinAuthority,
   NativeTransferHelper,
   ReceiptVerifier,
-  LOCALDEV_FEE_RECIPIENT,
   getClients,
 } from '../helpers'
 import { signPermit, USDC } from '../helpers/FiatToken'
@@ -83,8 +82,8 @@ describe('NativeFiatToken', () => {
     const receipt = await USDC.attach(sender)
       .write.transfer([receiver.account.address, amount])
       .then(ReceiptVerifier.waitSuccess)
-    // Zero5: EIP-2929 warm/cold gas pricing
-    receipt.verifyGasUsedApproximately(54638n).verifyEvents((ev) => {
+    // Zero6: EIP-2929 warm/cold account-load pricing
+    receipt.verifyGasUsedApproximately(51038n).verifyEvents((ev) => {
       ev.expectNativeTransfer({ from: sender, to: receiver, amount: USDC.toNative(amount) })
         .expectUSDCTransfer({ from: sender, to: receiver, value: amount })
         .expectAllEventsMatched()
@@ -447,7 +446,6 @@ describe('NativeFiatToken', () => {
 
       // Setup balance tracking AFTER blocklist operation to avoid interference
       const balances = await balancesSnapshot(client, {
-        beneficiary: LOCALDEV_FEE_RECIPIENT,
         sender: sender.account.address,
         receiver: receiver.address,
       })
@@ -460,13 +458,19 @@ describe('NativeFiatToken', () => {
       // Calculate gas fees and verify balance changes
       const totalFee = receiptVerifier.totalFee()
 
-      // Verify that gas was consumed from sender and reward sent to beneficiary
+      // Verify the actual block miner received the gas fees. Derived from block.miner
+      // (not hard-coded) so this works under both smoke scenarios — reth --dev always
+      // mines to the genesis coinbase, malachite rotates per proposer.
+      const block = await client.getBlock({ blockHash: receiptVerifier.blockHash })
+      const [minerBefore, minerAfter] = await Promise.all([
+        client.getBalance({ address: block.miner, blockNumber: block.number - 1n }),
+        client.getBalance({ address: block.miner, blockNumber: block.number }),
+      ])
+      expect(minerAfter - minerBefore, `miner ${block.miner} should receive gas fees`).to.equal(totalFee)
+
       await balances
-        .increase({
-          beneficiary: totalFee, // Beneficiary receives gas fees
-        })
         .decrease({
-          sender: totalFee, // Sender pays the gas fees
+          sender: totalFee,
         })
         .verify()
 

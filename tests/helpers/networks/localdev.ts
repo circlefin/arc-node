@@ -26,6 +26,16 @@ import { expect } from 'chai'
 // Used as genesis coinbase and cl_suggested_fee_recipient across all localdev validators.
 export const LOCALDEV_FEE_RECIPIENT: Address = localdevFeeRecipient
 
+// Per-validator fee recipients used by `crates/quake/scenarios/localdev.toml`.
+// Index `i` corresponds to `validator${i + 1}` in the manifest.
+export const LOCALDEV_FEE_RECIPIENTS: readonly Address[] = [
+  '0x1111111111111111111111111111111111111111',
+  '0x2222222222222222222222222222222222222222',
+  '0x3333333333333333333333333333333333333333',
+  '0x4444444444444444444444444444444444444444',
+  '0x5555555555555555555555555555555555555555',
+] as const
+
 /**
  * Get the clients for the localdev network
  * @returns The clients for the localdev network

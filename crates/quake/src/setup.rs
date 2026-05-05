@@ -39,6 +39,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 use url::Url;
 
+use crate::cli_version::{apply_version_compat, supports_cli_flags};
 use crate::infra::InfraType;
 use crate::manifest::{self, Subnets};
 use crate::node::{CidrBlock, NodeMetadata, NodeName, SubnetName, RETH_HTTP_BASE_PORT};
@@ -52,8 +53,10 @@ const APP_METRICS_DEFAULT_PORT: usize = 29000;
 const APP_RPC_DEFAULT_PORT: usize = 31000;
 const REMOTE_SIGNER_PROXY_PORT: usize = 10340;
 
-/// Placeholder recipient for validators that don't set `cl_suggested_fee_recipient`;
-/// matches `LOCALDEV_FEE_RECIPIENT` in `tests/helpers/networks/localdev.ts`.
+/// Fallback recipient when a validator scenario doesn't set `cl_suggested_fee_recipient`.
+/// Matches `LOCALDEV_FEE_RECIPIENT` in `tests/helpers/networks/localdev.ts`. Used by
+/// scenarios like `localdev-remote-signer.toml`; `localdev.toml` sets per-validator
+/// recipients explicitly.
 const QUAKE_DEFAULT_FEE_RECIPIENT: Address = address!("0x65E0a200006D4FF91bD59F9694220dafc49dbBC1");
 
 /// Compile system contracts and bindings
@@ -63,13 +66,23 @@ pub(crate) fn generate_system_contracts(repo_root_dir: &Path, force: bool) -> Re
         let cmd = "npm install";
         shell::exec("bash", vec!["-c", cmd], repo_root_dir, None, false)?;
     }
-    // Compile contracts
-    let contracts_dir = repo_root_dir.join("contracts").join("out").join("hardhat");
-    if force || !contracts_dir.exists() {
+    // Compile Hardhat contracts (genesis task reads from contracts/out/hardhat/)
+    let hardhat_out_dir = repo_root_dir.join("contracts").join("out").join("hardhat");
+    if force || !hardhat_out_dir.exists() {
         let cmd = "npx hardhat --config hardhat.config.ts compile";
         shell::exec("bash", vec!["-c", cmd], repo_root_dir, None, false)?;
     } else {
-        debug!("⏭️ Skipping compiling contracts");
+        debug!("⏭️ Skipping Hardhat compile");
+    }
+
+    // Compile Forge contracts (ArtifactHelper.s.sol reads from contracts/out/forge/ to
+    // compute CREATE2 addresses; stale artifacts produce wrong contract addresses in genesis)
+    let forge_out_dir = repo_root_dir.join("contracts").join("out").join("forge");
+    if force || !forge_out_dir.exists() {
+        let cmd = "forge build";
+        shell::exec("bash", vec!["-c", cmd], repo_root_dir, None, false)?;
+    } else {
+        debug!("⏭️ Skipping Forge compile");
     }
 
     Ok(())
@@ -144,7 +157,7 @@ pub(crate) fn generate_genesis_file(
 
     // Cache genesis file for the given parameters. For 100k extra prefunded
     // accounts, it takes about 10 minutes to generate.
-    if !cached_genesis_file.exists() {
+    if force || !cached_genesis_file.exists() {
         let val_names_joined = validator_names.join(",");
         let mut cmd = format!(
             "npx hardhat \
@@ -692,63 +705,6 @@ fn save_config(path: &Path, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// The minimum version that supports CLI flags instead of config.toml
-const MIN_CLI_FLAGS_VERSION: (u64, u64, u64) = (0, 5, 0);
-
-/// Result of checking whether a CL image supports CLI flags.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum CliVersionCheck {
-    /// Version parsed and supports CLI flags (>= v0.5.0)
-    SupportsCli,
-    /// Version parsed and does NOT support CLI flags (< v0.5.0, needs config.toml)
-    RequiresConfigToml,
-    /// Version could not be parsed (e.g. git SHA); assumed to support CLI flags
-    Assumed,
-}
-
-/// Detailed version check for safeguard validation.
-pub(crate) fn check_cli_version(image_tag: Option<&str>) -> CliVersionCheck {
-    let Some(tag) = image_tag else {
-        return CliVersionCheck::Assumed;
-    };
-    let version_str = tag.rsplit(':').next().unwrap_or(tag);
-    if version_str == "latest" {
-        return CliVersionCheck::SupportsCli;
-    }
-    let version_str = version_str.strip_prefix('v').unwrap_or(version_str);
-    let parts: Vec<&str> = version_str.split('.').collect();
-    if parts.len() < 3 {
-        return CliVersionCheck::Assumed;
-    }
-    let Ok(major) = parts[0].parse::<u64>() else {
-        return CliVersionCheck::Assumed;
-    };
-    let Ok(minor) = parts[1].parse::<u64>() else {
-        return CliVersionCheck::Assumed;
-    };
-    let patch_str = parts[2].split('-').next().unwrap_or(parts[2]);
-    let Ok(patch) = patch_str.parse::<u64>() else {
-        return CliVersionCheck::Assumed;
-    };
-    if (major, minor, patch) >= MIN_CLI_FLAGS_VERSION {
-        CliVersionCheck::SupportsCli
-    } else {
-        CliVersionCheck::RequiresConfigToml
-    }
-}
-
-/// Check if an image tag version supports CLI flags.
-///
-/// Returns `false` only for versions definitively older than v0.5.0.
-/// Returns `true` for `latest`, `None`, versions >= v0.5.0, and unparseable tags
-/// (which are assumed to be v0.5.0+).
-///
-/// See [`check_cli_version`] for finer-grained distinction between confirmed
-/// and assumed support.
-pub(crate) fn supports_cli_flags(image_tag: Option<&str>) -> bool {
-    check_cli_version(image_tag) != CliVersionCheck::RequiresConfigToml
-}
-
 //////////////////////////////////////////////////////////////////
 // END OF TODO: Remove once the network is fully migrated to use CLI flags. I.e
 // when all scenarios use v0.5.0 or later.
@@ -815,7 +771,8 @@ pub(crate) fn generate_consensus_cli_flags(
 
             // `--validator` requires a non-zero `--suggested-fee-recipient`. When
             // validator scenarios omit `cl_suggested_fee_recipient`, fall back to
-            // the localdev placeholder so consensus can still start.
+            // QUAKE_DEFAULT_FEE_RECIPIENT, which is what localdev genesis expects
+            // when `ProtocolConfig.rewardBeneficiary = 0`.
             let effective_fee_recipient = node.cl_suggested_fee_recipient.or_else(|| {
                 (node.node_type == manifest::NodeType::Validator)
                     .then_some(QUAKE_DEFAULT_FEE_RECIPIENT)
@@ -852,7 +809,7 @@ pub(crate) fn generate_consensus_cli_flags(
 
             let flags = cmd.to_cli_flags();
             validate_generated_cl_flags(&flags)?;
-            Ok(flags)
+            Ok(apply_version_compat(flags, image_tag))
         }
     }
 }
@@ -894,7 +851,7 @@ fn generate_default_consensus_cli_flags(
 
     let flags = cmd.to_cli_flags();
     validate_generated_cl_flags(&flags)?;
-    Ok(flags)
+    Ok(apply_version_compat(flags, image_tag))
 }
 
 /// Validate generated CL CLI flags by trial-parsing them against the actual
@@ -1383,42 +1340,6 @@ mod tests {
             read_key(ref_dir.path(), "ref-3"),
             "sentry-1 should get key[3]"
         );
-    }
-
-    #[test]
-    fn supports_cli_flags_returns_true_for_latest() {
-        assert!(supports_cli_flags(Some("arc_consensus:latest")));
-        assert!(supports_cli_flags(Some("latest")));
-    }
-
-    #[test]
-    fn supports_cli_flags_returns_true_for_new_versions() {
-        assert!(supports_cli_flags(Some("arc_consensus:v0.5.0")));
-        assert!(supports_cli_flags(Some("arc_consensus:v0.6.0")));
-        assert!(supports_cli_flags(Some("arc_consensus:v1.0.0")));
-        assert!(supports_cli_flags(Some("v0.5.0")));
-        assert!(supports_cli_flags(Some("0.5.0")));
-    }
-
-    #[test]
-    fn supports_cli_flags_returns_false_for_old_versions() {
-        assert!(!supports_cli_flags(Some("arc_consensus:v0.4.0")));
-        assert!(!supports_cli_flags(Some("arc_consensus:v0.4.1")));
-        assert!(!supports_cli_flags(Some("arc_consensus:v0.3.0")));
-        assert!(!supports_cli_flags(Some("v0.4.0")));
-        assert!(!supports_cli_flags(Some("0.4.0")));
-    }
-
-    #[test]
-    fn supports_cli_flags_returns_true_for_none() {
-        assert!(supports_cli_flags(None));
-    }
-
-    #[test]
-    fn supports_cli_flags_handles_prerelease_versions() {
-        assert!(supports_cli_flags(Some("v0.5.0-rc1")));
-        assert!(supports_cli_flags(Some("v0.5.0-beta")));
-        assert!(!supports_cli_flags(Some("v0.4.0-rc1")));
     }
 
     #[test]
@@ -1994,6 +1915,91 @@ mod tests {
         assert!(
             !flags_str.contains("--validator"),
             "should not contain --validator: {flags_str}"
+        );
+    }
+
+    #[test]
+    fn generate_consensus_cli_flags_omits_validator_for_images_that_predate_the_flag() {
+        let node = manifest::Node {
+            node_type: manifest::NodeType::Validator,
+            ..Default::default()
+        };
+        let flags = generate_consensus_cli_flags(
+            "val-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            Some("arc_consensus:v0.6.0"),
+            &[],
+        )
+        .unwrap();
+        let flags_str = flags.join(" ");
+        assert!(
+            !flags_str.contains("--validator"),
+            "should not contain --validator for a pre-flag image: {flags_str}"
+        );
+    }
+
+    #[test]
+    fn generate_consensus_cli_flags_emits_validator_for_images_strictly_newer_than_last_unsupported(
+    ) {
+        let node = manifest::Node {
+            node_type: manifest::NodeType::Validator,
+            ..Default::default()
+        };
+        for tag in ["arc_consensus:v0.6.1", "arc_consensus:v0.7.0"] {
+            let flags = generate_consensus_cli_flags(
+                "val-1",
+                Some(&node),
+                "172.19.0.5",
+                &[],
+                Some(tag),
+                &[],
+            )
+            .unwrap();
+            let flags_str = flags.join(" ");
+            assert!(
+                flags_str.contains("--validator"),
+                "missing --validator for tag {tag:?} (expected to postdate the flag): {flags_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_consensus_cli_flags_emits_validator_for_latest_image() {
+        let node = manifest::Node {
+            node_type: manifest::NodeType::Validator,
+            ..Default::default()
+        };
+        let flags = generate_consensus_cli_flags(
+            "val-1",
+            Some(&node),
+            "172.19.0.5",
+            &[],
+            Some("arc_consensus:latest"),
+            &[],
+        )
+        .unwrap();
+        let flags_str = flags.join(" ");
+        assert!(
+            flags_str.contains("--validator"),
+            "missing --validator for the latest image: {flags_str}"
+        );
+    }
+
+    #[test]
+    fn generate_consensus_cli_flags_emits_validator_when_image_tag_missing() {
+        let node = manifest::Node {
+            node_type: manifest::NodeType::Validator,
+            ..Default::default()
+        };
+        let flags =
+            generate_consensus_cli_flags("val-1", Some(&node), "172.19.0.5", &[], None, &[])
+                .unwrap();
+        let flags_str = flags.join(" ");
+        assert!(
+            flags_str.contains("--validator"),
+            "missing --validator when no image tag is given: {flags_str}"
         );
     }
 

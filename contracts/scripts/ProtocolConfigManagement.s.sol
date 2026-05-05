@@ -32,9 +32,6 @@ import {Addresses} from "./Addresses.sol";
  * Print consensus params:
  *   forge script scripts/ProtocolConfigManagement.s.sol --rpc-url <network> --sig "printConsensusParams()"
  *
- * Print reward beneficiary:
- *   forge script scripts/ProtocolConfigManagement.s.sol --rpc-url <network> --sig "printRewardBeneficiary()"
- *
  * Print all params:
  *   forge script scripts/ProtocolConfigManagement.s.sol --rpc-url <network> --sig "printAllParams()"
  *
@@ -72,10 +69,6 @@ import {Addresses} from "./Addresses.sol";
  *
  * Update all consensus params:
  *   forge script scripts/ProtocolConfigManagement.s.sol --rpc-url <network> --sig "updateAllConsensusParams(uint16,uint16,uint16,uint16,uint16,uint16,uint16,uint16)" <propose> <proposeDelta> <prevote> <prevoteDelta> <precommit> <precommitDelta> <rebroadcast> <targetBlockTime> --broadcast
- *
- * ============ Update Reward Beneficiary (controller only, requires CONTROLLER_KEY env var) ============
- * Update reward beneficiary:
- *   forge script scripts/ProtocolConfigManagement.s.sol --rpc-url <network> --sig "updateRewardBeneficiary(address)" <newBeneficiary> --broadcast
  */
 contract ProtocolConfigManagement is Script {
     // ============ Constants ============
@@ -110,19 +103,10 @@ contract ProtocolConfigManagement is Script {
         console.log("targetBlockTimeMs:", params.targetBlockTimeMs);
     }
 
-    function printRewardBeneficiary() public view returns (address beneficiary) {
-        beneficiary = PROTOCOL_CONFIG.rewardBeneficiary();
-
-        console.log("ProtocolConfig RewardBeneficiary:");
-        console.log("beneficiary:", beneficiary);
-    }
-
     function printAllParams() public view {
         printFeeParams();
         console.log("");
         printConsensusParams();
-        console.log("");
-        printRewardBeneficiary();
     }
 
     // ============ Internal Helpers ============
@@ -379,17 +363,6 @@ contract ProtocolConfigManagement is Script {
         _broadcastConsensusParamsUpdate(params);
     }
 
-    /**
-     * @notice Updates the reward beneficiary address
-     * @dev Requires CONTROLLER_KEY env var and controller role on ProtocolConfig
-     */
-    function updateRewardBeneficiary(address newBeneficiary) public {
-        uint256 controllerKey = _getControllerKey();
-
-        vm.startBroadcast(controllerKey);
-        PROTOCOL_CONFIG.updateRewardBeneficiary(newBeneficiary);
-        vm.stopBroadcast();
-    }
 }
 
 /// @title ProtocolConfigState
@@ -416,13 +389,7 @@ library ProtocolConfigState {
         IProtocolConfig.FeeParams memory fee = ProtocolConfig(proxy).feeParams();
         IProtocolConfig.ConsensusParams memory cons = ProtocolConfig(proxy).consensusParams();
         return keccak256(
-            abi.encode(
-                fee,
-                cons,
-                ProtocolConfig(proxy).rewardBeneficiary(),
-                ProtocolConfig(proxy).owner(),
-                ProtocolConfig(proxy).controller()
-            )
+            abi.encode(fee, cons, ProtocolConfig(proxy).owner(), ProtocolConfig(proxy).controller())
         );
     }
 }

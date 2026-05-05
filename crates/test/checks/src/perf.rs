@@ -1369,4 +1369,30 @@ grpc_server_handled_total{method="Propose"} 500
             report.checks[0].message
         );
     }
+
+    #[test]
+    fn extract_raw_histogram_sum_before_buckets() {
+        // Reproduces the real CL output where _sum and _count come before _bucket lines.
+        let raw = r#"# HELP arc_malachite_app_block_transactions_count Number of transactions in each finalized block.
+# TYPE arc_malachite_app_block_transactions_count histogram
+arc_malachite_app_block_transactions_count_sum{moniker="validator1"} 163797.0
+arc_malachite_app_block_transactions_count_count{moniker="validator1"} 36233
+arc_malachite_app_block_transactions_count_bucket{moniker="validator1",le="1.0"} 32565
+arc_malachite_app_block_transactions_count_bucket{moniker="validator1",le="+Inf"} 36233
+"#;
+        let samples = parse_metrics(raw);
+        let hist = extract_raw_histogram(&samples, "arc_malachite_app_block_transactions_count");
+        assert!(hist.is_some(), "histogram should be found");
+        let hist = hist.unwrap();
+        assert!(
+            (hist.sum - 163797.0).abs() < f64::EPSILON,
+            "sum should be 163797.0, got {}",
+            hist.sum
+        );
+        assert!(
+            (hist.inf_count - 36233.0).abs() < f64::EPSILON,
+            "inf_count should be 36233, got {}",
+            hist.inf_count
+        );
+    }
 }

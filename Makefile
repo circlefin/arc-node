@@ -4,9 +4,11 @@ COV_FILE := target/lcov.info
 SCRIPTS="./scripts"
 FOUNDRY_VERSION := $(shell cat .foundry-version)
 QUAKE_MANIFEST ?= crates/quake/scenarios/localdev.toml
-NUM_VALIDATORS := $(shell grep -c '^\[nodes\.validator' $(QUAKE_MANIFEST) 2>/dev/null || echo 5)
+# Recursively expanded so smoke targets that override QUAKE_MANIFEST re-evaluate
+# at recipe time. All localdev* scenarios must keep the same validator count
+# (5) so `make smoke` produces a single genesis that matches both sub-targets.
+NUM_VALIDATORS = $(shell grep -c '^\[nodes\.validator' $(QUAKE_MANIFEST) 2>/dev/null || echo 5)
 QUAKE := cargo run --bin quake --
-LOAD_PREDEFINED_ARC_REMOTE_SIGNER_KEYS := true
 DEFAULT_BRANCH ?= $(shell git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
 ifeq ($(DEFAULT_BRANCH),)
 DEFAULT_BRANCH = main
@@ -191,7 +193,8 @@ smoke: genesis ## Run smoke tests (both reth and malachite)
 	@echo "All smoke tests completed successfully!"
 
 .PHONY: smoke-reth
-smoke-reth: genesis ## Run Reth smoke tests
+smoke-reth: export ARC_SMOKE_SCENARIO := reth
+smoke-reth: genesis ## Run Reth smoke tests (mock CL, single fee recipient)
 	@echo "Running smoke tests on local reth(mock CL)..."
 	cargo build --release --bin arc-node-execution
 	@bash -c '\
@@ -202,12 +205,13 @@ smoke-reth: genesis ## Run Reth smoke tests
 	'
 
 .PHONY: smoke-malachite
-smoke-malachite: testnet ## Run Malachite smoke & Quake tests
-	@echo "Running smoke tests on local reth + malachite using testnet setup..."
+smoke-malachite: export ARC_SMOKE_SCENARIO := malachite
+smoke-malachite: testnet ## Run Malachite smoke tests (real CL, per-validator recipients)
+	@echo "Running smoke tests on local reth + malachite using testnet setup (localdev.toml)..."
 	@bash -c '\
 		set -ex; \
 		trap "$(MAKE) testnet-clean" EXIT; \
-		env LOAD_PREDEFINED_ARC_REMOTE_SIGNER_KEYS=$(LOAD_PREDEFINED_ARC_REMOTE_SIGNER_KEYS) $(MAKE) test-localdev; \
+		$(MAKE) test-localdev; \
 	'
 
 .PHONY: smoke-quake

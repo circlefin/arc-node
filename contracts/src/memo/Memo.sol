@@ -25,6 +25,8 @@ import {IMemo} from "./IMemo.sol";
  * @notice Wraps the callFrom precompile to attach memo metadata to subcalls.
  * @dev Not upgradeable, no proxy. Deployed at runtime via CREATE2.
  *      The callFrom precompile enforces its own allowlist — this contract does not add access control.
+ * @dev EOA-only: contract callers hit the callFrom sender-spoofing constraint
+ *      and the call reverts without raising {MemoFailed}. See {IMemo}.
  */
 contract Memo is IMemo {
     /// @inheritdoc IMemo

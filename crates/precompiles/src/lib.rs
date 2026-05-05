@@ -22,32 +22,6 @@
 //!
 //! ## Types of Precompiles
 //!
-//! ### Stateless Precompiles
-//! These are simple precompiles that perform computations without modifying state.
-//! They are ideal for:
-//! - Cryptographic operations
-//! - Mathematical/deterministic computations
-//! - Data transformations
-//!
-//! Example:
-//! ```rust,ignore
-//! // Define the interface using Solidity ABI
-//! sol! {
-//!     interface IStatelessPrecompile {
-//!         function doSomething(uint256 first, uint8 second, bool third, string memory message)
-//!             external returns (uint256 result);
-//!     }
-//! }
-//!
-//! // Implement using the stateless! macro
-//! stateless!(stateless_precompile_fn, input, gas_limit; {
-//!     IStatelessPrecompile::doSomethingCall => |call| {
-//!         // Access decoded parameters directly
-//!         call.first + U256::from(call.second) + U256::from(call.third) + U256::from(call.message.len())
-//!     },
-//! });
-//! ```
-//!
 //! ### Stateful Precompiles
 //! These precompiles can read from and write to storage, making them suitable for:
 //! - Managing on-chain state
@@ -64,20 +38,38 @@
 //!     interface IStatefulPrecompile {
 //!         function increment() external returns (uint256 newValue);
 //!         function getCounter() external view returns (uint256 value);
-//!         function setCounter(uint256 newValue) external returns (uint256 previousValue);
 //!     }
 //! }
 //!
-//! // Implement using the stateful! macro
-//! stateful!(run_stateful_precompile, context, inputs, gas_limit; {
-//!     IStatefulPrecompile::incrementCall => |_call| {
-//!         // Read current value
-//!         let (output, gas_counter) = read(context, ADDRESS, COUNTER_STORAGE_KEY, gas_limit)?;
-//!         let current = U256::from_be_slice(&output.bytes);
+//! // Implement using the precompile! macro. Each arm receives the calldata bytes
+//! // following the 4-byte selector (`input` below) and must evaluate to
+//! // `Result<PrecompileOutput, PrecompileErrorOrRevert>`.
+//! precompile!(run_stateful_precompile, precompile_input, hardfork_flags; {
+//!     IStatefulPrecompile::incrementCall => |_input| {
+//!         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
+//!             let mut gas_counter = Gas::new(precompile_input.gas);
+//!             let mut precompile_input = precompile_input;
 //!
-//!         // Write new value
-//!         let new_value = current + U256::from(1);
-//!         write(context, ADDRESS, COUNTER_STORAGE_KEY, &new_value.to_be_bytes_vec(), gas_counter)
+//!             let output = read(
+//!                 &mut precompile_input.internals,
+//!                 ADDRESS,
+//!                 COUNTER_STORAGE_KEY,
+//!                 &mut gas_counter,
+//!                 hardfork_flags,
+//!             )?;
+//!             let new_value = U256::from_be_slice(&output) + U256::from(1);
+//!
+//!             write(
+//!                 &mut precompile_input.internals,
+//!                 ADDRESS,
+//!                 COUNTER_STORAGE_KEY,
+//!                 &new_value.to_be_bytes_vec(),
+//!                 &mut gas_counter,
+//!                 hardfork_flags,
+//!             )?;
+//!
+//!             Ok(PrecompileOutput::new(gas_counter.used(), new_value.abi_encode().into()))
+//!         })()
 //!     },
 //! });
 //! ```
@@ -101,61 +93,85 @@
 //! ```
 //!
 //! ### Step 3: Implement the Logic
-//! For stateless precompiles:
-//! ```rust,ignore
-//! stateless!(my_precompile_fn, input, gas_limit; {
-//!     IMyPrecompile::myFunctionCall => |call| {
-//!         // Your logic here
-//!         call.param * U256::from(2)
-//!     },
-//! });
-//! ```
 //!
-//! For stateful precompiles:
 //! ```rust,ignore
-//! stateful!(run_my_precompile, context, inputs, gas_limit; {
-//!     IMyPrecompile::myFunctionCall => |call| {
-//!         // Read/write storage as needed
-//!         read(context, MY_PRECOMPILE_ADDRESS, StorageKey::from(0), gas_limit)
+//! precompile!(run_my_precompile, precompile_input, hardfork_flags; {
+//!     IMyPrecompile::myFunctionCall => |input| {
+//!         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
+//!             let mut gas_counter = Gas::new(precompile_input.gas);
+//!             let mut precompile_input = precompile_input;
+//!
+//!             let args = IMyPrecompile::myFunctionCall::abi_decode_raw(input)
+//!                 .map_err(|_| PrecompileErrorOrRevert::new_reverted_with_penalty(
+//!                     gas_counter,
+//!                     PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY,
+//!                     ERR_EXECUTION_REVERTED,
+//!                 ))?;
+//!
+//!             let output = read(
+//!                 &mut precompile_input.internals,
+//!                 MY_PRECOMPILE_ADDRESS,
+//!                 StorageKey::from(0),
+//!                 &mut gas_counter,
+//!                 hardfork_flags,
+//!             )?;
+//!
+//!             Ok(PrecompileOutput::new(gas_counter.used(), output))
+//!         })()
 //!     },
 //! });
 //! ```
 //!
 //! ### Step 4: Register the Precompile
-//! For stateless precompiles, add to `custom_stateless_precompiles()`:
+//! Add a match arm to `ArcPrecompileProvider::create_precompiles_map` in
+//! `precompile_provider.rs`:
 //! ```rust,ignore
-//! precompiles.extend([PrecompileWithAddress::from((
-//!     MY_PRECOMPILE_ADDRESS,
-//!     PrecompileFn::from(my_precompile_fn as fn(&[u8], u64) -> PrecompileResult),
-//! ))]);
-//! ```
-//!
-//! For stateful precompiles, add to the `stateful_precompiles` HashMap in `Default::default()`:
-//! ```rust,ignore
-//! stateful_precompiles.insert(
-//!     MY_PRECOMPILE_ADDRESS,
-//!     run_my_precompile as StatefulPrecompileFn,
-//! );
+//! MY_PRECOMPILE_ADDRESS => Some(DynPrecompile::new_stateful(
+//!     PrecompileId::Custom("MY_PRECOMPILE".into()),
+//!     move |input| run_my_precompile(input, hardfork_flags),
+//! )),
 //! ```
 //!
 //! ## Gas Accounting
 //!
-//! Both macros handle gas accounting automatically:
-//! - Stateless precompiles consume all provided gas
-//! - Stateful precompiles track gas usage through storage operations
-//! - Out-of-gas errors are handled gracefully
+//! The `precompile!` macro does not track gas on its own — each arm constructs a `Gas`
+//! counter from `precompile_input.gas` and threads `&mut gas_counter` through the helpers
+//! (`read`, `write`, `emit_event`, `balance_incr`, …). Helpers mutate the counter in place
+//! and return `PrecompileErrorOrRevert::Error(OutOfGas)` when the remaining gas is
+//! insufficient. The macro adds `PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY` when the
+//! selector is unknown or the input is shorter than 4 bytes; arms should use the same
+//! penalty when ABI decoding fails.
 //!
 //! ## Storage Operations
 //!
-//! The `read` and `write` helper functions provide storage access:
-//! - `read`: Costs 2,100 gas, returns stored value
-//! - `write`: Costs 41,000 gas (21,000 base + 20,000 SSTORE)
+//! `read` and `write` take a mutable borrow of `precompile_input.internals`, the gas
+//! counter, and the active hardfork flags. `read` returns the stored value as
+//! big-endian `Bytes`; `write` returns `()`:
 //!
-//! When chaining operations, pass the gas counter between calls:
 //! ```rust,ignore
-//! let (output, gas_counter) = read(context, address, key, gas_limit)?;
-//! write(context, address, key, &new_value, gas_counter)
+//! let output = read(
+//!     &mut precompile_input.internals,
+//!     address,
+//!     key,
+//!     &mut gas_counter,
+//!     hardfork_flags,
+//! )?;
+//! let current = U256::from_be_slice(&output);
+//!
+//! write(
+//!     &mut precompile_input.internals,
+//!     address,
+//!     key,
+//!     &new_value.to_be_bytes_vec(),
+//!     &mut gas_counter,
+//!     hardfork_flags,
+//! )?;
 //! ```
+//!
+//! Gas costs:
+//! - `read`: 2,100 gas pre-Zero5; EIP-2929 warm/cold pricing from Zero5+
+//!   (`WARM_STORAGE_READ_COST` / `COLD_SLOAD_COST`).
+//! - `write`: 2,900 gas pre-Zero5; EIP-2929 / EIP-2200 pricing from Zero5+.
 
 pub mod helpers;
 mod macros;

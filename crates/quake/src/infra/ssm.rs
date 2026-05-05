@@ -141,7 +141,15 @@ impl Ssm {
             match status {
                 TunnelStatus::Usable => continue,
                 TunnelStatus::Conflict => {
-                    conflicting_sessions.push(session.label());
+                    // Before giving up, check whether the port is held by a stale
+                    // session-manager-plugin from a previous run and kill it if so.
+                    if kill_stale_ssm_on_port(session.local_port)
+                        && !self.backend.is_local_port_listening(session.local_port)
+                    {
+                        sessions_to_start.push(session);
+                    } else {
+                        conflicting_sessions.push(session.label());
+                    }
                 }
                 TunnelStatus::StaleAws => {
                     stale_sessions.extend(aws_sessions_for_tunnel.into_iter().cloned());
@@ -549,6 +557,55 @@ fn parse_aws_sessions_output(output: &str) -> Vec<AwsSession> {
 fn is_local_port_listening(local_port: u16) -> bool {
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok()
+}
+
+/// If the process holding `port` is a stale `session-manager-plugin` (an SSM
+/// tunnel left over from a previous Quake run), kill it and return `true`.
+/// Returns `false` when the port is held by an unrelated process.
+fn kill_stale_ssm_on_port(port: u16) -> bool {
+    // lsof -t prints just the PID(s); -sTCP:LISTEN restricts to listening sockets.
+    let output = std::process::Command::new("lsof")
+        .args(["-i", &format!("TCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .output();
+
+    let pid_str = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return false,
+    };
+    let pid: u32 = match pid_str.lines().next().and_then(|s| s.trim().parse().ok()) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // Check the process name — only kill the AWS SSM plugin, nothing else.
+    let name_output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output();
+    let proc_name = match name_output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(_) => return false,
+    };
+
+    if !proc_name.contains("session-manager") {
+        return false;
+    }
+
+    warn!(
+        pid,
+        port, "Killing stale session-manager-plugin process on port {port}"
+    );
+    let killed = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status();
+    if killed.as_ref().map_or(true, |s| !s.success()) {
+        debug!(
+            pid,
+            port, "Failed to kill stale session-manager-plugin; port may still be held"
+        );
+    }
+    // Give the OS a moment to release the port.
+    std::thread::sleep(Duration::from_millis(200));
+    true
 }
 
 #[cfg(test)]

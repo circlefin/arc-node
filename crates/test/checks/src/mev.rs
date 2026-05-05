@@ -228,7 +228,7 @@ async fn check_blocked(
             passed: false,
             message: format!(
                 "{method} returned data! \
-                 Pending-tx filter is disabled (--arc.hide-pending-txs must be set)"
+                 Pending-tx filter is disabled (unset --arc.expose-pending-txs or use --public-api)"
             ),
         },
         RpcOutcome::Err { code, message } => CheckResult {

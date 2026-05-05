@@ -326,9 +326,6 @@ impl BaseFeeConfigProvider for ArcChainSpec {
 #[cfg(any(feature = "test-utils", test))]
 const PROTOCOL_CONFIG_BLOCK_GAS_LIMIT_SLOT: B256 =
     b256!("668f09ce856848ead6cb1ddee963f15ef833cea8958030868f867aec84385203");
-#[cfg(any(feature = "test-utils", test))]
-const PROTOCOL_CONFIG_REWARD_BENEFICIARY_SLOT: B256 =
-    b256!("668f09ce856848ead6cb1ddee963f15ef833cea8958030868f867aec84385204");
 /// ERC-1967 implementation slot on the proxy.
 #[cfg(any(feature = "test-utils", test))]
 const PROXY_IMPLEMENTATION_SLOT: B256 =
@@ -393,28 +390,13 @@ pub fn localdev_with_hardforks(hardforks: &[(ArcHardfork, u64)]) -> Arc<ArcChain
     Arc::new(ArcChainSpec::new(inner))
 }
 
-/// Creates a localdev chain spec with a custom ProtocolConfig reward beneficiary.
+/// Creates a localdev chain spec with an address pre-blocklisted in NativeCoinControl.
 #[cfg(any(feature = "test-utils", test))]
-pub fn localdev_with_storage_override(
-    beneficiary: Address,
-    blocklisted_address: Option<Address>,
-) -> Arc<ArcChainSpec> {
+pub fn localdev_with_storage_override(blocklisted_address: Option<Address>) -> Arc<ArcChainSpec> {
     let mut genesis: Genesis =
         serde_json::from_str(include_str!("../../../assets/localdev/genesis.json"))
             .expect("Can't deserialize localdev genesis json");
 
-    let protocol_config_account = genesis
-        .alloc
-        .get_mut(&crate::protocol_config::PROTOCOL_CONFIG_ADDRESS)
-        .expect("LOCAL_DEV genesis missing ProtocolConfig account");
-
-    let storage = protocol_config_account
-        .storage
-        .get_or_insert_with(Default::default);
-    storage.insert(
-        PROTOCOL_CONFIG_REWARD_BENEFICIARY_SLOT,
-        beneficiary.into_word(),
-    );
     if let Some(blocklisted_address) = blocklisted_address {
         const BLOCKLISTED_STATUS: B256 =
             b256!("0000000000000000000000000000000000000000000000000000000000000001");

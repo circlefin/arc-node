@@ -68,7 +68,6 @@ const build = async () => {
       owner: creator.nextAccount('ProtocolConfig.owner', adminPrefund),
       controller: creator.nextAccount('ProtocolConfig.controller', adminPrefund),
       pauser: creator.nextAccount('ProtocolConfig.pauser', adminPrefund),
-      beneficiary: creator.nextAccount('ProtocolConfig.beneficiary'),
       feeParams: {
         alpha: 20n,
         kRate: 25n,

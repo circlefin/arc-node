@@ -43,10 +43,16 @@ thiserror.workspace = true
 alloy-consensus.workspace = true
 arc-evm.workspace = true
 arc-execution-config = { workspace = true, features = ["test-utils"] }
+criterion.workspace = true
 reth-chainspec.workspace = true
 reth-ethereum-forks.workspace = true
 revm-context-interface.workspace = true
 serde_with.workspace = true
+sha2.workspace = true
+
+[[bench]]
+name = "pq"
+harness = false
 
 [lints]
 workspace = true

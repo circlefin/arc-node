@@ -57,15 +57,29 @@ pub async fn handle(
             StoredMisbehaviorEvidence::from_misbehavior_evidence(certificate.height, &evidence);
 
         let validators_count = stored_evidence.validators.len();
+        let validator_addresses = stored_evidence
+            .validators
+            .iter()
+            .map(|v| v.address.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
 
         if let Err(e) = state
             .store()
             .store_misbehavior_evidence(stored_evidence)
             .await
         {
-            warn!("Failed to store misbehavior evidence: {e:#}");
+            error!(
+                %validators_count,
+                %validator_addresses,
+                "Failed to store misbehavior evidence: {e:#}"
+            );
         } else {
-            info!(%validators_count, "Stored misbehavior evidence");
+            warn!(
+                %validators_count,
+                %validator_addresses,
+                "Stored misbehavior evidence"
+            );
         }
     }
 

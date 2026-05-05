@@ -23,7 +23,7 @@ use color_eyre::eyre::{self, Result};
 use k256::ecdsa::SigningKey;
 use rand::Rng;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, info, warn};
@@ -37,7 +37,29 @@ use crate::ws::{WsClient, WsClientBuilder};
 use crate::erc20::TEST_TOKEN_ADDRESS;
 
 pub(crate) const TESTNET_CHAIN_ID: u64 = 1337;
+
+/// Max fee per gas (in wei) used for all generated transactions.
+///
+/// Sized for 2x headroom over the testnet `maxBaseFee` ceiling (20,000 gwei) so
+/// the spammer keeps submitting when the base fee pegs at the ceiling.
+pub(crate) const MAX_FEE_PER_GAS: u128 = 40_000 * 1_000_000_000;
+
+/// Max priority fee per gas (tip) in wei.
+pub(crate) const MAX_PRIORITY_FEE_PER_GAS: u128 = 1_000_000_000;
+
 const GUZZLER_ADDRESS: Address = address!("45a834A6bB86F516D4157a8cBcc60f2F35F8398C");
+
+/// Fallback gas limit for Guzzler calls when estimation fails.
+const GUZZLER_GAS_FALLBACK: u64 = 10_000_000;
+
+/// Multiplier applied to cached gas estimates (covers per-call arg variance across all
+/// future transactions of that type).
+pub(crate) const GAS_CACHE_BUFFER: u64 = 2;
+
+/// Numerator and denominator for the safety margin applied to per-call gas estimates
+/// on the fallback path (1.25×).
+pub(crate) const GAS_ESTIMATE_MARGIN_NUM: u64 = 5;
+pub(crate) const GAS_ESTIMATE_MARGIN_DEN: u64 = 4;
 
 /// Generates and signs transactions from a pool of pre-funded genesis accounts.
 ///
@@ -88,6 +110,10 @@ pub(crate) struct TxGenerator {
     query_nonces_on_init: bool,
     /// Accounts permanently excluded from round-robin (e.g., after repeated failures)
     skipped_accounts: HashSet<usize>,
+    /// Cached gas limit per ERC-20 function, estimated once in init() with 2× buffer.
+    erc20_gas_cache: HashMap<Erc20Function, u64>,
+    /// Cached gas limit per Guzzler function, estimated once in init() with 2× buffer.
+    guzzler_gas_cache: HashMap<GuzzlerFunction, u64>,
 }
 
 impl TxGenerator {
@@ -127,6 +153,8 @@ impl TxGenerator {
             next_account_index: 0,
             query_nonces_on_init: false,
             skipped_accounts: HashSet::new(),
+            erc20_gas_cache: HashMap::new(),
+            guzzler_gas_cache: HashMap::new(),
         }
     }
 
@@ -180,6 +208,21 @@ impl TxGenerator {
     pub fn with_query_nonces_on_init(mut self, enabled: bool) -> Self {
         self.query_nonces_on_init = enabled;
         self
+    }
+
+    /// Replace the tx channel sender, used when reusing a generator across phases.
+    pub(crate) fn reset_tx_sender(&mut self, sender: Sender<TxEnvelope>) {
+        self.tx_sender = Some(sender);
+        // Clear stale connections so init() rebuilds them on the next run.
+        self.ws_clients = None;
+    }
+
+    /// Update the WebSocket client builders, used when reusing a generator
+    /// against a different set of target nodes. Clears cached connections so
+    /// they are rebuilt against the new URLs on the next run.
+    pub(crate) fn update_ws_client_builders(&mut self, builders: Vec<WsClientBuilder>) {
+        self.ws_client_builders = builders;
+        self.ws_clients = None;
     }
 
     async fn build_ws_clients(&self) -> Result<Vec<WsClient>> {
@@ -266,11 +309,87 @@ impl TxGenerator {
             info!("TestToken contract verified at {TEST_TOKEN_ADDRESS}");
             self.test_token_verified = true;
         }
+        let erc20_cache_incomplete = self
+            .erc20_fn_weights
+            .buckets()
+            .iter()
+            .any(|(f, w)| *w > 0 && !self.erc20_gas_cache.contains_key(f));
+        if self.tx_type_mix.erc20 > 0 && erc20_cache_incomplete {
+            let from = self.first_account_address()?;
+            let ws_clients = self
+                .ws_clients
+                .as_mut()
+                .expect("ws_clients initialized above");
+            for (function, weight) in self.erc20_fn_weights.buckets() {
+                if weight == 0 {
+                    continue;
+                }
+                let calldata = match function {
+                    Erc20Function::Transfer => {
+                        crate::erc20::encode_transfer(from, U256::from(1u64))
+                    }
+                    Erc20Function::Approve => crate::erc20::encode_approve(from, U256::from(1u64)),
+                    Erc20Function::TransferFrom => {
+                        crate::erc20::encode_transfer_from(from, from, U256::from(1u64))
+                    }
+                };
+                match Self::estimate_gas_tx(ws_clients, from, Some(TEST_TOKEN_ADDRESS), &calldata)
+                    .await
+                {
+                    Some(estimate) => {
+                        self.erc20_gas_cache
+                            .insert(function, estimate.saturating_mul(GAS_CACHE_BUFFER));
+                    }
+                    None => warn!(
+                        "gas estimate failed for ERC-20 {:?}; falling back to per-tx estimation",
+                        function
+                    ),
+                }
+            }
+        }
+        let guzzler_cache_incomplete = self
+            .guzzler_fn_weights
+            .buckets()
+            .iter()
+            .any(|(f, w)| *w > 0 && !self.guzzler_gas_cache.contains_key(f));
+        if self.tx_type_mix.guzzler > 0 && guzzler_cache_incomplete {
+            let from = self.first_account_address()?;
+            let ws_clients = self
+                .ws_clients
+                .as_mut()
+                .expect("ws_clients initialized above");
+            for (function, weight) in self.guzzler_fn_weights.buckets() {
+                if weight == 0 {
+                    continue;
+                }
+                let base_arg = self.guzzler_fn_weights.arg_for(function);
+                let calldata = TxGenerator::encode_guzzler_calldata(function, base_arg);
+                match Self::estimate_gas_tx(ws_clients, from, Some(GUZZLER_ADDRESS), &calldata)
+                    .await
+                {
+                    Some(estimate) => {
+                        self.guzzler_gas_cache
+                            .insert(function, estimate.saturating_mul(GAS_CACHE_BUFFER));
+                    }
+                    None => warn!(
+                        "gas estimate failed for Guzzler {:?}; falling back to per-tx estimation",
+                        function
+                    ),
+                }
+            }
+        }
         if self.query_nonces_on_init {
             self.query_nonces_on_init = false; // run once
             self.query_all_nonces().await?;
         }
         Ok(())
+    }
+
+    fn first_account_address(&mut self) -> Result<Address> {
+        if self.signers[0].is_none() {
+            self.signers[0] = Some(self.account_builder.build(self.signers_range.start)?);
+        }
+        Ok(self.signers[0].as_ref().expect("built above").address())
     }
 
     /// Query the latest nonce for every account that hasn't been initialized yet.
@@ -411,6 +530,7 @@ impl TxGenerator {
                         recipient,
                         next_nonce,
                         function,
+                        self.erc20_gas_cache.get(&function).copied(),
                     )
                     .await?;
                     let sig = signer.sign_hash(&tx.signature_hash()).await?;
@@ -426,6 +546,7 @@ impl TxGenerator {
                         next_nonce,
                         base_arg,
                         guzzler_function,
+                        self.guzzler_gas_cache.get(&guzzler_function).copied(),
                     )
                     .await?;
                     let sig = signer.sign_hash(&tx.signature_hash()).await?;
@@ -462,6 +583,52 @@ impl TxGenerator {
         self.skipped_accounts.insert(account_index);
     }
 
+    /// Re-query on-chain nonces for all accounts and overwrite cached values.
+    ///
+    /// Uses `eth_getTransactionCount` with "pending" to skip nonces already
+    /// accepted by the pool.
+    pub(crate) async fn resync_nonces(&mut self) -> Result<()> {
+        let size = self.signers_range.len();
+        info!(
+            "TxGenerator {}: resyncing nonces for {size} accounts...",
+            self.id
+        );
+
+        for i in 0..size {
+            if self.signers[i].is_none() {
+                let index = self.signers_range.start + i;
+                self.signers[i] = Some(self.account_builder.build(index)?);
+            }
+        }
+
+        let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, u64)>>> =
+            Vec::with_capacity(size);
+        for i in 0..size {
+            let address = self.signers[i].as_ref().expect("built above").address();
+            let cached = self.next_nonces[i];
+            let builders = self.ws_client_builders.clone();
+            handles.push(tokio::spawn(async move {
+                let mut ws_clients = {
+                    let mut clients = Vec::with_capacity(builders.len());
+                    for builder in builders {
+                        clients.push(builder.build().await?);
+                    }
+                    clients
+                };
+                Self::fetch_nonce(&mut ws_clients, address, cached)
+                    .await
+                    .map(|nonce| (i, nonce))
+            }));
+        }
+        for handle in handles {
+            let (i, nonce) = handle.await??;
+            self.next_nonces[i] = Some(nonce);
+        }
+
+        info!("TxGenerator {}: nonce resync complete", self.id);
+        Ok(())
+    }
+
     /// Re-query the latest nonce for the given account from the node.
     /// Used after a rejection to recover to the correct nonce.
     pub async fn refresh_nonce(&mut self, account_index: usize) -> Result<()> {
@@ -473,7 +640,7 @@ impl TxGenerator {
             .ws_clients
             .as_mut()
             .ok_or_else(|| eyre::eyre!("ws_clients not initialized"))?;
-        let nonce = Self::get_latest_nonce(ws_clients, address).await?;
+        let nonce = Self::fetch_nonce(ws_clients, address, None).await?;
         self.next_nonces[account_index] = Some(nonce);
         Ok(())
     }
@@ -525,15 +692,21 @@ impl TxGenerator {
         nonce: u64,
         base_arg: u64,
         guzzler_function: GuzzlerFunction,
+        cached_gas: Option<u64>,
     ) -> Result<TxEip1559> {
         let factor: u64 = rand::thread_rng().gen_range(80u64..=120u64); // -/+ 20% random adjustment
         let adjusted_arg = core::cmp::max(1, base_arg.saturating_mul(factor) / 100);
         let calldata = Self::encode_guzzler_calldata(guzzler_function, adjusted_arg);
-        let estimate =
-            Self::estimate_gas_tx(ws_clients, signer_addr, Some(contract_addr), &calldata).await;
-        let gas_limit = estimate
-            .map(|g| g.saturating_mul(5) / 4) // 25% safety margin
-            .unwrap_or(10_000_000); // fall back to a generous limit
+        let gas_limit = if let Some(cached) = cached_gas {
+            cached
+        } else {
+            let estimate =
+                Self::estimate_gas_tx(ws_clients, signer_addr, Some(contract_addr), &calldata)
+                    .await;
+            estimate
+                .map(|g| g.saturating_mul(GAS_ESTIMATE_MARGIN_NUM) / GAS_ESTIMATE_MARGIN_DEN)
+                .unwrap_or(GUZZLER_GAS_FALLBACK)
+        };
         Ok(Self::make_guzzler_call_tx(
             nonce,
             contract_addr,
@@ -613,6 +786,26 @@ impl TxGenerator {
         None
     }
 
+    /// Fetch the latest nonce for `address`, falling back to `cached` on failure.
+    ///
+    /// Pass `cached = None` to propagate errors (e.g. in `refresh_nonce`, where
+    /// the caller must obtain the correct nonce). Pass `cached = Some(n)` to
+    /// tolerate transient RPC failures by keeping the last known value.
+    async fn fetch_nonce(
+        ws_clients: &mut [WsClient],
+        address: Address,
+        cached: Option<u64>,
+    ) -> Result<u64> {
+        match (Self::get_latest_nonce(ws_clients, address).await, cached) {
+            (Ok(nonce), _) => Ok(nonce),
+            (Err(e), Some(c)) => {
+                warn!("Failed to fetch nonce for {address}: {e}; keeping cached {c}");
+                Ok(c)
+            }
+            (Err(e), None) => Err(e),
+        }
+    }
+
     /// Query all RPC endpoints to find the latest nonce (the highest
     /// value) used by the given address. Tolerates individual node
     /// failures and returns the highest nonce from any successful
@@ -659,8 +852,8 @@ impl TxGenerator {
         TxEip1559 {
             chain_id: TESTNET_CHAIN_ID,
             nonce,
-            max_priority_fee_per_gas: 1_000_000_000, // 1 gwei
-            max_fee_per_gas: 2_000_000_000,          // 2 gwei
+            max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS,
+            max_fee_per_gas: MAX_FEE_PER_GAS,
             gas_limit: 30_000 + input_gas, // base tx + input gas, Arc requires ~26k for transfers (blocklist check)
             to: Address::left_padding_from(&(nonce.wrapping_add(0x1000)).to_be_bytes()).into(), // avoid zero address and Ethereum precompile addresses
             value: U256::from(1e16), // 0.01 ETH
@@ -677,7 +870,7 @@ impl TxGenerator {
         TxLegacy {
             chain_id: Some(TESTNET_CHAIN_ID),
             nonce,
-            gas_price: 2_000_000_000, // 2 gwei
+            gas_price: MAX_FEE_PER_GAS,
             gas_limit: 30_000 + input_gas,
             to: Address::left_padding_from(&(nonce.wrapping_add(0x1000)).to_be_bytes()).into(),
             value: U256::from(1e16), // 0.01 ETH
@@ -697,8 +890,8 @@ impl TxGenerator {
         TxEip1559 {
             chain_id: TESTNET_CHAIN_ID,
             nonce,
-            max_priority_fee_per_gas: 1_000_000_000, // 1 gwei
-            max_fee_per_gas: 2_000_000_000,          // 2 gwei
+            max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS,
+            max_fee_per_gas: MAX_FEE_PER_GAS,
             gas_limit,
             to: Some(addr).into(),
             value: U256::ZERO,

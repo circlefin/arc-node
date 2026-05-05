@@ -19,7 +19,7 @@ use crate::helpers::{
     PrecompileErrorOrRevert, ERR_EXECUTION_REVERTED, ERR_INVALID_CALLER,
     PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY, PRECOMPILE_SLOAD_GAS_COST,
 };
-use crate::stateful;
+use crate::precompile;
 use alloy_evm::Evm;
 use alloy_primitives::B256;
 use alloy_primitives::{address, keccak256, Address, Bytes, StorageKey};
@@ -51,7 +51,11 @@ const GAS_VALUES_STORAGE_KEY: StorageKey = StorageKey::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
 ]);
 
-// Number of historical gas values to store in ring buffer
+/// Ring buffer capacity for historical gas values. Consensus reads only
+/// freshly-written slots (the executor reads the parent slot for EMA smoothing;
+/// the assembler reads the current slot just written by `finish()`), so no
+/// history depth is required for correctness. The extra capacity exists purely
+/// as headroom for external readers (RPC, monitoring) and is otherwise arbitrary.
 const GAS_VALUES_RING_BUFFER_SIZE: u64 = 64;
 
 // Address impersonated by the system caller
@@ -67,7 +71,26 @@ sol! {
     }
 
     interface ISystemAccounting {
+        /// Writes `gasValues` into ring-buffer slot
+        /// `blockNumber % GAS_VALUES_RING_BUFFER_SIZE`, overwriting whatever
+        /// the slot previously held. SYSTEM_CALLER-gated; no validation on
+        /// `blockNumber`, since writes happen once per block from the block
+        /// executor.
         function storeGasValues(uint64 blockNumber, GasValues calldata gasValues) external returns (bool);
+
+        /// Returns ring-buffer slot `blockNumber % GAS_VALUES_RING_BUFFER_SIZE`
+        /// as-is, without any freshness check. If `blockNumber` has been
+        /// rotated out (more than `GAS_VALUES_RING_BUFFER_SIZE - 1` behind the
+        /// latest written block) or is in the future, the slot holds the last
+        /// block that mapped to it, i.e. a different block's values. Slots
+        /// that have never been written (possible only early in the chain's
+        /// life, before every slot has been reached once) read as zero.
+        /// Callers needing freshness must cross-check against their own view
+        /// of the chain tip. Consensus does not depend on freshness: the
+        /// executor reads only the parent slot for EMA smoothing, which was
+        /// written by the previous block's `finish()` (or reads as zero at
+        /// genesis, the correct EMA baseline), and the block assembler reads
+        /// only the current slot just written by the same block's `finish()`.
         function getGasValues(uint64 blockNumber) external view returns (GasValues calldata gasValue);
     }
 }
@@ -83,6 +106,12 @@ sol! {
 /// - p is the mapping slot position (GAS_VALUES_STORAGE_KEY)
 /// - h left-pads the key to 32 bytes
 /// - . is concatenation
+///
+/// `block_number` is reduced mod `GAS_VALUES_RING_BUFFER_SIZE` before hashing,
+/// so any two block numbers that differ by a multiple of the ring buffer size
+/// collide on the same slot. The mapping carries no identity of the block that
+/// last wrote the slot — callers who need that identity must track it
+/// out-of-band.
 pub fn compute_gas_values_storage_slot(block_number: u64) -> StorageKey {
     // Map block number into ring buffer
     let key_value = block_number % GAS_VALUES_RING_BUFFER_SIZE;
@@ -102,7 +131,7 @@ pub fn compute_gas_values_storage_slot(block_number: u64) -> StorageKey {
     StorageKey::new(keccak256(data).0)
 }
 
-stateful!(run_system_accounting, precompile_input, hardfork_flags; {
+precompile!(run_system_accounting, precompile_input, hardfork_flags; {
     ISystemAccounting::storeGasValuesCall => |input| {
         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
             let mut gas_counter = Gas::new(precompile_input.gas);
@@ -134,7 +163,7 @@ stateful!(run_system_accounting, precompile_input, hardfork_flags; {
             check_delegatecall(
                 SYSTEM_ACCOUNTING_ADDRESS,
                 &precompile_input,
-                &mut gas_counter,
+                &gas_counter,
             )?;
 
             // Update storage

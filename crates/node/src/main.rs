@@ -43,8 +43,10 @@ use directories::BaseDirs;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum::cli::interface::{Cli as RethCli, Commands};
 use reth_node_core::version::default_extra_data;
+use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection};
 use tracing::info;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use reth_node_core::args::DefaultPruningValues;
@@ -81,6 +83,20 @@ impl ArcCli {
             // Arc uses the extra_data field to store the next block's base fee.
             if node_cmd.builder.extra_data != default_extra_data() {
                 return Err("--builder.extradata is not supported");
+            }
+
+            // The middleware intercepts `eth_getBlockByNumber("pending")` on single
+            // calls only; batch calls fall through to Reth and rely on
+            // `--rpc.pending-block=none` to return null. Reject the asymmetric
+            // combination that would leak pending-block data via batch.
+            if compute_filter_pending_txs(&node_cmd.ext)
+                && node_cmd.rpc.rpc_pending_block
+                    != reth_rpc_eth_types::builder::config::PendingBlockKind::None
+            {
+                return Err(
+                    "--rpc.pending-block must be 'none' when the pending-tx filter is active; \
+                     pass --arc.expose-pending-txs to opt out of hiding or set --rpc.pending-block=none",
+                );
             }
         }
         Ok(())
@@ -239,18 +255,31 @@ struct ArcExtraCli {
     )]
     arc_denylist_addresses_exclusions: Vec<String>,
 
-    /// Hide pending-tx RPCs (subscriptions, filters, and pending block queries).
+    /// Expose pending-tx RPCs on externally-reachable sockets.
     ///
-    /// When set, the middleware blocks newPendingTransactions subscriptions,
-    /// eth_newPendingTransactionFilter, and returns null for
-    /// eth_getBlockByNumber("pending"). Use on externally-exposed nodes
-    /// for MEV protection.
+    /// Off by default: the middleware blocks `eth_subscribe("newPendingTransactions")`,
+    /// `eth_newPendingTransactionFilter`, and returns null for
+    /// `eth_getBlockByNumber("pending")`. Set this flag on trusted / internal
+    /// nodes where exposing pending-tx state is desired (e.g. debugging).
     #[arg(
-        long = "arc.hide-pending-txs",
+        long = "arc.expose-pending-txs",
         default_value_t = false,
         help_heading = "Arc RPC"
     )]
-    arc_hide_pending_txs: bool,
+    arc_expose_pending_txs: bool,
+
+    /// Convenience flag for externally-exposed RPC nodes.
+    ///
+    /// Forces hiding of pending-tx RPCs. Conflicts with
+    /// `--arc.expose-pending-txs`, and warns at startup if `--http.api` or
+    /// `--ws.api` exposes namespaces outside `{eth, net, web3, rpc}`.
+    #[arg(
+        long = "public-api",
+        default_value_t = false,
+        conflicts_with = "arc_expose_pending_txs",
+        help_heading = "Arc RPC"
+    )]
+    public_api: bool,
 
     /// Interval in seconds between transaction rebroadcast rounds.
     ///
@@ -331,6 +360,48 @@ fn build_addresses_denylist_config(ext: &ArcExtraCli) -> eyre::Result<AddressesD
         }
     })?;
     Ok(config)
+}
+
+/// Namespaces considered safe on a `--public-api` node.
+///
+/// Excludes anything that exposes pending / mempool state, admin controls,
+/// tracing, MEV endpoints, or implementation-specific internals.
+const PUBLIC_API_SAFE_MODULES: [RethRpcModule; 4] = [
+    RethRpcModule::Eth,
+    RethRpcModule::Net,
+    RethRpcModule::Web3,
+    RethRpcModule::Rpc,
+];
+
+/// Returns the modules in `selection` that are not in `PUBLIC_API_SAFE_MODULES`.
+/// `RethRpcModule::Other(_)` is always considered unsafe.
+pub(crate) fn unsafe_public_api_modules(selection: &RpcModuleSelection) -> Vec<RethRpcModule> {
+    let safe: HashSet<RethRpcModule> = PUBLIC_API_SAFE_MODULES.into_iter().collect();
+    selection
+        .to_selection()
+        .into_iter()
+        .filter(|m| !safe.contains(m))
+        .collect()
+}
+
+/// Emits a `warn!` if `selection` contains modules outside the safe set.
+/// `None` is safe: Reth's default is `Standard` = {eth, net, web3}, a subset of our safe set.
+fn warn_if_public_api_unsafe(selection: Option<&RpcModuleSelection>, socket_flag: &str) {
+    let Some(sel) = selection else { return };
+    let unsafe_modules = unsafe_public_api_modules(sel);
+    if !unsafe_modules.is_empty() {
+        let names: Vec<String> = unsafe_modules.iter().map(|m| m.to_string()).collect();
+        tracing::warn!(
+            "--public-api set but {socket_flag} exposes sensitive namespaces: {names:?}. \
+             Consider dropping them or removing --public-api to acknowledge the risk."
+        );
+    }
+}
+
+/// Computes whether the pending-tx RPC filter should be active for this run.
+/// `--public-api` wins; clap enforces it can't coexist with `--arc.expose-pending-txs`.
+fn compute_filter_pending_txs(ext: &ArcExtraCli) -> bool {
+    ext.public_api || !ext.arc_expose_pending_txs
 }
 
 /// Number of bodies, receipts, etc. to retain after pruning.
@@ -458,6 +529,12 @@ fn main() {
                 InvalidTxListConfig::new(ext.invalid_tx_list_enable, ext.invalid_tx_list_cap);
             let payload_builder_deadline_ms = ext.payload_builder_deadline_ms;
 
+            if ext.public_api {
+                let rpc = &builder.config().rpc;
+                warn_if_public_api_unsafe(rpc.http_api.as_ref(), "--http.api");
+                warn_if_public_api_unsafe(rpc.ws_api.as_ref(), "--ws.api");
+            }
+
             // Run an RPC node if enabled (unsafe - no verification)
             if let Some(ref unsafe_follow_url) = ext.unsafe_follow_url {
                 follow_url_for_consensus(&mut builder, unsafe_follow_url)?;
@@ -474,7 +551,7 @@ fn main() {
             arc_node_execution::metrics::register_version_info();
 
             let wait_for_payload = ext.wait_for_payload;
-            let filter_pending_txs = ext.arc_hide_pending_txs;
+            let filter_pending_txs = compute_filter_pending_txs(&ext);
             let rebroadcast_interval =
                 std::time::Duration::from_secs(ext.txpool_rebroadcast_interval);
             let handle = builder
@@ -598,22 +675,72 @@ mod tests {
     use super::*;
     use alloy_primitives::{address, b256};
 
+    /// Parse CLI args with `patch_node_command_defaults` applied (mirrors production).
+    fn parse_with_arc_defaults<I>(argv: I) -> ArcCli
+    where
+        I: IntoIterator<Item = &'static str>,
+    {
+        let patched = patch_node_command_defaults(ArcCli::command());
+        ArcCli::from_arg_matches(&patched.get_matches_from(argv)).unwrap()
+    }
+
     #[test]
     fn test_extradata_default_is_allowed() {
-        let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
+        let cli = parse_with_arc_defaults(["arc-node-execution", "node"]);
         assert!(cli.validate().is_ok());
     }
 
     #[test]
     fn test_extradata_custom_is_rejected() {
-        let cli = ArcCli::try_parse_from([
+        let cli = parse_with_arc_defaults([
             "arc-node-execution",
             "node",
             "--builder.extradata",
             "custom",
-        ])
-        .unwrap();
+        ]);
         assert_eq!(cli.validate(), Err("--builder.extradata is not supported"));
+    }
+
+    #[test]
+    fn test_validate_rejects_filter_with_pending_block_full() {
+        let cli =
+            parse_with_arc_defaults(["arc-node-execution", "node", "--rpc.pending-block=full"]);
+        assert!(
+            cli.validate()
+                .unwrap_err()
+                .contains("--rpc.pending-block must be 'none'"),
+            "default filter + --rpc.pending-block=full must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_allows_expose_with_pending_block_full() {
+        let cli = parse_with_arc_defaults([
+            "arc-node-execution",
+            "node",
+            "--arc.expose-pending-txs",
+            "--rpc.pending-block=full",
+        ]);
+        assert!(
+            cli.validate().is_ok(),
+            "--arc.expose-pending-txs + --rpc.pending-block=full must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_public_api_with_pending_block_full() {
+        let cli = parse_with_arc_defaults([
+            "arc-node-execution",
+            "node",
+            "--public-api",
+            "--rpc.pending-block=full",
+        ]);
+        assert!(
+            cli.validate()
+                .unwrap_err()
+                .contains("--rpc.pending-block must be 'none'"),
+            "--public-api + --rpc.pending-block=full must be rejected"
+        );
     }
 
     #[test]
@@ -960,12 +1087,12 @@ mod tests {
     }
 
     #[test]
-    fn test_arc_hide_pending_txs_default_is_false() {
+    fn test_arc_expose_pending_txs_default_is_false() {
         let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
         if let Commands::Node(node_cmd) = cli.inner.command {
             assert!(
-                !node_cmd.ext.arc_hide_pending_txs,
-                "Default: --arc.hide-pending-txs should be false"
+                !node_cmd.ext.arc_expose_pending_txs,
+                "Default: --arc.expose-pending-txs should be false (pending txs hidden by default)"
             );
         } else {
             panic!("Expected Node command");
@@ -973,13 +1100,96 @@ mod tests {
     }
 
     #[test]
-    fn test_arc_hide_pending_txs_when_set() {
-        let cli = ArcCli::try_parse_from(["arc-node-execution", "node", "--arc.hide-pending-txs"])
-            .unwrap();
+    fn test_arc_expose_pending_txs_when_set() {
+        let cli =
+            ArcCli::try_parse_from(["arc-node-execution", "node", "--arc.expose-pending-txs"])
+                .unwrap();
         if let Commands::Node(node_cmd) = cli.inner.command {
             assert!(
-                node_cmd.ext.arc_hide_pending_txs,
-                "--arc.hide-pending-txs should enable filtering"
+                node_cmd.ext.arc_expose_pending_txs,
+                "--arc.expose-pending-txs should flip the flag"
+            );
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_public_api_default_is_false() {
+        let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert!(
+                !node_cmd.ext.public_api,
+                "Default: --public-api should be false"
+            );
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_public_api_when_set() {
+        let cli = ArcCli::try_parse_from(["arc-node-execution", "node", "--public-api"]).unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert!(node_cmd.ext.public_api, "--public-api should flip the flag");
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_public_api_conflicts_with_expose_pending_txs() {
+        use clap::error::ErrorKind;
+
+        let err = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--public-api",
+            "--arc.expose-pending-txs",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::ArgumentConflict,
+            "clap should reject --public-api + --arc.expose-pending-txs as a conflict"
+        );
+    }
+
+    #[test]
+    fn test_public_api_enables_filter() {
+        let cli = ArcCli::try_parse_from(["arc-node-execution", "node", "--public-api"]).unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert!(
+                compute_filter_pending_txs(&node_cmd.ext),
+                "--public-api alone must enable the filter"
+            );
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_compute_filter_pending_txs_default_hides() {
+        let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert!(
+                compute_filter_pending_txs(&node_cmd.ext),
+                "default config must keep the filter on"
+            );
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_compute_filter_pending_txs_expose_disables() {
+        let cli =
+            ArcCli::try_parse_from(["arc-node-execution", "node", "--arc.expose-pending-txs"])
+                .unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert!(
+                !compute_filter_pending_txs(&node_cmd.ext),
+                "--arc.expose-pending-txs must disable the filter"
             );
         } else {
             panic!("Expected Node command");
@@ -1184,5 +1394,78 @@ mod tests {
         } else {
             panic!("Expected Node command");
         }
+    }
+}
+
+#[cfg(test)]
+mod public_api_tests {
+    use super::*;
+
+    #[test]
+    fn unsafe_modules_empty_when_selection_is_subset_of_safe() {
+        let sel = RpcModuleSelection::try_from_selection(["eth", "net", "web3", "rpc"]).unwrap();
+        let unsafe_ = unsafe_public_api_modules(&sel);
+        assert!(unsafe_.is_empty(), "eth/net/web3/rpc are all safe");
+    }
+
+    #[test]
+    fn unsafe_modules_lists_sensitive_namespaces() {
+        let sel = RpcModuleSelection::try_from_selection([
+            "eth", "net", "web3", "txpool", "debug", "trace", "admin",
+        ])
+        .unwrap();
+        let unsafe_: HashSet<_> = unsafe_public_api_modules(&sel).into_iter().collect();
+        assert_eq!(
+            unsafe_,
+            HashSet::from([
+                RethRpcModule::Txpool,
+                RethRpcModule::Debug,
+                RethRpcModule::Trace,
+                RethRpcModule::Admin,
+            ])
+        );
+    }
+
+    #[test]
+    fn unsafe_modules_treats_other_as_unsafe() {
+        let sel = RpcModuleSelection::try_from_selection(["eth", "custom"]).unwrap();
+        let unsafe_ = unsafe_public_api_modules(&sel);
+        assert_eq!(unsafe_.len(), 1);
+        assert!(matches!(unsafe_[0], RethRpcModule::Other(_)));
+    }
+
+    #[test]
+    fn unsafe_modules_handles_all_selection() {
+        let sel = RpcModuleSelection::All;
+        let unsafe_ = unsafe_public_api_modules(&sel);
+        assert!(!unsafe_.is_empty());
+        assert!(!unsafe_.contains(&RethRpcModule::Eth));
+        assert!(!unsafe_.contains(&RethRpcModule::Rpc));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn warn_if_public_api_unsafe_none_is_silent() {
+        warn_if_public_api_unsafe(None, "--http.api");
+        assert!(!logs_contain("sensitive namespaces"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn warn_if_public_api_unsafe_safe_selection_is_silent() {
+        let sel = RpcModuleSelection::try_from_selection(["eth", "net", "web3"]).unwrap();
+        warn_if_public_api_unsafe(Some(&sel), "--http.api");
+        assert!(!logs_contain("sensitive namespaces"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn warn_if_public_api_unsafe_unsafe_selection_warns() {
+        let sel = RpcModuleSelection::try_from_selection(["eth", "txpool", "debug"]).unwrap();
+        warn_if_public_api_unsafe(Some(&sel), "--ws.api");
+        assert!(logs_contain("sensitive namespaces"));
+        assert!(logs_contain("--ws.api"));
+        assert!(logs_contain("txpool"));
+        assert!(logs_contain("debug"));
     }
 }

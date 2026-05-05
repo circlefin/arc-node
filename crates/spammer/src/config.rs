@@ -20,7 +20,7 @@ use crate::accounts::PartitionMode;
 use color_eyre::eyre::{self, Result};
 use std::str::FromStr;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GuzzlerFunction {
     #[default]
     HashLoop,
@@ -145,7 +145,7 @@ impl FromStr for GuzzlerFnWeights {
 }
 
 /// ERC-20 function the spammer can call.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Erc20Function {
     #[default]
     Transfer,
@@ -384,6 +384,41 @@ impl Config {
             );
         }
         Ok(())
+    }
+}
+
+/// Subset of [`Config`] used when resuming a spammer across phases.
+///
+/// Fields that control account provisioning (`num_generators`, `partition_mode`,
+/// `max_num_accounts`, `preinit_accounts`) are intentionally absent — those come
+/// from the captured [`SpammerState`](crate::SpammerState) instead.
+pub struct ResumeConfig {
+    pub max_rate: u64,
+    pub max_num_txs: u64,
+    pub max_time: u64,
+    pub wait_response: bool,
+    pub reconnect_attempts: u32,
+    pub reconnect_period: std::time::Duration,
+    pub silent: bool,
+    pub show_pool_status: bool,
+    pub tx_latency: bool,
+    pub csv_dir: Option<PathBuf>,
+}
+
+impl From<&Config> for ResumeConfig {
+    fn from(c: &Config) -> Self {
+        Self {
+            max_rate: c.max_rate,
+            max_num_txs: c.max_num_txs,
+            max_time: c.max_time,
+            wait_response: c.wait_response,
+            reconnect_attempts: c.reconnect_attempts,
+            reconnect_period: c.reconnect_period,
+            silent: c.silent,
+            show_pool_status: c.show_pool_status,
+            tx_latency: c.tx_latency,
+            csv_dir: c.csv_dir.clone(),
+        }
     }
 }
 

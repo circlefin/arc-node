@@ -42,7 +42,7 @@ pub fn compute_is_blocklisted_storage_slot(key: Address) -> B256 {
     data[..32].copy_from_slice(&key_bytes);
     data[32..].copy_from_slice(BLOCKLIST_MAPPING_SLOT.as_ref());
 
-    B256::new(keccak256(data).0)
+    keccak256(data)
 }
 
 /// Returns true if a blocklist storage word means "blocked".

@@ -1000,14 +1000,10 @@ where
             // Child completed immediately (e.g. rejected by allowlist, empty bytecode).
             // complete_subcall must run now since frame_return_result won't see this child.
             FrameInitOutcome::Immediate(child_result) => {
-                let Some(continuation) = self.subcall_continuations.remove(&depth) else {
-                    // Defensive: the continuation was inserted a few lines above. If somehow
-                    // missing, revert — do not panic in production.
-                    return Ok(ItemOrResult::Result(init_subcall_revert(
-                        "internal error: missing subcall continuation",
-                        call_inputs,
-                    )));
-                };
+                let continuation = self
+                    .subcall_continuations
+                    .remove(&depth)
+                    .expect("continuation was inserted above");
                 let final_result = Self::complete_subcall(child_result, continuation)?;
                 Ok(ItemOrResult::Result(final_result))
             }

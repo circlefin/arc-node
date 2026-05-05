@@ -99,6 +99,23 @@ impl PrecompileErrorOrRevert {
     }
 }
 
+/// Gas cost to load an account balance for stateful precompiles.
+///
+/// Under Zero6+, applies EIP-2929 warm/cold pricing. Before Zero6, a flat
+/// cost is charged (matches pre-hardfork behavior for the `balance_incr`,
+/// `balance_decr` and `transfer` helpers).
+fn account_load_cost(is_cold: bool, hardfork_flags: ArcHardforkFlags) -> u64 {
+    if hardfork_flags.is_active(ArcHardfork::Zero6) {
+        if is_cold {
+            revm_interpreter::gas::COLD_ACCOUNT_ACCESS_COST
+        } else {
+            revm_interpreter::gas::WARM_STORAGE_READ_COST
+        }
+    } else {
+        PRECOMPILE_SLOAD_GAS_COST
+    }
+}
+
 pub(crate) fn record_cost_or_out_of_gas(
     gas_counter: &mut Gas,
     cost: u64,
@@ -273,40 +290,37 @@ pub(crate) fn transfer(
     to: Address,
     amount: U256,
     gas_counter: &mut Gas,
-    is_burn: bool,
-    check_selfdestructed: bool,
+    hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
-    record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SLOAD_GAS_COST)?;
     let loaded_from_account = internals.load_account(from).map_err(|_| {
         PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
     })?;
+    record_cost_or_out_of_gas(
+        gas_counter,
+        account_load_cost(loaded_from_account.is_cold, hardfork_flags),
+    )?;
 
     // Check that the account can be decremented by the amount
     check_can_decr_account(&loaded_from_account.info, amount, gas_counter)?;
 
-    // Overflow checking is handled by the Journal and the TransferError
-    // returned
-    // Here we stack the STORE gas cost, mimicking the prior balance_decr + balance_incr calls,
-    // where we charged:
-    // SLOAD, SSTORE
-    // SLOAD, SSTORE
-    // For burns, we only charge the first SLOAD, SSTORE to mimick balance_decr
+    // Charge SLOAD + SSTORE for both accounts, mimicking the prior balance_decr +
+    // balance_incr sequence. Pre-Zero6 each SLOAD is flat; Zero6+ uses cold/warm pricing
+    // via account_load_cost.
     record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
-    if !is_burn {
-        record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SLOAD_GAS_COST)?;
-        record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
-    }
+    let to_load = internals.load_account(to).map_err(|_| {
+        PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
+    })?;
+    record_cost_or_out_of_gas(
+        gas_counter,
+        account_load_cost(to_load.is_cold, hardfork_flags),
+    )?;
+    record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
 
-    if check_selfdestructed {
-        let to_account = internals.load_account(to).map_err(|_| {
-            PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
-        })?;
-        if to_account.is_selfdestructed() {
-            return Err(PrecompileErrorOrRevert::new_reverted(
-                *gas_counter,
-                ERR_SELFDESTRUCTED_BALANCE_INCREASED,
-            ));
-        }
+    if hardfork_flags.is_active(ArcHardfork::Zero5) && to_load.is_selfdestructed() {
+        return Err(PrecompileErrorOrRevert::new_reverted(
+            *gas_counter,
+            ERR_SELFDESTRUCTED_BALANCE_INCREASED,
+        ));
     }
 
     let transfer_result = internals.transfer(from, to, amount).map_err(|_e| {
@@ -339,16 +353,18 @@ pub(crate) fn balance_incr(
     to: Address,
     amount: U256,
     gas_counter: &mut Gas,
-    check_selfdestructed: bool,
+    hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
-    record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SLOAD_GAS_COST)?;
-
     // Balance check, but doesn't touch state
     let account = internals.load_account(to).map_err(|_| {
         PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
     })?;
+    record_cost_or_out_of_gas(
+        gas_counter,
+        account_load_cost(account.is_cold, hardfork_flags),
+    )?;
 
-    if check_selfdestructed && account.is_selfdestructed() {
+    if hardfork_flags.is_active(ArcHardfork::Zero5) && account.is_selfdestructed() {
         return Err(PrecompileErrorOrRevert::new_reverted(
             *gas_counter,
             ERR_SELFDESTRUCTED_BALANCE_INCREASED,
@@ -378,11 +394,15 @@ pub(crate) fn balance_decr(
     from: Address,
     amount: U256,
     gas_counter: &mut Gas,
+    hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
-    record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SLOAD_GAS_COST)?;
     let loaded_from_account = internals.load_account(from).map_err(|_| {
         PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
     })?;
+    record_cost_or_out_of_gas(
+        gas_counter,
+        account_load_cost(loaded_from_account.is_cold, hardfork_flags),
+    )?;
 
     // Check that the account can be decremented by the amount
     check_can_decr_account(&loaded_from_account.info, amount, gas_counter)?;
@@ -424,7 +444,7 @@ pub(crate) fn check_staticcall(
 pub(crate) fn check_delegatecall(
     precompile_address: Address,
     precompile_input: &PrecompileInput,
-    gas_counter: &mut Gas,
+    gas_counter: &Gas,
 ) -> Result<(), PrecompileErrorOrRevert> {
     if precompile_input.target_address != precompile_address
         || precompile_input.bytecode_address != precompile_address
@@ -642,5 +662,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn from_precompile_error_or_revert_revert_sets_reverted_flag() {
+        let revert_bytes = revert_message_to_bytes("test revert");
+        let err_or_revert =
+            PrecompileErrorOrRevert::Revert(PrecompileOutput::new(1_000, revert_bytes.clone()));
+
+        let result: Result<PrecompileOutput, PrecompileError> = err_or_revert.into();
+
+        let output = result.expect("Revert variant must convert to Ok(PrecompileOutput)");
+        assert!(
+            output.reverted,
+            "canonical From impl must set reverted flag on Revert variant"
+        );
+        assert_eq!(output.gas_used, 1_000);
+        assert_eq!(output.bytes, revert_bytes);
+    }
+
+    #[test]
+    fn from_precompile_error_or_revert_error_maps_to_err() {
+        let err_or_revert = PrecompileErrorOrRevert::Error(PrecompileError::OutOfGas);
+
+        let result: Result<PrecompileOutput, PrecompileError> = err_or_revert.into();
+
+        assert!(matches!(result, Err(PrecompileError::OutOfGas)));
     }
 }

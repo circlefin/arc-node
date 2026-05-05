@@ -18,6 +18,13 @@ pragma solidity ^0.8.29;
 
 /// @title IMemo
 /// @notice Interface for the Memo contract.
+/// @dev EOA-only: {memo} invokes the callFrom precompile, which requires the
+///      sender argument (`msg.sender` of Memo) to equal the precompile caller
+///      or `tx.origin`. A contract caller is neither, so callFrom reverts and
+///      the entire call reverts without raising {MemoFailed}.
+///
+///      Target-contract reverts (callFrom returning `success=false`) are
+///      re-raised as {MemoFailed} with the target's revert bytes.
 interface IMemo {
     /// @notice Thrown when the call via callFrom fails.
     error MemoFailed(bytes returnData);
@@ -39,6 +46,7 @@ interface IMemo {
     function memoIndex() external view returns (uint256);
 
     /// @notice Executes a subcall via the callFrom precompile and emits memo metadata.
+    /// @dev EOA-only. See {IMemo}.
     /// @param target The address to call via the precompile.
     /// @param data The calldata to forward to the target.
     /// @param memoId A caller-supplied identifier for the memo.

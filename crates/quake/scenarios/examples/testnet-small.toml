@@ -124,7 +124,6 @@ el.config.disable_discovery = true
 el.config.http.api = ["eth", "net", "web3"]
 el.config.ws.api = ["eth", "net", "web3"]
 el.config.prune.preset = "full"
-el.config.arc.hide_pending_txs = true
 
 # --- Snapshot node (full profile, snapshot source) ---
 

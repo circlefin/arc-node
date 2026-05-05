@@ -224,16 +224,26 @@ impl LatencyTracker {
         txs_finalized += self.drain_remaining_blocks(&mut block_receiver).await?;
 
         let txs_not_finalized = self.submitted_txs.len();
-        info!(
-            "LatencyTracker finished: \
-             {} txs found in blocks out of {} submitted, \
-             {} txs not found in blocks. \
-             CSV file: {}",
-            txs_finalized,
-            txs_submissions_recv,
-            txs_not_finalized,
-            self.csv_path.display(),
-        );
+        if txs_finalized == 0 && txs_submissions_recv > 0 {
+            warn!(
+                "LatencyTracker finished: 0 txs found in blocks out of {} submitted — \
+                 check that eth_sendRawTransaction is being accepted by the node. \
+                 CSV file: {}",
+                txs_submissions_recv,
+                self.csv_path.display(),
+            );
+        } else {
+            info!(
+                "LatencyTracker finished: \
+                 {} txs found in blocks out of {} submitted, \
+                 {} txs not found in blocks. \
+                 CSV file: {}",
+                txs_finalized,
+                txs_submissions_recv,
+                txs_not_finalized,
+                self.csv_path.display(),
+            );
+        }
 
         self.csv_writer.flush()?;
         Ok(())

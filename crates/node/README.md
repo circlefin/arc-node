@@ -109,7 +109,8 @@ In addition to standard Reth flags, `arc-node-execution` provides the following 
 | `--invalid-tx-list-cap <CAPACITY>` | `100000` | - | Maximum capacity of the invalid tx list LRU cache. Only read if `--invalid-tx-list-enable` is set |
 | `--full` | - | - | Full-node pruning preset. Fully prunes sender recovery; keeps the last 237,600 blocks for all other segments. Also sets `--prune.block-interval=5000`. Mutually exclusive with `--minimal`. |
 | `--minimal` | - | - | Minimal-storage pruning preset. Fully prunes sender recovery; keeps transaction lookup for 64 blocks, receipts for 64 blocks, account/storage history for 10,064 blocks, and block bodies for 237,600 blocks. Also sets `--prune.block-interval=5000`. Mutually exclusive with `--full`. |
-| `--arc.hide-pending-txs` | `false` | - | Hide pending-tx RPCs. When set, a filter blocks pending-tx subscriptions, filters, and pending block queries (see [Pending Txs Filter](#pending-txs-filter)). |
+| `--arc.expose-pending-txs` | `false` | - | Expose pending-tx RPCs. By default pending-tx subscriptions, filters, and pending-block queries are blocked — set this on trusted / internal nodes where exposing pending state is intentional. |
+| `--public-api` | `false` | - | Convenience flag for externally-exposed RPC nodes. Forces pending-tx hiding and warns if `--http.api` / `--ws.api` expose namespaces outside `{eth, net, web3, rpc}`. Conflicts with `--arc.expose-pending-txs`. |
 
 **Examples:**
 
@@ -182,15 +183,22 @@ arc-node-execution node \
 
 ## Pending Txs Filter
 
-By default, the node allows all pending-tx RPCs. Pass `--arc.hide-pending-txs` to enable the filter that blocks them (for externally-exposed nodes).
+By default, the node hides pending-tx RPCs. Pass `--arc.expose-pending-txs`
+to disable the filter on trusted / internal nodes. External / public-facing
+nodes should instead use `--public-api`, which also narrows the advised
+RPC surface.
 
-**When the filter is enabled (`--arc.hide-pending-txs`):**
+**When the filter is enabled (default, or enforced by `--public-api`):**
 
 | Method or call | Behavior |
 |----------------|----------|
 | `eth_subscribe("newPendingTransactions")` | Error -32001 |
 | `eth_newPendingTransactionFilter` | Error -32001 |
 | `eth_getBlockByNumber("pending")` | Returns `null` (success) |
+
+**When the filter is disabled (`--arc.expose-pending-txs`):**
+
+All three methods bypass the middleware. Pending-block queries additionally depend on `--rpc.pending-block` (Arc default: `none`); to actually receive pending-block data, set `--rpc.pending-block=full` alongside `--arc.expose-pending-txs`.
 
 ## Architecture
 

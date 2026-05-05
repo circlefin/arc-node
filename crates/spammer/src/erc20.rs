@@ -20,13 +20,19 @@ use alloy_sol_types::{sol, SolCall};
 use color_eyre::eyre::Result;
 
 use crate::config::Erc20Function;
-use crate::generator::{TxGenerator, TESTNET_CHAIN_ID};
+use crate::generator::{
+    TxGenerator, GAS_ESTIMATE_MARGIN_DEN, GAS_ESTIMATE_MARGIN_NUM, MAX_FEE_PER_GAS,
+    MAX_PRIORITY_FEE_PER_GAS, TESTNET_CHAIN_ID,
+};
 use crate::ws::WsClient;
 
 /// TestToken ERC-20 contract address (deterministic deployment in genesis).
 pub(crate) const TEST_TOKEN_ADDRESS: Address = address!("298122B4bF05CC897662e535C18417f44C7f274b");
 
-fn encode_transfer(to: Address, amount: U256) -> Bytes {
+/// Fallback gas limit for ERC-20 calls when estimation fails (~65k typical).
+const ERC20_GAS_FALLBACK: u64 = 100_000;
+
+pub(crate) fn encode_transfer(to: Address, amount: U256) -> Bytes {
     sol! {
         function transfer(address to, uint256 amount) returns (bool);
     }
@@ -54,6 +60,7 @@ pub(crate) async fn prepare_erc20_tx(
     recipient: Address,
     nonce: u64,
     function: Erc20Function,
+    cached_gas: Option<u64>,
 ) -> Result<TxEip1559> {
     let amount = U256::from(1_000_000_000_000_000_000u64); // 1 token (1e18)
     let calldata = match function {
@@ -61,17 +68,25 @@ pub(crate) async fn prepare_erc20_tx(
         Erc20Function::Approve => encode_approve(recipient, amount),
         Erc20Function::TransferFrom => encode_transfer_from(signer_addr, recipient, amount),
     };
-    let estimate =
-        TxGenerator::estimate_gas_tx(ws_clients, signer_addr, Some(TEST_TOKEN_ADDRESS), &calldata)
-            .await;
-    let gas_limit = estimate
-        .map(|g| g.saturating_mul(5) / 4) // 25% safety margin
-        .unwrap_or(100_000); // ERC-20 call typically ~65k gas
+    let gas_limit = if let Some(cached) = cached_gas {
+        cached
+    } else {
+        let estimate = TxGenerator::estimate_gas_tx(
+            ws_clients,
+            signer_addr,
+            Some(TEST_TOKEN_ADDRESS),
+            &calldata,
+        )
+        .await;
+        estimate
+            .map(|g| g.saturating_mul(GAS_ESTIMATE_MARGIN_NUM) / GAS_ESTIMATE_MARGIN_DEN)
+            .unwrap_or(ERC20_GAS_FALLBACK)
+    };
     Ok(TxEip1559 {
         chain_id: TESTNET_CHAIN_ID,
         nonce,
-        max_priority_fee_per_gas: 1_000_000_000, // 1 gwei
-        max_fee_per_gas: 2_000_000_000,          // 2 gwei
+        max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS,
+        max_fee_per_gas: MAX_FEE_PER_GAS,
         gas_limit,
         to: Some(TEST_TOKEN_ADDRESS).into(),
         value: U256::ZERO,
