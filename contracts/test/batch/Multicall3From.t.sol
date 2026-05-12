@@ -340,7 +340,7 @@ contract Multicall3FromTest is Test {
             multicall.blockAndAggregate(calls);
 
         assertEq(blockNumber, block.number);
-        assertEq(blockHash, blockhash(block.number));
+        assertEq(blockHash, blockhash(block.number - 1));
         assertEq(results.length, 1);
         assertTrue(results[0].success);
         assertEq(target.value(), 33);
@@ -370,7 +370,7 @@ contract Multicall3FromTest is Test {
             multicall.tryBlockAndAggregate(false, calls);
 
         assertEq(blockNumber, block.number);
-        assertEq(blockHash, blockhash(block.number));
+        assertEq(blockHash, blockhash(block.number - 1));
         assertEq(results.length, 1);
         assertFalse(results[0].success);
     }

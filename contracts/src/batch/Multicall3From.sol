@@ -163,7 +163,7 @@ contract Multicall3From is IMulticall3From {
         returns (uint256 blockNumber, bytes32 blockHash, Result[] memory returnData)
     {
         blockNumber = block.number;
-        blockHash = blockhash(block.number);
+        blockHash = blockhash(block.number - 1);
         uint256 length = calls.length;
         returnData = new Result[](length);
         for (uint256 i = 0; i < length;) {
