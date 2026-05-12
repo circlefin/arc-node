@@ -206,6 +206,7 @@ sudo journalctl -u arc-consensus -f
 
 # Execution layer logs
 sudo journalctl -u arc-execution -f
+```
 
 > Notice that this command queries the execution layer's HTTP server offering
 > a local JSON-RPC API.
