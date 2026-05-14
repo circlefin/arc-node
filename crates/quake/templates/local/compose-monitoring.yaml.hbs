@@ -20,7 +20,7 @@ services:
     image: grafana/grafana-oss
     # if you are running as root then set it to 0
     # else find the right id with the id -u command
-    user: '501'
+    user: '472'
     container_name: grafana
     ports:
       - {{default monitoring_bind_host "127.0.0.1"}}:3000:3000
