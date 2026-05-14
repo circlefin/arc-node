@@ -511,7 +511,12 @@ impl Testnet {
         // For local testnets, create EL reth dirs and set permissions so containers (user arc) can write
         if self.infra_data.infra_type == InfraType::Local {
             let node_names: Vec<String> = self.manifest.nodes.keys().cloned().collect();
-            setup::set_local_testnet_directory_permissions(&self.dir, &node_names)?;
+            let monitoring_dir = self.quake_dir.join("monitoring");
+            setup::set_local_testnet_directory_permissions(
+                &self.dir,
+                &monitoring_dir,
+                &node_names,
+            )?;
         }
 
         // In remote mode, provision the Control Center server
