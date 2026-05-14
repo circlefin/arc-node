@@ -633,8 +633,7 @@ describe('NativeFiatToken', () => {
           true, // requireSuccess = true, so A will revert when B call fails
           callBToC,
         ),
-        // FIXME no error message for address blocked?
-      ).to.be.rejectedWith(ContractFunctionExecutionError, /Relay reverted/)
+      ).to.be.rejectedWith(ContractFunctionExecutionError, ERR_BLOCKED_ADDRESS)
 
       // Verify that no balance changes occurred (no gas deduction for blocked transaction)
       await balances.verify()
