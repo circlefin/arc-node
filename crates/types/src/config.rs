@@ -134,18 +134,18 @@ pub struct PruningConfig {
 impl PruningConfig {
     /// Returns true if pruning is enabled, false otherwise.
     pub fn enabled(&self) -> bool {
-        self.certificates_distance > 0 || self.certificates_before > Height::ZERO
+        self.certificates_distance > 0 || self.certificates_before > Height::new(0)
     }
 
     /// Calculates the effective minimum certificates height to keep based on
     /// the current height.
     pub fn effective_certificates_min_height(&self, current_height: Height) -> Height {
-        if self.certificates_before > Height::ZERO {
+        if self.certificates_before > Height::new(0) {
             self.certificates_before
         } else if self.certificates_distance > 0 {
             current_height.saturating_sub(self.certificates_distance)
         } else {
-            Height::ZERO
+            Height::new(0)
         }
     }
 }
@@ -397,6 +397,67 @@ mod tests {
 
             config.execution.persistence_backpressure_threshold = 0;
             assert!(config.validate().is_err());
+        }
+
+        #[test]
+        fn pruning_config_disabled_by_default() {
+            let config = PruningConfig::default();
+            assert!(!config.enabled());
+        }
+
+        #[test]
+        fn pruning_config_enabled_by_distance() {
+            let config = PruningConfig {
+                certificates_distance: 100,
+                certificates_before: Height::new(0),
+            };
+            assert!(config.enabled());
+        }
+
+        #[test]
+        fn pruning_config_enabled_by_before() {
+            let config = PruningConfig {
+                certificates_distance: 0,
+                certificates_before: Height::new(50),
+            };
+            assert!(config.enabled());
+        }
+
+        #[test]
+        fn pruning_config_effective_height_uses_before_over_distance() {
+            let config = PruningConfig {
+                certificates_distance: 10,
+                certificates_before: Height::new(42),
+            };
+            let result = config.effective_certificates_min_height(Height::new(100));
+            assert_eq!(result, Height::new(42));
+        }
+
+        #[test]
+        fn pruning_config_effective_height_distance() {
+            let config = PruningConfig {
+                certificates_distance: 30,
+                certificates_before: Height::new(0),
+            };
+            let result = config.effective_certificates_min_height(Height::new(100));
+            assert_eq!(result, Height::new(70));
+        }
+
+        #[test]
+        fn pruning_config_effective_height_saturates_at_zero() {
+            let config = PruningConfig {
+                certificates_distance: 200,
+                certificates_before: Height::new(0),
+            };
+            let result = config.effective_certificates_min_height(Height::new(50));
+            assert_eq!(result, Height::new(0));
+        }
+
+        #[test]
+        fn pruning_config_effective_height_disabled_returns_zero() {
+            let config = PruningConfig::default();
+            let result = config.effective_certificates_min_height(Height::new(999));
+            assert_eq!(result, Height::new(0));
         }
     }
 }
