@@ -24,7 +24,7 @@ use std::borrow::Cow;
 
 // FIXME: Update this to the actual snapshot URL.
 /// Default snapshot URL for Arc Network testnet (chain ID 5042002).
-pub(crate) const DEFAULT_DOWNLOAD_URL: &str = "https://snapshots.arc.network/5042002";
+pub(crate) const DEFAULT_DOWNLOAD_URL: &str = "https://snapshots.arc.io/5042002";
 
 /// Initialize download URL defaults for snapshot-based node bootstrapping.
 ///
@@ -34,8 +34,8 @@ fn init_download_urls() {
     let download_defaults = DownloadDefaults {
         available_snapshots: vec![
             // FIXME: Update this to the actual snapshot URL.
-            Cow::Borrowed("https://snapshots.arc.network/5042002 (testnet)"),
-            Cow::Borrowed("https://snapshots.arc.network/5042001 (devnet)"),
+            Cow::Borrowed("https://snapshots.arc.io/5042002 (testnet)"),
+            Cow::Borrowed("https://snapshots.arc.io/5042001 (devnet)"),
         ],
         default_base_url: Cow::Borrowed(DEFAULT_DOWNLOAD_URL),
         default_chain_aware_base_url: None,

@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://www.arc.network/">
+  <a href="https://www.arc.io/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/assets/arc-logo-light.svg">
       <img alt="Arc" src="docs/assets/arc-logo-dark.svg" width="auto" height="120">
@@ -10,7 +10,7 @@
 <p align="center">The Economic OS for the internet</p>
 
 <p align="center">
-  <a href="https://www.arc.network/"><img src="https://img.shields.io/badge/Website-arc.network-blue" alt="Website"></a>
+  <a href="https://www.arc.io/"><img src="https://img.shields.io/badge/Website-arc.io-blue" alt="Website"></a>
 </p>
 
 > [!IMPORTANT]
@@ -29,7 +29,7 @@ Arc is an open EVM-compatible layer 1 built on [Malachite](https://github.com/ci
 
 - 🚀 **[Execution](crates/node/README.md)** - Execution binary and configuration
 - 🗳️ **[Consensus](crates/malachite-app/README.md)** - Consensus binary and configuration
-- More: see Arc [developer docs](https://docs.arc.network/arc/concepts/welcome-to-arc) for guides, APIs, and specs
+- More: see Arc [developer docs](https://docs.arc.io/arc/concepts/welcome-to-arc) for guides, APIs, and specs
 
 ## Install and Run a Node
 
@@ -187,8 +187,8 @@ For more details, see our [Contributing Guide](CONTRIBUTING.md).
 
 ## Resources
 
-- [Arc Network](https://www.arc.network/) - Official Arc Network website
-- [Arc Documentation](https://docs.arc.network/) - Official Arc developer documentation
+- [Arc Network](https://www.arc.io/) - Official Arc Network website
+- [Arc Documentation](https://docs.arc.io/) - Official Arc developer documentation
 - [Reth](https://github.com/paradigmxyz/reth) - The underlying execution layer framework
 - [Malachite](https://github.com/circlefin/malachite) - BFT consensus engine
 - [Local Documentation](docs/) - Implementation guides and references
