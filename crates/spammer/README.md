@@ -391,7 +391,7 @@ a finalized block.
 The latency tracker records the time between:
 
 1. **Submission**: when the spammer sends the transaction to the RPC endpoint of a node
-2. **Finalization**: the block in which the the transaction was included is known to be finalized, via a RPC subscription
+2. **Finalization**: the block in which the transaction was included is known to be finalized, via a RPC subscription
 observes.
 
 This measures end-to-end transaction latency as experienced by a client.

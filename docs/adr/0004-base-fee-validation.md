@@ -15,7 +15,7 @@ On Arc, the base fee calculation combines: 1) an EIP-1559-style algorithm, 2)  s
 
 The value of 1) is that it is familiar and well-understood. The value of 2) is to enable rapid adjusting of fee parameters and strictly enforcing block gas limits through governance. The value of 3) is to dampen fee increases against sudden shocks in usage with Arc's fast blocktimes.
 
-The combination of these makes it challenging for integrators to precisely understand the next block base fee as the calculation is more involved. To address this, Arc includes the next block base fee the the header, computed at the end of the parent's block execution, since it is fully known at that point. 
+The combination of these makes it challenging for integrators to precisely understand the next block base fee as the calculation is more involved. To address this, Arc includes the next block base fee in the header, computed at the end of the parent's block execution, since it is fully known at that point. 
 
 Currently, the implementation has several gaps in validation. This ADR, similar to ADR-003, seeks to document solutions to these gaps.
 
