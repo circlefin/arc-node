@@ -173,7 +173,7 @@ impl Engine {
     /// Stays pending forever for non-IPC engines (RPC, mock), so calling code can
     /// unconditionally `select!` on this without special-casing the transport.
     pub async fn wait_for_disconnect(&self) {
-        match &self.0.disconnect_rx {
+        match &self.disconnect_rx {
             // wait_for checks the current value first, so late subscribers see a prior disconnect.
             Some(rx) => {
                 rx.clone().wait_for(|&v| v).await.ok();
@@ -188,7 +188,7 @@ impl Engine {
     /// The provided function should use the same chainspec as the EL so that
     /// the V4/V5 decision always aligns.
     pub fn set_is_osaka_active(&self, f: IsOsakaActiveFn) {
-        if self.0.is_osaka_active.set(f).is_err() {
+        if self.is_osaka_active.set(f).is_err() {
             tracing::warn!("Osaka activation function already set; ignoring duplicate call");
         }
     }
@@ -262,7 +262,7 @@ impl Engine {
     /// if one was configured. `None` for test/mock engines or RPC without
     /// `--execution-ws-endpoint`.
     pub fn subscription_endpoint(&self) -> Option<&SubscriptionEndpoint> {
-        self.0.subscription_endpoint.as_ref()
+        self.subscription_endpoint.as_ref()
     }
 }
 
