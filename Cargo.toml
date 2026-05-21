@@ -362,3 +362,53 @@ strip = false
 # This version of `ark-relations` includes a fix for the issue,
 # as it bumped `tracing-subscriber` to v0.3.0.
 ark-relations = { git = "https://github.com/arkworks-rs/snark.git", rev = "9c528529763f1a0a2e0cba83528f93d32247d621" }
+
+# Pinned to kaleido-io/reth's release-v1.11.3 branch (commit 88e180a0), which carries
+# the `admin_addTrustedPeer` hostname-support backport on top of upstream v1.11.3.
+# Every reth-* crate is repointed so cargo doesn't see two versions of the same crate
+# (one from the upstream tag, one from our branch). All listed crates resolve to the
+# same git checkout, which is a strict superset of v1.11.3 with our patch on top.
+[patch."https://github.com/paradigmxyz/reth"]
+reth-basic-payload-builder = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-chainspec = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-cli = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-cli-commands = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-consensus = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-consensus-common = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-db = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-e2e-test-utils = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-engine-local = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-engine-primitives = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-errors = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-ethereum = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-ethereum-engine-primitives = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-ethereum-forks = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-ethereum-payload-builder = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-ethereum-primitives = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-evm = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-evm-ethereum = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-ipc = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-network = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-network-api = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-network-peers = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-node-api = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-node-builder = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-node-core = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-node-ethereum = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-node-metrics = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-payload-builder = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-payload-primitives = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-primitives-traits = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-provider = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-prune-types = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-revm = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-rpc = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-rpc-api = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-rpc-builder = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-rpc-eth-api = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-rpc-eth-types = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-rpc-server-types = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-storage-api = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-tasks = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-tracing = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
+reth-transaction-pool = { git = "https://github.com/kaleido-io/reth", rev = "88e180a0659a38dafd5788b7a000812caae457cc" }
