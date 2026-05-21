@@ -67,7 +67,7 @@ services:
       - --metrics=0.0.0.0:9001
       - --disable-discovery
       - --enable-arc-rpc
-      - --rpc.forwarder=https://rpc.quicknode.testnet.arc.io/
+      - --rpc.forwarder=https://rpc.quicknode.testnet.arc.network/
       - --log.file.directory=/data/execution/logs
     volumes:
       - ${ARC_HOME}/execution:/data/execution
@@ -90,9 +90,9 @@ services:
       - --execution-socket=/sockets/auth.ipc
       - --rpc.addr=0.0.0.0:31000
       - --follow
-      - --follow.endpoint=https://rpc.drpc.testnet.arc.io,wss=rpc.drpc.testnet.arc.io
-      - --follow.endpoint=https://rpc.quicknode.testnet.arc.io,wss=rpc.quicknode.testnet.arc.io
-      - --follow.endpoint=https://rpc.blockdaemon.testnet.arc.io,wss=rpc.blockdaemon.testnet.arc.io/websocket
+      - --follow.endpoint=https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network
+      - --follow.endpoint=https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network
+      - --follow.endpoint=https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network/websocket
       - --full
       - --execution-persistence-backpressure
       - --execution-persistence-backpressure-threshold=50

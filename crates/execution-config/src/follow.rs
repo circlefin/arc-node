@@ -24,7 +24,7 @@ use arc_shared::chain_ids::{LOCALDEV_CHAIN_ID, TESTNET_CHAIN_ID};
 /// Returns the WebSocket URL for the given chain ID.
 pub fn ws_url_for_chain_id(chain_id: u64) -> Result<String> {
     let url = match chain_id {
-        TESTNET_CHAIN_ID => "wss://rpc.quicknode.testnet.arc.io",
+        TESTNET_CHAIN_ID => "wss://rpc.quicknode.testnet.arc.network",
         LOCALDEV_CHAIN_ID => "ws://localhost:8546",
         _ => return Err(eyre!("Unsupported chain for follow mode: {}", chain_id)),
     };
@@ -64,7 +64,7 @@ mod tests {
     #[test]
     fn test_ws_url_for_chain_id_testnet() {
         let url = ws_url_for_chain_id(TESTNET_CHAIN_ID).unwrap();
-        assert_eq!(url, "wss://rpc.quicknode.testnet.arc.io");
+        assert_eq!(url, "wss://rpc.quicknode.testnet.arc.network");
     }
 
     #[test]

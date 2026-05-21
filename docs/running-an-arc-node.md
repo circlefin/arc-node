@@ -97,7 +97,7 @@ arc-snapshots download \
 
 The `arc-snapshots` binary is part of the Arc node installation.
 The command above fetches the latest snapshots for `arc-testnet` chain from
-https://snapshots.arc.io and extracts them into the
+https://snapshots.arc.network and extracts them into the
 `$ARC_CONSENSUS` and `$ARC_EXECUTION` data directories.
 
 > **Download sizes:** At the time of writing, the most recent snapshot sizes
@@ -129,7 +129,7 @@ arc-node-execution node \
   --auth-ipc --auth-ipc.path $ARC_RUN/auth.ipc \
   --http --http.addr 127.0.0.1 --http.port 8545 \
   --http.api eth,net,web3,txpool,trace,debug \
-  --rpc.forwarder https://rpc.quicknode.testnet.arc.io/ \
+  --rpc.forwarder https://rpc.quicknode.testnet.arc.network/ \
   --metrics 127.0.0.1:9001 \
   --disable-discovery \
   --enable-arc-rpc
@@ -170,9 +170,9 @@ arc-node-consensus start \
   --execution-socket $ARC_RUN/auth.ipc \
   --rpc.addr 127.0.0.1:31000 \
   --follow \
-  --follow.endpoint https://rpc.drpc.testnet.arc.io,wss=rpc.drpc.testnet.arc.io \
-  --follow.endpoint https://rpc.quicknode.testnet.arc.io,wss=rpc.quicknode.testnet.arc.io \
-  --follow.endpoint https://rpc.blockdaemon.testnet.arc.io,wss=rpc.blockdaemon.testnet.arc.io/websocket \
+  --follow.endpoint https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network \
+  --follow.endpoint https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network \
+  --follow.endpoint https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network/websocket \
   --execution-persistence-backpressure \
   --execution-persistence-backpressure-threshold=50 \
   --metrics 127.0.0.1:29000
@@ -460,7 +460,7 @@ ExecStart=/usr/local/bin/arc-node-execution node \
   --http.api eth,net,web3,txpool,trace,debug \
   --metrics 127.0.0.1:9001 \
   --enable-arc-rpc \
-  --rpc.forwarder https://rpc.quicknode.testnet.arc.io/
+  --rpc.forwarder https://rpc.quicknode.testnet.arc.network/
 
 Restart=always
 RestartSec=10
@@ -498,9 +498,9 @@ ExecStart=/usr/local/bin/arc-node-consensus start \
   --execution-socket /run/arc/auth.ipc \
   --rpc.addr 127.0.0.1:31000 \
   --follow \
-  --follow.endpoint https://rpc.drpc.testnet.arc.io,wss=rpc.drpc.testnet.arc.io \
-  --follow.endpoint https://rpc.quicknode.testnet.arc.io,wss=rpc.quicknode.testnet.arc.io \
-  --follow.endpoint https://rpc.blockdaemon.testnet.arc.io,wss=rpc.blockdaemon.testnet.arc.io/websocket \
+  --follow.endpoint https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network \
+  --follow.endpoint https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network \
+  --follow.endpoint https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network/websocket \
   --execution-persistence-backpressure \
   --execution-persistence-backpressure-threshold=50 \
   --metrics 127.0.0.1:29000

@@ -39,7 +39,7 @@ use tracing::info;
 use url::Url;
 
 /// Base URL for the snapshot listing and download API.
-pub const SNAPSHOT_API_BASE_URL: &str = "https://snapshots.arc.io/api";
+pub const SNAPSHOT_API_BASE_URL: &str = "https://snapshots.arc.network/api";
 
 const BYTE_UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
 const MAX_DOWNLOAD_RETRIES: u32 = 10;
