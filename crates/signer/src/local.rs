@@ -18,9 +18,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use arc_consensus_types::signing::{SignedExtension, SignedProposal, SignedVote, SigningError};
-use arc_consensus_types::signing::{SigningProvider, VerificationResult};
+use arc_consensus_types::signing::{Signer, SigningProvider, VerificationResult, Verifier};
 
 use crate::{ArcContext, Proposal, Vote};
+use malachitebft_core_types::ValidatorProof;
 
 pub use malachitebft_signing_ed25519::*;
 
@@ -72,27 +73,41 @@ impl LocalSigningProvider {
 }
 
 #[async_trait]
-impl SigningProvider<ArcContext> for LocalSigningProvider {
-    async fn sign_bytes(&self, bytes: &[u8]) -> Result<Signature, SigningError> {
-        Ok(self.sign(bytes))
-    }
-
-    async fn verify_signed_bytes(
-        &self,
-        bytes: &[u8],
-        signature: &Signature,
-        public_key: &PublicKey,
-    ) -> Result<VerificationResult, SigningError> {
-        Ok(VerificationResult::from_bool(
-            self.verify(bytes, signature, public_key),
-        ))
-    }
-
+impl Signer<ArcContext> for LocalSigningProvider {
     async fn sign_vote(&self, vote: Vote) -> Result<SignedVote<ArcContext>, SigningError> {
         let signature = self.sign(&vote.to_sign_bytes());
         Ok(SignedVote::new(vote, signature))
     }
 
+    async fn sign_proposal(
+        &self,
+        proposal: Proposal,
+    ) -> Result<SignedProposal<ArcContext>, SigningError> {
+        let signature = self.private_key.sign(&proposal.to_sign_bytes());
+        Ok(SignedProposal::new(proposal, signature))
+    }
+
+    async fn sign_vote_extension(
+        &self,
+        extension: Bytes,
+    ) -> Result<SignedExtension<ArcContext>, SigningError> {
+        let signature = self.private_key.sign(extension.as_ref());
+        Ok(SignedExtension::new(extension, signature))
+    }
+
+    async fn sign_validator_proof(
+        &self,
+        public_key: Vec<u8>,
+        peer_id: Vec<u8>,
+    ) -> Result<ValidatorProof<ArcContext>, SigningError> {
+        let signing_bytes = ValidatorProof::<ArcContext>::signing_bytes(&public_key, &peer_id);
+        let signature = self.sign(&signing_bytes);
+        Ok(ValidatorProof::new(public_key, peer_id, signature))
+    }
+}
+
+#[async_trait]
+impl Verifier<ArcContext> for LocalSigningProvider {
     async fn verify_signed_vote(
         &self,
         vote: &Vote,
@@ -102,14 +117,6 @@ impl SigningProvider<ArcContext> for LocalSigningProvider {
         Ok(VerificationResult::from_bool(
             public_key.verify(&vote.to_sign_bytes(), signature).is_ok(),
         ))
-    }
-
-    async fn sign_proposal(
-        &self,
-        proposal: Proposal,
-    ) -> Result<SignedProposal<ArcContext>, SigningError> {
-        let signature = self.private_key.sign(&proposal.to_sign_bytes());
-        Ok(SignedProposal::new(proposal, signature))
     }
 
     async fn verify_signed_proposal(
@@ -125,14 +132,6 @@ impl SigningProvider<ArcContext> for LocalSigningProvider {
         ))
     }
 
-    async fn sign_vote_extension(
-        &self,
-        extension: Bytes,
-    ) -> Result<SignedExtension<ArcContext>, SigningError> {
-        let signature = self.private_key.sign(extension.as_ref());
-        Ok(SignedExtension::new(extension, signature))
-    }
-
     async fn verify_signed_vote_extension(
         &self,
         extension: &Bytes,
@@ -141,6 +140,39 @@ impl SigningProvider<ArcContext> for LocalSigningProvider {
     ) -> Result<VerificationResult, SigningError> {
         Ok(VerificationResult::from_bool(
             public_key.verify(extension.as_ref(), signature).is_ok(),
+        ))
+    }
+
+    async fn verify_validator_proof(
+        &self,
+        proof: &ValidatorProof<ArcContext>,
+    ) -> Result<VerificationResult, SigningError> {
+        let signing_bytes = proof.preimage();
+        let public_key = proof
+            .decoded_public_key()
+            .map_err(|e| SigningError::from_source(format!("Invalid public key: {e}")))?;
+        Ok(VerificationResult::from_bool(self.verify(
+            &signing_bytes,
+            &proof.signature,
+            &public_key,
+        )))
+    }
+}
+
+#[async_trait]
+impl SigningProvider<ArcContext> for LocalSigningProvider {
+    async fn sign_bytes(&self, bytes: &[u8]) -> Result<Signature, SigningError> {
+        Ok(self.sign(bytes))
+    }
+
+    async fn verify_signed_bytes(
+        &self,
+        bytes: &[u8],
+        signature: &Signature,
+        public_key: &PublicKey,
+    ) -> Result<VerificationResult, SigningError> {
+        Ok(VerificationResult::from_bool(
+            self.verify(bytes, signature, public_key),
         ))
     }
 }

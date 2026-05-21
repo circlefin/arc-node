@@ -32,6 +32,18 @@ pub(crate) struct ResultTracker {
     show_pool_status: bool,
 }
 
+/// Aggregate statistics from a single [`ResultTracker::run`].
+pub(crate) struct ResultSummary {
+    /// Per-category server error counts (grouped by `(code, head_message)`).
+    pub errors: HashMap<String, u64>,
+    /// Total transactions locally submitted, regardless of server acceptance.
+    pub total_sent: u64,
+    /// Total transaction bytes locally submitted, regardless of server acceptance.
+    pub total_bytes: u64,
+    /// Wall-clock duration of the tracker's run.
+    pub elapsed: Duration,
+}
+
 impl ResultTracker {
     pub async fn new(
         ws_client_builders: Vec<WsClientBuilder>,
@@ -53,8 +65,13 @@ impl ResultTracker {
         })
     }
 
-    // Track and report statistics on sent transactions.
-    pub async fn run(&mut self) -> Result<()> {
+    /// Track and report statistics on sent transactions.
+    ///
+    /// Returns the aggregated error counter, the total number of locally-sent
+    /// transactions (regardless of server acceptance), and the wall-clock
+    /// duration of the run. The caller computes locally-observed TPS as
+    /// `total_sent / elapsed.as_secs_f64()`.
+    pub async fn run(&mut self) -> Result<ResultSummary> {
         // Initialize counters
         let start_time = Instant::now();
         let mut stats = Stats::new(start_time);
@@ -97,7 +114,12 @@ impl ResultTracker {
             }
         }
         println!("{}", stats.total_display());
-        Ok(())
+        Ok(ResultSummary {
+            errors: stats.total_errors,
+            total_sent: stats.total_succeed,
+            total_bytes: stats.total_bytes,
+            elapsed: start_time.elapsed(),
+        })
     }
 
     async fn get_txpool_statuses(&mut self) -> Result<Vec<(u64, u64)>> {
@@ -153,12 +175,13 @@ impl Stats {
     }
 
     fn incr_err(&mut self, error: &str) {
+        let category = categorize_error(error);
         self.errors_counter
-            .entry(error.to_string())
+            .entry(category.clone())
             .and_modify(|count| *count += 1)
             .or_insert(1);
         self.total_errors
-            .entry(error.to_string())
+            .entry(category)
             .and_modify(|count| *count += 1)
             .or_insert(1);
     }
@@ -197,5 +220,61 @@ impl fmt::Display for Stats {
             stats += &format!(", \x1b[31m{count} failed\x1b[0m with \"{error}\"");
         }
         write!(f, "{}", stats)
+    }
+}
+
+/// Collapse server error strings to a stable `(code, head_message)` key.
+///
+/// Server errors arrive as `Server Error <code>: <message>[: <variable_data>]`.
+/// The third token onwards holds varying data (nonces, addresses, balances)
+/// that would otherwise explode the cardinality of the error map. The first
+/// two tokens — error code and message head — uniquely identify the failure
+/// mode, since `-32000` covers several distinct categories.
+///
+/// Errors that don't follow this shape (fewer than two `: `-separated tokens)
+/// are returned unchanged so they remain visible rather than being silently
+/// merged with unrelated entries.
+fn categorize_error(error: &str) -> String {
+    error.splitn(3, ": ").take(2).collect::<Vec<_>>().join(": ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::categorize_error;
+
+    #[test]
+    fn nonce_too_low_collapses_across_distinct_nonces() {
+        let a =
+            categorize_error("Server Error -32000: nonce too low: next nonce 962, tx nonce 846");
+        let b =
+            categorize_error("Server Error -32000: nonce too low: next nonce 943, tx nonce 930");
+        assert_eq!(a, "Server Error -32000: nonce too low");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn same_code_distinct_messages_stay_separate() {
+        let pool = categorize_error("Server Error -32003: txpool is full");
+        let funds = categorize_error(
+            "Server Error -32003: insufficient funds for gas * price + value: address 0xabc balance 0 want 1",
+        );
+        assert_ne!(pool, funds);
+        assert_eq!(pool, "Server Error -32003: txpool is full");
+        assert_eq!(
+            funds,
+            "Server Error -32003: insufficient funds for gas * price + value"
+        );
+    }
+
+    #[test]
+    fn message_without_variable_suffix_is_preserved() {
+        let s = categorize_error("Server Error -32003: txpool is full");
+        assert_eq!(s, "Server Error -32003: txpool is full");
+    }
+
+    #[test]
+    fn single_token_error_is_returned_as_is() {
+        let s = categorize_error("connection closed");
+        assert_eq!(s, "connection closed");
     }
 }

@@ -16,12 +16,22 @@
 
 import hre from 'hardhat'
 import { Account, Address, Chain, Client, getContract, Transport } from 'viem'
-import { denylistAddress } from '../../scripts/genesis'
+import { denylistAddressByNetwork } from '../../scripts/genesis'
 import { KeyedClient } from './client-extension'
 import { AdminUpgradeableProxy } from './AdminUpgradeableProxy'
 
 export class Denylist {
-  static address = denylistAddress
+  static get address(): Address {
+    const network = hre.network.name as keyof typeof denylistAddressByNetwork
+    const address = denylistAddressByNetwork[network]
+    if (!address) {
+      throw new Error(
+        `Denylist address not configured for network "${hre.network.name}". ` +
+          `Known networks: ${Object.keys(denylistAddressByNetwork).join(', ')}`,
+      )
+    }
+    return address
+  }
   static abi = hre.artifacts.readArtifactSync('Denylist').abi
 
   static attach<

@@ -16,7 +16,7 @@
 
 #![cfg(all(test, feature = "integration-remote-signer"))]
 
-use arc_remote_signer::SigningProvider;
+use arc_consensus_types::signing::SigningProvider;
 use arc_remote_signer::{RemoteSigningConfig, RemoteSigningError, RemoteSigningProvider};
 use arc_signer::local::LocalSigningProvider;
 use malachitebft_signing_ed25519::PrivateKey;

@@ -106,9 +106,11 @@ resource "aws_vpc" "testnet_vpc" {
   enable_dns_hostnames = true
   enable_dns_support   = true
 
-  tags = {
-    Name = local.project_name
-  }
+  tags = merge(
+    { Name = local.project_name },
+    { for tag in var.tags : tag => "true" },
+    { project = local.project_name }
+  )
 }
 
 # Create one subnet per logical network defined in the manifest

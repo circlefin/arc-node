@@ -49,11 +49,6 @@ contract ControllerTest is Test {
         assertFalse(mockController.isController(controllerAddr));
         assertFalse(mockController.isController(anotherController));
         assertFalse(mockController.isController(address(0)));
-
-        // Initially all controllers should have registration ID 0
-        assertEq(mockController.getRegistrationId(controllerAddr), 0);
-        assertEq(mockController.getRegistrationId(anotherController), 0);
-        assertEq(mockController.getRegistrationId(address(0)), 0);
     }
 
     function test_ConfigureController_Success() public {
@@ -116,8 +111,9 @@ contract ControllerTest is Test {
         // Verify controller was not configured
         assertFalse(mockController.isController(controllerAddr));
 
-        // Verify registration ID remains 0
-        assertEq(mockController.getRegistrationId(controllerAddr), 0);
+        // Registration ID getter must revert for unconfigured addresses
+        vm.expectRevert(Controller.ControllerNotConfigured.selector);
+        mockController.getRegistrationId(controllerAddr);
     }
 
     function test_ConfigureController_AlreadyConfigured() public {
@@ -185,9 +181,11 @@ contract ControllerTest is Test {
 
         // Verify controller is no longer configured
         assertFalse(mockController.isController(controllerAddr));
-        // Registration ID and voting power limit should be cleared
-        assertEq(mockController.getRegistrationId(controllerAddr), 0);
-        assertEq(mockController.getVotingPowerLimit(controllerAddr), 0);
+        // Getters must revert for unconfigured addresses
+        vm.expectRevert(Controller.ControllerNotConfigured.selector);
+        mockController.getRegistrationId(controllerAddr);
+        vm.expectRevert(Controller.ControllerNotConfigured.selector);
+        mockController.getVotingPowerLimit(controllerAddr);
 
         vm.stopPrank();
     }
@@ -248,7 +246,8 @@ contract ControllerTest is Test {
         // Only the second one should remain
         assertFalse(mockController.isController(controllerAddr));
         assertTrue(mockController.isController(anotherController));
-        assertEq(mockController.getVotingPowerLimit(controllerAddr), 0);
+        vm.expectRevert(Controller.ControllerNotConfigured.selector);
+        mockController.getVotingPowerLimit(controllerAddr);
         assertEq(mockController.getVotingPowerLimit(anotherController), defaultVotingPowerLimit);
 
         vm.stopPrank();
@@ -321,9 +320,11 @@ contract ControllerTest is Test {
         assertTrue(mockController.isController(anotherController));
 
         // Verify registration ID is cleared after removal
-        assertEq(mockController.getRegistrationId(controllerAddr), 0);
+        vm.expectRevert(Controller.ControllerNotConfigured.selector);
+        mockController.getRegistrationId(controllerAddr);
         assertEq(mockController.getRegistrationId(anotherController), 2);
-        assertEq(mockController.getVotingPowerLimit(controllerAddr), 0);
+        vm.expectRevert(Controller.ControllerNotConfigured.selector);
+        mockController.getVotingPowerLimit(controllerAddr);
         assertEq(mockController.getVotingPowerLimit(anotherController), defaultVotingPowerLimit);
 
         // Re-configure the first one with a different registration ID
@@ -342,8 +343,6 @@ contract ControllerTest is Test {
         mockController.removeController(anotherController);
         assertFalse(mockController.isController(controllerAddr));
         assertFalse(mockController.isController(anotherController));
-        assertEq(mockController.getVotingPowerLimit(controllerAddr), 0);
-        assertEq(mockController.getVotingPowerLimit(anotherController), 0);
 
         vm.stopPrank();
     }

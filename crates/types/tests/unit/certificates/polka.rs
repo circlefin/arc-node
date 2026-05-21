@@ -142,17 +142,16 @@ fn invalid_polka_certificate_unknown_validator() {
 }
 
 /// Tests the verification of a certificate containing a vote with an invalid signature.
+///
+/// The verifier must reject the entire certificate as soon as it encounters a bad
+/// signature, even if the remaining signatures still meet the threshold.
 #[test]
 fn invalid_polka_certificate_invalid_signature() {
     CertificateTest::<Polka>::new()
         .with_validators([10, 10, 10])
         .with_votes(0..2, VoteType::Prevote)
         .with_invalid_signature_vote(2, VoteType::Prevote) // Validator 2 has invalid signature
-        .expect_error(CertificateError::NotEnoughVotingPower {
-            signed: 20,
-            total: 30,
-            expected: 21,
-        });
+        .expect_err_matches(|e| matches!(e, CertificateError::InvalidPolkaSignature(_)));
 }
 
 /// Tests the verification of a certificate containing a vote with invalid height or round.
@@ -193,6 +192,9 @@ fn empty_polka_certificate() {
 }
 
 /// Tests the verification of a certificate containing both valid and invalid votes.
+///
+/// Both scenarios below must be rejected with `InvalidPolkaSignature`, even when the
+/// valid subset of signatures still meets the 2/3 voting-power threshold.
 #[test]
 fn polka_certificate_with_mixed_valid_and_invalid_votes() {
     CertificateTest::<Polka>::new()
@@ -200,16 +202,12 @@ fn polka_certificate_with_mixed_valid_and_invalid_votes() {
         .with_votes(2..4, VoteType::Prevote)
         .with_invalid_signature_vote(0, VoteType::Prevote) // Invalid signature for validator 0
         .with_invalid_signature_vote(1, VoteType::Prevote) // Invalid signature for validator 1
-        .expect_valid();
+        .expect_err_matches(|e| matches!(e, CertificateError::InvalidPolkaSignature(_)));
 
     CertificateTest::<Polka>::new()
         .with_validators([10, 20, 30, 40])
         .with_votes(0..2, VoteType::Prevote)
         .with_invalid_signature_vote(2, VoteType::Prevote) // Invalid signature for validator 2
         .with_invalid_signature_vote(3, VoteType::Prevote) // Invalid signature for validator 3
-        .expect_error(CertificateError::NotEnoughVotingPower {
-            signed: 30,
-            total: 100,
-            expected: 67,
-        });
+        .expect_err_matches(|e| matches!(e, CertificateError::InvalidPolkaSignature(_)));
 }

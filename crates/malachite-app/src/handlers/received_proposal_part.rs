@@ -29,7 +29,7 @@ use arc_eth_engine::engine::Engine;
 use arc_signer::ArcSigningProvider;
 
 use crate::block::ConsensusBlock;
-use crate::metrics::AppMetrics;
+use crate::metrics::{AppMetrics, InvalidPayloadSource};
 use crate::payload::{validate_consensus_block, EnginePayloadValidator};
 use crate::proposal_parts::{
     assemble_block_from_parts, resolve_expected_proposer, validate_proposal_parts,
@@ -220,7 +220,7 @@ async fn validate_block(
     from: PeerId,
 ) -> eyre::Result<()> {
     let validator = EnginePayloadValidator::new(engine, metrics);
-    let validity = validate_consensus_block(&validator, block, store)
+    let validity = validate_consensus_block(&validator, block, store, metrics)
         .await
         .wrap_err_with(|| {
             format!(
@@ -329,6 +329,14 @@ async fn process_proposal_parts(
     let block = match assemble_block_from_parts(&parts) {
         Ok(block) => block,
         Err(e) => {
+            warn!(
+                height = %parts_height,
+                round = %parts_round,
+                proposer = %parts_proposer,
+                "Failed to assemble block from parts: {e}",
+            );
+            ctx.metrics
+                .inc_invalid_payloads_count(InvalidPayloadSource::AssemblyFailure);
             let invalid = InvalidPayload::new_from_parts(&parts, &e.to_string());
             ctx.store.append_invalid_payload(invalid).await.wrap_err_with(|| {
                 format!(
@@ -397,4 +405,59 @@ async fn maybe_store_pending_proposal(
     metrics.observe_pending_proposal_parts_count(pending_count);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arc_consensus_db::{DbMetrics, DbUpgrade};
+    use arc_consensus_types::proposer::RoundRobin;
+    use arc_consensus_types::Validator;
+    use arc_signer::local::{LocalSigningProvider, PrivateKey};
+    use bytesize::ByteSize;
+    use tempfile::tempdir;
+
+    use crate::handlers::test_utils::signed_parts_without_data;
+
+    #[tokio::test]
+    async fn process_proposal_parts_increments_on_assembly_failure() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(
+            dir.path().join("db"),
+            DbMetrics::default(),
+            DbUpgrade::Skip,
+            ByteSize::mib(64),
+        )
+        .await
+        .unwrap();
+
+        let signing_key = PrivateKey::generate(rand::rngs::OsRng);
+        let validator = Validator::new(signing_key.public_key(), 1);
+        let validator_set = ValidatorSet::new(vec![validator]);
+
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let parts = signed_parts_without_data(height, round, &signing_key).await;
+
+        let selector = RoundRobin;
+        let provider = ArcSigningProvider::Local(LocalSigningProvider::new(signing_key));
+        let metrics = AppMetrics::default();
+
+        let ctx = ProcessingContext {
+            store: &store,
+            metrics: &metrics,
+            signing_provider: &provider,
+            current_height: height,
+            current_round: round,
+            current_validator_set: &validator_set,
+            proposer_selector: &selector,
+            max_pending_proposals: 10,
+        };
+
+        let result = process_proposal_parts(ctx, parts).await;
+
+        assert!(result.is_err());
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
+    }
 }

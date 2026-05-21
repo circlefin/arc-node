@@ -23,6 +23,7 @@ alloy-rpc-types-engine = { workspace = true, features = ["ssz"] }
 # others
 arbitrary = { workspace = true, optional = true }
 arc-shared = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 bytesize = { workspace = true }
 config = { workspace = true }

@@ -56,7 +56,7 @@ pub(crate) enum ContainerKind {
 }
 
 impl ContainerKind {
-    fn suffix(&self) -> &str {
+    pub fn suffix(&self) -> &str {
         match self {
             ContainerKind::Consensus => CONSENSUS_SUFFIX,
             ContainerKind::Execution => EXECUTION_SUFFIX,

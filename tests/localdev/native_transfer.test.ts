@@ -49,10 +49,7 @@ describe('native transfer', () => {
     const receipt = await sender
       .sendTransaction({ to: receiver.account.address, value: amount })
       .then(ReceiptVerifier.waitSuccess)
-
-    // Zero5: cold SLOAD = 2100 for blocklist check
-    // Value transfer: base 21000 + caller check 2100 + recipient check 2100 = 25200
-    receipt.verifyGasUsed(25200n).verifyEvents((ev) => {
+    receipt.verifyGasUsed(21000n).verifyEvents((ev) => {
       ev.expectCount(1).expectNativeTransfer({ from: sender, to: receiver, amount })
     })
 
@@ -70,9 +67,7 @@ describe('native transfer', () => {
       const receipt = await sender
         .sendTransaction({ to: receiver.account.address, value: amount })
         .then(ReceiptVerifier.waitSuccess)
-
-      // Zero5: base 21000 + caller check 2100 + recipient check 2100 = 25200
-      receipt.verifyGasUsed(25200n).verifyEvents((ev) => {
+      receipt.verifyGasUsed(21000n).verifyEvents((ev) => {
         ev.expectCount(1).expectNativeTransfer({ from: sender, to: receiver, amount })
       })
     })
@@ -83,9 +78,7 @@ describe('native transfer', () => {
       const receipt = await sender
         .sendTransaction({ to: receiver.account.address, value: 0n })
         .then(ReceiptVerifier.waitSuccess)
-
-      // Zero5: base 21000 + caller check 2100 = 23100 (no recipient check for zero value)
-      receipt.verifyGasUsed(23100n).verifyNoEvents()
+      receipt.verifyGasUsed(21000n).verifyNoEvents()
     })
 
     it('calling and sending to a contract should emit an event', async () => {
@@ -93,9 +86,7 @@ describe('native transfer', () => {
       const amount = parseEther('0.0000001')
 
       const receipt = await nativeTransferHelper.callCanReceive(sender, amount).then(ReceiptVerifier.build)
-
-      // Zero5: base ~21160 + caller check 2100 + recipient check 2100 = ~25360
-      receipt.verifyGasUsedApproximately(25360n).verifyEvents((ev) => {
+      receipt.verifyGasUsedApproximately(21000n).verifyEvents((ev) => {
         ev.expectCount(1).expectNativeTransfer({ from: sender, to: nativeTransferHelper.address, amount: amount })
       })
     })
@@ -116,8 +107,7 @@ describe('native transfer', () => {
         )
         .then(ReceiptVerifier.build)
 
-      // Zero5: base + caller/recipient blocklist checks + nested frame warm/cold SLOAD costs
-      receipt.verifyGasUsedApproximately(38786n).verifyEvents((ev) => {
+      receipt.verifyGasUsedApproximately(32386n).verifyEvents((ev) => {
         ev.expectCount(2)
           .expectNativeTransfer({ from: sender, to: nativeTransferHelper.address, amount: callerAmount })
           .expectNativeTransfer({
@@ -156,8 +146,7 @@ describe('native transfer', () => {
         )
         .then(ReceiptVerifier.build)
 
-      // Zero5: base + caller/recipient blocklist checks + nested frame warm/cold SLOAD costs
-      receipt.verifyGasUsedApproximately(38806n).verifyEvents((ev) => {
+      receipt.verifyGasUsedApproximately(32406n).verifyEvents((ev) => {
         ev.expectCount(1).expectNativeTransfer({ from: sender, to: nativeTransferHelper.address, amount: callerAmount })
       })
 
@@ -200,8 +189,7 @@ describe('native transfer', () => {
         )
         .then(ReceiptVerifier.build)
 
-      // Zero5: base + caller/recipient blocklist checks + nested frame warm/cold SLOAD costs
-      receipt.verifyGasUsedApproximately(38712n).verifyEvents((ev) => {
+      receipt.verifyGasUsedApproximately(32312n).verifyEvents((ev) => {
         ev.expectCount(1).expectNativeTransfer({ from: sender, to: nativeTransferHelper.address, amount: callerAmount })
       })
 
@@ -328,8 +316,7 @@ describe('native transfer', () => {
         .callCreate2(sender, deploymentBytecode, salt, amount)
         .then(ReceiptVerifier.build)
 
-      // Zero5: base + caller/recipient blocklist checks + nested frame warm/cold SLOAD costs
-      receipt.verifyGasUsedApproximately(83987n).verifyEvents((ev) => {
+      receipt.verifyGasUsedApproximately(75587n).verifyEvents((ev) => {
         ev.expectCount(2)
           .expectNativeTransfer({ from: sender, to: nativeTransferHelper.address, amount })
           .expectNativeTransfer({ from: nativeTransferHelper.address, to: expectedDeployedAddr, amount })
@@ -345,8 +332,7 @@ describe('native transfer', () => {
         .callCreate2(sender, nativeTransferHelper.encodeDeploymentBytecode(), salt, 0n)
         .then(ReceiptVerifier.build)
 
-      // Zero5: base + caller check 2100 + nested frame SLOAD costs
-      receipt.verifyGasUsedApproximately(79799n).verifyNoEvents()
+      receipt.verifyGasUsedApproximately(75599n).verifyNoEvents()
     })
 
     it('SELFDESTRUCT from deployment transaction should NOT emit an event for zero amounts', async () => {
@@ -373,8 +359,7 @@ describe('native transfer', () => {
         .then((h) => h.deploymentReceipt)
         .then(ReceiptVerifier.build)
 
-      // Zero5: base ~79849 + caller check 2100 + recipient check 2100 = ~84049
-      txn.verifyGasUsedApproximately(84049n).verifyEvents((ev) => {
+      txn.verifyGasUsedApproximately(81271n).verifyEvents((ev) => {
         ev.expectCount(2)
           .expectNativeTransfer({ from: sender, to: expectedDeployedAddr, amount })
           .expectNativeTransfer({ from: expectedDeployedAddr, to: receiver.account.address, amount })
@@ -390,8 +375,7 @@ describe('native transfer', () => {
       // Call SELFDESTRUCT
       const receipt = await helper.callSelfDestruct(sender, receiver.account.address).then(ReceiptVerifier.build)
 
-      // Zero5: base ~29380 + caller check 2100 = ~31480 (no recipient check for zero value)
-      receipt.verifyGasUsedApproximately(31480n).verifyNoEvents()
+      receipt.verifyGasUsedApproximately(29380n).verifyNoEvents()
     })
 
     it('SELFDESTRUCT should emit an event for non-zero amounts', async () => {
@@ -408,8 +392,7 @@ describe('native transfer', () => {
       // SELFDESTRUCT
       const txn = await helper.callSelfDestruct(sender, receiver.account.address).then(ReceiptVerifier.build)
 
-      // Zero5: base ~29380 + caller check 2100 = ~31480
-      txn.verifyGasUsedApproximately(31480n).verifyEvents((ev) => {
+      txn.verifyGasUsedApproximately(29380n).verifyEvents((ev) => {
         ev.expectCount(1).expectNativeTransfer({ from: expectedDeployedAddr, to: receiver.account.address, amount })
       })
     })

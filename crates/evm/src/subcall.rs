@@ -22,6 +22,7 @@
 
 use alloy_primitives::Address;
 use arc_precompiles::subcall::{SubcallContinuationData, SubcallPrecompile};
+use revm_context_interface::journaled_state::JournalCheckpoint;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -40,6 +41,9 @@ pub struct SubcallContinuation {
     pub(crate) return_memory_offset: std::ops::Range<usize>,
     /// Opaque state carried from `init_subcall` to `complete_subcall`.
     pub(crate) continuation_data: SubcallContinuationData,
+    /// Journal checkpoint taken before child dispatch. Used to revert the child's
+    /// committed state if `complete_subcall` rejects a successful child.
+    pub(crate) checkpoint: JournalCheckpoint,
 }
 
 /// Specifies which addresses are authorized to call a subcall precompile.

@@ -41,14 +41,12 @@ layer (Reth) and a consensus layer (Malachite), connected via Engine API.
           │  - new(id, nodes, params, config)     │
           │  - spawn(id) → NodeHandle             │
           └──────────────────┬────────────────────┘
-                             │
-                             ▼
-                  ┌─────────────────────┐
-                  │  NodeRunner impl    │
-                  │  (MockRunner, or    │
-                  │   future real node  │
-                  │   runner)           │
-                  └─────────────────────┘
+                     ┌───────┴───────┐
+                     ▼               ▼
+    ┌─────────────────────┐      ┌─────────────────────┐
+    │     MockRunner      │      │    ArcNodeRunner    │
+    │                     │      │    (integration)    │
+    └─────────────────────┘      └─────────────────────┘
 ```
 
 Each node runs concurrently in a `JoinSet` task. The step sequencer processes
@@ -108,10 +106,11 @@ pub trait NodeHandle: Send + Sync + 'static {
 - **`subscribe`** returns a receiver for the unified event stream.
 - **`kill_cl` / `kill_el`** hard-abort the consensus / execution layer (crash
   semantics). Tasks are cancelled immediately; OS resources may linger briefly.
-- **`shutdown_cl` / `shutdown_el`** gracefully shut down the consensus /
-  execution layer, waiting for ports, file locks, and other OS resources to be
-  released before returning. The defaults delegate to the corresponding `kill_*`
-  methods; implementations that manage real OS resources should override them.
+- **`shutdown_cl` / `shutdown_el`** gracefully shut down the consensus / execution
+  layer, waiting for ports, file locks, and other OS resources to be released
+  before returning. The defaults delegate to the corresponding `kill_*` methods;
+  implementations that manage real OS resources (e.g., `ArcNodeHandle`) should
+  override them.
 
 The per-layer methods reflect Arc's two-binary architecture and allow
 fault-injection scenarios that target a single layer (e.g., crash consensus
@@ -125,7 +124,47 @@ background tasks) when dropped. The framework may drop handles without calling
 `kill_cl`/`kill_el` first (e.g., on timeout), so relying solely on explicit kill
 calls will leak resources.
 
-### `ArcEvent` unified event enum
+### `ArcNodeRunner`: integration runner (`arc-test-integration` crate)
+
+Spawns real in-process Arc nodes with:
+- **Execution layer:** Reth `ArcNode` with IPC sockets in a per-node temp dir
+- **Consensus layer:** Malachite `App` connecting to the execution layer via IPC
+- **Event bridge:** Background task mapping `TxEvent<ArcContext>` → `ArcEvent`
+
+Nodes communicate via real libp2p P2P (persistent peers on `127.0.0.1`).
+Port allocation: `26000 + test_id * 100 + node_id * 10`.
+
+Lives in a separate crate to keep the framework free of heavy node dependencies:
+
+```sh
+cargo nextest run -p arc-test-integration
+```
+
+### Choosing a runner
+
+The two runners test fundamentally different things:
+
+**`MockRunner`** tests the **framework itself** — step sequencer logic, event
+dispatch, decision counting, timeout handling, terminal step enforcement, error
+propagation (lagged/closed channels), lifecycle state machines (crash → restart),
+handler control flow, builder API, and multi-node orchestration. Events are
+synthetic and node spawning is a no-op, so tests run in milliseconds with no
+external dependencies.
+
+**`ArcNodeRunner`** tests the **full Arc stack** — consensus liveness, real block
+production, Engine API IPC wiring, the `TxEvent<ArcContext>` → `ArcEvent` bridge,
+and libp2p peer discovery. Each node spawns a real Reth instance and Malachite
+consensus app, so tests are slower and non-deterministic.
+
+| Scenario | Runner |
+|----------|--------|
+| Step sequencer logic, builder API, event handler plumbing | `MockRunner` |
+| Edge cases (lagged receivers, channel closure, missing terminal steps) | `MockRunner` |
+| Consensus liveness, block production, Engine API wiring | `ArcNodeRunner` |
+| CI unit tests (fast feedback) | `MockRunner` |
+| Pre-merge integration gate | `ArcNodeRunner` |
+
+### `ArcEvent`: unified event enum
 
 Bridges consensus events (from `TxEvent<ArcContext>`) and execution events into
 a single stream:
@@ -177,6 +216,7 @@ Event handlers return a `HandlerResult`:
 ## Usage
 
 For runnable examples, see `tests/basic.rs` and `tests/errors.rs` (both use `MockRunner`).
+Integration tests using `ArcNodeRunner` live in the separate `arc-test-integration` crate.
 
 ### Reusable scenarios
 
@@ -194,6 +234,11 @@ use arc_test_framework::{scenarios, TestParams};
 scenarios::validators_reach_height(4, 3)
     .run::<MockRunner>(Duration::from_secs(60))
     .await;
+
+// How to run it with ArcNodeRunner (real in-process nodes, from arc-test-integration crate):
+// scenarios::validators_reach_height(5, 3)
+//     .run::<ArcNodeRunner>(Duration::from_secs(60))
+//     .await;
 ```
 
 ### Custom parameters

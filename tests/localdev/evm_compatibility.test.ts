@@ -1043,7 +1043,7 @@ describe('EVM compatibility', () => {
       })
       expect(res.results[0].status).to.be.eq('success')
       expect(res.results[0].data).to.be.eq('0x')
-      expectGasUSedApproximately(res.results[0].gasUsed, 25255n)
+      expectGasUSedApproximately(res.results[0].gasUsed, 21055n)
     })
 
     it('inner transfer', async () => {
@@ -1054,7 +1054,7 @@ describe('EVM compatibility', () => {
       })
       expect(res.results[0].status).to.be.eq('success')
       expect(res.results[0].data).to.be.eq('0x')
-      expectGasUSedApproximately(res.results[0].gasUsed, 36563n)
+      expectGasUSedApproximately(res.results[0].gasUsed, 32235n)
     })
 
     it('reverted message', async () => {
@@ -1065,7 +1065,7 @@ describe('EVM compatibility', () => {
       })
       expect(res.results[0].status).to.be.eq('failure')
       expect(res.results[0].data).to.be.eq(CallHelper.encodeRevertMessage('test'))
-      expectGasUSedApproximately(res.results[0].gasUsed, 24474n)
+      expectGasUSedApproximately(res.results[0].gasUsed, 22366n)
     })
 
     it('inner reverted message', async () => {
@@ -1087,7 +1087,7 @@ describe('EVM compatibility', () => {
       expect(res.results[0].data).to.be.eq(
         CallHelper.result({ success: true, nested: { success: false, revertString: 'test' } }).result,
       )
-      expectGasUSedApproximately(res.results[0].gasUsed, 29623n)
+      expectGasUSedApproximately(res.results[0].gasUsed, 27533n)
     })
 
     it('unknown method', async () => {
@@ -1098,7 +1098,7 @@ describe('EVM compatibility', () => {
       })
       expect(res.results[0].status).to.be.eq('failure')
       expect(res.results[0].data).to.be.eq('0x')
-      expectGasUSedApproximately(res.results[0].gasUsed, 23350n)
+      expectGasUSedApproximately(res.results[0].gasUsed, 21250n)
     })
 
     it('invalid selector', async () => {
@@ -1109,7 +1109,7 @@ describe('EVM compatibility', () => {
       })
       expect(res.results[0].status).to.be.eq('failure')
       expect(res.results[0].data).to.be.eq('0x')
-      expectGasUSedApproximately(res.results[0].gasUsed, 23220n)
+      expectGasUSedApproximately(res.results[0].gasUsed, 21120n)
     })
 
     it('static call revert', async () => {
@@ -1132,7 +1132,7 @@ describe('EVM compatibility', () => {
         ],
       })
       expect(res.results[0].status).to.be.eq('success')
-      expectGasUSedApproximately(res.results[0].gasUsed, 26850n)
+      expectGasUSedApproximately(res.results[0].gasUsed, 24746n)
 
       expect(res.results[1].status).to.be.eq('success')
       // the gas used is not stable in arc/reth/geth
@@ -1149,7 +1149,7 @@ describe('EVM compatibility', () => {
         to: A,
         value: 1n,
       })
-      expectGasUSedApproximately(gasEstimated, 25420n)
+      expectGasUSedApproximately(gasEstimated, 21220n)
     })
 
     it('direct transfer to EOA', async () => {
@@ -1159,7 +1159,7 @@ describe('EVM compatibility', () => {
         to: receiver.account.address,
         value: 1n,
       })
-      expectGasUSedApproximately(gasEstimated, 25541n, 0)
+      expectGasUSedApproximately(gasEstimated, 21000n, 0)
     })
 
     it('inner transfer', async () => {
@@ -1169,7 +1169,7 @@ describe('EVM compatibility', () => {
         to: A,
         data: CallHelper.encodeNested({ fn: 'transfer', to: A, value: 1n }),
       })
-      expectGasUSedApproximately(gasEstimated, 36926n)
+      expectGasUSedApproximately(gasEstimated, 32590n)
     })
 
     it('reverted message', async () => {
@@ -1194,7 +1194,7 @@ describe('EVM compatibility', () => {
           data: { fn: 'revertWithString', message: 'test' },
         }),
       })
-      expectGasUSedApproximately(gasEstimated, 29972n)
+      expectGasUSedApproximately(gasEstimated, 27878n)
     })
 
     it('unknown method', async () => {

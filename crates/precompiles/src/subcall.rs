@@ -46,15 +46,11 @@ use std::any::Any;
 /// precompile, the CALL opcode triggers a new `frame_init` cycle through `ArcEvm`, which
 /// consults the subcall registry as expected.
 ///
-/// # No separate checkpoint around child execution
+/// # Checkpoint and revert semantics
 ///
-/// The subcall framework does **not** take a separate journal checkpoint around the child
-/// execution. The child frame's own checkpoint (managed by revm's `make_call_frame` /
-/// `process_next_action`) handles commit/revert based on the child's success or failure.
-///
+/// The subcall framework takes a journal checkpoint **before** dispatching the child frame.
 /// If `complete_subcall` returns `success: false` or `Err` when the child succeeded, the
-/// child's state changes will **not** be reverted — they are already committed. Implementors
-/// should be aware of this when designing their completion logic.
+/// framework reverts the child's committed state changes using that checkpoint.
 ///
 /// Returning `success: true` when the child failed is fine (e.g., `CallFromPrecompile`
 /// always succeeds and encodes the child's outcome in its output bytes). The child's
@@ -81,8 +77,8 @@ pub trait SubcallPrecompile: Send + Sync {
     ///
     /// # Note on checkpoint semantics
     ///
-    /// Returning `success: false` or `Err` when the child succeeded will **not** revert
-    /// the child's state changes. See the trait-level docs for details.
+    /// Returning `success: false` or `Err` when the child succeeded will cause the
+    /// framework to revert the child's committed state changes. See the trait-level docs.
     fn complete_subcall(
         &self,
         continuation_data: SubcallContinuationData,
@@ -133,6 +129,9 @@ pub struct SubcallCompletionResult {
     pub output: Bytes,
     /// Whether the precompile considers the call successful.
     pub success: bool,
+    /// Gas consumed by the completion phase (e.g., ABI encoding the return data).
+    /// Added to the total gas_used for the precompile invocation.
+    pub gas_overhead: u64,
 }
 
 /// Errors that can occur during subcall precompile execution.

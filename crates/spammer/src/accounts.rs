@@ -39,7 +39,7 @@ impl AccountBuilder {
     }
 }
 
-#[derive(Clone, Copy, Debug, EnumString, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, EnumString, Default)]
 #[strum(serialize_all = "lowercase")]
 pub enum PartitionMode {
     #[default]

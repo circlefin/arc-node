@@ -99,10 +99,13 @@ pub struct ArcNode {
     pub wait_for_payload: bool,
     /// When true (default), pending-tx RPCs are restricted
     /// (`eth_subscribe("newPendingTransactions")`, `eth_newPendingTransactionFilter`,
-    /// and `eth_getBlockByNumber("pending")`). When false, all requests are forwarded.
+    /// `eth_getBlockByNumber("pending")`, and `eth_getTransactionBySenderAndNonce`).
+    /// When false, all requests are forwarded.
     /// CLI users opt out of the default via `--arc.expose-pending-txs`.
     /// `--public-api` also forces this to `true` (and conflicts with `--arc.expose-pending-txs`).
     pub filter_pending_txs: bool,
+    /// Maximum batch response size in bytes, mirrors `--rpc.max-response-size`.
+    pub max_response_body_size: u32,
     /// Interval between tx rebroadcast rounds. Zero disables rebroadcast.
     pub rebroadcast_interval: std::time::Duration,
 }
@@ -116,6 +119,7 @@ impl Default for ArcNode {
             payload_builder_deadline_ms: None,
             wait_for_payload: true,
             filter_pending_txs: true,
+            max_response_body_size: 160 * 1024 * 1024,
             rebroadcast_interval: crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
         }
     }
@@ -123,6 +127,7 @@ impl Default for ArcNode {
 
 impl ArcNode {
     /// Creates a new `ArcNode`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rpc_cfg: ArcRpcConfig,
         invalid_tx_list_cfg: InvalidTxListConfig,
@@ -130,6 +135,7 @@ impl ArcNode {
         payload_builder_deadline_ms: Option<u64>,
         wait_for_payload: bool,
         filter_pending_txs: bool,
+        max_response_body_size: u32,
         rebroadcast_interval: std::time::Duration,
     ) -> Self {
         Self {
@@ -139,6 +145,7 @@ impl ArcNode {
             payload_builder_deadline_ms,
             wait_for_payload,
             filter_pending_txs,
+            max_response_body_size,
             rebroadcast_interval,
         }
     }
@@ -512,7 +519,10 @@ where
     fn add_ons(&self) -> Self::AddOns {
         ArcAddOns::default()
             .with_arc_rpc_config(self.rpc_cfg.clone())
-            .with_rpc_middleware(ArcRpcLayer::new(self.filter_pending_txs))
+            .with_rpc_middleware(ArcRpcLayer::new(
+                self.filter_pending_txs,
+                self.max_response_body_size as usize,
+            ))
     }
 }
 
@@ -701,6 +711,7 @@ mod tests {
             None,
             true,
             true,
+            160 * 1024 * 1024,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
         );
 
@@ -729,6 +740,7 @@ mod tests {
             None,
             true,
             true,
+            160 * 1024 * 1024,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
         );
         assert!(node.addresses_denylist_config.is_enabled());
@@ -763,6 +775,7 @@ mod tests {
             None,
             true,
             false,
+            160 * 1024 * 1024,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
         );
         assert!(!node.filter_pending_txs);
@@ -786,6 +799,7 @@ mod tests {
             None,
             false,
             false,
+            160 * 1024 * 1024,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
         );
         assert!(!node.wait_for_payload);
@@ -809,6 +823,7 @@ mod tests {
             None,
             true,
             true,
+            160 * 1024 * 1024,
             std::time::Duration::ZERO,
         );
         assert!(node.rebroadcast_interval.is_zero());

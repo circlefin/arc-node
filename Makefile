@@ -87,8 +87,11 @@ build-contract: check-foundry ## Build the contracts and bindings
 	npm install
 	$(HARDHAT) compile
 
-genesis: build-contract  ## Generate the genesis file idempotently
+genesis: build-contract  ## Generate the localdev genesis file idempotently
 	$(HARDHAT) genesis --network localdev --num-validators $(NUM_VALIDATORS)
+
+genesis-mainnet: build-contract  ## Generate the mainnet genesis file
+	$(HARDHAT) genesis --network mainnet
 
 .PHONY: mine-denylist-salt
 mine-denylist-salt: check-foundry ## Mine a CREATE2 salt for the Denylist proxy with a 0x360 address prefix (usage: make mine-denylist-salt INIT_CODE_HASH=0x...)

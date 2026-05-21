@@ -28,6 +28,19 @@ use crate::{
 
 pub(crate) const TERRAFORM_STATE_FILENAME: &str = "terraform.tfstate";
 
+/// Pairs of `(env var name, terraform variable name)` whose values are
+/// sensitive and must be forwarded to Terraform as `TF_VAR_<name>` env vars
+/// instead of `-var` CLI args, so they never appear in argv, process listings,
+/// or any error message that echoes the command. Extend this list when adding
+/// new secrets. The env name and the terraform variable name differ for
+/// historical reasons (e.g. `EC2_AMI_OWNER` → `ami_owner`).
+const SECRET_VAR_NAMES: &[(&str, &str)] = &[
+    ("GITHUB_TOKEN", "github_token"),
+    ("CIRCLE_BASE_IMAGE", "circle_base_image"),
+    ("EC2_AMI_OWNER", "ami_owner"),
+    ("EC2_PROFILE_NAME", "ec2_profile_name"),
+];
+
 /// Manage Terraform state and remote infrastructure
 pub(crate) struct Terraform {
     /// Directory containing the Terraform files
@@ -85,6 +98,9 @@ impl Terraform {
     /// `node_size` and `cc_size` override the Terraform defaults for EC2 instance types.
     /// When set, `node_disk_gb` and `cc_disk_gb` configure root EBS volume sizes (GiB). When omitted,
     /// Terraform leaves the AMI default root volume size.
+    /// `node_volume_type` and `node_volume_iops` configure the node root EBS volume type
+    /// and provisioned IOPS; when omitted, Terraform falls back to `gp3` at the AMI default IOPS.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create(
         &self,
         dry_run: bool,
@@ -93,6 +109,8 @@ impl Terraform {
         cc_size: Option<&str>,
         node_disk_gb: Option<u32>,
         cc_disk_gb: Option<u32>,
+        node_volume_type: Option<&str>,
+        node_volume_iops: Option<u32>,
     ) -> Result<()> {
         // Ensure testnet directory exists
         if !dry_run {
@@ -108,17 +126,21 @@ impl Terraform {
             cc_size,
             node_disk_gb,
             cc_disk_gb,
+            node_volume_type,
+            node_volume_iops,
         )?;
         args.extend(vars.iter().map(String::as_str));
 
         let state_flag = self.state_flag();
         args.push(&state_flag);
 
-        if yes {
+        // `--auto-approve` is only valid for `apply`; `plan` rejects unknown flags.
+        if yes && !dry_run {
             args.push("--auto-approve");
         }
 
-        shell::exec("terraform", args, &self.terraform_dir, None, false)?;
+        let envs = self.secret_envs()?;
+        shell::exec("terraform", args, &self.terraform_dir, Some(envs), false)?;
         info!(dir=%self.terraform_dir.display(), "✅ Remote infrastructure created via Terraform");
         Ok(())
     }
@@ -127,7 +149,7 @@ impl Terraform {
     pub(crate) fn destroy(&self, yes: bool) -> Result<()> {
         let mut args: Vec<&str> = vec!["destroy"];
 
-        let vars = self.build_variables(&self.node_names, None, None, None, None)?;
+        let vars = self.build_variables(&self.node_names, None, None, None, None, None, None)?;
         args.extend(vars.iter().map(String::as_str));
 
         let state_flag = self.state_flag();
@@ -137,7 +159,8 @@ impl Terraform {
             args.push("--auto-approve");
         }
 
-        shell::exec("terraform", args, &self.terraform_dir, None, false)?;
+        let envs = self.secret_envs()?;
+        shell::exec("terraform", args, &self.terraform_dir, Some(envs), false)?;
         info!(dir=%self.terraform_dir.display(), "✅ Remote infrastructure destroyed via Terraform");
         Ok(())
     }
@@ -162,7 +185,24 @@ impl Terraform {
         format!("-state={}", self.state_file.display())
     }
 
+    /// Collect Terraform variables that must stay out of the process argv —
+    /// secrets and credentials. They are passed to the child process as
+    /// `TF_VAR_<name>` env vars, which Terraform reads natively. Keeping them
+    /// out of argv prevents leakage via `ps`, audit logs, and the command
+    /// strings that `shell::exec` echoes on failure.
+    fn secret_envs(&self) -> Result<Vec<(String, String)>> {
+        SECRET_VAR_NAMES
+            .iter()
+            .map(|(env_name, tf_var_name)| {
+                let value = dotenvy::var(env_name)
+                    .wrap_err_with(|| format!("{env_name} not set (check environment or .env)"))?;
+                Ok((format!("TF_VAR_{tf_var_name}"), value))
+            })
+            .collect()
+    }
+
     // Build variables for passing as arguments to Terraform commands
+    #[allow(clippy::too_many_arguments)]
     fn build_variables(
         &self,
         node_names: &[String],
@@ -170,6 +210,8 @@ impl Terraform {
         cc_size: Option<&str>,
         node_disk_gb: Option<u32>,
         cc_disk_gb: Option<u32>,
+        node_volume_type: Option<&str>,
+        node_volume_iops: Option<u32>,
     ) -> Result<Vec<String>> {
         let mut args: Vec<String> = Vec::new();
 
@@ -225,30 +267,10 @@ impl Terraform {
         args.push("-var".to_string());
         args.push(format!("github_user={}", github_user));
 
-        let github_token = dotenvy::var("GITHUB_TOKEN")
-            .wrap_err("GITHUB_TOKEN not set (check environment or .env)")?;
-        args.push("-var".to_string());
-        args.push(format!("github_token={}", github_token));
-
-        let circle_base_image = dotenvy::var("CIRCLE_BASE_IMAGE")
-            .wrap_err("CIRCLE_BASE_IMAGE not set (check environment or .env)")?;
-        args.push("-var".to_string());
-        args.push(format!("circle_base_image={}", circle_base_image));
-
-        let ami_owner = dotenvy::var("EC2_AMI_OWNER")
-            .wrap_err("EC2_AMI_OWNER not set (check environment or .env)")?;
-        args.push("-var".to_string());
-        args.push(format!("ami_owner={}", ami_owner));
-
         let ami_name_filter = dotenvy::var("EC2_AMI_NAME_FILTER")
             .wrap_err("EC2_AMI_NAME_FILTER not set (check environment or .env)")?;
         args.push("-var".to_string());
         args.push(format!("ami_name_filter={}", ami_name_filter));
-
-        let ec2_profile_name = dotenvy::var("EC2_PROFILE_NAME")
-            .wrap_err("EC2_PROFILE_NAME not set (check environment or .env)")?;
-        args.push("-var".to_string());
-        args.push(format!("ec2_profile_name={}", ec2_profile_name));
 
         if let Some(size) = node_size {
             args.push("-var".to_string());
@@ -268,6 +290,16 @@ impl Terraform {
         if let Some(gib) = cc_disk_gb {
             args.push("-var".to_string());
             args.push(format!("cc_volume_size={gib}"));
+        }
+
+        if let Some(vt) = node_volume_type {
+            args.push("-var".to_string());
+            args.push(format!("node_volume_type={vt}"));
+        }
+
+        if let Some(iops) = node_volume_iops {
+            args.push("-var".to_string());
+            args.push(format!("node_volume_iops={iops}"));
         }
 
         Ok(args)

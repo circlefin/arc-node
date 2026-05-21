@@ -19,6 +19,7 @@ Quake is a tool for deploying Arc testnets and running end-to-end tests.
   - change the voting power of validators in the validator set of a node,
   - upgrade the running version of individual nodes.
 - Emulate network latency between nodes by assigning data-center regions to nodes and injecting artificial latency between regions.
+- Web-based topology viewer for real-time visualization of nodes, connections, peer status, and network health.
 - MCP (Model Context Protocol) server for AI-assisted testnet management via Claude Code, Cursor, and other MCP-compatible clients.
 
 __Table of contents__
@@ -37,6 +38,7 @@ __Table of contents__
       - [Upgrade](#upgrade)
       - [Chaos testing](#chaos-testing)
     - [The `valset` command](#the-valset-command)
+    - [The `web` command](#the-web-command)
     - [The `mcp` command](#the-mcp-command)
     - [The `generate` command](#the-generate-command)
   - [Manifest File Format](#manifest-file-format)
@@ -62,6 +64,7 @@ __Table of contents__
     - [Custom Docker images](#custom-docker-images)
     - [Remote commands](#remote-commands)
     - [Sharing a remote testnet](#sharing-a-remote-testnet)
+    - [Cleaning up orphaned AWS resources](#cleaning-up-orphaned-aws-resources)
   - [Profiling](#profiling)
     - [Prerequisites](#prerequisites)
     - [Feature environment variables](#feature-environment-variables)
@@ -184,6 +187,7 @@ graph LR
         logs
         valset
         load
+        web
         ssh["remote ssh"]
         export["remote export"]
         import["remote import"]
@@ -317,17 +321,18 @@ Remove generated files
 ```bash
 ./quake clean
 ```
-It will `stop` the nodes, if not done before.
+It will stop the nodes first if needed. Monitoring services are managed
+separately with `quake monitoring`.
 
 Clean and restart the testnet in one step:
 ```bash
 ./quake restart
 ```
-This is equivalent to running `clean` followed by `start`. It accepts the same
-flags as both commands, e.g. `--all` (from `clean`) and `--remote` (from `start`):
+This is equivalent to running `clean` followed by `start`. It accepts clean
+scope flags such as `--all` and `--data`, plus the regular `start` flags:
 ```bash
-# Clean everything (including monitoring data) and restart
-./quake restart --all
+# Clean everything (including monitoring data) and restart without monitoring services
+./quake restart --all --monitoring=false
 
 # Clean all nodes and restart specific nodes
 ./quake restart validator1 validator2
@@ -616,6 +621,37 @@ Notes:
 do not use container names (`validator1_cl`, `validator2_cl`).
 - it does not accept `*` wildcards.
 
+### The `web` command
+
+The `web` command starts a browser-based topology viewer that visualizes the testnet in real time and allows you to control the testnet.
+Open `http://localhost:7777` in a browser to see the web application.
+Currently, it only works in local mode.
+
+There is one tab per topology:
+- **Manifest**: expected topology from manifest peers and subnets (always available)
+- **CL Consensus / Liveness / Proposal Parts**: gossipsub mesh per topic (live)
+- **EL Peers**: execution layer devp2p peer connections (live)
+
+Two views: **Graph** (force-directed layout with subnet clustering) and **Map** (world map with nodes at their AWS region coordinates).
+
+#### Data architecture
+
+- **CL data** (mesh topology, proposer, rounds): Fetched via HTTP from each node's `/network-state` and `/status` endpoints during each topology poll.
+- **EL data** (block heights, peers, mempool): Collected via a single WebSocket connection per node. Block heights arrive in real-time via `eth_subscribe(newHeads)`. Peer data (`admin_peers`) and mempool status (`txpool_status`) are polled periodically on the same connection.
+- **Container statuses**: Tracked by two background tasks: a `docker events` subscriber for real-time state changes (start, stop, pause, die) and a periodic `docker inspect` poller for network disconnect detection.
+
+For a deeper dive (server state, background tasks, topology assembly, frontend rendering pipeline), see [`docs/web-architecture.md`](docs/web-architecture.md).
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host` | `127.0.0.1` | Bind address for the web server |
+| `--port` | `7777` | Web server port |
+| `--refresh-ms` | `1000` | Frontend topology poll interval (ms) |
+| `--el-refresh-ms` | `1000` | EL peer refresh poller interval (ms) |
+| `--container-refresh-ms` | `1000` | Docker container status poller interval (ms) |
+
 ### The `mcp` command
 
 The `mcp` command starts a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that exposes Quake's testnet tools to AI assistants like Claude Code, Cursor, and other MCP-compatible clients. This lets you observe, manage, and test a running testnet through natural language.
@@ -750,12 +786,12 @@ PRs labeled `test-random` will also trigger this workflow.
 
 ### The `clean` command
 
-By default, `clean` removes all node data and configuration. The following flags control what is removed:
+By default, `clean` stops the testnet and removes all node data and configuration,
+but leaves monitoring data alone. The following flags control what is removed:
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--all` | `-a` | Remove everything, including monitoring services and their data. Cannot be combined with other flags. |
-| `--monitoring` | `-m` | Stop monitoring services and remove their data only. |
+| `--all` | `-a` | Remove everything, including monitoring services and their data. Cannot be combined with data flags. |
 | `--data` | `-d` | Remove only execution and consensus layer data, preserving configuration. Cannot be combined with `--execution-data` or `--consensus-data`. |
 | `--execution-data` | `-x` | Remove only execution layer (Reth) data. Cannot be combined with `--data` or `--consensus-data`. |
 | `--consensus-data` | `-c` | Remove only consensus layer (Malachite) data. Cannot be combined with `--data` or `--execution-data`. |
@@ -770,11 +806,23 @@ By default, `clean` removes all node data and configuration. The following flags
 # Remove only consensus layer data
 ./quake clean --consensus-data
 
-# Remove node data and monitoring
-./quake clean --data --monitoring
-
 # Remove everything including monitoring
 ./quake clean --all
+```
+
+### The `monitoring` command
+
+Monitoring services (Prometheus, Grafana, cAdvisor, Blockscout) can be controlled with the `monitoring` command:
+
+```bash
+# Start monitoring services
+./quake monitoring start
+
+# Stop monitoring services
+./quake monitoring stop
+
+# Stop monitoring services and remove monitoring data
+./quake monitoring clean
 ```
 
 ## Manifest File Format
@@ -800,6 +848,37 @@ Optional top-level settings:
     `${IMAGE_REGISTRY_URL}/arc-execution:<version>`, where `IMAGE_REGISTRY_URL`
     is taken from the `.env` file (see [Custom Docker images](#custom-docker-images)).
 - **image_cl_upgrade**, **image_el_upgrade**: Docker images to use when upgrading containers with `quake perturb upgrade`. Required for upgrade scenarios; not supported in remote mode.
+- **node_size**: EC2 instance type for validator/full nodes (e.g. `"m6a.4xlarge"`). Equivalent to
+  the `--node-size` CLI flag. See [Instance sizing](#instance-sizing) for available options.
+  **Remote mode only** — ignored in local mode (a warning is printed).
+- **cc_size**: EC2 instance type for the Control Center. Equivalent to `--cc-size`.
+  **Remote mode only** — ignored in local mode.
+- **node_disk_gb**: Root EBS volume size in GiB for each node. Must be ≥ 8. Equivalent to
+  `--node-disk-gb`. Omit to keep the AMI default. **Remote mode only** — ignored in local mode.
+- **cc_disk_gb**: Root EBS volume size in GiB for the Control Center. Must be ≥ 8. Equivalent to
+  `--cc-disk-gb`. **Remote mode only** — ignored in local mode.
+- **node_volume_type**: AWS EBS volume type for each node's root disk; tunes disk
+  cost/performance (e.g. match a production disk profile). General Purpose SSD
+  (`gp2`, `gp3`), Provisioned IOPS SSD (`io1`, `io2`), Throughput Optimized HDD (`st1`),
+  Cold HDD (`sc1`). Default: `gp3`. See [AWS EBS volume types][ebs-types]. Equivalent
+  to `--node-volume-type`. **Remote mode only**.
+- **node_volume_iops**: Provisioned IOPS for the node root EBS volume; raises the I/O
+  ceiling above the volume type's baseline. Only valid with `gp3`, `io1`, `io2`; range
+  100–256000. Default: AMI's baseline IOPS for the chosen type. Equivalent to
+  `--node-volume-iops`. **Remote mode only**.
+- **el_cpu_limit**: Hard CPU cap for each EL container; reproduces production CPU quotas
+  on the testnet. Whole or fractional CPUs (e.g. `0.5`). Maps to Docker Compose
+  [`cpus`][compose-cpus]. Default: no limit (container uses all host CPUs).
+- **el_memory_limit_gb**: Hard memory cap for each EL container in GiB; fractional values
+  (e.g. `2.5`) are allowed. Maps to Docker Compose [`mem_limit`][compose-mem-limit].
+  Default: no limit locally; 2.5 GiB on remote.
+- **cl_cpu_limit**: Hard CPU cap for each CL container; same semantics as `el_cpu_limit`.
+- **cl_memory_limit_gb**: Hard memory cap for each CL container in GiB; fractional values
+  allowed. Default: no limit locally; 1 GiB on remote.
+
+[ebs-types]: https://docs.aws.amazon.com/ebs/latest/userguide/ebs-volume-types.html
+[compose-cpus]: https://docs.docker.com/reference/compose-file/services/#cpus
+[compose-mem-limit]: https://docs.docker.com/reference/compose-file/services/#mem_limit
 
 ### Nodes
 
@@ -1106,7 +1185,6 @@ targets. For example:
 ```bash
 ./quake load -t 60 -r 500 --targets ALL_VALIDATORS
 ./quake spam -t 30 -r 1000 --targets TRUSTED
-./quake remote load -- --targets FULL_NODES -r 1000 -t 60
 ```
 
 To distinguish group references from individual nodes in peer lists, by convention we use lowercase for node names and uppercase for node group names.
@@ -1628,12 +1706,12 @@ stop.
 
 Send transaction load:
 ```sh
-./quake remote load -- --targets validator1,validator2 -r 1000 -t 60
+./quake load --targets validator1,validator2 -r 1000 -t 60
 ```
-Under the hood, this commands calls Spammer from CC. All Spammer options are supported.
-`--targets` accepts the same comma-separated selectors as `quake load` on a
-local testnet, including manifest node groups such as `ALL_VALIDATORS` or
-custom `[node_groups]`.
+`quake load` and `quake spam` auto-dispatch based on testnet type: local testnets
+run the spammer directly, remote testnets forward to the Control Center via SSH.
+All Spammer options are supported. `--targets` accepts comma-separated selectors
+including manifest node groups such as `ALL_VALIDATORS` or custom `[node_groups]`.
 
 Download diagnostic artifacts from the remote testnet:
 ```bash
@@ -1712,6 +1790,47 @@ also tear down the infrastructure when done. Bundles exported with
 > The export file contains the SSH private key and Terraform state for the remote
 > infrastructure. Treat it as sensitive material: transfer it securely and do not
 > commit it to version control.
+
+### Cleaning up orphaned AWS resources
+
+`quake clean` relies on Terraform state to delete the AWS infrastructure for a
+remote testnet. If that state is lost (e.g. the `.quake/` directory was deleted,
+or `quake remote create` crashed before state was written), the nodes, VPC,
+security groups, and related resources stay in AWS with no supported way for
+`quake` to remove them.
+
+`crates/quake/scripts/aws-resources.sh` is the recovery path. It discovers
+resources by the project name they were created with
+(`arc-<testnet>-testnet-<user>`) and removes them using the AWS CLI directly,
+no Terraform state required.
+
+```bash
+# Summarize every orphaned project for the current user.
+./crates/quake/scripts/aws-resources.sh list
+
+# Show the full resource plan for a single testnet (no deletion).
+./crates/quake/scripts/aws-resources.sh list <testnet>
+
+# Delete orphaned resources for a testnet. Without --yes, the script prints the
+# plan and prompts before deleting; with --yes, it proceeds non-interactively.
+./crates/quake/scripts/aws-resources.sh remove <testnet>
+./crates/quake/scripts/aws-resources.sh remove <testnet> --yes
+```
+
+`list` is read-only. `remove` defaults to an interactive confirmation, so a
+bare invocation never deletes anything without an explicit `y`. The script
+scopes to the current user (`$GITHUB_USER`, or `--user NAME`); `remove` and
+`list TESTNET` refuse to touch a project belonging to another user unless
+`--user` is passed explicitly, and the bare `list` summary surfaces a notice
+when `--user` overrides the current `$GITHUB_USER`. Run `--help` for the full
+option set.
+
+> [!IMPORTANT]
+> Prefer `quake clean` whenever the Terraform state is still available. This
+> script is a recovery tool for orphaned infrastructure only. It matches
+> resources on AWS-side names and tags alone, so a mistyped testnet or the
+> wrong `--region` can tear down infrastructure belonging to an active
+> testnet.
 
 ## Profiling
 
@@ -1864,9 +1983,15 @@ TODO: more testing scenarios to come
 
 ### Running tests
 
-Run all tests in all groups:
+Run all tests (except excluded groups: `validation`, `health`, `validator_set`, `perf`):
 ```bash
 ./quake test
+```
+
+Run an excluded group explicitly:
+```bash
+./quake test perf:block_time
+./quake test validation:basic
 ```
 
 Run all tests in a specific group:

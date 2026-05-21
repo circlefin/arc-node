@@ -48,7 +48,7 @@ import { USDC } from '../helpers/FiatToken'
 import { PermissionedValidatorManager, ValidatorRegistry, ValidatorStatus } from '../helpers/ValidatorManager'
 import {
   memoAddress,
-  denylistAddress,
+  denylistAddressByNetwork,
   gasGuzzlerAddress,
   Manifest,
   multicall3Address,
@@ -258,18 +258,20 @@ describe('genesis', () => {
 
     it('admin', async () => {
       const { usdc, expectAddr } = await clients()
-      const [admin, owner, masterMinter, pauser, blacklister] = await Promise.all([
+      const [admin, owner, masterMinter, pauser, blacklister, rescuer] = await Promise.all([
         usdc.admin(),
         usdc.owner(),
         usdc.masterMinter(),
         usdc.pauser(),
         usdc.blacklister(),
+        usdc.rescuer(),
       ])
       expect(admin).to.be.addressEqual(expectAddr.proxyAdmin)
       expect(owner).to.be.addressEqual(expectAddr.admin)
       expectAddressEq(masterMinter, expectAddr.admin)
       expectAddressEq(pauser, expectAddr.admin)
       expectAddressEq(blacklister, expectAddr.operator)
+      expectAddressEq(rescuer, expectAddr.admin)
     })
 
     it('token info', async () => {
@@ -321,6 +323,21 @@ describe('genesis', () => {
       expect(feeParams.minBaseFee).to.be.eq(1n)
       expect(feeParams.maxBaseFee).to.be.eq(parseGwei('1000'))
       expect(feeParams.blockGasLimit).to.be.eq(30_000_000n)
+    })
+
+    // Guards the bit-packed uint16 layout in ProtocolConfig.ts: a mis-shifted
+    // field would silently ship wrong consensus timeouts to malachite.
+    it('consensus params', async () => {
+      const { protocolConfig } = await clients()
+      const consensusParams = await protocolConfig.consensusParams()
+      expect(consensusParams.timeoutProposeMs).to.be.eq(3000)
+      expect(consensusParams.timeoutProposeDeltaMs).to.be.eq(500)
+      expect(consensusParams.timeoutPrevoteMs).to.be.eq(1000)
+      expect(consensusParams.timeoutPrevoteDeltaMs).to.be.eq(500)
+      expect(consensusParams.timeoutPrecommitMs).to.be.eq(1000)
+      expect(consensusParams.timeoutPrecommitDeltaMs).to.be.eq(500)
+      expect(consensusParams.timeoutRebroadcastMs).to.be.eq(1000)
+      expect(consensusParams.targetBlockTimeMs).to.be.eq(500)
     })
   })
 
@@ -380,25 +397,41 @@ describe('genesis', () => {
 
   describe('permissioned validator manager', () => {
     it('initial addresses', async () => {
-      const { poaValidatorManager, expectAddr, getController } = await clients()
-      const controller1 = getController(1n)
-      const controller5 = getController(5n)
+      const { poaValidatorManager, expectAddr } = await clients()
 
-      const [admin, owner, isController1, isController5, isValidatorRegisterer1, isValidatorRegisterer2] =
-        await Promise.all([
-          poaValidatorManager.admin(),
-          poaValidatorManager.owner(),
-          poaValidatorManager.isController([controller1.account.address]),
-          poaValidatorManager.isController([controller5.account.address]),
-          poaValidatorManager.isValidatorRegisterer([expectAddr.admin]),
-          poaValidatorManager.isValidatorRegisterer([expectAddr.operator]),
-        ])
+      const [admin, owner, pauser, isValidatorRegisterer1, isValidatorRegisterer2] = await Promise.all([
+        poaValidatorManager.admin(),
+        poaValidatorManager.owner(),
+        poaValidatorManager.pauser(),
+        poaValidatorManager.isValidatorRegisterer([expectAddr.admin]),
+        poaValidatorManager.isValidatorRegisterer([expectAddr.operator]),
+      ])
       expect(admin).to.be.addressEqual(expectAddr.proxyAdmin)
       expect(owner.toLowerCase()).to.be.eq(expectAddr.admin)
-      expect(isController1).to.be.true
-      expect(isController5).to.be.true
+      expect(pauser.toLowerCase()).to.be.eq(expectAddr.admin)
       expect(isValidatorRegisterer1).to.be.true
       expect(isValidatorRegisterer2).to.be.true
+    })
+
+    // Every validator's controller must be wired at genesis to its registrationId
+    // with the configured voting power limit (UINT64_MAX in localdev). Guards
+    // against regressions in slotForAddressMap or per-controller flattening.
+    it('controllers wired with voting power limits', async () => {
+      const { poaValidatorManager, getController } = await clients()
+      const validators = await getValidators()
+      const UINT64_MAX = (1n << 64n) - 1n
+
+      await Promise.all(
+        validators.map(async (v) => {
+          const controller = getController(v.registrationID)
+          const [isCtrl, limit] = await Promise.all([
+            poaValidatorManager.isController([controller.account.address]),
+            poaValidatorManager.getVotingPowerLimit([controller.account.address]),
+          ])
+          expect(isCtrl, `controller ${v.registrationID} registered`).to.be.true
+          expect(limit, `controller ${v.registrationID} voting power limit`).to.be.eq(UINT64_MAX)
+        }),
+      )
     })
   })
 
@@ -407,7 +440,7 @@ describe('genesis', () => {
       const { client } = await getClients()
       const code = await client.getCode({ address: Denylist.address })
       expect(code?.length).to.be.greaterThan(0)
-      expect(Denylist.address).to.be.addressEqual(denylistAddress)
+      expect(Denylist.address).to.be.addressEqual(denylistAddressByNetwork.localdev)
     })
 
     it('implementation contract exists', async () => {
@@ -483,8 +516,9 @@ describe('genesis', () => {
     // Regression guard: compute the Denylist proxy CREATE2 address from
     //   AdminUpgradeableProxy bytecode + abi.encode(impl, proxyAdmin, initData)
     // combined with the documented mined salt, and assert it matches BOTH the hardcoded
-    // denylistAddress constant AND that runtime code is placed at that address in genesis.
-    // Mined via `INIT_CODE_HASH=<hash> make mine-denylist-salt` — see scripts/genesis/addresses.ts.
+    // denylistAddressByNetwork.localdev constant AND that runtime code is placed at that
+    // address in genesis. Mined via `INIT_CODE_HASH=<hash> make mine-denylist-salt` —
+    // see scripts/genesis/addresses.ts.
     it('proxy at expected CREATE2 address (mined salt)', async () => {
       const { client, denylist } = await clients()
       const denylistArtifact = readForgeArtifactSync('Denylist')
@@ -504,11 +538,11 @@ describe('genesis', () => {
       )
       const fullInit = concat([proxyArtifact.bytecode, ctorArgs])
 
-      const MINED_SALT = 0x2e8184e0b708cc70e9f829091612c4c8efef8006ee7527c73bdbbd70b64c36c8n
+      const MINED_SALT = 0x2e8184e0b708cc70e9f829091612c4c8efef8006ee7527c777e0bd70b64c36c8n
       const computed = DeterministicDeployerProxy.getDeployAddress(fullInit, MINED_SALT)
 
       // (1) computed matches hardcoded constant
-      expect(computed).to.be.addressEqual(denylistAddress)
+      expect(computed).to.be.addressEqual(denylistAddressByNetwork.localdev)
 
       // (2) genesis placed runtime code at the computed address
       const code = await client.getCode({ address: computed })

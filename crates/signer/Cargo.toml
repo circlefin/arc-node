@@ -26,6 +26,7 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 hex = { workspace = true }
+malachitebft-core-types = { workspace = true }
 malachitebft-signing-ed25519 = { workspace = true, optional = true }
 tracing = { workspace = true }
 

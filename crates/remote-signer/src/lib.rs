@@ -33,7 +33,7 @@ pub use metrics::RemoteSigningMetrics;
 pub use provider::RemoteSigningProvider;
 
 // Re-export signing types from malachitebft_signing
-pub use malachitebft_signing::{Error as SigningError, SigningProvider, VerificationResult};
+pub use malachitebft_signing::{Error as SigningError, Signer, VerificationResult, Verifier};
 
 /// Result type for consensus remote signing operations
 pub type Result<T> = std::result::Result<T, RemoteSigningError>;

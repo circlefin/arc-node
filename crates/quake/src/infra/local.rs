@@ -30,6 +30,21 @@ pub(crate) const COMPOSE_BUILD_FILENAME: &str = "arc_builders.yaml";
 pub(crate) const DEFAULT_IMAGE_CL: &str = "arc_consensus:latest";
 pub(crate) const DEFAULT_IMAGE_EL: &str = "arc_execution:latest";
 
+const BLOCKSCOUT_CONTAINERS: [&str; 5] = [
+    "blockscout-db-init",
+    "blockscout-db",
+    "blockscout-backend",
+    "blockscout-proxy",
+    "blockscout-frontend",
+];
+
+fn blockscout_container_names() -> Vec<NodeOrContainerName> {
+    BLOCKSCOUT_CONTAINERS
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
 trait DockerArg<'a> {
     fn add_to(self, args: &mut Vec<&'a str>);
 }
@@ -131,6 +146,23 @@ impl LocalInfra {
         docker::exec(&self.root_dir, args)
     }
 
+    /// Execute a docker command per container, collecting failures.
+    /// Returns Ok if all succeed, or an error listing which containers failed.
+    fn docker_exec_per_container(&self, action: &str, containers: &[ContainerName]) -> Result<()> {
+        let mut failures = Vec::new();
+        for c in containers {
+            if let Err(e) = self.docker_exec(vec![action, c]) {
+                warn!(container = %c, action, "docker {action} failed: {e}");
+                failures.push(format!("{c}: {e}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(eyre!("{}", failures.join("; ")))
+        }
+    }
+
     fn docker_compose_exec(&self, compose_path: &Path, args: Vec<&str>) -> Result<()> {
         docker::compose_exec(&self.root_dir, compose_path, args)
     }
@@ -228,19 +260,35 @@ impl InfraProvider for LocalInfra {
     }
 
     fn kill(&self, containers: &[ContainerName]) -> Result<()> {
-        self.docker_exec(args!("kill", containers))
+        self.docker_exec_per_container("kill", containers)
     }
 
     fn pause(&self, containers: &[ContainerName]) -> Result<()> {
-        self.docker_exec(args!("pause", containers))
+        self.docker_exec_per_container("pause", containers)
     }
 
     fn unpause(&self, containers: &[ContainerName]) -> Result<()> {
-        self.docker_exec(args!("unpause", containers))
+        self.docker_exec_per_container("unpause", containers)
     }
 
     fn restart(&self, containers: &[ContainerName]) -> Result<()> {
-        self.docker_exec(args!("restart", containers))
+        self.docker_exec_per_container("restart", containers)
+    }
+
+    fn start_monitoring(&self) -> Result<()> {
+        self.monitoring.start()?;
+        self.start(&blockscout_container_names())?;
+        Ok(())
+    }
+
+    fn stop_monitoring(&self) -> Result<()> {
+        self.down(&blockscout_container_names())?;
+        self.monitoring.stop()?;
+        Ok(())
+    }
+
+    fn clean_monitoring_data(&self) -> Result<()> {
+        self.monitoring.clean()
     }
 }
 
@@ -277,6 +325,7 @@ impl MonitoringManager {
 
     /// Start monitoring services (Prometheus and Grafana).
     pub fn start(&self) -> Result<()> {
+        self.setup()?;
         docker::compose_exec(&self.root_dir, &self.compose_path, args!("up", "-d"))
     }
 

@@ -117,10 +117,6 @@ terraform.tfvars*
 .claude/memory/
 .claude/worktrees/
 .claude/todo.md
-.claude/skills/**
-!.claude/skills/
-!.claude/skills/*/
-!.claude/skills/*/**
 .planning
 
 deployments/certs/*

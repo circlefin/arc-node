@@ -51,6 +51,13 @@ resource "aws_instance" "cc" {
     { region = var.region },
     { project = local.project_name }
   )
+
+  # See nodes.tf for rationale.
+  volume_tags = merge(
+    { Name = "cc-root" },
+    { for tag in var.tags : tag => "true" },
+    { project = local.project_name }
+  )
 }
 
 # Auto-recover the CC instance when system status checks fail.

@@ -15,15 +15,17 @@
 // limitations under the License.
 pragma solidity ^0.8.29;
 
-/// @title IPQ — Post-Quantum cryptography precompile interface
-/// @notice Exposes post-quantum cryptographic primitives to on-chain callers.
+/// @title IPQ — Experimental post-quantum cryptography precompile interface
+/// @notice Exposes post-quantum cryptographic primitives for early integrations.
 ///         Additional algorithms may be added in future hardforks.
 interface IPQ {
     /// @notice Verify an SLH-DSA-SHA2-128s signature (FIPS 205).
-    /// @dev Gas cost: 230,000 base + 6 per 32-byte word of msg (same rate as KECCAK256).
+    /// @dev Since PQ signatures are still very new, we recommend not to solely rely on them for
+    ///      authentication, but pair them with classical signatures. Gas cost: 230,000 base + 6
+    ///      per 32-byte word of message (same rate as KECCAK256).
     /// @param vk  Verifying key (32 bytes)
-    /// @param msg Message that was signed
+    /// @param message Message that was signed
     /// @param sig Signature (7856 bytes)
     /// @return    True if the signature is valid
-    function verifySlhDsaSha2128s(bytes memory vk, bytes memory msg, bytes memory sig) external view returns (bool);
+    function verifySlhDsaSha2128s(bytes memory vk, bytes memory message, bytes memory sig) external view returns (bool);
 }

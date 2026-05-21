@@ -423,7 +423,7 @@ mod tests {
                 last_signed_prevote: None,
                 last_signed_precommit: None,
                 round_certificate: None,
-                input_queue: dump_types::BoundedQueue::new(0),
+                input_queue: dump_types::BoundedQueue::new(0, 0),
             }
         }
 

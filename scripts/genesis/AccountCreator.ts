@@ -126,8 +126,6 @@ export class LocalDevAccountCreator {
     numExtraAccounts: z.number().min(0).optional(),
     // number of extra minters, default is 0.
     numExtraMinters: z.number().min(0).optional(),
-    // number of controllers, default is numValidators.
-    numControllers: z.number().min(1).optional(),
     // override public keys for validators, format: ID:KEY,ID:KEY
     overridePublicKeys: z.string().optional(),
     // per-validator voting powers; when omitted every validator gets the default (20)
@@ -137,7 +135,6 @@ export class LocalDevAccountCreator {
   numValidators: number
   numExtraAccounts: number
   numExtraMinters: number
-  numControllers: number
   overridePublicKeys: Map<number, Hex>
   votingPowers?: number[]
   mnemonic: string
@@ -147,14 +144,12 @@ export class LocalDevAccountCreator {
       numValidators = 5,
       numExtraAccounts = 0,
       numExtraMinters = 0,
-      numControllers = numValidators,
       overridePublicKeys = defaultOverridePublicKeys(),
       votingPowers,
     } = options ? LocalDevAccountCreator.optionsSchema.parse(options) : {}
     this.numValidators = numValidators
     this.numExtraAccounts = numExtraAccounts
     this.numExtraMinters = numExtraMinters
-    this.numControllers = numControllers
     this.overridePublicKeys = parseOverridePublicKeys(overridePublicKeys)
     if (votingPowers && votingPowers.length !== numValidators) {
       throw new Error(`votingPowers length (${votingPowers.length}) must match numValidators (${numValidators})`)
@@ -185,9 +180,9 @@ export class LocalDevAccountCreator {
       mnemonicToAccount(this.mnemonic, { path: `m/44'/60'/1'/0/${i}` }),
     )
 
-  // Controller accounts, BIP44: m/44'/60'/2'/0/{index}
+  // Controller accounts, BIP44: m/44'/60'/2'/0/{index}. One per validator.
   controllers = () =>
-    Array.from({ length: this.numControllers }).map((_, i) =>
+    Array.from({ length: this.numValidators }).map((_, i) =>
       mnemonicToAccount(this.mnemonic, { path: `m/44'/60'/2'/0/${i}` }),
     )
 
@@ -198,9 +193,9 @@ export class LocalDevAccountCreator {
     }
     if (existing) {
       // verify the controller is in the genesis
-      if (registrationID > BigInt(this.numControllers)) {
+      if (registrationID > BigInt(this.numValidators)) {
         throw new Error(
-          `the controller (registrationID: ${registrationID}) is not in the genesis (${this.numControllers} controllers)`,
+          `the controller (registrationID: ${registrationID}) is not in the genesis (${this.numValidators} validators)`,
         )
       }
     }

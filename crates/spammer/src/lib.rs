@@ -35,4 +35,4 @@ mod ws;
 pub use accounts::PartitionMode;
 pub use cli::SpammerArgs;
 pub use config::{Config, ResumeConfig};
-pub use spammer::{Spammer, SpammerState};
+pub use spammer::{Spammer, SpammerRunResult, SpammerState};

@@ -29,7 +29,6 @@ import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/acces
  * @dev Uses ERC-7201 namespaced storage pattern for upgrade safety.
  */
 abstract contract Pausable is Ownable2StepUpgradeable {
-
     // ============ Errors ============
 
     /// @notice Thrown when pauser address is zero
@@ -157,20 +156,26 @@ abstract contract Pausable is Ownable2StepUpgradeable {
     /**
      * @notice Pauses the contract
      * @dev Only callable by pauser
+     * @dev Idempotent: repeated calls while paused leave state unchanged and emit no event.
      */
     function pause() external virtual onlyPauser {
         PausableStorage storage $ = _getPausableStorage();
-        $.paused = true;
-        emit Pause();
+        if (!$.paused) {
+            $.paused = true;
+            emit Pause();
+        }
     }
 
     /**
      * @notice Unpauses the contract
      * @dev Only callable by pauser
+     * @dev Idempotent: repeated calls while unpaused leave state unchanged and emit no event.
      */
     function unpause() external virtual onlyPauser {
         PausableStorage storage $ = _getPausableStorage();
-        $.paused = false;
-        emit Unpause();
+        if ($.paused) {
+            $.paused = false;
+            emit Unpause();
+        }
     }
 }

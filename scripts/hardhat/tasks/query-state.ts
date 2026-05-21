@@ -96,13 +96,14 @@ task('query-state', 'query state for the network')
         hre,
         client,
         config?.ValidatorManager.PermissionedValidatorManager?.validatorRegisterers,
-        config?.ValidatorManager.PermissionedValidatorManager?.controllers,
+        config?.ValidatorManager.validators,
       ),
+      prefund: await queryPrefund(client, config?.prefund),
     }
 
     console.log(JSON.stringify(state, jsonHelper, 2))
 
-    if (genesisConfig) {
+    if (config) {
       const cmp = new ConfigComparator()
       // check implementation
       cmp.eq('NativeFiatToken.proxy.admin', state, config)
@@ -139,9 +140,47 @@ task('query-state', 'query state for the network')
       cmp.eq('ValidatorManager.proxy.admin', state, config)
       cmp.eq('ValidatorManager.PermissionedValidatorManager.proxy.admin', state, config)
       cmp.eq('ValidatorManager.PermissionedValidatorManager.owner', state, config)
+      cmp.eq('ValidatorManager.PermissionedValidatorManager.pauser', state, config)
       cmp.eq('ValidatorManager.PermissionedValidatorManager.validatorRegisterers', state, config)
-      cmp.eq('ValidatorManager.PermissionedValidatorManager.controllers', state, config)
-      cmp.eq('ValidatorManager.validators', state, config, (x: Array<{ publicKey: Hex }>) => x.map((v) => v.publicKey))
+
+      // Structural invariant: ValidatorRegistry.owner == PVM proxy address. Set at
+      // genesis and never changed via config, so it lives outside the schema — read
+      // and compare directly so a drifted owner can't go undetected.
+      const expectedVrOwner =
+        config.ValidatorManager.PermissionedValidatorManager.proxy.address ?? permissionedManagerAddress
+      const validatorRegistry = getContract({
+        abi: hre.artifacts.readArtifactSync('ValidatorRegistry').abi,
+        address: validatorRegistryAddress,
+        client,
+      }).read
+      const vrOwner = await validatorRegistry.owner()
+      if (vrOwner.toLowerCase() !== expectedVrOwner.toLowerCase()) {
+        console.warn(`ValidatorRegistry.owner is ${vrOwner}, expected ${expectedVrOwner} (PVM proxy)`)
+        cmp.hasDiff = true
+      }
+      // Compare the full nested validator shape: publicKey, votingPower, and each
+      // validator's controllers (address + votingPowerLimit). The registrationId is
+      // implicit (= validator index + 1) and enforced at genesis-build time.
+      cmp.eq(
+        'ValidatorManager.validators',
+        state,
+        config,
+        (
+          x: Array<{
+            publicKey: Hex
+            votingPower: bigint
+            controllers?: Array<{ address: Address; votingPowerLimit: bigint }>
+          }>,
+        ) =>
+          x.map((v) => ({
+            publicKey: v.publicKey,
+            votingPower: v.votingPower,
+            controllers: (v.controllers ?? []).map((c) => ({
+              address: c.address,
+              votingPowerLimit: c.votingPowerLimit,
+            })),
+          })),
+      )
 
       // Verify ValidatorManager bytecode
       await cmp.verifyProxyCode(genesisAllocs, client, validatorRegistryAddress, 'ValidatorManager')
@@ -153,6 +192,8 @@ task('query-state', 'query state for the network')
         permissionedManagerAddress,
         'PermissionedValidatorManager',
       )
+
+      cmp.eq('prefund', state, config)
 
       if (cmp.hasDiff) {
         throw new Error(`state and config is different`)
@@ -238,7 +279,7 @@ const queryValidatorManagerConfig = async (
   hre: HardhatRuntimeEnvironment,
   client: PublicClient,
   validatorRegisterers?: Array<Address>,
-  controllers?: Array<Address>,
+  configValidators?: Array<{ controllers?: Array<{ address: Address }> }>,
 ): Promise<GenesisConfig['ValidatorManager']> => {
   const abiValidatorRegistry = hre.artifacts.readArtifactSync('ValidatorRegistry').abi
   const abiPermissionedValidatorManager = hre.artifacts.readArtifactSync('PermissionedValidatorManager').abi
@@ -255,42 +296,76 @@ const queryValidatorManagerConfig = async (
     client,
   }).read
 
-  const [vrAdmin, vrImpl, vrOwner, nextRegistrationId, admin, impl, owner, ...isValidatorRegisterer] =
-    await Promise.all([
+  const [vrAdmin, vrImpl, nextRegistrationId, admin, impl, owner, pauser, ...isValidatorRegisterer] = await Promise.all(
+    [
       validatorRegistry.admin(),
       validatorRegistry.implementation(),
-      validatorRegistry.owner(),
       validatorRegistry.getNextRegistrationId(),
       poaManager.admin(),
       poaManager.implementation(),
       poaManager.owner(),
+      poaManager.pauser(),
       ...(validatorRegisterers ?? []).map((x) => poaManager.isValidatorRegisterer([x])),
-    ])
+    ],
+  )
 
-  const validators = await Promise.all(
+  const onChainValidators = await Promise.all(
     Array(Number(nextRegistrationId - 1n))
       .fill(0)
       .map((_, i) => validatorRegistry.getValidator([BigInt(i) + 1n])),
   )
 
-  const isController = await Promise.all((controllers ?? []).map((x) => poaManager.isController([x])))
+  // For each validator, query the on-chain state for the controller addresses
+  // that config says should manage it. A controller is considered to belong to
+  // validator i if its on-chain registrationId equals i+1 — mismatches produce
+  // a missing entry here, which the comparator flags as a diff.
+  const validators = await Promise.all(
+    onChainValidators.map(async (v, i) => {
+      const expectedRegistrationId = BigInt(i + 1)
+      const configControllers = configValidators?.[i]?.controllers ?? []
+      const controllers = await Promise.all(
+        configControllers.map(async (c) => {
+          const [registrationId, votingPowerLimit] = await Promise.all([
+            poaManager.getRegistrationId([c.address]),
+            poaManager.getVotingPowerLimit([c.address]),
+          ])
+          return registrationId === expectedRegistrationId ? { address: c.address, votingPowerLimit } : null
+        }),
+      )
+      return {
+        ...v,
+        controllers: controllers.filter((c): c is { address: Address; votingPowerLimit: bigint } => c !== null),
+      }
+    }),
+  )
 
   return {
     proxy: { admin: vrAdmin },
     implementation: { address: vrImpl },
-    owner: vrOwner,
 
     PermissionedValidatorManager: {
       proxy: { admin },
       implementation: { address: impl },
       owner,
+      pauser,
       validatorRegisterers: (validatorRegisterers ?? [])?.filter((_, i) => isValidatorRegisterer[i]),
-      controllers: (controllers ?? [])?.filter((_, i) => isController[i]),
     },
 
-    validators: validators,
+    validators,
   }
 }
+
+// Read current on-chain balance for each prefund address and flag drift.
+const queryPrefund = async (
+  client: PublicClient,
+  configPrefund: GenesisConfig['prefund'] = [],
+): Promise<GenesisConfig['prefund']> =>
+  Promise.all(
+    configPrefund.map(async ({ address }) => ({
+      address,
+      balance: await client.getBalance({ address }),
+    })),
+  )
 
 class ConfigComparator {
   hasDiff = false

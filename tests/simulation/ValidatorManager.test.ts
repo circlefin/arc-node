@@ -20,6 +20,7 @@ import { getChain } from '../../scripts/hardhat/viem-helper'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { encodeFunctionData, parseAbi, zeroAddress } from 'viem'
 import { multicall3Address } from '../../scripts/genesis'
+import { loadGenesisConfig } from '../helpers'
 import { PermissionedValidatorManager, ValidatorRegistry } from '../helpers/ValidatorManager'
 
 describe('ValidatorRegistry simulation', () => {
@@ -33,6 +34,18 @@ describe('ValidatorRegistry simulation', () => {
 
     return { client, randomWallet, validatorRegistry, extraAbi }
   }
+
+  // Reads at block 0 so the assertion is immune to validator registrations
+  // performed by the localdev test suite (which only grows _nextRegistrationId).
+  it('_nextRegistrationId at genesis equals validators.length + 1', async () => {
+    const { validatorRegistry } = await clients()
+    const genesis = loadGenesisConfig()
+    if (!genesis) {
+      throw new Error('genesis config required for simulation tests')
+    }
+    const nextId = await validatorRegistry.read.getNextRegistrationId({ blockTag: 'earliest' })
+    expect(nextId).to.be.eq(BigInt(genesis.ValidatorManager.validators.length + 1))
+  })
 
   it('migrate contract', async () => {
     const { client, validatorRegistry, extraAbi } = await clients()

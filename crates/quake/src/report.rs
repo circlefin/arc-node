@@ -406,7 +406,7 @@ async fn collect_report_data(
         } else {
             let config =
                 crate::tests::sanity::build_spammer_config(load_rate, duration_s, &load_mix)?;
-            testnet.load(load_target_selectors.clone(), &config).await?;
+            crate::load::load(testnet, load_target_selectors.clone(), &config).await?;
         }
     } else {
         info!("Observing for {duration_s}s (no load)");

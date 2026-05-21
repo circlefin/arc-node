@@ -39,6 +39,19 @@ Tests network resilience under chaos (random kill/pause/restart and valset chang
 - Default scenario: `crates/quake/scenarios/nightly-chaos-testing.toml`
 - Runs spammer and chaos loop in parallel; results in `target/nightly-chaos-testing-results/`
 
+### nightly-tx-propagation
+
+Tests transaction propagation from each fullnode after a quiet period in a sentry topology.
+
+```bash
+./scripts/scenarios/nightly-tx-propagation.sh [scenario] [quiet_period_seconds] [warmup_duration_seconds] [warmup_rate]
+```
+
+- Default scenario: `crates/quake/scenarios/nightly-tx-propagation.toml`
+- Runs a short warmup load, waits with zero transaction load, then probes each fullnode individually
+- Optional environment overrides: `WARMUP_TARGETS`, `FULLNODE_TARGETS`, `RECEIPT_NODE`, `RECEIPT_TIMEOUT_SECS`
+- Writes per-node probe JSON and logs to `target/nightly-tx-propagation-results/probes/`
+
 ## Adding New Scenarios
 
 1. Create or reuse a TOML config in `crates/quake/scenarios/<name>.toml`

@@ -52,7 +52,7 @@ use arc_execution_config::chainspec::{BaseFeeConfigProvider, BlockGasLimitProvid
 use arc_execution_config::gas_fee::{
     self, arc_calc_next_block_base_fee, decode_base_fee_from_bytes,
 };
-use arc_execution_config::hardforks::ArcHardfork;
+use arc_execution_config::hardforks::{is_arc_fork_active, ArcHardfork};
 use arc_execution_config::native_coin_control::{
     compute_is_blocklisted_storage_slot, is_blocklisted_status,
 };
@@ -64,6 +64,7 @@ use revm::DatabaseCommit;
 
 const ERR_BLOCKLIST_READ_FAILED: &str = "Failed to read beneficiary blocklist status";
 const ERR_BLOCK_NUMBER_CONVERSION_FAILED: &str = "Failed to convert block number to u64";
+const ERR_BLOCK_TIMESTAMP_CONVERSION_FAILED: &str = "Failed to convert block timestamp to u64";
 
 /// Result of executing an Arc transaction.
 #[derive(Debug)]
@@ -137,6 +138,24 @@ where
                 "Failed to convert block number to u64"
             );
             BlockExecutionError::msg(ERR_BLOCK_NUMBER_CONVERSION_FAILED)
+        })
+    }
+
+    /// Current block timestamp as `u64`.
+    ///
+    /// Needed alongside [`Self::block_number_u64`] because Arc hardforks may activate
+    /// either by block or by timestamp (e.g. testnet Zero5/Zero6, all networks' Zero7+);
+    /// runtime hardfork gating must consult both dimensions via
+    /// [`arc_execution_config::hardforks::is_arc_fork_active`].
+    fn block_timestamp_u64(&self) -> Result<u64, BlockExecutionError> {
+        let block_timestamp = self.evm.block().timestamp();
+        block_timestamp.try_into().map_err(|err| {
+            tracing::error!(
+                error = %err,
+                block_timestamp = %block_timestamp,
+                "Failed to convert block timestamp to u64"
+            );
+            BlockExecutionError::msg(ERR_BLOCK_TIMESTAMP_CONVERSION_FAILED)
         })
     }
 }
@@ -342,11 +361,14 @@ where
 
         // Zero5+ pre-execution checks: beneficiary blocklist, gas limit validation
         let block_number = self.block_number_u64()?;
+        let block_timestamp = self.block_timestamp_u64()?;
 
-        if self
-            .chain_spec
-            .is_fork_active_at_block(ArcHardfork::Zero5, block_number)
-        {
+        if is_arc_fork_active(
+            &self.chain_spec,
+            ArcHardfork::Zero5,
+            block_number,
+            block_timestamp,
+        ) {
             // EIP-2935: persist parent block hash in history storage contract.
             // Internally gates on Prague activation and is a no-op at block 0 (genesis).
             self.system_caller
@@ -462,6 +484,7 @@ where
         let requests = Requests::default();
 
         let block_number = self.block_number_u64()?;
+        let block_timestamp = self.block_timestamp_u64()?;
 
         // At the end of the block, call a system contract (precompile) to persist gas accounting
         // state: raw gas used, smoothed gas used, and the next block's base fee.
@@ -474,9 +497,12 @@ where
                 );
             })
             .ok();
-        let is_zero5 = self
-            .chain_spec
-            .is_fork_active_at_block(ArcHardfork::Zero5, block_number);
+        let is_zero5 = is_arc_fork_active(
+            &self.chain_spec,
+            ArcHardfork::Zero5,
+            block_number,
+            block_timestamp,
+        );
         let gas_values = if is_zero5 {
             // ADR-0004 implementation: compute gas values within local bounds
             self.compute_gas_values(block_number, fee_params)?
@@ -544,7 +570,7 @@ mod tests {
     use alloy_primitives::map::HashMap;
     use alloy_primitives::B256 as AlloyB256;
     use alloy_primitives::KECCAK256_EMPTY;
-    use reth_chainspec::EthChainSpec;
+    use reth_chainspec::{EthChainSpec, ForkCondition};
     use reth_evm::ConfigureEvm;
     use reth_evm::EvmEnv;
 
@@ -808,7 +834,7 @@ mod tests {
     #[test]
     fn test_zero4_invalid_alpha_stores_zero_next_base_fee() {
         let block_env = get_mock_block_env();
-        let chain_spec = localdev_with_hardforks(&[(ArcHardfork::Zero3, 0)]);
+        let chain_spec = localdev_with_hardforks(&[(ArcHardfork::Zero3, ForkCondition::Block(0))]);
 
         let mut db = InMemoryDB::default();
         insert_alloc_into_db(&mut db, chain_spec.genesis());
@@ -1016,7 +1042,7 @@ mod tests {
     #[test]
     fn test_beneficiary_validation_skipped_before_zero5() {
         // Test that beneficiary validation is skipped for blocks before Zero5 hardfork
-        let chain_spec = localdev_with_hardforks(&[(ArcHardfork::Zero4, 0)]);
+        let chain_spec = localdev_with_hardforks(&[(ArcHardfork::Zero4, ForkCondition::Block(0))]);
 
         let mut db = InMemoryDB::default();
         insert_alloc_into_db(&mut db, chain_spec.genesis());

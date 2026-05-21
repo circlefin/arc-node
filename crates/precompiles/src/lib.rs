@@ -74,6 +74,13 @@
 //! });
 //! ```
 //!
+//! ### Subcall Precompiles
+//! Subcall precompiles need to run a child EVM call and then post-process the
+//! child result. They are not registered through `ArcPrecompileProvider`.
+//! Implement [`crate::subcall::SubcallPrecompile`] instead, then register the
+//! address, implementation, and allowed callers in `ArcEvmFactory::build_subcall_registry`.
+//! [`crate::call_from::CallFromPrecompile`] is the production example.
+//!
 //! ## Creating a New Precompile
 //!
 //! ### Step 1: Choose an Address
@@ -101,10 +108,13 @@
 //!             let mut gas_counter = Gas::new(precompile_input.gas);
 //!             let mut precompile_input = precompile_input;
 //!
-//!             let args = IMyPrecompile::myFunctionCall::abi_decode_raw(input)
+//!             let args = abi_decode_raw_with_zero6_validation::<IMyPrecompile::myFunctionCall>(
+//!                 input,
+//!                 hardfork_flags,
+//!             )
 //!                 .map_err(|_| PrecompileErrorOrRevert::new_reverted_with_penalty(
 //!                     gas_counter,
-//!                     PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY,
+//!                     PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
 //!                     ERR_EXECUTION_REVERTED,
 //!                 ))?;
 //!
@@ -123,6 +133,7 @@
 //! ```
 //!
 //! ### Step 4: Register the Precompile
+//! Provider-managed precompiles should be registered in the precompile map.
 //! Add a match arm to `ArcPrecompileProvider::create_precompiles_map` in
 //! `precompile_provider.rs`:
 //! ```rust,ignore
@@ -132,13 +143,18 @@
 //! )),
 //! ```
 //!
+//! For a subcall precompile, skip `create_precompiles_map`. Register it in
+//! `ArcEvmFactory::build_subcall_registry` with an `AllowedCallers` policy so
+//! `ArcEvm::frame_init` can intercept the call and drive the two-phase
+//! `init_subcall` / `complete_subcall` flow.
+//!
 //! ## Gas Accounting
 //!
 //! The `precompile!` macro does not track gas on its own — each arm constructs a `Gas`
 //! counter from `precompile_input.gas` and threads `&mut gas_counter` through the helpers
 //! (`read`, `write`, `emit_event`, `balance_incr`, …). Helpers mutate the counter in place
 //! and return `PrecompileErrorOrRevert::Error(OutOfGas)` when the remaining gas is
-//! insufficient. The macro adds `PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY` when the
+//! insufficient. The macro adds `PRECOMPILE_EARLY_REVERT_GAS_PENALTY` when the
 //! selector is unknown or the input is shorter than 4 bytes; arms should use the same
 //! penalty when ABI decoding fails.
 //!

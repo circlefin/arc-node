@@ -206,6 +206,32 @@ pub struct RawManifest {
     image_cl_upgrade: Option<String>,
     #[serde(default, alias = "image_tag_el_upgrade")]
     image_el_upgrade: Option<String>,
+    /// EC2 instance type for validator/full nodes (remote only).
+    node_size: Option<String>,
+    /// EC2 instance type for the Control Center (remote only).
+    cc_size: Option<String>,
+    /// Root EBS volume size for nodes in GiB (remote only).
+    node_disk_gb: Option<u32>,
+    /// Root EBS volume size for the Control Center in GiB (remote only).
+    cc_disk_gb: Option<u32>,
+    /// Initial balance for each prefunded account, in whole token units (e.g. 1_000_000 = 1M USDC).
+    /// Defaults to 1_000_000 when unset.
+    extra_account_balance_usdc: Option<u64>,
+    /// ProtocolConfig blockGasLimit and genesis header gas limit.
+    /// Defaults to 30_000_000 when unset.
+    block_gas_limit: Option<u64>,
+    /// Root EBS volume type for nodes (e.g. "gp3", "io2") (remote only).
+    node_volume_type: Option<String>,
+    /// Provisioned IOPS for the node root EBS volume (remote only).
+    node_volume_iops: Option<u32>,
+    /// CPU limit for the EL container (Docker `cpus`). Whole or fractional CPUs.
+    el_cpu_limit: Option<f64>,
+    /// Memory limit for the EL container, in GiB. Fractional values are allowed.
+    el_memory_limit_gb: Option<f64>,
+    /// CPU limit for the CL container (Docker `cpus`). Whole or fractional CPUs.
+    cl_cpu_limit: Option<f64>,
+    /// Memory limit for the CL container, in GiB. Fractional values are allowed.
+    cl_memory_limit_gb: Option<f64>,
 }
 
 impl RawManifest {
@@ -239,6 +265,18 @@ impl Default for RawManifest {
             image_el: None,
             image_cl_upgrade: None,
             image_el_upgrade: None,
+            node_size: None,
+            cc_size: None,
+            node_disk_gb: None,
+            cc_disk_gb: None,
+            extra_account_balance_usdc: None,
+            block_gas_limit: None,
+            node_volume_type: None,
+            node_volume_iops: None,
+            el_cpu_limit: None,
+            el_memory_limit_gb: None,
+            cl_cpu_limit: None,
+            cl_memory_limit_gb: None,
         }
     }
 }
@@ -432,6 +470,18 @@ impl TryFrom<RawManifest> for Manifest {
             nodes,
             node_groups: custom_node_groups,
             el_init_hardfork: raw.el_init_hardfork,
+            node_size: raw.node_size,
+            cc_size: raw.cc_size,
+            node_disk_gb: raw.node_disk_gb,
+            cc_disk_gb: raw.cc_disk_gb,
+            extra_account_balance_usdc: raw.extra_account_balance_usdc,
+            block_gas_limit: raw.block_gas_limit,
+            node_volume_type: raw.node_volume_type,
+            node_volume_iops: raw.node_volume_iops,
+            el_cpu_limit: raw.el_cpu_limit,
+            el_memory_limit_gb: raw.el_memory_limit_gb,
+            cl_cpu_limit: raw.cl_cpu_limit,
+            cl_memory_limit_gb: raw.cl_memory_limit_gb,
         })
     }
 }
@@ -472,6 +522,18 @@ impl TryFrom<Manifest> for RawManifest {
             image_el_upgrade: manifest.images.el_upgrade,
             arc_image_tag: None,
             arc_image_registry: None,
+            node_size: manifest.node_size,
+            cc_size: manifest.cc_size,
+            node_disk_gb: manifest.node_disk_gb,
+            cc_disk_gb: manifest.cc_disk_gb,
+            extra_account_balance_usdc: manifest.extra_account_balance_usdc,
+            block_gas_limit: manifest.block_gas_limit,
+            node_volume_type: manifest.node_volume_type,
+            node_volume_iops: manifest.node_volume_iops,
+            el_cpu_limit: manifest.el_cpu_limit,
+            el_memory_limit_gb: manifest.el_memory_limit_gb,
+            cl_cpu_limit: manifest.cl_cpu_limit,
+            cl_memory_limit_gb: manifest.cl_memory_limit_gb,
         })
     }
 }

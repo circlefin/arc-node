@@ -11,11 +11,15 @@ resource "aws_instance" "node" {
   iam_instance_profile   = local.ec2_profile_name
 
   dynamic "root_block_device" {
-    for_each = var.node_volume_size != null ? [var.node_volume_size] : []
-    iterator = vol
+    for_each = (
+      var.node_volume_size != null
+      || var.node_volume_type != null
+      || var.node_volume_iops != null
+    ) ? [1] : []
     content {
-      volume_size = vol.value
-      volume_type = "gp3"
+      volume_size = var.node_volume_size
+      volume_type = coalesce(var.node_volume_type, "gp3")
+      iops        = var.node_volume_iops
     }
   }
 
@@ -26,15 +30,15 @@ resource "aws_instance" "node" {
   }
 
   user_data = templatefile("nodes-data.yaml", {
-    id                     = var.node_names[count.index]
-    username               = local.username
-    region                 = var.region
-    ssh_public_key         = tls_private_key.ssh.public_key_openssh
-    arch                   = local.arch,
-    consensus_image        = var.image_cl
-    execution_image        = var.image_el
-    github_user            = var.github_user
-    github_token           = var.github_token
+    id                      = var.node_names[count.index]
+    username                = local.username
+    region                  = var.region
+    ssh_public_key          = tls_private_key.ssh.public_key_openssh
+    arch                    = local.arch,
+    consensus_image         = var.image_cl
+    execution_image         = var.image_el
+    github_user             = var.github_user
+    github_token            = var.github_token
     expected_secondary_enis = length(local.node_secondary_networks[var.node_names[count.index]])
   })
 
@@ -44,6 +48,14 @@ resource "aws_instance" "node" {
     { region = var.region },
     { project = local.project_name },
     { primary_network = local.node_primary_network[var.node_names[count.index]] }
+  )
+
+  # Propagate the project tag to the root volume so the recovery script
+  # crates/quake/scripts/aws-resources.sh can find detached orphans.
+  volume_tags = merge(
+    { Name = "${var.node_names[count.index]}-root" },
+    { for tag in var.tags : tag => "true" },
+    { project = local.project_name }
   )
 }
 

@@ -71,6 +71,7 @@ jobs:
             ${{ matrix.image }}.tags=
             ${{ matrix.image }}.output=type=oci,tar=false,dest=/tmp/image
         env:
+          BUILDX_NO_DEFAULT_ATTESTATIONS: 1
           GITHUB_TOKEN: ${{ github.token }}
           GIT_COMMIT_HASH: ${{ github.sha }}
           GIT_VERSION: ${{ github.ref_name }}
@@ -104,17 +105,23 @@ jobs:
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}
           BAKE_METADATA: ${{ steps.build.outputs.metadata }}
+          MATRIX_IMAGE: ${{ matrix.image }}
+          MATRIX_PLATFORM: ${{ matrix.platform }}
         run: |
-          DIGEST=$(echo "${BAKE_METADATA}" | jq -r '."${{ matrix.image }}"."containerimage.digest"')
+          DIGEST=$(echo "${BAKE_METADATA}" | jq -r --arg img "${MATRIX_IMAGE}" '.[$img]."containerimage.digest"')
           if [ -z "${DIGEST}" ] || [ "${DIGEST}" = "null" ]; then
             echo "::error::Failed to extract digest from build metadata"
             exit 1
           fi
-          skopeo copy "oci:/tmp/image" "docker://${IMAGE}@${DIGEST}"
+          skopeo copy "oci:/tmp/image" "docker://${IMAGE}@${DIGEST}" --digestfile /tmp/push-digest
           rm -rf /tmp/image
-          PLATFORM_SLUG=$(echo "${{ matrix.platform }}" | tr '/' '-')
-          mkdir -p "/tmp/digests/${{ matrix.image }}"
-          echo "${DIGEST}" > "/tmp/digests/${{ matrix.image }}/${PLATFORM_SLUG}"
+          REGISTRY_DIGEST=$(cat /tmp/push-digest)
+          if [ "${DIGEST}" != "${REGISTRY_DIGEST}" ]; then
+            echo "::warning::Bake metadata digest ${DIGEST} differs from registry digest ${REGISTRY_DIGEST}"
+          fi
+          PLATFORM_SLUG=$(echo "${MATRIX_PLATFORM}" | tr '/' '-')
+          mkdir -p "/tmp/digests/${MATRIX_IMAGE}"
+          echo "${REGISTRY_DIGEST}" > "/tmp/digests/${MATRIX_IMAGE}/${PLATFORM_SLUG}"
 
       - name: Upload digest
         if: ${{ github.event_name == 'push' }}
@@ -188,11 +195,13 @@ jobs:
           echo "image-with-digest=${IMAGE}@${MANIFEST_DIGEST}" >> "$GITHUB_OUTPUT"
 
       - name: Generate SBOM
+        continue-on-error: true
         uses: anchore/sbom-action@17ae1740179002c89186b61233e0f892c3118b11 # v0.23.0
         with:
           image: ${{ steps.manifest.outputs.image-with-digest }}
           artifact-name: sbom-${{ matrix.image }}.spdx.json
           output-file: sbom-${{ matrix.image }}.spdx.json
+          upload-release-assets: false
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0

@@ -103,10 +103,18 @@ contract ProtocolConfigManagement is Script {
         console.log("targetBlockTimeMs:", params.targetBlockTimeMs);
     }
 
+    function printPauseState() public view {
+        console.log("ProtocolConfig PauseState:");
+        console.log("pauser:", PROTOCOL_CONFIG.pauser());
+        console.log("paused:", PROTOCOL_CONFIG.paused());
+    }
+
     function printAllParams() public view {
         printFeeParams();
         console.log("");
         printConsensusParams();
+        console.log("");
+        printPauseState();
     }
 
     // ============ Internal Helpers ============

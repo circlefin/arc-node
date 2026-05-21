@@ -21,10 +21,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use eyre::eyre;
 
-use malachitebft_core_types::{Context, SignedExtension, SignedProposal, SignedVote};
-use malachitebft_signing::{Error as SigningError, SigningProvider, VerificationResult};
+use malachitebft_core_types::{
+    Context, SignedExtension, SignedProposal, SignedVote, ValidatorProof,
+};
+use malachitebft_signing::{Error as SigningError, Signer, VerificationResult, Verifier};
 
-use arc_consensus_types::signing::{PublicKey, Signature as ConsensusSignature};
+use arc_consensus_types::signing::{PublicKey, Signature as ConsensusSignature, SigningProvider};
 use arc_consensus_types::{ArcContext, Proposal, Vote};
 use tokio::sync::RwLock;
 
@@ -87,12 +89,17 @@ impl RemoteSigningProvider {
 
         // Fetch from external service using the async method
         let public_key_bytes = self.client.get_public_key().await?;
-        let public_key = PublicKey::from_bytes(public_key_bytes.try_into().map_err(|pk| {
+        let public_key_array: [u8; 32] = public_key_bytes.try_into().map_err(|pk| {
             RemoteSigningError::InvalidResponse(format!(
                 "Invalid public key bytes from signer: expected 32 bytes, got 0x{}",
                 hex::encode(pk)
             ))
-        })?);
+        })?;
+        let public_key = PublicKey::from_bytes(public_key_array).map_err(|e| {
+            RemoteSigningError::InvalidResponse(format!(
+                "Invalid public key bytes from signer: {e}"
+            ))
+        })?;
 
         // Update cache
         *cache = Some(public_key);
@@ -126,7 +133,87 @@ impl Clone for RemoteSigningProvider {
     }
 }
 
-// SigningProvider trait implementation
+#[async_trait]
+impl Signer<ArcContext> for RemoteSigningProvider {
+    async fn sign_vote(&self, vote: Vote) -> Result<SignedVote<ArcContext>, SigningError> {
+        let vote_bytes = vote.to_sign_bytes();
+        let signature = self.sign_bytes(&vote_bytes).await?;
+
+        Ok(SignedVote::new(vote, signature))
+    }
+
+    async fn sign_proposal(
+        &self,
+        proposal: Proposal,
+    ) -> Result<SignedProposal<ArcContext>, SigningError> {
+        let proposal_bytes = proposal.to_sign_bytes();
+
+        let signature = self.sign_bytes(&proposal_bytes).await?;
+        Ok(SignedProposal::new(proposal, signature))
+    }
+
+    async fn sign_vote_extension(
+        &self,
+        _extension: <ArcContext as Context>::Extension,
+    ) -> Result<SignedExtension<ArcContext>, SigningError> {
+        unreachable!("Vote extensions are not supported in Arc");
+    }
+
+    async fn sign_validator_proof(
+        &self,
+        public_key: Vec<u8>,
+        peer_id: Vec<u8>,
+    ) -> Result<ValidatorProof<ArcContext>, SigningError> {
+        let signing_bytes = ValidatorProof::<ArcContext>::signing_bytes(&public_key, &peer_id);
+        let signature = self.sign_bytes(&signing_bytes).await?;
+        Ok(ValidatorProof::new(public_key, peer_id, signature))
+    }
+}
+
+#[async_trait]
+impl Verifier<ArcContext> for RemoteSigningProvider {
+    async fn verify_signed_vote(
+        &self,
+        vote: &Vote,
+        signature: &ConsensusSignature,
+        public_key: &PublicKey,
+    ) -> Result<VerificationResult, SigningError> {
+        self.verify_signed_bytes(&vote.to_sign_bytes(), signature, public_key)
+            .await
+    }
+
+    async fn verify_signed_proposal(
+        &self,
+        proposal: &Proposal,
+        signature: &ConsensusSignature,
+        public_key: &PublicKey,
+    ) -> Result<VerificationResult, SigningError> {
+        self.verify_signed_bytes(&proposal.to_sign_bytes(), signature, public_key)
+            .await
+    }
+
+    async fn verify_signed_vote_extension(
+        &self,
+        _extension: &<ArcContext as Context>::Extension,
+        _signature: &ConsensusSignature,
+        _public_key: &PublicKey,
+    ) -> Result<VerificationResult, SigningError> {
+        unreachable!("Vote extensions are not supported in Arc");
+    }
+
+    async fn verify_validator_proof(
+        &self,
+        proof: &ValidatorProof<ArcContext>,
+    ) -> Result<VerificationResult, SigningError> {
+        let signing_bytes = proof.preimage();
+        let public_key = proof
+            .decoded_public_key()
+            .map_err(|e| SigningError::from_source(format!("Invalid public key: {e}")))?;
+        self.verify_signed_bytes(&signing_bytes, &proof.signature, &public_key)
+            .await
+    }
+}
+
 #[async_trait]
 impl SigningProvider<ArcContext> for RemoteSigningProvider {
     async fn sign_bytes(&self, bytes: &[u8]) -> Result<ConsensusSignature, SigningError> {
@@ -159,59 +246,6 @@ impl SigningProvider<ArcContext> for RemoteSigningProvider {
                 })
                 .is_ok(),
         ))
-    }
-
-    async fn sign_vote(&self, vote: Vote) -> Result<SignedVote<ArcContext>, SigningError> {
-        let vote_bytes = vote.to_sign_bytes();
-        let signature = self.sign_bytes(&vote_bytes).await?;
-
-        Ok(SignedVote::new(vote, signature))
-    }
-
-    async fn verify_signed_vote(
-        &self,
-        vote: &Vote,
-        signature: &ConsensusSignature,
-        public_key: &PublicKey,
-    ) -> Result<VerificationResult, SigningError> {
-        self.verify_signed_bytes(&vote.to_sign_bytes(), signature, public_key)
-            .await
-    }
-
-    async fn sign_proposal(
-        &self,
-        proposal: Proposal,
-    ) -> Result<SignedProposal<ArcContext>, SigningError> {
-        let proposal_bytes = proposal.to_sign_bytes();
-
-        let signature = self.sign_bytes(&proposal_bytes).await?;
-        Ok(SignedProposal::new(proposal, signature))
-    }
-
-    async fn verify_signed_proposal(
-        &self,
-        proposal: &Proposal,
-        signature: &ConsensusSignature,
-        public_key: &PublicKey,
-    ) -> Result<VerificationResult, SigningError> {
-        self.verify_signed_bytes(&proposal.to_sign_bytes(), signature, public_key)
-            .await
-    }
-
-    async fn sign_vote_extension(
-        &self,
-        _extension: <ArcContext as Context>::Extension,
-    ) -> Result<SignedExtension<ArcContext>, SigningError> {
-        unreachable!("Vote extensions are not supported in Arc");
-    }
-
-    async fn verify_signed_vote_extension(
-        &self,
-        _extension: &<ArcContext as Context>::Extension,
-        _signature: &ConsensusSignature,
-        _public_key: &PublicKey,
-    ) -> Result<VerificationResult, SigningError> {
-        unreachable!("Vote extensions are not supported in Arc");
     }
 }
 
@@ -551,10 +585,10 @@ mod integration_tests {
         }
     }
 
-    /// Test the signing/verify flows for the remote signing provider via the SigningProvider trait
+    /// Test the signing/verify flows for the remote signing provider via the `Signer` and `Verifier` traits.
     #[tokio::test]
     async fn remote_signing_provider_sign_verify_flows() {
-        use super::SigningProvider;
+        use super::{Signer, Verifier};
 
         let provider = create_provider().await.expect("Failed to create provider");
 

@@ -38,6 +38,23 @@ pub struct TestValidationResult {
 }
 
 const ARC_NATIVE_COIN_AUTHORITY: Address = address!("1800000000000000000000000000000000000000");
+const ARC_NATIVE_COIN_CONTROL: Address = address!("1800000000000000000000000000000000000001");
+const ARC_SYSTEM_ACCOUNTING: Address = address!("1800000000000000000000000000000000000002");
+const ARC_CALL_FROM: Address = address!("1800000000000000000000000000000000000003");
+const ARC_PQ: Address = address!("1800000000000000000000000000000000000004");
+
+const ARC_SYSTEM_ADDRESSES: &[Address] = &[
+    ARC_NATIVE_COIN_AUTHORITY,
+    ARC_NATIVE_COIN_CONTROL,
+    ARC_SYSTEM_ACCOUNTING,
+    ARC_CALL_FROM,
+    ARC_PQ,
+];
+
+#[inline]
+fn is_arc_system_address(address: &Address) -> bool {
+    ARC_SYSTEM_ADDRESSES.iter().any(|a| a == address)
+}
 
 pub fn compute_test_roots(
     exec_result: &Result<
@@ -56,7 +73,12 @@ pub fn compute_test_roots(
             )
             .as_slice(),
         ),
-        state_root: state_merkle_trie_root(db.cache.trie_account()),
+        state_root: state_merkle_trie_root(
+            db.cache
+                .trie_account()
+                .into_iter()
+                .filter(|(address, _)| !is_arc_system_address(address)),
+        ),
     }
 }
 
@@ -271,6 +293,64 @@ mod tests {
             state_merkle_trie_root(cache.trie_account()),
             EMPTY_ROOT_HASH
         );
+    }
+
+    #[test]
+    fn arc_system_addresses_recognized() {
+        for arc in ARC_SYSTEM_ADDRESSES {
+            assert!(
+                is_arc_system_address(arc),
+                "{arc} should be recognized as ARC system address"
+            );
+        }
+
+        for non_arc in [
+            Address::ZERO,
+            address!("1800000000000000000000000000000000000005"),
+            address!("1000000000000000000000000000000000000001"),
+        ] {
+            assert!(
+                !is_arc_system_address(&non_arc),
+                "{non_arc} should not be recognized as ARC system address"
+            );
+        }
+    }
+
+    #[test]
+    fn state_root_filter_excludes_arc_system_accounts_with_state() {
+        let user_address = address!("4000000000000000000000000000000000000004");
+        let user_info = AccountInfo {
+            balance: U256::from(42),
+            nonce: 7,
+            ..Default::default()
+        };
+
+        let mut cache_with_arc = CacheState::new(true);
+        for arc in ARC_SYSTEM_ADDRESSES {
+            cache_with_arc.insert_account(
+                *arc,
+                AccountInfo {
+                    balance: U256::from(999),
+                    nonce: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        cache_with_arc.insert_account(user_address, user_info.clone());
+
+        let filtered_root = state_merkle_trie_root(
+            cache_with_arc
+                .trie_account()
+                .into_iter()
+                .filter(|(address, _)| !is_arc_system_address(address)),
+        );
+
+        let mut cache_user_only = CacheState::new(true);
+        cache_user_only.insert_account(user_address, user_info);
+        let expected_root = state_merkle_trie_root(cache_user_only.trie_account());
+
+        assert_eq!(filtered_root, expected_root);
+        assert_ne!(filtered_root, EMPTY_ROOT_HASH);
     }
 
     #[test]

@@ -22,10 +22,10 @@
 //! the P2P network without possessing their consensus key.
 
 use arc_consensus_types::codec::{network::NetCodec, Codec};
+use arc_consensus_types::signing::Signer;
 use arc_signer::ArcSigningProvider;
 use bytes::Bytes;
 use eyre::Result;
-use malachitebft_app_channel::SigningProviderExt;
 use tracing::info;
 
 /// Create a signed validator proof binding the consensus public key to the P2P peer ID.
@@ -64,6 +64,7 @@ pub async fn create_validator_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arc_consensus_types::signing::Verifier;
     use arc_consensus_types::ArcContext;
     use arc_signer::local::{LocalSigningProvider, PrivateKey};
     use malachitebft_app_channel::app::types::Keypair;

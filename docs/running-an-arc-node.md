@@ -38,15 +38,19 @@ then use the derived variables in the remaining of this guide:
 cat << "EOF" > ~/.arc_env
 # Base directory for Arc node data (default: ~/.arc)
 ARC_HOME="${ARC_HOME:-$HOME/.arc}"
+ARC_BIN_DIR="${ARC_BIN_DIR:-$ARC_HOME/bin}"
 
 # Linux runtime directory:
 ARC_RUN="/run/arc"
 
-# Mac OS runtime directory:
-#ARC_RUN="$ARC_HOME/run"
+# macOS runtime directory:
+# ARC_RUN="$ARC_HOME/run"
 
 ARC_EXECUTION=$ARC_HOME/execution
 ARC_CONSENSUS=$ARC_HOME/consensus
+
+export ARC_HOME ARC_BIN_DIR ARC_RUN ARC_EXECUTION ARC_CONSENSUS
+export PATH="$ARC_BIN_DIR:$PATH"
 EOF
 ```
 
@@ -60,11 +64,11 @@ Or using the POSIX shorthand: `. ~/.arc_env`
 
 ### Setup directories
 
-The standard installation sets up `$ARC_HOME=~/.arc` as base directory.
+The standard `arcup` installation sets up `$ARC_HOME=~/.arc` as base directory.
 Create the **data directories** for the execution and consensus layers:
 
 ```sh
-mkdir -p $ARC_EXECUTION $ARC_CONSENSUS
+mkdir -p "$ARC_EXECUTION" "$ARC_CONSENSUS" "$ARC_BIN_DIR"
 ```
 
 To set up the **runtime directory** in a **Linux** environment:
@@ -76,11 +80,19 @@ sudo install -d -o $USER "$ARC_RUN"
 > When running Arc as a systemd service, `RuntimeDirectory=arc`
 > sets up `/run/arc` automatically — the last command is not needed.
 
-To set up the **runtime directory** in a **MacOS** environment,
+To set up the **runtime directory** in a **macOS** environment,
 uncomment the `ARC_RUN="$ARC_HOME/run"` line above and run:
 
 ```sh
 mkdir -p "$ARC_RUN"
+```
+
+Confirm that the installed binaries are available before downloading snapshots:
+
+```sh
+arc-snapshots --version
+arc-node-execution --version
+arc-node-consensus --version
 ```
 
 ### Download snapshots
@@ -99,6 +111,8 @@ The `arc-snapshots` binary is part of the Arc node installation.
 The command above fetches the latest snapshots for `arc-testnet` chain from
 https://snapshots.arc.network and extracts them into the
 `$ARC_CONSENSUS` and `$ARC_EXECUTION` data directories.
+The command is safe to rerun; existing snapshot data is detected unless you
+pass the command's `--force` option.
 
 > **Download sizes:** At the time of writing, the most recent snapshot sizes
 > (tagged `20260408`) are: **~68 GB** for EL and **~16 GB** for CL.
@@ -158,6 +172,11 @@ enforces hiding of pending-tx RPCs (a potential MEV vector) and warns if
 `--http.api` / `--ws.api` exposes namespaces beyond the safe set
 (`eth`, `net`, `web3`, `rpc`).
 
+On high-traffic public endpoints, raise `--rpc.max-connections` (default `250`)
+and `--rpc.max-subscriptions-per-connection` (default `32`) if clients see
+`MaxConnections` or `TooManySubscriptions` errors. The defaults bound WebSocket
+log-fanout memory growth and should only be raised, not lowered.
+
 ### Start consensus layer
 
 After starting the [execution layer](#start-execution-layer), in a different terminal, start the consensus layer:
@@ -203,6 +222,9 @@ The `result` field represents the next block height, in hexadecimal
 (you can use `printf "%0d"` to translate it into decimal).
 It should increase over time.
 If it remains `0x0`, check the logs of the consensus layer for errors.
+Common causes are a missing or incomplete snapshot, mismatched `$ARC_RUN`
+between the two processes, or the consensus layer not reaching any follow
+endpoint.
 
 > Notice that this command queries the execution layer's HTTP server offering
 > a local JSON-RPC API.

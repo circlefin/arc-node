@@ -17,7 +17,6 @@
 // adapted from https://github.com/informalsystems/malachite/tree/v0.4.0/code/crates/test
 
 use malachitebft_core_types::CommitCertificate;
-use malachitebft_signing::SigningProviderExt;
 
 use super::{make_validators, types::*, CertificateBuilder, CertificateTest, DEFAULT_SEED};
 
@@ -144,17 +143,16 @@ fn invalid_commit_certificate_unknown_validator() {
 }
 
 /// Tests the verification of a certificate containing a vote with an invalid signature.
+///
+/// The verifier must reject the entire certificate as soon as it encounters a bad
+/// signature, even if the remaining signatures still meet the threshold.
 #[test]
 fn invalid_commit_certificate_invalid_signature_1() {
     CertificateTest::<Commit>::new()
         .with_validators([10, 10, 10])
         .with_votes(0..2, VoteType::Precommit)
-        .with_invalid_signature_vote(2, VoteType::Precommit) // Validator 0 has invalid signature
-        .expect_error(CertificateError::NotEnoughVotingPower {
-            signed: 20,
-            total: 30,
-            expected: 21,
-        });
+        .with_invalid_signature_vote(2, VoteType::Precommit) // Validator 2 has invalid signature
+        .expect_err_matches(|e| matches!(e, CertificateError::InvalidCommitSignature(_)));
 }
 
 /// Tests the verification of a certificate with no votes.
@@ -171,6 +169,10 @@ fn empty_commit_certificate() {
 }
 
 /// Tests the verification of a certificate containing both valid and invalid votes.
+///
+/// Both scenarios below must be rejected with `InvalidCommitSignature`, even when the
+/// valid subset of signatures still meets the 2/3 voting-power threshold. This prevents
+/// a Byzantine peer from padding an otherwise-valid certificate with garbage signatures.
 #[test]
 fn commit_certificate_with_mixed_valid_and_invalid_votes() {
     CertificateTest::<Commit>::new()
@@ -178,16 +180,12 @@ fn commit_certificate_with_mixed_valid_and_invalid_votes() {
         .with_votes(2..4, VoteType::Precommit)
         .with_invalid_signature_vote(0, VoteType::Precommit) // Invalid signature for validator 0
         .with_invalid_signature_vote(1, VoteType::Precommit) // Invalid signature for validator 1
-        .expect_valid();
+        .expect_err_matches(|e| matches!(e, CertificateError::InvalidCommitSignature(_)));
 
     CertificateTest::<Commit>::new()
         .with_validators([10, 20, 30, 40])
         .with_votes(0..2, VoteType::Precommit)
-        .with_invalid_signature_vote(2, VoteType::Precommit) // Invalid signature for validator 0
-        .with_invalid_signature_vote(3, VoteType::Precommit) // Invalid signature for validator 1
-        .expect_error(CertificateError::NotEnoughVotingPower {
-            signed: 30,
-            total: 100,
-            expected: 67,
-        });
+        .with_invalid_signature_vote(2, VoteType::Precommit) // Invalid signature for validator 2
+        .with_invalid_signature_vote(3, VoteType::Precommit) // Invalid signature for validator 3
+        .expect_err_matches(|e| matches!(e, CertificateError::InvalidCommitSignature(_)));
 }

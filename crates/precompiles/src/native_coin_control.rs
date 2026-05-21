@@ -20,9 +20,10 @@
 //! blocklisting and unblocklisting addresses from receiving native coin transfers.
 
 use crate::helpers::{
-    check_delegatecall, check_gas_remaining, check_staticcall, emit_event, read, write,
+    abi_decode_raw_with_zero6_validation, check_delegatecall, check_gas_remaining,
+    check_staticcall, emit_event, new_reverted_with_early_penalty, read, write,
     PrecompileErrorOrRevert, ERR_EXECUTION_REVERTED, LOG_BASE_COST, LOG_TOPIC_COST,
-    NATIVE_FIAT_TOKEN_ADDRESS, PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY, PRECOMPILE_SLOAD_GAS_COST,
+    NATIVE_FIAT_TOKEN_ADDRESS, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, PRECOMPILE_SLOAD_GAS_COST,
     PRECOMPILE_SSTORE_GAS_COST,
 };
 use crate::precompile;
@@ -128,7 +129,7 @@ fn is_authorized(
 ///
 /// Delegates to the execution-config canonical implementation.
 pub fn compute_is_blocklisted_storage_slot(key: Address) -> StorageKey {
-    StorageKey::new(native_coin_control_config::compute_is_blocklisted_storage_slot(key).0)
+    native_coin_control_config::compute_is_blocklisted_storage_slot(key)
 }
 
 precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
@@ -144,23 +145,46 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             )?;
 
             // Decode arguments passed to blocklist function
-            let args = INativeCoinControl::blocklistCall::abi_decode_raw(input)
+            let args = abi_decode_raw_with_zero6_validation::<INativeCoinControl::blocklistCall>(
+                input,
+                hardfork_flags,
+            )
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
+                        gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
                     )
                 )?;
 
             if hardfork_flags.is_active(ArcHardfork::Zero5) {
-                // Early return if not enough gas
-                check_gas_remaining(&gas_counter, BLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST)?;
-
-                // Check authorization
-                if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
-                    return Err(PrecompileErrorOrRevert::new_reverted(
-                        gas_counter,
-                        ERR_CANNOT_BLOCKLIST,
-                    ));
+                if hardfork_flags.is_active(ArcHardfork::Zero6) {
+                    // Auth first so the Zero6 early-revert penalty is reachable
+                    // regardless of remaining gas; otherwise the success-path
+                    // floor below OOGs callers in the 200..4024 gas window.
+                    if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
+                        return Err(new_reverted_with_early_penalty(
+                            gas_counter,
+                            ERR_CANNOT_BLOCKLIST,
+                            hardfork_flags,
+                        ));
+                    }
+                    check_gas_remaining(
+                        &gas_counter,
+                        BLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST,
+                    )?;
+                } else {
+                    // Zero5-only: keep the original order to preserve consensus
+                    // on networks already past the Zero5 activation block.
+                    check_gas_remaining(
+                        &gas_counter,
+                        BLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST,
+                    )?;
+                    if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
+                        return Err(new_reverted_with_early_penalty(
+                            gas_counter,
+                            ERR_CANNOT_BLOCKLIST,
+                            hardfork_flags,
+                        ));
+                    }
                 }
             } else {
                 // Early return if not enough gas
@@ -173,7 +197,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                     &mut gas_counter,
                     hardfork_flags,
                 )?) {
-                    return Err(PrecompileErrorOrRevert::new_reverted(gas_counter, ERR_CANNOT_BLOCKLIST));
+                    return Err(new_reverted_with_early_penalty(gas_counter, ERR_CANNOT_BLOCKLIST, hardfork_flags));
                 }
             }
 
@@ -216,10 +240,14 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             let mut precompile_input = precompile_input;
 
             // Decode arguments passed to isBlocklisted function
-            let args = INativeCoinControl::isBlocklistedCall::abi_decode_raw(input)
+            let args =
+                abi_decode_raw_with_zero6_validation::<INativeCoinControl::isBlocklistedCall>(
+                    input,
+                    hardfork_flags,
+                )
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
+                        gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
                     )
                 )?;
 
@@ -257,23 +285,46 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             )?;
 
             // Decode arguments passed to unBlocklist function
-            let args = INativeCoinControl::unBlocklistCall::abi_decode_raw(input)
+            let args = abi_decode_raw_with_zero6_validation::<INativeCoinControl::unBlocklistCall>(
+                input,
+                hardfork_flags,
+            )
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
+                        gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
                     )
                 )?;
 
             if hardfork_flags.is_active(ArcHardfork::Zero5) {
-                // Early return if not enough gas
-                check_gas_remaining(&gas_counter, UNBLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST)?;
-
-                // Check authorization
-                if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
-                    return Err(PrecompileErrorOrRevert::new_reverted(
-                        gas_counter,
-                        ERR_CANNOT_UNBLOCKLIST,
-                    ));
+                if hardfork_flags.is_active(ArcHardfork::Zero6) {
+                    // Auth first so the Zero6 early-revert penalty is reachable
+                    // regardless of remaining gas; otherwise the success-path
+                    // floor below OOGs callers in the 200..4024 gas window.
+                    if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
+                        return Err(new_reverted_with_early_penalty(
+                            gas_counter,
+                            ERR_CANNOT_UNBLOCKLIST,
+                            hardfork_flags,
+                        ));
+                    }
+                    check_gas_remaining(
+                        &gas_counter,
+                        UNBLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST,
+                    )?;
+                } else {
+                    // Zero5-only: keep the original order to preserve consensus
+                    // on networks already past the Zero5 activation block.
+                    check_gas_remaining(
+                        &gas_counter,
+                        UNBLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST,
+                    )?;
+                    if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
+                        return Err(new_reverted_with_early_penalty(
+                            gas_counter,
+                            ERR_CANNOT_UNBLOCKLIST,
+                            hardfork_flags,
+                        ));
+                    }
                 }
             } else {
                 // Early return if not enough gas
@@ -286,7 +337,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                     &mut gas_counter,
                     hardfork_flags,
                 )?) {
-                    return Err(PrecompileErrorOrRevert::new_reverted(gas_counter, ERR_CANNOT_UNBLOCKLIST));
+                    return Err(new_reverted_with_early_penalty(gas_counter, ERR_CANNOT_UNBLOCKLIST, hardfork_flags));
                 }
             }
 
@@ -396,8 +447,17 @@ mod tests {
         gas_used: u64,
         /// If set, overrides gas_used for pre-Zero5 hardforks (before EIP-2929/2200 storage costs)
         pre_zero5_gas_used: Option<u64>,
+        /// If set, overrides gas_used when Zero6 is active (auth/validation reverts now
+        /// charge `PRECOMPILE_EARLY_REVERT_GAS_PENALTY`).
+        zero6_gas_used: Option<u64>,
         target_address: Address,
         bytecode_address: Address,
+        /// If true, skip this test case for hardfork combinations without Zero6.
+        /// Used for cases whose result shape differs under Zero6 (e.g. penalty
+        /// revert vs OOG for low-gas unauthorized calls).
+        zero6_only: bool,
+        /// If true, skip this test case for hardfork combinations with Zero6.
+        pre_zero6_only: bool,
     }
 
     // Test constants
@@ -446,7 +506,9 @@ mod tests {
                     );
                 }
 
-                let expected_gas_used = if hardfork_flags.is_active(ArcHardfork::Zero5) {
+                let expected_gas_used = if hardfork_flags.is_active(ArcHardfork::Zero6) {
+                    tc.zero6_gas_used.unwrap_or(tc.gas_used)
+                } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
                     tc.gas_used
                 } else {
                     tc.pre_zero5_gas_used.unwrap_or(tc.gas_used)
@@ -479,6 +541,9 @@ mod tests {
                 return_data: Some(true.abi_encode().into()),
                 gas_used: 23225,
                 pre_zero5_gas_used: Some(BLOCKLIST_GAS_COST),
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -495,6 +560,9 @@ mod tests {
                 return_data: None,
                 gas_used: 0,
                 pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
+                zero6_gas_used: Some(PRECOMPILE_EARLY_REVERT_GAS_PENALTY),
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -510,6 +578,9 @@ mod tests {
                 return_data: None,
                 gas_used: 0,
                 pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -521,8 +592,11 @@ mod tests {
                 expected_result: InstructionResult::Revert,
                 expected_revert_str: Some(ERR_EXECUTION_REVERTED),
                 return_data: None,
-                gas_used: PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY,
+                gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
                 pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -539,6 +613,9 @@ mod tests {
                 return_data: None,
                 gas_used: 0,
                 pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: ADDRESS_B,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -555,6 +632,9 @@ mod tests {
                 return_data: None,
                 gas_used: 0,
                 pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: ADDRESS_B,
             },
@@ -571,6 +651,9 @@ mod tests {
                 return_data: Some(false.abi_encode().into()),
                 gas_used: PRECOMPILE_SLOAD_GAS_COST,
                 pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -586,6 +669,9 @@ mod tests {
                 return_data: None,
                 gas_used: 0,
                 pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -597,8 +683,11 @@ mod tests {
                 expected_result: InstructionResult::Revert,
                 expected_revert_str: Some(ERR_EXECUTION_REVERTED),
                 return_data: None,
-                gas_used: PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY,
+                gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
                 pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -615,6 +704,9 @@ mod tests {
                 return_data: Some(true.abi_encode().into()),
                 gas_used: 3325,
                 pre_zero5_gas_used: Some(UNBLOCKLIST_GAS_COST),
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -631,6 +723,9 @@ mod tests {
                 return_data: None,
                 gas_used: 0,
                 pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: ADDRESS_B,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -647,6 +742,9 @@ mod tests {
                 return_data: None,
                 gas_used: 0,
                 pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: ADDRESS_B,
             },
@@ -663,6 +761,9 @@ mod tests {
                 return_data: None,
                 gas_used: 0,
                 pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
+                zero6_gas_used: Some(PRECOMPILE_EARLY_REVERT_GAS_PENALTY),
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -678,6 +779,9 @@ mod tests {
                 return_data: None,
                 gas_used: 0,
                 pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -689,8 +793,89 @@ mod tests {
                 expected_result: InstructionResult::Revert,
                 expected_revert_str: Some(ERR_EXECUTION_REVERTED),
                 return_data: None,
-                gas_used: PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY,
+                gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
                 pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
+                target_address: NATIVE_COIN_CONTROL_ADDRESS,
+                bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
+            },
+            // Under Zero6, the auth check runs before the success-path gas
+            // floor, so an unauthorized caller with gas >= 200 (the penalty)
+            // gets a penalized revert — not an OOG.
+            NativeCoinControlTest {
+                name: "blocklist() Zero6 low-gas unauthorized reverts with penalty",
+                caller: ADDRESS_A,
+                calldata: INativeCoinControl::blocklistCall { account: ADDRESS_B }
+                    .abi_encode()
+                    .into(),
+                gas_limit: 500,
+                expected_result: InstructionResult::Revert,
+                expected_revert_str: Some(ERR_CANNOT_BLOCKLIST),
+                return_data: None,
+                gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+                pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: true,
+                pre_zero6_only: false,
+                target_address: NATIVE_COIN_CONTROL_ADDRESS,
+                bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
+            },
+            // Pre-Zero6 (Zero3/Zero4/Zero5): gas floor runs before auth, so a
+            // low-gas unauthorized caller OOGs. Locks in the historical Zero5
+            // behavior on devnet.
+            NativeCoinControlTest {
+                name: "blocklist() pre-Zero6 low-gas unauthorized OOGs",
+                caller: ADDRESS_A,
+                calldata: INativeCoinControl::blocklistCall { account: ADDRESS_B }
+                    .abi_encode()
+                    .into(),
+                gas_limit: 500,
+                expected_result: InstructionResult::PrecompileOOG,
+                expected_revert_str: None,
+                return_data: None,
+                gas_used: 0,
+                pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: true,
+                target_address: NATIVE_COIN_CONTROL_ADDRESS,
+                bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
+            },
+            NativeCoinControlTest {
+                name: "unBlocklist() Zero6 low-gas unauthorized reverts with penalty",
+                caller: ADDRESS_A,
+                calldata: INativeCoinControl::unBlocklistCall { account: ADDRESS_B }
+                    .abi_encode()
+                    .into(),
+                gas_limit: 500,
+                expected_result: InstructionResult::Revert,
+                expected_revert_str: Some(ERR_CANNOT_UNBLOCKLIST),
+                return_data: None,
+                gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+                pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: true,
+                pre_zero6_only: false,
+                target_address: NATIVE_COIN_CONTROL_ADDRESS,
+                bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
+            },
+            NativeCoinControlTest {
+                name: "unBlocklist() pre-Zero6 low-gas unauthorized OOGs",
+                caller: ADDRESS_A,
+                calldata: INativeCoinControl::unBlocklistCall { account: ADDRESS_B }
+                    .abi_encode()
+                    .into(),
+                gas_limit: 500,
+                expected_result: InstructionResult::PrecompileOOG,
+                expected_revert_str: None,
+                return_data: None,
+                gas_used: 0,
+                pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: true,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -698,6 +883,20 @@ mod tests {
 
         for tc in cases {
             for hardfork_flags in ArcHardforkFlags::all_combinations() {
+                // ZeroX hardforks are cumulative; Zero6 implies Zero5.
+                if hardfork_flags.is_active(ArcHardfork::Zero6)
+                    && !hardfork_flags.is_active(ArcHardfork::Zero5)
+                {
+                    continue;
+                }
+
+                if tc.zero6_only && !hardfork_flags.is_active(ArcHardfork::Zero6) {
+                    continue;
+                }
+                if tc.pre_zero6_only && hardfork_flags.is_active(ArcHardfork::Zero6) {
+                    continue;
+                }
+
                 let tc_name =
                     tc.name.to_string() + &format!(" (hardfork_flags: {:?})", hardfork_flags);
 

@@ -159,6 +159,7 @@ async fn test_engine() {
         None,
         true,
         true,
+        160 * 1024 * 1024,
         std::time::Duration::from_secs(0), // disable rebroadcast in integration tests
     );
     let node_handle = NodeBuilder::new(node_config)

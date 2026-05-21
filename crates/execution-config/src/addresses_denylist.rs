@@ -33,7 +33,7 @@ pub const ERR_DENYLISTED_ADDRESS: &str = "Address is denylisted";
 /// Address derived via deterministic CREATE2 salt search: cast create2 with --seed keccak256("Denylist.v1"),
 /// first match with prefix 0x360. Reproduce: `make mine-denylist-salt INIT_CODE_HASH=<hash>`
 pub const DEFAULT_DENYLIST_ADDRESS: Address =
-    address!("0x360Eb67EDbA456Bbe01512679f36c2717AA65121");
+    address!("0x36059b615370eB999e8eC0c9401835B407834221");
 
 /// ERC-7201 base storage slot for the Denylist contract (arc.storage.Denylist.v1).
 /// Matches the slot used by the genesis builder (`scripts/genesis/Denylist.ts`).

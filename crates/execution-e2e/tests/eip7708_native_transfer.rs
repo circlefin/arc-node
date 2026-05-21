@@ -53,7 +53,11 @@ async fn test_call_eoa_with_value_emits_eip7708_log() {
                 .with_value(value),
         )
         .with_action(ProduceBlocks::new(1))
-        .with_action(AssertTxIncluded::new("transfer").expect(TxStatus::Success))
+        .with_action(
+            AssertTxIncluded::new("transfer")
+                .expect(TxStatus::Success)
+                .expect_gas_used(21_000),
+        )
         .with_action(
             AssertTxLogs::new("transfer")
                 .expect_log_count(1)
@@ -81,7 +85,11 @@ async fn test_call_eoa_zero_value_no_log() {
                 .with_value(U256::ZERO),
         )
         .with_action(ProduceBlocks::new(1))
-        .with_action(AssertTxIncluded::new("transfer").expect(TxStatus::Success))
+        .with_action(
+            AssertTxIncluded::new("transfer")
+                .expect(TxStatus::Success)
+                .expect_gas_used(21_000),
+        )
         .with_action(AssertTxLogs::new("transfer").expect_no_logs())
         .with_action(AssertTxTrace::new("transfer"))
         .run()
@@ -104,7 +112,11 @@ async fn test_call_eoa_self_transfer_no_log() {
                 .with_value(value),
         )
         .with_action(ProduceBlocks::new(1))
-        .with_action(AssertTxIncluded::new("transfer").expect(TxStatus::Success))
+        .with_action(
+            AssertTxIncluded::new("transfer")
+                .expect(TxStatus::Success)
+                .expect_gas_used(21_000),
+        )
         .with_action(AssertTxLogs::new("transfer").expect_no_logs())
         .with_action(AssertTxTrace::new("transfer"))
         .run()
@@ -679,8 +691,16 @@ async fn test_multiple_transfers_in_block() {
                 .with_value(value_b),
         )
         .with_action(ProduceBlocks::new(1))
-        .with_action(AssertTxIncluded::new("tx_a").expect(TxStatus::Success))
-        .with_action(AssertTxIncluded::new("tx_b").expect(TxStatus::Success))
+        .with_action(
+            AssertTxIncluded::new("tx_a")
+                .expect(TxStatus::Success)
+                .expect_gas_used(21_000),
+        )
+        .with_action(
+            AssertTxIncluded::new("tx_b")
+                .expect(TxStatus::Success)
+                .expect_gas_used(21_000),
+        )
         .with_action(
             AssertTxLogs::new("tx_a")
                 .expect_log_count(1)

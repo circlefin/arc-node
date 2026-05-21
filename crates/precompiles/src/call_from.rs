@@ -58,6 +58,16 @@ pub fn abi_decode_gas(data_len: usize) -> u64 {
     ABI_DECODE_BASE_GAS.saturating_add(words.saturating_mul(gas::COPY))
 }
 
+/// Fixed base gas for complete_subcall ABI encoding of `(bool success, bytes returnData)`.
+/// Covers the fixed-size tuple header (bool + offset + length words).
+pub const ABI_ENCODE_BASE_GAS: u64 = 100;
+
+/// Computes total complete_subcall gas: base overhead + ceil(data.len() / 32) * COPY.
+pub fn abi_encode_gas(data_len: usize) -> u64 {
+    let words = (data_len as u64).div_ceil(32);
+    ABI_ENCODE_BASE_GAS.saturating_add(words.saturating_mul(gas::COPY))
+}
+
 sol! {
     /// CallFrom precompile interface.
     interface ICallFrom {
@@ -89,7 +99,7 @@ fn decode_child_call(inputs: &CallInputs) -> Result<(CallInputs, u64), SubcallEr
             ));
         }
     };
-    let decoded = ICallFrom::callFromCall::abi_decode(input_bytes)
+    let decoded = ICallFrom::callFromCall::abi_decode_validate(input_bytes)
         .map_err(|e| SubcallError::AbiDecodeError(format!("callFrom: {e}")))?;
 
     let sender = decoded.sender;
@@ -159,6 +169,7 @@ impl SubcallPrecompile for CallFromPrecompile {
 
         let child_success = outcome.result.result.is_ok();
         let child_output = outcome.result.output.clone();
+        let encode_gas = abi_encode_gas(child_output.len());
 
         // ABI-encode (bool success, bytes returnData) matching the declared interface.
         // The precompile always succeeds; the caller inspects the bool to determine
@@ -171,6 +182,7 @@ impl SubcallPrecompile for CallFromPrecompile {
         Ok(SubcallCompletionResult {
             output: encoded.into(),
             success: true,
+            gas_overhead: encode_gas,
         })
     }
 }
@@ -180,15 +192,29 @@ mod tests {
     use super::*;
 
     /// Guard against silent upstream changes to the EVM COPY gas cost.
-    /// An unexpected change would alter `abi_decode_gas` results, effectively
-    /// creating an unintentional hardfork.
+    /// An unexpected change would alter `abi_decode_gas` and `abi_encode_gas` results,
+    /// effectively creating an unintentional hardfork.
     #[test]
     fn evm_copy_gas_cost_is_3() {
         assert_eq!(
             gas::COPY,
             3,
-            "revm COPY gas cost changed — review abi_decode_gas impact"
+            "revm COPY gas cost changed — review abi_decode_gas/abi_encode_gas impact"
         );
+    }
+
+    #[test]
+    fn abi_encode_gas_base_plus_per_word() {
+        // 0 bytes → base only (no per-word charge since div_ceil(0, 32) = 0)
+        assert_eq!(abi_encode_gas(0), ABI_ENCODE_BASE_GAS);
+        // 1 byte → 1 word
+        assert_eq!(abi_encode_gas(1), ABI_ENCODE_BASE_GAS + gas::COPY);
+        // 32 bytes → 1 word
+        assert_eq!(abi_encode_gas(32), ABI_ENCODE_BASE_GAS + gas::COPY);
+        // 33 bytes → 2 words
+        assert_eq!(abi_encode_gas(33), ABI_ENCODE_BASE_GAS + 2 * gas::COPY);
+        // 64 bytes → 2 words
+        assert_eq!(abi_encode_gas(64), ABI_ENCODE_BASE_GAS + 2 * gas::COPY);
     }
 
     /// Guard against `trace_child_call` and `init_subcall` diverging.

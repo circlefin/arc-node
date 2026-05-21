@@ -30,13 +30,13 @@ pub enum GuzzlerFunction {
     Guzzle2,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GuzzlerFnConfig {
     pub weight: u32,
     pub arg: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GuzzlerFnWeights {
     pub hash_loop: GuzzlerFnConfig,
     pub storage_write: GuzzlerFnConfig,
@@ -158,7 +158,7 @@ pub enum Erc20Function {
 /// Parsed from a comma-separated string such as `transfer=70,approve=20,transfer-from=10`.
 /// Weights are ratios. When all weights are 0 (the default), the generator
 /// defaults to 100% transfer for backward compatibility.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Erc20FnWeights {
     pub transfer: u32,
     pub approve: u32,
@@ -232,7 +232,7 @@ pub enum TxType {
 /// Parsed from a comma-separated string such as `transfer=70,erc20=20,guzzler=10`.
 /// Weights are ratios, not percentages, so `transfer=2,erc20=1` produces ~67% transfers
 /// and ~33% ERC-20 calls.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TxTypeMix {
     pub transfer: u32,
     pub legacy: u32,

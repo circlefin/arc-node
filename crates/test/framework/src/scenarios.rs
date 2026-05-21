@@ -75,21 +75,32 @@ pub fn crash_and_restart(
         .restart_after(layer, restart_delay)
         .wait_until_block(height)
         .success();
-    add_background_validators(&mut builder, n - 1, height);
+    // Keep support validators alive past the restarted node's target so it can
+    // receive fresh peer status and sync any heights missed during downtime.
+    add_background_validators(&mut builder, n - 1, height + 1);
     builder.build()
 }
 
-/// `num_vals` validators plus `num_fulls` non-validator nodes, all reaching block `height`.
+/// `val_count` validators reaching block `val_height` plus `full_count`
+/// non-validator nodes reaching block `full_height`.
+///
+/// Important: validators need to be alive slightly longer (one height at least)
+/// to provide block and sync support to full nodes.
 pub fn validators_and_full_nodes_reach_height(
-    num_vals: usize,
-    num_fulls: usize,
-    height: u64,
+    val_count: usize,
+    val_height: u64,
+    full_count: usize,
+    full_height: u64,
 ) -> Test<()> {
-    assert!(num_vals >= 1, "scenario requires at least 1 validator");
-    assert!(num_fulls >= 1, "scenario requires at least 1 full node");
+    assert!(val_count >= 1, "scenario requires at least 1 validator");
+    assert!(full_count >= 1, "scenario requires at least 1 full node");
+    assert!(
+        val_height > full_height,
+        "val_height must be higher than full_height to provide block and sync support to full nodes"
+    );
     let mut builder = TestBuilder::<()>::new();
-    add_background_validators(&mut builder, num_vals, height);
-    add_background_full_nodes(&mut builder, num_fulls, height);
+    add_background_validators(&mut builder, val_count, val_height);
+    add_background_full_nodes(&mut builder, full_count, full_height);
     builder.build()
 }
 

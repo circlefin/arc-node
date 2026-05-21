@@ -19,12 +19,113 @@ import hre from 'hardhat'
 import { getChain } from '../../scripts/hardhat/viem-helper'
 import { USDC } from '../helpers/FiatToken'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
-import { Address, concat, InternalRpcError, parseAbi, parseEther, toHex, zeroAddress } from 'viem'
+import {
+  Account,
+  Address,
+  Chain,
+  concat,
+  InternalRpcError,
+  parseAbi,
+  parseEther,
+  PublicClient,
+  RpcSchema,
+  StateMapping,
+  StateOverride,
+  toHex,
+  Transport,
+  zeroAddress,
+} from 'viem'
 import type { Call } from 'viem/types/calls'
 import { multicall3Address, fiatTokenProxyAddress } from '../../scripts/genesis'
+import { addressToBytes32, slotIndex } from '../../scripts/genesis/types'
 import { loadGenesisConfig } from '../helpers'
 import { multicall3Abi } from '../helpers/CallHelper'
-import { ERR_BLOCKED_ADDRESS } from '../helpers/NativeCoinControl'
+import { ERR_BLOCKED_ADDRESS, NativeCoinControl } from '../helpers/NativeCoinControl'
+
+/**
+ * Resolve role addresses (pauser, blacklister, masterMinter, rescuer), plus
+ * the `stateOverrides` payload needed to install them.
+ */
+const resolveFiatTokenRoles = async <
+  T extends Transport,
+  C extends Chain | undefined,
+  A extends Account | undefined,
+  R extends RpcSchema | undefined,
+>(
+  client: PublicClient<T, C, A, R>,
+): Promise<{
+  pauser: Address
+  blacklister: Address
+  masterMinter: Address
+  rescuer: Address
+  stateOverrides: StateOverride
+}> => {
+  const readRole = (functionName: 'pauser' | 'blacklister' | 'masterMinter' | 'rescuer') =>
+    client.readContract({ address: USDC.address, abi: USDC.abi, functionName })
+
+  const [pauserOnChain, blacklisterOnChain, masterMinterOnChain, rescuerOnChain] = await Promise.all([
+    readRole('pauser'),
+    readRole('blacklister'),
+    readRole('masterMinter'),
+    readRole('rescuer'),
+  ])
+
+  if (hre.network.name !== 'mainnet') {
+    return {
+      pauser: pauserOnChain,
+      blacklister: blacklisterOnChain,
+      masterMinter: masterMinterOnChain,
+      rescuer: rescuerOnChain,
+      stateOverrides: [],
+    }
+  }
+
+  // NativeFiatTokenV2_2 storage layout (see scripts/genesis/NativeFiatToken.ts).
+  // Slot 1: pauser (offset 0, 20 bytes) + paused (offset 20, 1 byte)
+  // Slot 2: blacklister
+  // Slot 8: masterMinter (offset 0, 20 bytes) + initialized (offset 20, 1 byte)
+  // Slot 14: _rescuer
+  const SLOT_PAUSER = 1n
+  const SLOT_BLACKLISTER = 2n
+  const SLOT_MASTER_MINTER = 8n
+  const SLOT_RESCUER = 14n
+
+  const random = () => privateKeyToAccount(generatePrivateKey()).address
+  const stateDiff: StateMapping = []
+
+  const pauser = pauserOnChain === zeroAddress ? random() : pauserOnChain
+  if (pauserOnChain === zeroAddress) {
+    stateDiff.push({ slot: slotIndex(SLOT_PAUSER), value: addressToBytes32(pauser) })
+  }
+
+  const blacklister = blacklisterOnChain === zeroAddress ? random() : blacklisterOnChain
+  if (blacklisterOnChain === zeroAddress) {
+    stateDiff.push({ slot: slotIndex(SLOT_BLACKLISTER), value: addressToBytes32(blacklister) })
+  }
+
+  const masterMinter = masterMinterOnChain === zeroAddress ? random() : masterMinterOnChain
+  if (masterMinterOnChain === zeroAddress) {
+    stateDiff.push({
+      slot: slotIndex(SLOT_MASTER_MINTER),
+      // Slot 8 packs `initialized = 1` at offset 20 alongside masterMinter
+      // — preserve it so the contract does not re-initialize.
+      value: concat([toHex(1n, { size: 12 }), masterMinter]),
+    })
+  }
+
+  const rescuer = rescuerOnChain === zeroAddress ? random() : rescuerOnChain
+  if (rescuerOnChain === zeroAddress) {
+    stateDiff.push({ slot: slotIndex(SLOT_RESCUER), value: addressToBytes32(rescuer) })
+  }
+
+  return {
+    pauser,
+    blacklister,
+    masterMinter,
+    rescuer,
+    stateOverrides: stateDiff.length > 0 ? [{ address: USDC.address, stateDiff }] : [],
+  }
+}
 
 describe('NativeFiatToken simulation', () => {
   const genesisConfig = loadGenesisConfig()
@@ -80,11 +181,12 @@ describe('NativeFiatToken simulation', () => {
   describe('mint', () => {
     it('add minter by masterMinter', async () => {
       const { client, usdc, newAddress } = await clients()
-      const masterMinter = await usdc.read.masterMinter()
+      const { masterMinter, stateOverrides } = await resolveFiatTokenRoles(client)
       expect(masterMinter).to.not.eq(zeroAddress)
       const res = await client.simulateCalls({
         account: masterMinter,
         calls: [{ to: USDC.address, abi: usdc.abi, functionName: 'configureMinter', args: [newAddress, 1n] }],
+        stateOverrides,
       })
       expect(res.results[0].status).to.be.eq('success')
     })
@@ -110,7 +212,7 @@ describe('NativeFiatToken simulation', () => {
 
     it('add minter to mint and burn', async () => {
       const { client, usdc, newAddress } = await clients()
-      const [masterMinter, pauser] = await Promise.all([usdc.read.masterMinter(), usdc.read.pauser()])
+      const { masterMinter, pauser, stateOverrides: roleOverrides } = await resolveFiatTokenRoles(client)
       expect(masterMinter).to.not.eq(zeroAddress)
       expect(pauser).to.not.eq(zeroAddress)
       const amount = 7n
@@ -147,7 +249,7 @@ describe('NativeFiatToken simulation', () => {
               ...mintAndBurn,
             ],
             blockOverrides: { baseFeePerGas: 10n },
-            stateOverrides: mockBalances(newAddress, pauser, masterMinter),
+            stateOverrides: [...mockBalances(newAddress, pauser, masterMinter), ...roleOverrides],
           },
         ],
       })
@@ -171,7 +273,7 @@ describe('NativeFiatToken simulation', () => {
   describe('Blacklistable', () => {
     it('blacklist by blacklister should be blocked', async () => {
       const { client, usdc, newAddress } = await clients()
-      const blacklister = await usdc.read.blacklister()
+      const { blacklister, stateOverrides: roleOverrides } = await resolveFiatTokenRoles(client)
       expect(blacklister).to.not.eq(zeroAddress)
 
       const res = await client.simulateCalls({
@@ -196,7 +298,7 @@ describe('NativeFiatToken simulation', () => {
           },
           { to: USDC.address, abi: usdc.abi, functionName: 'transfer', args: [newAddress, 1n] },
         ],
-        stateOverrides: mockBalances(blacklister, newAddress),
+        stateOverrides: [...mockBalances(blacklister, newAddress), ...roleOverrides],
       })
       let i = 0
       expect(res.results[i++].status).to.be.eq('success') // blacklist
@@ -209,7 +311,7 @@ describe('NativeFiatToken simulation', () => {
 
     it('send to blocked address should be rejected in pre-execution stage', async () => {
       const { client, usdc, newAddress } = await clients()
-      const blacklister = await usdc.read.blacklister()
+      const { blacklister, stateOverrides } = await resolveFiatTokenRoles(client)
       await expect(
         client.simulateCalls({
           account: blacklister,
@@ -217,13 +319,14 @@ describe('NativeFiatToken simulation', () => {
             { to: USDC.address, abi: usdc.abi, functionName: 'blacklist', args: [newAddress] },
             { to: newAddress, value: 7n },
           ],
+          stateOverrides,
         }),
       ).to.be.rejectedWith(InternalRpcError, ERR_BLOCKED_ADDRESS)
     })
 
     it('send to blocked address should be rejected in ERC20, and propagate the error', async () => {
       const { client, usdc, newAddress } = await clients()
-      const blacklister = await usdc.read.blacklister()
+      const { blacklister, stateOverrides: roleOverrides } = await resolveFiatTokenRoles(client)
       const gas = 60000n
       const res = await client.simulateCalls({
         account: blacklister,
@@ -231,6 +334,9 @@ describe('NativeFiatToken simulation', () => {
           { to: USDC.address, abi: usdc.abi, functionName: 'blacklist', args: [newAddress] },
           { to: USDC.address, abi: usdc.abi, functionName: 'transfer', args: [newAddress, 1n], gas } as Call,
         ],
+        // Fund the blacklister so `transfer` reaches the blacklist check
+        // instead of bailing earlier on insufficient balance.
+        stateOverrides: [...mockBalances(blacklister), ...roleOverrides],
       })
       expect(res.results[0].status).to.be.eq('success')
       expect(res.results[1].status).to.be.eq('failure')
@@ -240,7 +346,7 @@ describe('NativeFiatToken simulation', () => {
 
     it('transferFrom should reject when FROM address is blacklisted', async () => {
       const { client, usdc, newAddress } = await clients()
-      const blacklister = await usdc.read.blacklister()
+      const { blacklister, stateOverrides } = await resolveFiatTokenRoles(client)
       const gas = 100000n
       const amount = 100n
       const randomWallet = privateKeyToAccount(generatePrivateKey())
@@ -263,6 +369,7 @@ describe('NativeFiatToken simulation', () => {
                   gas,
                 } as Call,
               ],
+              stateOverrides,
             },
           ],
         }),
@@ -293,7 +400,8 @@ describe('NativeFiatToken simulation', () => {
 
   it('rescue', async () => {
     const { client, usdc, newAddress } = await clients()
-    const [owner, rescuer] = await Promise.all([usdc.read.owner(), usdc.read.rescuer()])
+    const { rescuer, stateOverrides: roleOverrides } = await resolveFiatTokenRoles(client)
+    const owner = await usdc.read.owner()
     const someAddress = toHex(1n, { size: 20 })
     expect(owner).to.not.eq(zeroAddress)
     expect(rescuer).to.not.eq(zeroAddress)
@@ -338,6 +446,11 @@ describe('NativeFiatToken simulation', () => {
           stateOverrides: [
             { address: newAddress, balance: amount + parseEther('0.01') },
             { address: someAddress, balance: parseEther('0.01') },
+            // USDC is blocklisted in NativeCoinControl at genesis, but this
+            // test needs to send USDC to the contract itself to exercise
+            // rescueERC20 — override the blocklist for the simulation.
+            NativeCoinControl.unblockStateOverride(USDC.address),
+            ...roleOverrides,
           ],
         },
       ],

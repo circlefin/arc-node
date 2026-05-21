@@ -33,6 +33,7 @@ use arc_execution_e2e::{
     ArcSetup, ArcTestBuilder,
 };
 use helpers::constants::{NATIVE_COIN_AUTHORITY_ADDRESS, SYSTEM_ADDRESS, WALLET_FIRST_ADDRESS};
+use reth_chainspec::ForkCondition;
 
 /// Test #20: Pre-Zero5 value transfer emits NativeCoinTransferred from NativeCoinAuthority.
 ///
@@ -43,10 +44,10 @@ async fn test_pre_zero5_emits_native_coin_transferred() {
     reth_tracing::init_test_tracing();
 
     let chain_spec = localdev_with_hardforks(&[
-        (ArcHardfork::Zero3, 0),
-        (ArcHardfork::Zero4, 0),
-        (ArcHardfork::Zero5, 100), // far in the future
-        (ArcHardfork::Zero6, 100),
+        (ArcHardfork::Zero3, ForkCondition::Block(0)),
+        (ArcHardfork::Zero4, ForkCondition::Block(0)),
+        (ArcHardfork::Zero5, ForkCondition::Block(100)), // far in the future
+        (ArcHardfork::Zero6, ForkCondition::Block(100)),
     ]);
 
     let recipient = address!("0x000000000000000000000000000000000000bEEF");
@@ -86,10 +87,10 @@ async fn test_zero5_activation_boundary() {
 
     // Zero5 activates at block 3
     let chain_spec = localdev_with_hardforks(&[
-        (ArcHardfork::Zero3, 0),
-        (ArcHardfork::Zero4, 0),
-        (ArcHardfork::Zero5, 3),
-        (ArcHardfork::Zero6, 100),
+        (ArcHardfork::Zero3, ForkCondition::Block(0)),
+        (ArcHardfork::Zero4, ForkCondition::Block(0)),
+        (ArcHardfork::Zero5, ForkCondition::Block(3)),
+        (ArcHardfork::Zero6, ForkCondition::Block(100)),
     ]);
 
     let recipient = address!("0x000000000000000000000000000000000000bEEF");

@@ -101,6 +101,13 @@ contract ValidatorManagement is Script {
      * @notice Register's a new validators public key
      * @dev Requires VALIDATOR_REGISTERER_KEY to be set in the environment
      * @dev Requires VALIDATOR_PUBLIC_KEY_BYTES to be set in the environment
+     *
+     * Runs a cheap sanity check (length, not all-zero) before broadcasting. Full ed25519
+     * curve-point validation cannot be done on-chain, and a bad key on-chain forces the
+     * consensus layer to skip the affected validator — reducing BFT security, and halting
+     * consensus entirely if the surviving validators no longer hold enough voting power
+     * for quorum. Operators should additionally cross-check VALIDATOR_PUBLIC_KEY_BYTES
+     * with off-chain tooling before running this script.
      */
     function registerValidator() public returns (uint256 _registrationId) {
         uint256 _validatorRegistererKey = vm.envUint(
@@ -110,12 +117,14 @@ contract ValidatorManagement is Script {
             "VALIDATOR_PUBLIC_KEY_BYTES"
         );
 
+        requirePublicKeyBasicSanity(_validatorPublicKey);
+
         vm.startBroadcast(_validatorRegistererKey);
         _registrationId = PERMISSIONED_VALIDATOR_MANAGER.registerValidator(_validatorPublicKey);
         vm.stopBroadcast();
 
         console.log(
-            "Registered validator with registrationId:", _registrationId, 
+            "Registered validator with registrationId:", _registrationId,
             "and public key:", vm.toString(_validatorPublicKey)
         );
     }
@@ -235,6 +244,23 @@ contract ValidatorManagement is Script {
     }
 
     // ============ Internal Utils ============
+
+    /**
+     * @notice Cheap off-chain sanity check on an ed25519 public key.
+     * @dev Catches obvious operator mistakes (wrong length, zero/placeholder bytes) before
+     *      they reach the registry. Full curve-point validation requires ed25519 math that
+     *      is not feasible on-chain; operators must validate with off-chain tooling as well.
+     *      Public (rather than internal) to allow direct unit testing without going through
+     *      environment-variable plumbing.
+     */
+    function requirePublicKeyBasicSanity(bytes memory publicKey) public pure {
+        require(publicKey.length == 32, "Public key must be 32 bytes");
+        bool allZero = true;
+        for (uint256 i = 0; i < publicKey.length; i++) {
+            if (publicKey[i] != 0x00) { allZero = false; break; }
+        }
+        require(!allZero, "Public key must not be all zero");
+    }
 
     /**
      * @notice Sanity-checks that a controller is valid for a voting power update

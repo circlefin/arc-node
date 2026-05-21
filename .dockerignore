@@ -59,6 +59,7 @@ docker-bake.hcl
 
 # CI/CD and tooling
 .github/
+.agents/
 .claude/
 .gitlab-ci.yml
 .travis.yml

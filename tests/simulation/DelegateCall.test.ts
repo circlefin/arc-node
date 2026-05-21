@@ -22,6 +22,7 @@ import { Hex } from 'viem'
 import { getChain } from '../../scripts/hardhat/viem-helper'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { fiatTokenProxyAddress, nativeCoinAutorityAddress } from '../../scripts/genesis/addresses'
+import { NativeCoinControl } from '../helpers/NativeCoinControl'
 
 /**
  * Delegatecall Attack Tests using Simulation with State Overrides
@@ -179,7 +180,9 @@ describe('Delegatecall Attack (Simulation)', () => {
     })
 
     // Simulate: Direct call to NativeCoinAuthority.mint from the FiatToken proxy,
-    // which is the hardcoded allowed caller under Zero5+.
+    // which is the hardcoded allowed caller under Zero5+. USDC is blocklisted
+    // in NativeCoinControl at genesis, which trips the pre-execution sender
+    // check — override it for this simulation.
     const blockSimulation = await client.simulateBlocks({
       blocks: [
         {
@@ -195,6 +198,7 @@ describe('Delegatecall Attack (Simulation)', () => {
               data: balanceCheckCalldata,
             },
           ],
+          stateOverrides: [NativeCoinControl.unblockStateOverride(fiatTokenProxyAddress)],
         },
       ],
     })

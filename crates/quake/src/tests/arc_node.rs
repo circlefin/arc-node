@@ -491,8 +491,7 @@ pub(crate) async fn tx_forwarding(
             ])
             .args
             .to_config(true, false);
-            testnet
-                .load(vec![arc_node.clone()], &load_config)
+            crate::load::load(testnet, vec![arc_node.clone()], &load_config)
                 .await
                 .wrap_err_with(|| format!("Failed to send load to {arc_node}"))?;
         }

@@ -100,10 +100,7 @@ impl NodesMetadata {
                 .filter_map(|endpoint_name| node_to_el_url.get(endpoint_name).cloned())
                 .collect();
 
-            let consensus_enabled = match &manifest_node.cl_config {
-                crate::manifest::NodeClConfig::Modern(cmd) => !cmd.no_consensus,
-                crate::manifest::NodeClConfig::Legacy(cfg) => cfg.consensus.enabled,
-            };
+            let consensus_enabled = manifest_node.cl_config.consensus_enabled();
 
             let mut node = match infra_data.infra_type {
                 InfraType::Local => {
@@ -189,32 +186,82 @@ impl NodesMetadata {
             .unwrap_or_default()
     }
 
-    pub fn consensus_ip_addresses_map(&self) -> IndexMap<NodeName, Vec<IpAddress>> {
-        self.nodes
-            .iter()
-            .map(|(name, node)| (name.clone(), node.consensus.private_ip_addresses()))
-            .collect()
-    }
-
-    /// Given a node and a list of its peers, return a list of their consensus-layer IP addresses.
+    /// Resolve explicit CL persistent peers to reachable consensus IPs.
     ///
-    /// Each name is looked up in the pre-built `addresses_map` (from
-    /// [`consensus_ip_addresses_map`](Self::consensus_ip_addresses_map)).
-    pub fn peer_consensus_ips(
+    /// If `node` has no shared subnet with its defined `peers`, return an
+    /// error instead of adding an unreachable persistent peer.
+    pub fn resolve_cl_persistent_peers_list_ips(
+        &self,
         node: &NodeName,
         peers: &[NodeName],
-        addresses_map: &IndexMap<NodeName, Vec<IpAddress>>,
     ) -> Result<Vec<IpAddress>> {
         peers
             .iter()
-            .map(|peer| {
-                addresses_map
-                    .get(peer.as_str())
-                    .cloned()
-                    .ok_or_else(|| eyre!("Persistent peer '{peer}' for node '{node}' not found"))
-            })
+            .map(|peer| self.resolve_cl_persistent_peer_ips(node, peer))
             .collect::<Result<Vec<_>>>()
             .map(|vecs| vecs.into_iter().flatten().collect())
+    }
+
+    /// Resolve default CL persistent peers to reachable consensus IPs.
+    ///
+    /// If the node has no explicit persistent peer list defined in the manifest,
+    /// quake connects it to every other node that shares a subnet with it, using
+    /// only the peer's IPs on those shared subnets.
+    pub fn default_cl_persistent_peers_list_ips(&self, node: &NodeName) -> Vec<IpAddress> {
+        self.nodes
+            .keys()
+            .filter(|peer| *peer != node)
+            .filter_map(|peer| self.default_cl_persistent_peer_ips(node, peer))
+            .flatten()
+            .collect()
+    }
+
+    /// Resolve one explicit persistent peer IP, returning an error if the peer is
+    /// not found or shares no subnet with the node.
+    fn resolve_cl_persistent_peer_ips(
+        &self,
+        node: &NodeName,
+        peer: &NodeName,
+    ) -> Result<Vec<IpAddress>> {
+        let Some(peer_meta) = self.nodes.get(peer) else {
+            return Err(eyre!(
+                "Persistent peer '{peer}' for node '{node}' not found"
+            ));
+        };
+
+        let shared_subnets = self.subnets.shared_subnets(node, peer);
+        if shared_subnets.is_empty() {
+            return Err(eyre!(
+                "Persistent peer '{peer}' for node '{node}' shares no subnet"
+            ));
+        }
+
+        Ok(peer_meta
+            .consensus
+            .private_ip_addresses_for(&shared_subnets))
+    }
+
+    /// Resolve one default persistent peer.
+    ///
+    /// When a node omits `cl_persistent_peers` in the manifest, quake treats every
+    /// other manifest node as a candidate persistent peer. Return the candidate's
+    /// consensus IPs on shared subnets, or `None` if the candidate is not
+    /// reachable from `node`.
+    fn default_cl_persistent_peer_ips(
+        &self,
+        node: &NodeName,
+        peer: &NodeName,
+    ) -> Option<Vec<IpAddress>> {
+        let shared_subnets = self.subnets.shared_subnets(node, peer);
+        if shared_subnets.is_empty() {
+            return None;
+        }
+
+        self.nodes.get(peer).map(|peer_meta| {
+            peer_meta
+                .consensus
+                .private_ip_addresses_for(&shared_subnets)
+        })
     }
 
     /// Find the IP address of `peer`'s EL container on the given subnet.
@@ -251,6 +298,13 @@ impl NodesMetadata {
         self.nodes
             .iter()
             .map(|(name, n)| (name.clone(), n.execution.http_url.clone()))
+            .collect()
+    }
+
+    pub fn all_execution_ws_urls(&self) -> Vec<(NodeName, Url)> {
+        self.nodes
+            .iter()
+            .map(|(name, n)| (name.clone(), n.execution.ws_url.clone()))
             .collect()
     }
 
@@ -452,5 +506,123 @@ impl NodesMetadata {
         // Create regex pattern that matches the entire string
         let pattern = format!("^{escaped}$");
         Regex::new(&pattern).wrap_err_with(|| format!("Failed to build regex pattern for '{name}'"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infra::InfraData;
+    use crate::manifest::Manifest;
+    use std::collections::BTreeSet;
+
+    type NodeSubnets = IndexMap<NodeName, Vec<String>>;
+
+    fn create_test_nodes_metadata(node_subnets: NodeSubnets) -> NodesMetadata {
+        let manifest_nodes = node_subnets
+            .keys()
+            .map(|name| (name.clone(), manifest::Node::default()))
+            .collect::<IndexMap<_, _>>();
+        let infra_data = InfraData::new_local("testnet".to_string(), &manifest_nodes);
+        let testnet_name = Some("testnet".to_string());
+        let manifest = Manifest::new(testnet_name, &manifest_nodes, &node_subnets);
+
+        NodesMetadata::new(infra_data, &manifest, &BTreeSet::new()).unwrap()
+    }
+
+    /// Build metadata where `source` shares subnet B with `reachable`,
+    /// while `unreachable` has no shared subnet with `source`.
+    fn metadata_with_reachable_and_unreachable_peers() -> NodesMetadata {
+        create_test_nodes_metadata(IndexMap::from([
+            ("source".to_string(), vec!["B".to_string()]),
+            (
+                "reachable".to_string(),
+                vec!["A".to_string(), "B".to_string()],
+            ),
+            ("unreachable".to_string(), vec!["A".to_string()]),
+        ]))
+    }
+
+    #[test]
+    fn resolve_cl_persistent_peers_ips_uses_only_shared_subnets() {
+        let metadata = metadata_with_reachable_and_unreachable_peers();
+
+        let reachable_b_ip = metadata
+            .get(&"reachable".to_string())
+            .unwrap()
+            .consensus
+            .private_ip_address_for("B")
+            .unwrap();
+        let reachable_a_ip = metadata
+            .get(&"reachable".to_string())
+            .unwrap()
+            .consensus
+            .private_ip_address_for("A")
+            .unwrap();
+        let source = "source".to_string();
+        let peers = ["reachable".to_string()];
+        let peer_ips = metadata
+            .resolve_cl_persistent_peers_list_ips(&source, &peers)
+            .unwrap();
+
+        assert_eq!(peer_ips, vec![reachable_b_ip]);
+        assert!(!peer_ips.contains(&reachable_a_ip));
+    }
+
+    #[test]
+    fn resolve_cl_persistent_peers_ips_errors_without_shared_subnet() {
+        let metadata = metadata_with_reachable_and_unreachable_peers();
+
+        let source = "source".to_string();
+        let peers = ["unreachable".to_string()];
+        let err = metadata
+            .resolve_cl_persistent_peers_list_ips(&source, &peers)
+            .unwrap_err();
+
+        let error = err.to_string();
+        let expected = "Persistent peer 'unreachable' for node 'source' shares no subnet";
+        assert!(error.contains(expected));
+    }
+
+    #[test]
+    fn resolve_cl_persistent_peers_ips_errors_for_unknown_peer() {
+        let metadata = metadata_with_reachable_and_unreachable_peers();
+
+        let source = "source".to_string();
+        let peers = ["missing".to_string()];
+        let err = metadata
+            .resolve_cl_persistent_peers_list_ips(&source, &peers)
+            .unwrap_err();
+
+        let error = err.to_string();
+        assert!(error.contains("Persistent peer 'missing' for node 'source' not found"));
+    }
+
+    #[test]
+    fn default_cl_persistent_peers_ips_skips_unshared_subnets() {
+        let metadata = metadata_with_reachable_and_unreachable_peers();
+
+        let reachable_b_ip = metadata
+            .get(&"reachable".to_string())
+            .unwrap()
+            .consensus
+            .private_ip_address_for("B")
+            .unwrap();
+        let unreachable_a_ip = metadata
+            .get(&"unreachable".to_string())
+            .unwrap()
+            .consensus
+            .private_ip_address_for("A")
+            .unwrap();
+        let source = "source".to_string();
+        let unreachable = "unreachable".to_string();
+        let peer_ips = metadata.default_cl_persistent_peers_list_ips(&source);
+
+        assert_eq!(peer_ips, vec![reachable_b_ip]);
+        assert!(!peer_ips.contains(&unreachable_a_ip));
+        assert_eq!(
+            metadata.default_cl_persistent_peer_ips(&source, &unreachable),
+            None
+        );
     }
 }

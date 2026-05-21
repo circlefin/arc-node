@@ -17,15 +17,17 @@
 import { expect } from 'chai'
 import { EventsVerifier, expectGasUSedApproximately, getClients } from '../helpers'
 import { CallHelper } from '../helpers/CallHelper'
-import { encodeFunctionData, zeroAddress } from 'viem'
+import { encodeFunctionData } from 'viem'
 import { SystemAccounting } from '../helpers/SystemAccounting'
+
+const systemAddress = '0xfffffffffffffffffffffffffffffffffffffffe'
 
 describe('SystemAccounting', () => {
   it('simulate storeGasvalues', async () => {
     const { client } = await getClients()
 
     const res = await client.simulateCalls({
-      account: zeroAddress,
+      account: systemAddress,
       calls: [
         {
           to: SystemAccounting.address,
@@ -38,8 +40,7 @@ describe('SystemAccounting', () => {
       ],
     })
     expect(res.results[0].status).to.be.eq('success')
-    // Zero5: EIP-2929 warm/cold gas pricing for SSTORE
-    expectGasUSedApproximately(res.results[0].gasUsed, 30908n)
+    expectGasUSedApproximately(res.results[0].gasUsed, 26708n)
   })
 
   it('delegatecall fails with authorization error', async () => {
@@ -85,7 +86,7 @@ describe('SystemAccounting', () => {
     })
 
     const res = await client.simulateCalls({
-      account: zeroAddress, // Authorized
+      account: systemAddress, // Authorized
       calls: [
         {
           to: helper.address,

@@ -38,6 +38,63 @@ mod generate;
 mod raw;
 mod subnets;
 
+/// Minimum EBS root volume size in GiB — matches the AWS lower bound and the CLI `range(8..)` constraint.
+pub const MIN_DISK_GB: u32 = 8;
+
+/// EBS volume types accepted by Quake's Terraform.
+const SUPPORTED_VOLUME_TYPES: &[&str] = &["gp2", "gp3", "io1", "io2", "st1", "sc1"];
+
+/// Volume types that accept user-provisioned IOPS.
+const IOPS_SUPPORTING_VOLUME_TYPES: &[&str] = &["gp3", "io1", "io2"];
+
+/// AWS-side absolute bounds on provisioned IOPS (loosest of gp3/io1/io2 ranges).
+/// AWS will reject finer-grained violations (volume-size ratio, per-type maxima) at apply time.
+const MIN_VOLUME_IOPS: u32 = 100;
+const MAX_VOLUME_IOPS: u32 = 256_000;
+
+pub(crate) fn validate_node_volume(volume_type: Option<&str>, iops: Option<u32>) -> Result<()> {
+    if let Some(vt) = volume_type {
+        if !SUPPORTED_VOLUME_TYPES.contains(&vt) {
+            bail!("node_volume_type must be one of {SUPPORTED_VOLUME_TYPES:?} (got {vt:?})");
+        }
+    }
+    if let Some(iops) = iops {
+        let vt = volume_type.unwrap_or("gp3");
+        if !IOPS_SUPPORTING_VOLUME_TYPES.contains(&vt) {
+            bail!(
+                "node_volume_iops is only valid with volume types {IOPS_SUPPORTING_VOLUME_TYPES:?} (got {vt:?})"
+            );
+        }
+        if !(MIN_VOLUME_IOPS..=MAX_VOLUME_IOPS).contains(&iops) {
+            bail!(
+                "node_volume_iops must be between {MIN_VOLUME_IOPS} and {MAX_VOLUME_IOPS} (got {iops})"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_resource_limits(
+    el_cpu_limit: Option<f64>,
+    el_memory_limit_gb: Option<f64>,
+    cl_cpu_limit: Option<f64>,
+    cl_memory_limit_gb: Option<f64>,
+) -> Result<()> {
+    for (name, value) in [
+        ("el_cpu_limit", el_cpu_limit),
+        ("cl_cpu_limit", cl_cpu_limit),
+        ("el_memory_limit_gb", el_memory_limit_gb),
+        ("cl_memory_limit_gb", cl_memory_limit_gb),
+    ] {
+        if let Some(v) = value {
+            if !v.is_finite() || v <= 0.0 {
+                bail!("{name} must be a positive finite number (got {v})");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) use generate::generate_manifests;
 pub(crate) use raw::is_validator;
 pub(crate) use subnets::Subnets;
@@ -94,6 +151,7 @@ const EL_DEFAULT_RPC_API: &[&str] = &[
 ];
 const EL_DEFAULT_ENABLE_ARC_RPC: bool = true;
 const EL_DEFAULT_ARC_DENYLIST_ENABLED: bool = true;
+const EL_DEFAULT_ARC_BUILDER_DEADLINE_MS: u64 = 100;
 
 fn default_rpc_api() -> Vec<String> {
     EL_DEFAULT_RPC_API.iter().map(|s| s.to_string()).collect()
@@ -287,17 +345,25 @@ impl Default for ElArcDenylistConfig {
 ///
 /// Fields correspond to `--arc.builder.*` CLI flags.
 /// Durations are in milliseconds.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ElArcBuilderConfig {
     /// Payload builder loop deadline in milliseconds.
     /// Maps to `--arc.builder.deadline`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deadline: Option<u64>,
+    pub deadline: u64,
     /// Wait for the in-flight payload build instead of racing an empty block.
     /// Maps to `--arc.builder.wait-for-payload`.
     #[serde(rename = "wait-for-payload", skip_serializing_if = "Option::is_none")]
     pub wait_for_payload: Option<bool>,
+}
+
+impl Default for ElArcBuilderConfig {
+    fn default() -> Self {
+        Self {
+            deadline: EL_DEFAULT_ARC_BUILDER_DEADLINE_MS,
+            wait_for_payload: None,
+        }
+    }
 }
 
 /// Execution layer Arc-specific configuration overrides.
@@ -458,6 +524,33 @@ pub(crate) struct Manifest {
     pub node_groups: IndexMap<String, Vec<String>>,
     /// Execution layer initial hardfork name for the network (e.g. "zero3", "zero4", "zero5")
     pub el_init_hardfork: Option<String>,
+    /// EC2 instance type for validator/full nodes (remote only).
+    pub node_size: Option<String>,
+    /// EC2 instance type for the Control Center (remote only).
+    pub cc_size: Option<String>,
+    /// Root EBS volume size for nodes in GiB (remote only).
+    pub node_disk_gb: Option<u32>,
+    /// Root EBS volume size for the Control Center in GiB (remote only).
+    pub cc_disk_gb: Option<u32>,
+    /// Initial balance for each prefunded account, in whole token units (e.g. 1_000_000 = 1M USDC).
+    /// Defaults to 1_000_000 when unset.
+    pub extra_account_balance_usdc: Option<u64>,
+    /// ProtocolConfig blockGasLimit and genesis header gas limit.
+    /// Defaults to 30_000_000 when unset.
+    pub block_gas_limit: Option<u64>,
+    /// Root EBS volume type for nodes (e.g. "gp3", "io2") (remote only).
+    pub node_volume_type: Option<String>,
+    /// Provisioned IOPS for the node root EBS volume (remote only).
+    /// Only meaningful for `gp3`, `io1`, and `io2` volume types.
+    pub node_volume_iops: Option<u32>,
+    /// CPU limit for the EL container (Docker `cpus`). Whole or fractional CPUs.
+    pub el_cpu_limit: Option<f64>,
+    /// Memory limit for the EL container, in GiB. Fractional values are allowed (e.g. 2.5).
+    pub el_memory_limit_gb: Option<f64>,
+    /// CPU limit for the CL container (Docker `cpus`). Whole or fractional CPUs.
+    pub cl_cpu_limit: Option<f64>,
+    /// Memory limit for the CL container, in GiB. Fractional values are allowed (e.g. 1.5).
+    pub cl_memory_limit_gb: Option<f64>,
 }
 
 impl Manifest {
@@ -474,16 +567,6 @@ impl Manifest {
             subnets: Subnets::new(node_subnets),
             ..Default::default()
         }
-    }
-
-    #[cfg(test)]
-    pub fn default_from_subnets(node_subnets: &IndexMap<NodeName, Vec<SubnetName>>) -> Self {
-        let node_names = node_subnets.keys().cloned().collect::<HashSet<_>>();
-        let nodes: IndexMap<NodeName, Node> = node_names
-            .iter()
-            .map(|n| (n.to_string(), Node::default()))
-            .collect();
-        Self::new(None, &nodes, node_subnets)
     }
 }
 
@@ -524,6 +607,19 @@ pub enum NodeClConfig {
 impl Default for NodeClConfig {
     fn default() -> Self {
         Self::Modern(StartCmd::default())
+    }
+}
+
+impl NodeClConfig {
+    /// Whether the consensus engine runs for this node.
+    ///
+    /// Sync-only followers disable consensus via `--no-consensus` (Modern) or
+    /// `consensus.enabled = false` (Legacy).
+    pub fn consensus_enabled(&self) -> bool {
+        match self {
+            Self::Modern(cmd) => !cmd.no_consensus,
+            Self::Legacy(cfg) => cfg.consensus.enabled,
+        }
     }
 }
 
@@ -762,6 +858,24 @@ impl Manifest {
             bail!("At least one node must be defined");
         }
 
+        if let Some(gb) = self.node_disk_gb {
+            if gb < MIN_DISK_GB {
+                bail!("node_disk_gb must be at least {MIN_DISK_GB} (got {gb})");
+            }
+        }
+        if let Some(gb) = self.cc_disk_gb {
+            if gb < MIN_DISK_GB {
+                bail!("cc_disk_gb must be at least {MIN_DISK_GB} (got {gb})");
+            }
+        }
+        validate_node_volume(self.node_volume_type.as_deref(), self.node_volume_iops)?;
+        validate_resource_limits(
+            self.el_cpu_limit,
+            self.el_memory_limit_gb,
+            self.cl_cpu_limit,
+            self.cl_memory_limit_gb,
+        )?;
+
         // Check starting heights
         for (node_name, node) in self.nodes.iter() {
             if let Some(start_at) = node.start_at {
@@ -896,20 +1010,16 @@ impl Manifest {
             }
         }
 
-        // Warn about persistent peers that don't share a subnet (CL P2P via Quake private IPs).
-        // Skip follow-mode nodes: they do not use CL persistent peers for P2P; RPC to
-        // `follow_endpoints` is checked above.
+        // CL persistent peers are resolved to private IPs on shared subnets.
+        // Without a shared subnet, Quake would generate an unreachable peer.
         if !self.subnets.is_empty() {
             for (node_name, node) in self.nodes.iter() {
-                if node.follow {
-                    continue;
-                }
                 if let Some(peers) = &node.cl_persistent_peers {
                     for peer in peers {
                         if self.subnets.shared_subnets(node_name, peer).is_empty() {
-                            warn!(
+                            bail!(
                                 "Node '{node_name}' has persistent peer '{peer}' but they share \
-                                 no subnet — CL P2P connections will fail at the network level"
+                                 no subnet. Add a shared subnet or remove the peer."
                             );
                         }
                     }
@@ -958,18 +1068,6 @@ impl Manifest {
             }
         }
         Ok(())
-    }
-
-    /// Nodes that share at least one subnet with the given node
-    pub fn filter_nodes_with_shared_subnets(
-        &self,
-        node: &NodeName,
-    ) -> impl Iterator<Item = (&NodeName, &Node)> {
-        let node_subnets = self.subnets.subnets_of(node);
-        self.nodes.iter().filter(move |(peer, _)| {
-            let peer_subnets = self.subnets.subnets_of(peer);
-            **peer != *node && peer_subnets.iter().any(|s| node_subnets.contains(s))
-        })
     }
 
     /// Build a map from each subnet to a list of nodes in that subnet.
@@ -1379,6 +1477,23 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid persistent peer 'nonexistent'"));
+    }
+
+    #[test]
+    fn test_validate_persistent_peer_requires_shared_subnet() {
+        let str = r#"
+        [nodes.validator1]
+        subnets = ["A"]
+        cl_persistent_peers = ["validator2"]
+        [nodes.validator2]
+        subnets = ["B"]
+        [nodes.bridge]
+        subnets = ["A", "B"]
+        "#;
+        let result = Manifest::from_string(str);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("share no subnet"));
     }
 
     #[test]
@@ -1916,17 +2031,16 @@ mod tests {
     }
 
     #[test]
-    fn test_arc_builder_deadline_omitted_when_unset() {
+    fn test_arc_builder_deadline_default_when_unset() {
         let str = r#"
         [nodes.validator1]
         "#;
         let manifest = Manifest::from_string(str).unwrap();
 
-        assert!(!manifest.nodes["validator1"]
+        assert!(manifest.nodes["validator1"]
             .el_cli_flags()
             .unwrap()
-            .iter()
-            .any(|f| f.contains("arc.builder.deadline")));
+            .contains(&"--arc.builder.deadline=100".to_string()));
     }
 
     #[test]
@@ -2519,105 +2633,6 @@ mod tests {
     }
 
     #[test]
-    fn filter_shared_subnets_single_node() {
-        let manifest =
-            Manifest::default_from_subnets(&[("node1".into(), vec!["default".into()])].into());
-        let peers: Vec<_> = manifest
-            .filter_nodes_with_shared_subnets(&"node1".into())
-            .collect();
-        assert_eq!(peers.len(), 0);
-    }
-
-    #[test]
-    fn filter_shared_subnets_single_subnet() {
-        let manifest = Manifest::default_from_subnets(
-            &[
-                ("node1".into(), vec!["default".into()]),
-                ("node2".into(), vec!["default".into()]),
-                ("node3".into(), vec!["default".into()]),
-            ]
-            .into(),
-        );
-        let peers: Vec<&String> = manifest
-            .filter_nodes_with_shared_subnets(&"node1".into())
-            .map(|(name, _)| name)
-            .collect();
-        assert_eq!(peers.len(), 2);
-        assert!(peers.contains(&&"node2".to_string()));
-        assert!(peers.contains(&&"node3".to_string()));
-
-        let subnets = &manifest.subnets;
-        assert_eq!(subnets.shared_subnets("node1", "node2"), vec!["default"]);
-        assert_eq!(subnets.shared_subnets("node1", "node3"), vec!["default"]);
-        assert_eq!(subnets.shared_subnets("node2", "node3"), vec!["default"]);
-    }
-
-    #[test]
-    fn filter_shared_subnets_disjoint_subnets() {
-        let manifest = Manifest::default_from_subnets(
-            &[
-                ("node1".into(), vec!["A".into()]),
-                ("node2".into(), vec!["B".into()]),
-                ("bridge".into(), vec!["A".into(), "B".into()]),
-            ]
-            .into(),
-        );
-        let peers: Vec<&String> = manifest
-            .filter_nodes_with_shared_subnets(&"node1".into())
-            .map(|(name, _)| name)
-            .collect();
-        assert!(!peers.contains(&&"node2".to_string()));
-        assert!(peers.contains(&&"bridge".to_string()));
-
-        let subnets = &manifest.subnets;
-        assert!(subnets.shared_subnets("node1", "node2").is_empty());
-        assert_eq!(subnets.shared_subnets("node1", "bridge"), vec!["A"]);
-        assert_eq!(subnets.shared_subnets("node2", "bridge"), vec!["B"]);
-    }
-
-    #[test]
-    fn filter_shared_subnets_chain_topology() {
-        let manifest = Manifest::default_from_subnets(
-            &[
-                ("n1".into(), vec!["A".into()]),
-                ("bridge_ab".into(), vec!["A".into(), "B".into()]),
-                ("n2".into(), vec!["B".into()]),
-                ("bridge_bc".into(), vec!["B".into(), "C".into()]),
-                ("n3".into(), vec!["C".into()]),
-            ]
-            .into(),
-        );
-
-        let peers_n1: Vec<&String> = manifest
-            .filter_nodes_with_shared_subnets(&"n1".into())
-            .map(|(name, _)| name)
-            .collect();
-        assert_eq!(peers_n1, vec!["bridge_ab"]);
-
-        let peers_n2: Vec<&String> = manifest
-            .filter_nodes_with_shared_subnets(&"n2".into())
-            .map(|(name, _)| name)
-            .collect();
-        assert_eq!(peers_n2.len(), 2);
-        assert!(peers_n2.contains(&&"bridge_ab".to_string()));
-        assert!(peers_n2.contains(&&"bridge_bc".to_string()));
-
-        let peers_n3: Vec<&String> = manifest
-            .filter_nodes_with_shared_subnets(&"n3".into())
-            .map(|(name, _)| name)
-            .collect();
-        assert_eq!(peers_n3, vec!["bridge_bc"]);
-
-        let subnets = &manifest.subnets;
-        assert_eq!(subnets.shared_subnets("n1", "bridge_ab"), vec!["A"]);
-        assert_eq!(subnets.shared_subnets("n2", "bridge_bc"), vec!["B"]);
-        assert_eq!(subnets.shared_subnets("n3", "bridge_bc"), vec!["C"]);
-        assert!(subnets.shared_subnets("n1", "n2").is_empty());
-        assert!(subnets.shared_subnets("n1", "n3").is_empty());
-        assert!(subnets.shared_subnets("n2", "n3").is_empty());
-    }
-
-    #[test]
     fn test_substitute_env_vars_replaces_known_vars() {
         unsafe { env::set_var("QUAKE_TEST_REGISTRY", "ghcr.io/test-org/repo") };
         let input = r#"image_cl="${QUAKE_TEST_REGISTRY}/consensus:abc""#;
@@ -2698,5 +2713,102 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Malformed placeholder"),);
+    }
+
+    #[test]
+    fn validate_node_volume_accepts_supported_types() {
+        for vt in SUPPORTED_VOLUME_TYPES {
+            assert!(validate_node_volume(Some(vt), None).is_ok(), "type {vt}");
+        }
+    }
+
+    #[test]
+    fn validate_node_volume_rejects_unknown_type() {
+        let err = validate_node_volume(Some("nvme"), None).unwrap_err();
+        assert!(err.to_string().contains("node_volume_type must be one of"));
+    }
+
+    #[test]
+    fn validate_node_volume_rejects_iops_on_non_iops_type() {
+        let err = validate_node_volume(Some("st1"), Some(3000)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("node_volume_iops is only valid with"));
+    }
+
+    #[test]
+    fn validate_node_volume_accepts_iops_on_supported_types() {
+        for vt in IOPS_SUPPORTING_VOLUME_TYPES {
+            assert!(
+                validate_node_volume(Some(vt), Some(3000)).is_ok(),
+                "type {vt}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_node_volume_iops_assumes_default_type_when_omitted() {
+        // Default Terraform type is gp3, which supports IOPS.
+        assert!(validate_node_volume(None, Some(3000)).is_ok());
+    }
+
+    #[test]
+    fn validate_node_volume_rejects_iops_below_minimum() {
+        let err = validate_node_volume(Some("gp3"), Some(50)).unwrap_err();
+        assert!(err.to_string().contains("node_volume_iops must be between"));
+    }
+
+    #[test]
+    fn validate_node_volume_rejects_iops_above_maximum() {
+        let err = validate_node_volume(Some("io2"), Some(300_000)).unwrap_err();
+        assert!(err.to_string().contains("node_volume_iops must be between"));
+    }
+
+    #[test]
+    fn validate_node_volume_accepts_no_overrides() {
+        assert!(validate_node_volume(None, None).is_ok());
+    }
+
+    #[test]
+    fn validate_resource_limits_accepts_no_overrides() {
+        assert!(validate_resource_limits(None, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn validate_resource_limits_accepts_positive_values() {
+        assert!(validate_resource_limits(Some(8.0), Some(27.0), Some(8.0), Some(5.0)).is_ok());
+        assert!(validate_resource_limits(Some(0.5), Some(2.5), None, None).is_ok());
+    }
+
+    #[test]
+    fn validate_resource_limits_rejects_zero_cpu() {
+        let err = validate_resource_limits(Some(0.0), None, None, None).unwrap_err();
+        assert!(err.to_string().contains("el_cpu_limit"));
+    }
+
+    #[test]
+    fn validate_resource_limits_rejects_negative_cpu() {
+        let err = validate_resource_limits(None, None, Some(-1.0), None).unwrap_err();
+        assert!(err.to_string().contains("cl_cpu_limit"));
+    }
+
+    #[test]
+    fn validate_resource_limits_rejects_nan_cpu() {
+        let err = validate_resource_limits(Some(f64::NAN), None, None, None).unwrap_err();
+        assert!(err.to_string().contains("el_cpu_limit"));
+    }
+
+    #[test]
+    fn validate_resource_limits_rejects_zero_memory() {
+        let err = validate_resource_limits(None, Some(0.0), None, None).unwrap_err();
+        assert!(err.to_string().contains("el_memory_limit_gb"));
+        let err = validate_resource_limits(None, None, None, Some(0.0)).unwrap_err();
+        assert!(err.to_string().contains("cl_memory_limit_gb"));
+    }
+
+    #[test]
+    fn validate_resource_limits_rejects_negative_memory() {
+        let err = validate_resource_limits(None, Some(-2.0), None, None).unwrap_err();
+        assert!(err.to_string().contains("el_memory_limit_gb"));
     }
 }

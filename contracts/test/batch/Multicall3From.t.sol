@@ -52,6 +52,31 @@ contract MockCallFrom {
     }
 }
 
+/// @dev Mock callFrom that reverts unconditionally when the target is the
+///      designated "revert target". Simulates framework-level reverts (e.g.
+///      static context, sender-spoofing rejection) that happen before the
+///      child EVM frame is constructed.
+contract MockRevertingCallFrom {
+    address public revertTarget;
+
+    constructor(address _revertTarget) {
+        revertTarget = _revertTarget;
+    }
+
+    function callFrom(address sender, address target, bytes calldata data)
+        external
+        returns (bool success, bytes memory returnData)
+    {
+        if (target == revertTarget) {
+            revert("subcall precompiles cannot be invoked in static context");
+        }
+        // Normal path: forward to target
+        (success, returnData) = target.call(data);
+        // Suppress unused variable warning
+        sender;
+    }
+}
+
 /// @dev Simple target contract for testing.
 contract MockTarget {
     uint256 public value;
@@ -426,5 +451,104 @@ contract Multicall3FromTest is Test {
 
     function test_getEthBalance() public view {
         assertEq(multicall.getEthBalance(address(this)), address(this).balance);
+    }
+
+    // ======================== Framework-level revert capture ========================
+
+    bytes constant EXPECTED_PRECOMPILE_REVERT =
+        abi.encodeWithSignature("Error(string)", "subcall precompiles cannot be invoked in static context");
+
+    function test_aggregate3_allowFailure_capturesPrecompileRevert() public {
+        address revertTarget = address(0xDEAD);
+        MockRevertingCallFrom revertingMock = new MockRevertingCallFrom(revertTarget);
+        vm.etch(Addresses.CALL_FROM, address(revertingMock).code);
+        vm.store(Addresses.CALL_FROM, bytes32(0), bytes32(uint256(uint160(revertTarget))));
+
+        IMulticall3From.Call3[] memory calls = new IMulticall3From.Call3[](2);
+        calls[0] = IMulticall3From.Call3({
+            target: revertTarget,
+            allowFailure: true,
+            callData: abi.encodeCall(MockTarget.setValue, (1))
+        });
+        calls[1] = IMulticall3From.Call3({
+            target: address(target),
+            allowFailure: false,
+            callData: abi.encodeCall(MockTarget.setValue, (42))
+        });
+
+        IMulticall3From.Result[] memory results = multicall.aggregate3(calls);
+
+        assertEq(results.length, 2);
+        assertFalse(results[0].success);
+        assertEq(results[0].returnData, EXPECTED_PRECOMPILE_REVERT);
+        assertTrue(results[1].success);
+        assertEq(target.value(), 42);
+    }
+
+    function test_tryAggregate_requireSuccessFalse_capturesPrecompileRevert() public {
+        address revertTarget = address(0xDEAD);
+        MockRevertingCallFrom revertingMock = new MockRevertingCallFrom(revertTarget);
+        vm.etch(Addresses.CALL_FROM, address(revertingMock).code);
+        vm.store(Addresses.CALL_FROM, bytes32(0), bytes32(uint256(uint160(revertTarget))));
+
+        IMulticall3From.Call[] memory calls = new IMulticall3From.Call[](2);
+        calls[0] = IMulticall3From.Call({
+            target: revertTarget,
+            callData: abi.encodeCall(MockTarget.setValue, (1))
+        });
+        calls[1] = IMulticall3From.Call({
+            target: address(target),
+            callData: abi.encodeCall(MockTarget.setValue, (99))
+        });
+
+        IMulticall3From.Result[] memory results = multicall.tryAggregate(false, calls);
+
+        assertEq(results.length, 2);
+        assertFalse(results[0].success);
+        assertEq(results[0].returnData, EXPECTED_PRECOMPILE_REVERT);
+        assertTrue(results[1].success);
+        assertEq(target.value(), 99);
+    }
+
+    function test_aggregate3_allowFailureFalse_precompileRevert_stillReverts() public {
+        address revertTarget = address(0xDEAD);
+        MockRevertingCallFrom revertingMock = new MockRevertingCallFrom(revertTarget);
+        vm.etch(Addresses.CALL_FROM, address(revertingMock).code);
+        vm.store(Addresses.CALL_FROM, bytes32(0), bytes32(uint256(uint160(revertTarget))));
+
+        IMulticall3From.Call3[] memory calls = new IMulticall3From.Call3[](1);
+        calls[0] = IMulticall3From.Call3({
+            target: revertTarget,
+            allowFailure: false,
+            callData: abi.encodeCall(MockTarget.setValue, (1))
+        });
+
+        vm.expectRevert(EXPECTED_PRECOMPILE_REVERT);
+        multicall.aggregate3(calls);
+    }
+
+    function test_tryBlockAndAggregate_requireSuccessFalse_capturesPrecompileRevert() public {
+        address revertTarget = address(0xDEAD);
+        MockRevertingCallFrom revertingMock = new MockRevertingCallFrom(revertTarget);
+        vm.etch(Addresses.CALL_FROM, address(revertingMock).code);
+        vm.store(Addresses.CALL_FROM, bytes32(0), bytes32(uint256(uint160(revertTarget))));
+
+        IMulticall3From.Call[] memory calls = new IMulticall3From.Call[](2);
+        calls[0] = IMulticall3From.Call({
+            target: revertTarget,
+            callData: abi.encodeCall(MockTarget.setValue, (1))
+        });
+        calls[1] = IMulticall3From.Call({
+            target: address(target),
+            callData: abi.encodeCall(MockTarget.setValue, (55))
+        });
+
+        (,, IMulticall3From.Result[] memory results) = multicall.tryBlockAndAggregate(false, calls);
+
+        assertEq(results.length, 2);
+        assertFalse(results[0].success);
+        assertEq(results[0].returnData, EXPECTED_PRECOMPILE_REVERT);
+        assertTrue(results[1].success);
+        assertEq(target.value(), 55);
     }
 }

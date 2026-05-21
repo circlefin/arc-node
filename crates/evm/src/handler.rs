@@ -15,11 +15,11 @@
 // limitations under the License.
 
 use alloy_primitives::{Address, U256};
-use arc_execution_config::hardforks::{ArcHardfork, ArcHardforkFlags};
+use arc_execution_config::hardforks::ArcHardforkFlags;
 use arc_execution_config::native_coin_control::{
     compute_is_blocklisted_storage_slot, is_blocklisted_status,
 };
-use arc_precompiles::helpers::{ERR_BLOCKED_ADDRESS, PRECOMPILE_SLOAD_GAS_COST};
+use arc_precompiles::helpers::ERR_BLOCKED_ADDRESS;
 use arc_precompiles::NATIVE_COIN_CONTROL_ADDRESS;
 use revm::inspector::{Inspector, InspectorEvmTr, InspectorHandler};
 use revm::{
@@ -37,6 +37,8 @@ use revm_primitives::TxKind;
 pub struct ArcEvmHandler<EVM, ERROR> {
     mainnet: MainnetHandler<EVM, ERROR, EthFrame<EthInterpreter>>,
     /// Feature flags for Arc hardforks active at the current block.
+    /// Retained for future hardfork-gated handler behavior (e.g. new precompiles).
+    #[allow(dead_code)]
     hardfork_flags: ArcHardforkFlags,
 }
 
@@ -102,59 +104,15 @@ where
             .map_err(From::from)
     }
 
-    /// Calculates initial gas costs including blocklist SLOAD costs for Zero6+.
+    /// Returns base intrinsic gas from the mainnet handler.
     ///
-    /// For Zero6 hardfork and later:
-    /// - Always adds 1 SLOAD cost (2,100 gas) for caller blocklist check
-    /// - Adds 1 additional SLOAD cost (2,100 gas) for recipient blocklist check if value > 0
-    ///
-    /// This ensures gas accounting matches the actual blocklist checks performed in pre_execution.
+    /// Blocklist SLOADs are unmetered — no extra gas is added for blocklist checks.
     #[inline]
     fn validate_initial_tx_gas(
         &self,
         evm: &mut Self::Evm,
     ) -> Result<InitialAndFloorGas, Self::Error> {
-        // Get base intrinsic gas from mainnet handler
-        let mut init_and_floor_gas = self.mainnet.validate_initial_tx_gas(evm)?;
-
-        // Add blocklist SLOAD costs if Zero6 is active
-        if self.hardfork_flags.is_active(ArcHardfork::Zero6) {
-            let ctx = evm.ctx_ref();
-            let tx = ctx.tx();
-
-            // Always charge for caller blocklist check
-            let mut extra_gas = PRECOMPILE_SLOAD_GAS_COST;
-
-            // Charge for recipient blocklist check if value > 0
-            // This applies to both Call and Create transactions with value
-            if !tx.value().is_zero() {
-                // 2,100 + 2,100 = 4,200; fits in u64
-                #[allow(clippy::arithmetic_side_effects)]
-                {
-                    extra_gas += PRECOMPILE_SLOAD_GAS_COST;
-                }
-            }
-
-            // Add extra gas to initial gas
-            init_and_floor_gas.initial_gas = init_and_floor_gas
-                .initial_gas
-                .checked_add(extra_gas)
-                .ok_or(InvalidTransaction::CallGasCostMoreThanGasLimit {
-                    gas_limit: tx.gas_limit(),
-                    initial_gas: u64::MAX,
-                })?;
-
-            // Verify total doesn't exceed gas limit
-            if init_and_floor_gas.initial_gas > tx.gas_limit() {
-                return Err(InvalidTransaction::CallGasCostMoreThanGasLimit {
-                    gas_limit: tx.gas_limit(),
-                    initial_gas: init_and_floor_gas.initial_gas,
-                }
-                .into());
-            }
-        }
-
-        Ok(init_and_floor_gas)
+        self.mainnet.validate_initial_tx_gas(evm)
     }
 }
 
@@ -186,35 +144,24 @@ where
         tx_kind: &TxKind,
         tx_value: U256,
     ) -> Result<(), ERROR> {
-        let (caller_blocklisted, _) = self.is_address_blocklisted(evm, caller)?;
-        if caller_blocklisted {
+        if self.is_address_blocklisted(evm, caller)? {
             return Err(InvalidTransaction::Str(ERR_BLOCKED_ADDRESS.into()).into());
         }
         if let TxKind::Call(to_address) = tx_kind {
-            if !tx_value.is_zero() {
-                let (to_blocklisted, _) = self.is_address_blocklisted(evm, *to_address)?;
-                if to_blocklisted {
-                    return Err(InvalidTransaction::Str(ERR_BLOCKED_ADDRESS.into()).into());
-                }
+            if !tx_value.is_zero() && self.is_address_blocklisted(evm, *to_address)? {
+                return Err(InvalidTransaction::Str(ERR_BLOCKED_ADDRESS.into()).into());
             }
         }
         Ok(())
     }
 
     /// Checks if an address is blocklisted by reading from the native coin control precompile storage.
-    ///
-    /// Returns `(is_blocklisted, is_cold)`. The `is_cold` flag is available for gas accounting
-    /// but is not used at depth 0 (where `validate_initial_tx_gas` charges fixed cold SLOAD costs).
-    fn is_address_blocklisted(
-        &self,
-        evm: &mut EVM,
-        address: Address,
-    ) -> Result<(bool, bool), ERROR> {
+    fn is_address_blocklisted(&self, evm: &mut EVM, address: Address) -> Result<bool, ERROR> {
         let storage_slot = compute_is_blocklisted_storage_slot(address).into();
         let journal = evm.ctx_mut().journal_mut();
 
         let state_load = journal.sload(NATIVE_COIN_CONTROL_ADDRESS, storage_slot)?;
-        Ok((is_blocklisted_status(state_load.data), state_load.is_cold))
+        Ok(is_blocklisted_status(state_load.data))
     }
 }
 
@@ -222,6 +169,7 @@ where
 mod tests {
     use super::*;
     use alloy_primitives::{address, U256};
+    use arc_execution_config::hardforks::ArcHardfork;
     use arc_precompiles::NATIVE_COIN_CONTROL_ADDRESS;
     use reth_ethereum::evm::revm::db::{CacheDB, EmptyDB};
     use revm::{
@@ -762,163 +710,30 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_initial_tx_gas_pre_zero6_no_extra_gas() {
-        // Pre-Zero6: No extra gas should be charged for blocklist checks
+    fn test_validate_initial_tx_gas_no_blocklist_surcharge() {
+        // Blocklist SLOADs are unmetered — native value transfer costs exactly 21,000 gas
         let caller = address!("1000000000000000000000000000000000000001");
         let recipient = address!("2000000000000000000000000000000000000002");
 
         let db: CacheDB<EmptyDBTyped<Infallible>> = CacheDB::new(EmptyDB::default());
         let mut evm = Context::mainnet().with_db(db).build_mainnet();
 
-        // Set up transaction with value
         evm.tx.caller = caller;
         evm.tx.kind = TxKind::Call(recipient);
         evm.tx.value = U256::from(1000);
         evm.tx.gas_limit = 100_000u64;
         evm.tx.gas_price = 1;
 
-        // Pre-Zero6 handler (Zero5 active but Zero6 not yet active)
-        let handler: ArcEvmHandler<_, EVMError<Infallible>> =
-            ArcEvmHandler::new(ArcHardforkFlags::with(&[ArcHardfork::Zero5]));
-        let result = handler.validate_initial_tx_gas(&mut evm);
-
-        assert!(result.is_ok(), "validate_initial_tx_gas should succeed");
-        let init_gas = result.unwrap();
-
-        // Base intrinsic gas for a simple call is 21000
-        // Pre-Zero6: no extra SLOAD costs added
-        assert_eq!(
-            init_gas.initial_gas, 21000,
-            "Pre-Zero6: Should use standard intrinsic gas without blocklist SLOAD costs"
-        );
-    }
-
-    #[test]
-    fn test_validate_initial_tx_gas_zero6_value_transfer() {
-        // Zero6: Value transfer should charge 2 SLOADs (caller + recipient)
-        let caller = address!("3000000000000000000000000000000000000003");
-        let recipient = address!("4000000000000000000000000000000000000004");
-
-        let db: CacheDB<EmptyDBTyped<Infallible>> = CacheDB::new(EmptyDB::default());
-        let mut evm = Context::mainnet().with_db(db).build_mainnet();
-
-        // Set up transaction with value
-        evm.tx.caller = caller;
-        evm.tx.kind = TxKind::Call(recipient);
-        evm.tx.value = U256::from(1000);
-        evm.tx.gas_limit = 100_000u64;
-        evm.tx.gas_price = 1;
-
-        // Zero6 active handler
+        // Zero6 active — still no extra gas for blocklist checks
         let handler: ArcEvmHandler<_, EVMError<Infallible>> =
             ArcEvmHandler::new(ArcHardforkFlags::with(&[ArcHardfork::Zero6]));
         let result = handler.validate_initial_tx_gas(&mut evm);
 
         assert!(result.is_ok(), "validate_initial_tx_gas should succeed");
-        let init_gas = result.unwrap();
-
-        // Base intrinsic gas (21000) + 2 SLOADs (2 * 2100 = 4200) = 25200
-        let expected_gas = 21000 + 2 * PRECOMPILE_SLOAD_GAS_COST;
         assert_eq!(
-            init_gas.initial_gas, expected_gas,
-            "Zero6 value transfer: Should add 2 SLOAD costs for blocklist checks"
+            result.unwrap().initial_gas,
+            21000,
+            "Native value transfer should cost exactly 21,000 gas (no blocklist surcharge)"
         );
-    }
-
-    #[test]
-    fn test_validate_initial_tx_gas_zero6_zero_value_call() {
-        // Zero6: Zero-value call should charge 1 SLOAD (caller only)
-        let caller = address!("5000000000000000000000000000000000000005");
-        let recipient = address!("6000000000000000000000000000000000000006");
-
-        let db: CacheDB<EmptyDBTyped<Infallible>> = CacheDB::new(EmptyDB::default());
-        let mut evm = Context::mainnet().with_db(db).build_mainnet();
-
-        // Set up transaction without value
-        evm.tx.caller = caller;
-        evm.tx.kind = TxKind::Call(recipient);
-        evm.tx.value = U256::ZERO;
-        evm.tx.gas_limit = 100_000u64;
-        evm.tx.gas_price = 1;
-
-        // Zero6 active handler
-        let handler: ArcEvmHandler<_, EVMError<Infallible>> =
-            ArcEvmHandler::new(ArcHardforkFlags::with(&[ArcHardfork::Zero6]));
-        let result = handler.validate_initial_tx_gas(&mut evm);
-
-        assert!(result.is_ok(), "validate_initial_tx_gas should succeed");
-        let init_gas = result.unwrap();
-
-        // Base intrinsic gas (21000) + 1 SLOAD (2100) = 23100
-        let expected_gas = 21000 + PRECOMPILE_SLOAD_GAS_COST;
-        assert_eq!(
-            init_gas.initial_gas, expected_gas,
-            "Zero6 zero-value call: Should add 1 SLOAD cost for caller blocklist check only"
-        );
-    }
-
-    #[test]
-    fn test_validate_initial_tx_gas_zero6_create_with_value() {
-        // Zero6: CREATE with value should charge 2 SLOADs (caller + recipient)
-        let caller = address!("7000000000000000000000000000000000000007");
-
-        let db: CacheDB<EmptyDBTyped<Infallible>> = CacheDB::new(EmptyDB::default());
-        let mut evm = Context::mainnet().with_db(db).build_mainnet();
-
-        // Set up CREATE transaction with value
-        evm.tx.caller = caller;
-        evm.tx.kind = TxKind::Create;
-        evm.tx.value = U256::from(1000);
-        evm.tx.gas_limit = 100_000u64;
-        evm.tx.gas_price = 1;
-
-        // Zero6 active handler
-        let handler: ArcEvmHandler<_, EVMError<Infallible>> =
-            ArcEvmHandler::new(ArcHardforkFlags::with(&[ArcHardfork::Zero6]));
-        let result = handler.validate_initial_tx_gas(&mut evm);
-
-        assert!(result.is_ok(), "validate_initial_tx_gas should succeed");
-        let init_gas = result.unwrap();
-
-        // Base intrinsic gas for CREATE (53000) + 2 SLOADs (4200) = 57200
-        let expected_gas = 53000 + 2 * PRECOMPILE_SLOAD_GAS_COST;
-        assert_eq!(
-            init_gas.initial_gas, expected_gas,
-            "Zero6 CREATE with value: Should add 2 SLOAD costs for blocklist checks"
-        );
-    }
-
-    #[test]
-    fn test_validate_initial_tx_gas_zero6_gas_limit_exceeded() {
-        // Zero6: Should fail if gas limit is too low for blocklist checks
-        let caller = address!("8000000000000000000000000000000000000008");
-        let recipient = address!("9000000000000000000000000000000000000009");
-
-        let db: CacheDB<EmptyDBTyped<Infallible>> = CacheDB::new(EmptyDB::default());
-        let mut evm = Context::mainnet().with_db(db).build_mainnet();
-
-        // Set up transaction with value but gas limit just below required
-        // Base (21000) + 2 SLOADs (4200) = 25200 required
-        evm.tx.caller = caller;
-        evm.tx.kind = TxKind::Call(recipient);
-        evm.tx.value = U256::from(1000);
-        evm.tx.gas_limit = 25199u64; // Just below 25200
-        evm.tx.gas_price = 1;
-
-        // Zero6 active handler
-        let handler: ArcEvmHandler<_, EVMError<Infallible>> =
-            ArcEvmHandler::new(ArcHardforkFlags::with(&[ArcHardfork::Zero6]));
-        let result = handler.validate_initial_tx_gas(&mut evm);
-
-        assert!(
-            result.is_err(),
-            "validate_initial_tx_gas should fail with insufficient gas"
-        );
-        match result.unwrap_err() {
-            EVMError::Transaction(InvalidTransaction::CallGasCostMoreThanGasLimit { .. }) => {
-                // Expected error
-            }
-            err => panic!("Expected CallGasCostMoreThanGasLimit error, got: {:?}", err),
-        }
     }
 }

@@ -28,11 +28,14 @@ pub use arc_execution_config::chainspec::{
 mod tests {
     use super::*;
     use arc_execution_config::hardforks::ArcHardfork;
-    use reth_chainspec::Hardforks;
+    use reth_chainspec::{ForkCondition, Hardforks};
 
     #[test]
     fn test_localdev_with_hardforks_creates_valid_spec() {
-        let spec = localdev_with_hardforks(&[(ArcHardfork::Zero3, 0), (ArcHardfork::Zero4, 5)]);
+        let spec = localdev_with_hardforks(&[
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(5)),
+        ]);
 
         // Zero3 should be active at block 0
         assert!(spec.is_fork_active_at_block(ArcHardfork::Zero3, 0));
@@ -47,7 +50,10 @@ mod tests {
 
     #[test]
     fn test_zero4_at_block_3() {
-        let spec = localdev_with_hardforks(&[(ArcHardfork::Zero3, 0), (ArcHardfork::Zero4, 3)]);
+        let spec = localdev_with_hardforks(&[
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(3)),
+        ]);
 
         assert!(spec.is_fork_active_at_block(ArcHardfork::Zero3, 0));
         assert!(!spec.is_fork_active_at_block(ArcHardfork::Zero4, 2));
@@ -57,9 +63,9 @@ mod tests {
     #[test]
     fn test_zero5_at_block_5() {
         let spec = localdev_with_hardforks(&[
-            (ArcHardfork::Zero3, 0),
-            (ArcHardfork::Zero4, 0),
-            (ArcHardfork::Zero5, 5),
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(0)),
+            (ArcHardfork::Zero5, ForkCondition::Block(5)),
         ]);
 
         assert!(spec.is_fork_active_at_block(ArcHardfork::Zero3, 0));
@@ -71,10 +77,10 @@ mod tests {
     #[test]
     fn test_zero6_at_block_5() {
         let spec = localdev_with_hardforks(&[
-            (ArcHardfork::Zero3, 0),
-            (ArcHardfork::Zero4, 0),
-            (ArcHardfork::Zero5, 0),
-            (ArcHardfork::Zero6, 5),
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(0)),
+            (ArcHardfork::Zero5, ForkCondition::Block(0)),
+            (ArcHardfork::Zero6, ForkCondition::Block(5)),
         ]);
 
         assert!(spec.is_fork_active_at_block(ArcHardfork::Zero3, 0));

@@ -24,6 +24,7 @@ mod round;
 use std::marker::PhantomData;
 
 pub mod types {
+    pub use arc_consensus_types::signing::{Signer, VerifierExt};
     pub use arc_consensus_types::{
         Address, ArcContext, BlockHash, Height, Validator, ValidatorSet, ValueId, Vote,
     };
@@ -32,7 +33,6 @@ pub mod types {
         CertificateError, Context, NilOrVal, Round, RoundCertificateType, SignedVote,
         ThresholdParams, VoteType, VotingPower,
     };
-    pub use malachitebft_signing::{SigningProvider, SigningProviderExt};
     pub use malachitebft_signing_ed25519::{PrivateKey, Signature};
 }
 
@@ -384,6 +384,29 @@ where
                 "Expected valid certificate, but got error: {:?}",
                 result.unwrap_err()
             );
+        }
+    }
+
+    /// Verify that the certificate is invalid and the error matches the predicate.
+    pub fn expect_err_matches<F>(self, predicate: F)
+    where
+        F: Fn(&CertificateError<ArcContext>) -> bool,
+    {
+        let (certificate, validator_set) = self.build_certificate();
+
+        for signer in &self.signers {
+            let result = block_on(C::verify_certificate(
+                &self.ctx,
+                signer,
+                &certificate,
+                &validator_set,
+                ThresholdParams::default(),
+            ));
+
+            match result {
+                Err(ref e) if predicate(e) => {}
+                _ => panic!("Expected error matching predicate, but got: {result:?}"),
+            }
         }
     }
 

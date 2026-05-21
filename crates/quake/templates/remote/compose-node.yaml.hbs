@@ -5,8 +5,14 @@ services:
     image: {{images.el}}
     container_name: {{el_container_name}}
     entrypoint: ["/assets/entrypoint_el.sh"]
+    cap_add:
+      - NET_ADMIN # Required by latency_setup.sh to install tc/netem rules
     restart: unless-stopped
-    mem_limit: 2560M
+    init: true
+    {{#if el_cpu_limit}}
+    cpus: "{{el_cpu_limit}}"
+    {{/if}}
+    mem_limit: {{#if el_memory_limit_gb}}{{el_memory_limit_gb}}G{{else}}2560M{{/if}}
     healthcheck:
       test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/8545' || exit 1"]
       interval: 10s
@@ -30,6 +36,9 @@ services:
       - {{remote_home_dir}}/data/reth:/data/reth
       - {{remote_home_dir}}/logs:/var/log/arc
       - /shared:/shared:ro
+      {{#if latency_emulation}}
+      - /shared/{{node_name}}/latency_setup.sh:/usr/local/bin/latency_setup.sh:ro
+      {{/if}}
       {{#unless rpc}}
       - shared-socket-volume:/sockets/
       {{/unless}}
@@ -71,11 +80,17 @@ services:
     image: {{images.cl}}
     container_name: {{cl_container_name}}
     entrypoint: ["/assets/entrypoint_cl.sh"]
+    cap_add:
+      - NET_ADMIN # Required by latency_setup.sh to install tc/netem rules
     depends_on:
       {{el_container_name}}:
         condition: service_healthy
     restart: unless-stopped
-    mem_limit: 1024M
+    init: true
+    {{#if cl_cpu_limit}}
+    cpus: "{{cl_cpu_limit}}"
+    {{/if}}
+    mem_limit: {{#if cl_memory_limit_gb}}{{cl_memory_limit_gb}}G{{else}}1024M{{/if}}
     extra_hosts:
       - host.docker.internal:host-gateway
     ports:
@@ -92,6 +107,9 @@ services:
       - {{remote_home_dir}}/logs:/var/log/arc
       # Mount /shared so symlinks to NFS can be resolved inside the container
       - /shared:/shared:ro
+      {{#if latency_emulation}}
+      - /shared/{{node_name}}/latency_setup.sh:/usr/local/bin/latency_setup.sh:ro
+      {{/if}}
       {{#unless rpc}}
       - shared-socket-volume:/sockets/
       {{/unless}}

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use arc_execution_config::chainspec::{BaseFeeConfigProvider, BlockGasLimitProvider};
 use arc_execution_config::gas_fee::decode_base_fee_from_bytes;
-use arc_execution_config::hardforks::ArcHardfork;
+use arc_execution_config::hardforks::{is_arc_fork_active, ArcHardfork};
 
 /// Arc Network custom consensus implementation
 #[derive(Debug, Clone)]
@@ -146,7 +146,12 @@ where
     let Some(expected_base_fee) = decode_base_fee_from_bytes(parent.extra_data()) else {
         // Post-Zero5 this branch should be unreachable: `arc_validate_extra_data_format`
         // enforces that extra_data is exactly 8 bytes.
-        if chain_spec.is_fork_active_at_block(ArcHardfork::Zero5, parent.number()) {
+        if is_arc_fork_active(
+            chain_spec,
+            ArcHardfork::Zero5,
+            parent.number(),
+            parent.timestamp(),
+        ) {
             tracing::error!(
                 parent_number = parent.number(),
                 extra_data_len = parent.extra_data().len(),
@@ -181,7 +186,12 @@ fn arc_validate_extra_data_format<H: BlockHeader, CS: Hardforks>(
     header: &H,
     chain_spec: &CS,
 ) -> Result<(), ConsensusError> {
-    if !chain_spec.is_fork_active_at_block(ArcHardfork::Zero5, header.number()) {
+    if !is_arc_fork_active(
+        chain_spec,
+        ArcHardfork::Zero5,
+        header.number(),
+        header.timestamp(),
+    ) {
         return Ok(());
     }
 
@@ -212,7 +222,12 @@ fn arc_validate_header_base_fee<
     validate_header_base_fee(header, chain_spec)?;
 
     // Post-Zero5: enforce absolute bounds.
-    if !chain_spec.is_fork_active_at_block(ArcHardfork::Zero5, header.number()) {
+    if !is_arc_fork_active(
+        chain_spec,
+        ArcHardfork::Zero5,
+        header.number(),
+        header.timestamp(),
+    ) {
         return Ok(());
     }
 
@@ -241,7 +256,12 @@ fn arc_validate_gas_limit_bounds<H: BlockHeader, CS: Hardforks + BlockGasLimitPr
     header: &H,
     chain_spec: &CS,
 ) -> Result<(), ConsensusError> {
-    if !chain_spec.is_fork_active_at_block(ArcHardfork::Zero5, header.number()) {
+    if !is_arc_fork_active(
+        chain_spec,
+        ArcHardfork::Zero5,
+        header.number(),
+        header.timestamp(),
+    ) {
         return Ok(());
     }
 
@@ -269,7 +289,12 @@ fn arc_validate_beneficiary_nonzero<H: BlockHeader, CS: Hardforks>(
     header: &H,
     chain_spec: &CS,
 ) -> Result<(), ConsensusError> {
-    if !chain_spec.is_fork_active_at_block(ArcHardfork::Zero6, header.number()) {
+    if !is_arc_fork_active(
+        chain_spec,
+        ArcHardfork::Zero6,
+        header.number(),
+        header.timestamp(),
+    ) {
         return Ok(());
     }
 
@@ -931,7 +956,7 @@ mod tests {
         }
 
         // Pre-Zero5: bounds check is skipped entirely.
-        let pre_zero5 = localdev_with_hardforks(&[(ArcHardfork::Zero4, 0)]);
+        let pre_zero5 = localdev_with_hardforks(&[(ArcHardfork::Zero4, ForkCondition::Block(0))]);
         let header = Header {
             number: 1,
             base_fee_per_gas: Some(config.absolute_min_base_fee - 1),
@@ -975,7 +1000,7 @@ mod tests {
         ));
 
         // Pre-Zero5: length check is skipped entirely.
-        let pre_zero5 = localdev_with_hardforks(&[(ArcHardfork::Zero4, 0)]);
+        let pre_zero5 = localdev_with_hardforks(&[(ArcHardfork::Zero4, ForkCondition::Block(0))]);
         let header = Header {
             number: 1,
             extra_data: Bytes::from([0u8; 7].as_slice()),

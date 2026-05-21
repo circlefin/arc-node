@@ -19,6 +19,7 @@ import {
   addressToBytes32,
   buildImplContractAlloc,
   buildSystemContractAlloc,
+  enforceOperatorsNotProxyAdmin,
   schemaAddress,
   schemaBigInt,
   slotIndex,
@@ -86,6 +87,13 @@ export const schemaProtocolConfig = z
       .optional(),
   })
   .strict()
+  .superRefine((data, ctx) => {
+    enforceOperatorsNotProxyAdmin(ctx, 'ProtocolConfig', data.proxy.admin, [
+      { key: 'owner', value: data.owner },
+      { key: 'controller', value: data.controller },
+      { key: 'pauser', value: data.pauser },
+    ])
+  })
 
 export type ProtocolConfigConfig = z.infer<typeof schemaProtocolConfig>
 
@@ -172,20 +180,20 @@ export const buildProtocolConfigGenesisAllocs = async (ctx: BuilderContext, conf
       // ConsensusParams packed into one slot (8 * uint16 = 128 bits) in slot 5
       ...(consensusParams
         ? [
-          StorageSlot(
-            slotIndex(PROTOCOL_CONFIG_STORAGE_LOCATION + 5n),
-            toBytes32(
-              consensusParams.timeoutProposeMs |
-              (consensusParams.timeoutProposeDeltaMs << 16n) |
-              (consensusParams.timeoutPrevoteMs << 32n) |
-              (consensusParams.timeoutPrevoteDeltaMs << 48n) |
-              (consensusParams.timeoutPrecommitMs << 64n) |
-              (consensusParams.timeoutPrecommitDeltaMs << 80n) |
-              (consensusParams.timeoutRebroadcastMs << 96n) |
-              (consensusParams.targetBlockTimeMs << 112n),
+            StorageSlot(
+              slotIndex(PROTOCOL_CONFIG_STORAGE_LOCATION + 5n),
+              toBytes32(
+                consensusParams.timeoutProposeMs |
+                  (consensusParams.timeoutProposeDeltaMs << 16n) |
+                  (consensusParams.timeoutPrevoteMs << 32n) |
+                  (consensusParams.timeoutPrevoteDeltaMs << 48n) |
+                  (consensusParams.timeoutPrecommitMs << 64n) |
+                  (consensusParams.timeoutPrecommitDeltaMs << 80n) |
+                  (consensusParams.timeoutRebroadcastMs << 96n) |
+                  (consensusParams.targetBlockTimeMs << 112n),
+              ),
             ),
-          ),
-        ]
+          ]
         : []),
     ],
   })

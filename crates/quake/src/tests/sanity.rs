@@ -303,7 +303,7 @@ fn basic_test<'a>(
                 testnet.remote(RemoteSubcommand::Load { args }).await?;
             } else {
                 let config = build_spammer_config(load_rate, duration_s, &load_mix)?;
-                testnet.load(load_targets.clone(), &config).await?;
+                crate::load::load(testnet, load_targets.clone(), &config).await?;
             }
         } else {
             println!("\n── Observation ({duration_s}s, no load) ──────────────");

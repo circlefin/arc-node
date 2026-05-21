@@ -33,7 +33,7 @@
 /// `PrecompileErrorOrRevert::Revert(...)` are converted into an `Ok(PrecompileOutput)`
 /// carrying the revert payload; `PrecompileErrorOrRevert::Error(...)` becomes `Err`.
 /// If the calldata is shorter than 4 bytes or the selector is unknown, the macro
-/// charges `PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY` and returns a revert.
+/// charges `PRECOMPILE_EARLY_REVERT_GAS_PENALTY` and returns a revert.
 ///
 /// # Example
 /// ```rust,ignore
@@ -88,9 +88,9 @@
 /// - Fallback revert (with gas penalty) for unknown selectors or truncated input
 /// - Conversion of `PrecompileErrorOrRevert` into the final `Result`
 ///
-/// ABI decoding, gas accounting, and output encoding remain the arm body's job; call
-/// `<$fn_call>::abi_decode_raw` on the supplied calldata bytes when you need the
-/// decoded arguments.
+/// ABI decoding, gas accounting, and output encoding remain the arm body's job; use
+/// `helpers::abi_decode_raw_with_zero6_validation` on the supplied calldata bytes when
+/// you need the decoded arguments.
 #[macro_export]
 macro_rules! precompile {
     ($fn_name:ident, $precompile_input:ident, $hardfork_flags:ident; {
@@ -107,7 +107,7 @@ macro_rules! precompile {
 
             if input_bytes.len() < 4 {
                 return $crate::helpers::PrecompileErrorOrRevert::new_reverted_with_penalty(
-                    gas_counter, PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY, "Input too short").into();
+                    gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, "Input too short").into();
             }
 
             let selector: [u8; 4] = input_bytes[0..4].try_into().unwrap();
@@ -121,7 +121,7 @@ macro_rules! precompile {
                 ),*
                 _ => {
                     return $crate::helpers::PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY, "Invalid selector").into();
+                        gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, "Invalid selector").into();
                 },
             };
 

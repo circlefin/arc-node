@@ -230,16 +230,34 @@ impl WsClient {
         Err(eyre::eyre!("timeout waiting for notification"))
     }
 
-    /// Non-blockingly drain one pending inbound message.
+    /// Non-blockingly drain one pending inbound message and return its error,
+    /// if any.
     ///
-    /// In fire-and-forget mode the sender never reads responses, so the TCP
-    /// receive buffer fills and eventually stalls the send path via flow control.
-    /// Calling this after each send keeps the pipe clear.
-    pub(crate) async fn drain_one(&mut self) {
+    /// Successful responses return `None` — fire-and-forget mode already counts
+    /// them at submit time, so surfacing them here would double-count.
+    /// Server-reported errors return `Some(Err(...))` so the sender can forward
+    /// them to the result tracker. Pings are answered with a pong; close frames
+    /// surface as a connection error so the sender's reconnect path engages.
+    pub(crate) async fn drain_one_result(&mut self) -> Option<Result<u64>> {
         tokio::select! {
             biased;
-            _ = self.ws.next() => {}
-            _ = std::future::ready(()) => {}
+            msg = self.ws.next() => {
+                let msg = msg?.ok()?;
+                match classify_ws_message(msg) {
+                    Ok(WsMessageAction::Response(body)) => body
+                        .error
+                        .map(|JsonError { code, message }| {
+                            Err(eyre::eyre!("Server Error {}: {}", code, message))
+                        }),
+                    Ok(WsMessageAction::Ping(p)) => {
+                        let _ = self.ws.send(Message::Pong(p.into())).await;
+                        None
+                    }
+                    Ok(WsMessageAction::Closed) => Some(Err(WsError::ConnectionClosed.into())),
+                    _ => None,
+                }
+            }
+            _ = std::future::ready(()) => None,
         }
     }
 

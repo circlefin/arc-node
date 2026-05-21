@@ -17,7 +17,7 @@
 //! Hardfork transition e2e tests for Arc Chain.
 //!
 //! These tests verify that block production works correctly across
-//! hardfork boundaries for Zero4, Zero5, and Zero6 hardforks.
+//! hardfork boundaries for Zero4, Zero5, Zero6, and Zero7 hardforks.
 
 use arc_execution_config::hardforks::ArcHardfork;
 use arc_execution_e2e::{
@@ -26,7 +26,7 @@ use arc_execution_e2e::{
     ArcSetup, ArcTestBuilder,
 };
 use eyre::Result;
-use reth_chainspec::EthereumHardfork;
+use reth_chainspec::{EthereumHardfork, ForkCondition};
 
 #[tokio::test]
 async fn test_hardfork_active_at_genesis() -> Result<()> {
@@ -38,6 +38,7 @@ async fn test_hardfork_active_at_genesis() -> Result<()> {
         .with_action(AssertHardfork::is_active(ArcHardfork::Zero4))
         .with_action(AssertHardfork::is_active(ArcHardfork::Zero5))
         .with_action(AssertHardfork::is_active(ArcHardfork::Zero6))
+        .with_action(AssertHardfork::is_active(ArcHardfork::Zero7))
         .run()
         .await
 }
@@ -48,10 +49,11 @@ async fn test_sequential_hardfork_transitions() -> Result<()> {
     reth_tracing::init_test_tracing();
 
     let chain_spec = localdev_with_hardforks(&[
-        (ArcHardfork::Zero3, 2),
-        (ArcHardfork::Zero4, 4),
-        (ArcHardfork::Zero5, 6),
-        (ArcHardfork::Zero6, 8),
+        (ArcHardfork::Zero3, ForkCondition::Block(2)),
+        (ArcHardfork::Zero4, ForkCondition::Block(4)),
+        (ArcHardfork::Zero5, ForkCondition::Block(6)),
+        (ArcHardfork::Zero6, ForkCondition::Block(8)),
+        (ArcHardfork::Zero7, ForkCondition::Block(10)),
     ]);
 
     ArcTestBuilder::new()
@@ -61,6 +63,7 @@ async fn test_sequential_hardfork_transitions() -> Result<()> {
         .with_action(AssertHardfork::is_not_active(ArcHardfork::Zero4))
         .with_action(AssertHardfork::is_not_active(ArcHardfork::Zero5))
         .with_action(AssertHardfork::is_not_active(ArcHardfork::Zero6))
+        .with_action(AssertHardfork::is_not_active(ArcHardfork::Zero7))
         // Produce block 1-2 - Zero3 activates
         .with_action(ProduceBlocks::new(2))
         .with_action(AssertBlockNumber::new(2))
@@ -77,6 +80,10 @@ async fn test_sequential_hardfork_transitions() -> Result<()> {
         .with_action(ProduceBlocks::new(2))
         .with_action(AssertBlockNumber::new(8))
         .with_action(AssertHardfork::is_active(ArcHardfork::Zero6))
+        // Produce block 9-10 - Zero7 activates
+        .with_action(ProduceBlocks::new(2))
+        .with_action(AssertBlockNumber::new(10))
+        .with_action(AssertHardfork::is_active(ArcHardfork::Zero7))
         .run()
         .await
 }

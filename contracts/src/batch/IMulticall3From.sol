@@ -24,11 +24,16 @@ pragma solidity ^0.8.29;
 /// @dev EOA-only: aggregate-family entrypoints invoke the callFrom precompile,
 ///      which requires the sender argument (`msg.sender` of Multicall3From)
 ///      to equal the precompile caller or `tx.origin`. A contract caller is
-///      neither, so callFrom reverts and the entire batch reverts regardless
-///      of `requireSuccess` / `allowFailure`.
+///      neither, so the precompile rejects every subcall.
 ///
-///      Target-contract reverts are captured per-call in the `(success,
-///      returnData)` tuple and gated by `requireSuccess` / `allowFailure`.
+///      Precompile rejections are captured per-call in the `(success,
+///      returnData)` tuple, just like target-contract reverts. Failure-
+///      tolerant entrypoints (`aggregate3` with `allowFailure = true`,
+///      `tryAggregate(false, …)`, `tryBlockAndAggregate(false, …)`) return
+///      `success = false` with the precompile's revert reason in
+///      `returnData`. Hard-fail entrypoints (`aggregate`,
+///      `blockAndAggregate`, `tryAggregate(true, …)`, and `allowFailure =
+///      false` paths) still revert the entire batch.
 interface IMulticall3From {
     struct Call {
         address target;

@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use color_eyre::eyre::{Context, OptionExt, Result};
+use color_eyre::eyre::{bail, Context, OptionExt, Result};
 use indexmap::IndexMap;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -30,6 +30,9 @@ use tracing::{debug, trace};
 
 use crate::manifest::Node;
 use crate::nodes::NodesMetadata;
+
+/// Filename under `testnet_dir` where node-to-region assignments are persisted.
+pub(crate) const REGION_ASSIGNMENTS_FILENAME: &str = "region_assignments.json";
 
 /// AWS regions enum corresponding to the latency matrix indices
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, EnumString, Display)]
@@ -301,8 +304,8 @@ pub fn generate_latency_scripts(
         nodes_metadata.num_nodes()
     );
 
-    // Try to load region_assignments.json and assign regions to nodes based on the file
-    let assignments_path = &testnet_dir.join("region_assignments.json");
+    // Try to load the region assignments file and assign regions to nodes based on it
+    let assignments_path = &testnet_dir.join(REGION_ASSIGNMENTS_FILENAME);
     let assignments_path_str = assignments_path.display().to_string();
     if let Ok(region_assignments) = std::fs::read_to_string(assignments_path) {
         let region_assignments =
@@ -311,10 +314,10 @@ pub fn generate_latency_scripts(
             )?;
         for (node_name, region) in region_assignments.iter() {
             let node = nodes.get_mut(node_name).ok_or_eyre(format!(
-                "Node {node_name} in region_assignments.json not found in manifest"
+                "Node {node_name} in {REGION_ASSIGNMENTS_FILENAME} not found in manifest"
             ))?;
             if !Region::is_valid(region) {
-                color_eyre::eyre::bail!("Invalid region {region} in region_assignments.json");
+                bail!("Invalid region {region} in {REGION_ASSIGNMENTS_FILENAME}");
             }
             node.region = Some(region.clone());
         }
