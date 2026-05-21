@@ -151,6 +151,25 @@ export const slotForBytes32Map = (slotIndex: bigint, key: Bytes32): Bytes32 =>
   slotForUint256Map(slotIndex, fromHex(schemaBytes32.parse(key), 'bigint'))
 
 /**
+ * Emit a zod issue for any operator that collides with the contract's proxy admin.
+ */
+export const enforceOperatorsNotProxyAdmin = (
+  ctx: z.RefinementCtx,
+  contractName: string,
+  proxyAdmin: Address,
+  operators: ReadonlyArray<{ key: string; value: Address }>,
+) => {
+  for (const { key, value } of operators) {
+    if (value === proxyAdmin) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Operator ${key} cannot be the same as the proxy admin of ${contractName}`,
+      })
+    }
+  }
+}
+
+/**
  * bigintReplacer encode bigint to string.
  *
  * Example:

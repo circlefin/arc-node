@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 # Arcup - Arc node installer
 # Downloads and installs arc-node binaries from GitHub releases
 
 # NOTE: if you make modifications to this script, please increment the version number.
 # WARNING: the SemVer pattern: major.minor.patch must be followed as we use it to determine if the script is up to date.
-ARCUP_INSTALLER_VERSION="0.0.1"
+ARCUP_INSTALLER_VERSION="0.2.0"
 
 REPO="${ARC_REPO:-circlefin/arc-node}"
 if [[ -n "${ARC_REPO:-}" ]] && [[ ! "$ARC_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
@@ -16,14 +16,25 @@ fi
 # TODO: set GPG key fingerprint once release signing key is published
 GPG_KEY_FINGERPRINT=""
 GPG_KEYSERVER="keyserver.ubuntu.com"
-BIN_DIR="${ARC_BIN_DIR:-$HOME/.arc/bin}"
+ARC_DIR="${ARC_DIR:-${ARC_HOME:-$HOME/.arc}}"
+BIN_DIR="${ARC_BIN_DIR:-$ARC_DIR/bin}"
 # Self-update always uses the canonical repo to prevent hijack via ARC_REPO
 ARCUP_BIN_URL="https://raw.githubusercontent.com/circlefin/arc-node/main/arcup/arcup"
 ARCUP_BIN_PATH="$BIN_DIR/arcup"
+GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
+case "$GITHUB_API_URL" in
+    https://?*) GITHUB_API_URL="${GITHUB_API_URL%/}" ;;
+    *)
+        echo "error: invalid GITHUB_API_URL: '$GITHUB_API_URL' (expected https:// URL)" >&2
+        exit 1
+        ;;
+esac
+CURL_RETRY_ARGS=(--retry 3 --retry-delay 2 --connect-timeout 15)
 CURL_HEADERS=()
 if [ "${CURL_HEADER:-}" ]; then
     CURL_HEADERS=(-H "$CURL_HEADER")
 fi
+GITHUB_AUTH_TOKEN="${ARC_GITHUB_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
 
 # Binaries included in each release archive
 BINARIES=("arc-node-execution" "arc-node-consensus" "arc-snapshots")
@@ -56,6 +67,195 @@ error() {
     exit 1
 }
 
+require_command() {
+    local command_name="$1"
+    local message="$2"
+
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        error "$message"
+    fi
+}
+
+curl_with_headers() {
+    if ((${#CURL_HEADERS[@]} > 0)); then
+        curl "${CURL_RETRY_ARGS[@]}" "${CURL_HEADERS[@]}" "$@"
+    else
+        curl "${CURL_RETRY_ARGS[@]}" "$@"
+    fi
+}
+
+curl_github_api_json() {
+    local args=("${CURL_RETRY_ARGS[@]}" -H "Accept: application/vnd.github+json")
+    if [[ -n "$GITHUB_AUTH_TOKEN" ]]; then
+        args+=(-H "Authorization: Bearer $GITHUB_AUTH_TOKEN")
+    fi
+    if ((${#CURL_HEADERS[@]} > 0)); then
+        args+=("${CURL_HEADERS[@]}")
+    fi
+    curl "${args[@]}" "$@"
+}
+
+curl_github_api_json_anonymous() {
+    local args=("${CURL_RETRY_ARGS[@]}" -H "Accept: application/vnd.github+json")
+    if ((${#CURL_HEADERS[@]} > 0)); then
+        args+=("${CURL_HEADERS[@]}")
+    fi
+    curl "${args[@]}" "$@"
+}
+
+safe_curl_error() {
+    local message="$1"
+
+    if [[ -n "$GITHUB_AUTH_TOKEN" ]] || ((${#CURL_HEADERS[@]} > 0)); then
+        echo "request failed"
+    else
+        echo "$message"
+    fi
+}
+
+curl_github_asset_headers() {
+    if [[ -z "$GITHUB_AUTH_TOKEN" ]] && ((${#CURL_HEADERS[@]} == 0)); then
+        return 1
+    fi
+
+    local args=("${CURL_RETRY_ARGS[@]}" -H "Accept: application/octet-stream")
+    if [[ -n "$GITHUB_AUTH_TOKEN" ]]; then
+        args+=(-H "Authorization: Bearer $GITHUB_AUTH_TOKEN")
+    fi
+    if ((${#CURL_HEADERS[@]} > 0)); then
+        args+=("${CURL_HEADERS[@]}")
+    fi
+    curl "${args[@]}" "$@"
+}
+
+resolve_github_asset_download_url() {
+    local asset_api_url="$1"
+    local headers location
+
+    headers=$(curl_github_asset_headers -fsS -D - -o /dev/null "$asset_api_url") || return 1
+    location=$(printf '%s\n' "$headers" | awk '
+        /^[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]:[[:space:]]*/ {
+            sub(/\r$/, "")
+            sub(/^[^:]+:[[:space:]]*/, "")
+            print
+            exit
+        }
+    ')
+
+    [[ -n "$location" ]] || return 1
+    printf '%s\n' "$location"
+}
+
+require_install_prerequisites() {
+    require_command curl "curl not found. Please install curl."
+    require_command tar "tar not found. Please install tar."
+
+    if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+        error "No SHA-256 tool found. Please install sha256sum or shasum."
+    fi
+}
+
+extract_json_string_field() {
+    local field="$1"
+
+    awk -v field="$field" '
+        {
+            pattern = "\"" field "\"[[:space:]]*:[[:space:]]*\"[^\"]+\""
+            if (match($0, pattern)) {
+                value = substr($0, RSTART, RLENGTH)
+                prefix = "\"" field "\"[[:space:]]*:[[:space:]]*\""
+                sub("^" prefix, "", value)
+                sub("\"$", "", value)
+                print value
+                exit
+            }
+        }
+    '
+}
+
+extract_arc_asset_names() {
+    awk '
+        {
+            while (match($0, /"name"[[:space:]]*:[[:space:]]*"[^"]+"/)) {
+                value = substr($0, RSTART, RLENGTH)
+                sub(/^"name"[[:space:]]*:[[:space:]]*"/, "", value)
+                sub(/"$/, "", value)
+                if (value ~ /^arc-node-/) {
+                    print value
+                }
+                $0 = substr($0, RSTART + RLENGTH)
+            }
+        }
+    '
+}
+
+extract_asset_api_url() {
+    local asset_name="$1"
+
+    awk -v asset_name="$asset_name" '
+        BEGIN { RS = "\\{" }
+        {
+            compact = $0
+            gsub(/[[:space:]]+/, "", compact)
+            if (index(compact, "\"name\":\"" asset_name "\"") > 0 &&
+                match(compact, /"url":"[^"]+\/releases\/assets\/[0-9]+"/)) {
+                value = substr(compact, RSTART, RLENGTH)
+                sub(/^"url":"/, "", value)
+                sub(/"$/, "", value)
+                print value
+                exit
+            }
+        }
+    '
+}
+
+fetch_release_json() {
+    local tag="$1"
+    local api_url="$GITHUB_API_URL/repos/$REPO/releases/tags/$tag"
+
+    curl_github_api_json -fsSL "$api_url"
+}
+
+fetch_latest_release_json() {
+    local api_url="$GITHUB_API_URL/repos/$REPO/releases/latest"
+
+    curl_github_api_json -fsSL "$api_url"
+}
+
+fetch_latest_release_json_anonymous() {
+    local api_url="$GITHUB_API_URL/repos/$REPO/releases/latest"
+
+    curl_github_api_json_anonymous -fsSL "$api_url"
+}
+
+list_release_assets() {
+    local tag="$1"
+
+    fetch_release_json "$tag" 2>/dev/null | extract_arc_asset_names || true
+}
+
+download_error() {
+    local tag="$1"
+    local filename="$2"
+    local url="$3"
+    local assets
+
+    echo -e "${RED}error${NC}: Failed to download $filename from $url" >&2
+    echo "  repository: $REPO" >&2
+    echo "  tag:        $tag" >&2
+    echo "  target:     ${TARGET:-unknown}" >&2
+    assets="$(list_release_assets "$tag")"
+    if [[ -n "$assets" ]]; then
+        echo "Available arc-node release assets for $tag:" >&2
+        while IFS= read -r asset; do
+            echo "  $asset" >&2
+        done <<< "$assets"
+    else
+        echo "Could not list release assets for $tag. Confirm the tag exists and contains binary assets." >&2
+    fi
+    exit 1
+}
+
 # Compare SemVer versions
 # Returns 0 if $1 > $2, 1 otherwise
 version_gt() {
@@ -64,6 +264,8 @@ version_gt() {
     # Remove 'v' prefix if present
     local ver1="${1#v}"
     local ver2="${2#v}"
+    ver1="${ver1%%-*}"
+    ver2="${ver2%%-*}"
 
     IFS=. read -r major1 minor1 patch1 <<EOF
 $ver1
@@ -82,6 +284,20 @@ EOF
     return 1
 }
 
+normalize_version() {
+    local version="$1"
+
+    if [[ "$version" != v* ]]; then
+        version="v$version"
+    fi
+
+    if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?$ ]]; then
+        error "Invalid version format: '$1' (expected e.g. v1.2.3 or v1.2.3-rc.1)"
+    fi
+
+    echo "$version"
+}
+
 # Print installer version
 version() {
     echo "$ARCUP_INSTALLER_VERSION"
@@ -97,14 +313,72 @@ download_file() {
     local url="https://github.com/${REPO}/releases/download/${tag}/${filename}"
     local output_path="$output_dir/$filename"
 
-    if ! command -v curl >/dev/null 2>&1; then
-        error "curl not found. Please install curl."
-    fi
+    require_command curl "curl not found. Please install curl."
 
     info "Downloading $filename..."
-    if ! curl -#fL "${CURL_HEADERS[@]}" -o "$output_path" "$url"; then
-        error "Failed to download $filename from $url"
+    if download_file_with_github_api "$tag" "$filename" "$output_dir"; then
+        return
     fi
+
+    if download_file_with_gh "$tag" "$filename" "$output_dir"; then
+        return
+    fi
+
+    if ! curl_with_headers -#fL --max-time 900 -o "$output_path" "$url"; then
+        rm -f "$output_path"
+        download_error "$tag" "$filename" "$url"
+    fi
+}
+
+download_file_with_github_api() {
+    local tag="$1"
+    local filename="$2"
+    local output_dir="$3"
+    local output_path="$output_dir/$filename"
+    local release_json asset_api_url download_url
+
+    if [[ -z "$GITHUB_AUTH_TOKEN" ]] && ((${#CURL_HEADERS[@]} == 0)); then
+        return 1
+    fi
+
+    release_json=$(fetch_release_json "$tag" 2>/dev/null) || return 1
+    asset_api_url=$(printf '%s\n' "$release_json" | extract_asset_api_url "$filename")
+    if [[ -z "$asset_api_url" ]]; then
+        return 1
+    fi
+
+    download_url=$(resolve_github_asset_download_url "$asset_api_url") || return 1
+
+    if curl "${CURL_RETRY_ARGS[@]}" -fL --max-time 900 -o "$output_path" "$download_url" >/dev/null 2>&1; then
+        [[ -f "$output_path" ]] && return 0
+    fi
+
+    rm -f "$output_path"
+    return 1
+}
+
+download_file_with_gh() {
+    local tag="$1"
+    local filename="$2"
+    local output_dir="$3"
+    local output_path="$output_dir/$filename"
+
+    if ! command -v gh >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+        gh release download "$tag" \
+            --repo "$REPO" \
+            --pattern "$filename" \
+            --dir "$output_dir" \
+            --clobber \
+            >/dev/null 2>&1; then
+        [[ -f "$output_path" ]] && return 0
+    fi
+
+    rm -f "$output_path"
+    return 1
 }
 
 # Compute SHA256 hash of a file
@@ -112,19 +386,35 @@ compute_sha256() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | cut -d' ' -f1
     else
+        require_command shasum "No SHA-256 tool found. Please install sha256sum or shasum."
         shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# Check available disk space meets minimum requirement
+check_disk_space() {
+    local dir="$1"
+    local required_mb="${2:-500}"
+
+    local available_kb
+    available_kb=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2 {print $4}')
+
+    if [[ -n "$available_kb" ]]; then
+        local available_mb=$((available_kb / 1024))
+        if [[ "$available_mb" -lt "$required_mb" ]]; then
+            error "Insufficient disk space: ${available_mb}MB available, ${required_mb}MB required in $dir"
+        fi
     fi
 }
 
 # Check if arcup installer is up to date
 check_installer_up_to_date() {
-    if ! command -v curl >/dev/null 2>&1; then
-        error "curl not found. Please install curl."
-    fi
+    require_command curl "curl not found. Please install curl."
 
+    local response
     local remote_version
-    remote_version=$(curl -fsSL "${CURL_HEADERS[@]}" "$ARCUP_BIN_URL" 2>/dev/null | \
-        grep '^ARCUP_INSTALLER_VERSION=' | sed -E 's/ARCUP_INSTALLER_VERSION="(.+)"/\1/')
+    response=$(curl_with_headers -fsSL "$ARCUP_BIN_URL" 2>/dev/null || true)
+    remote_version=$(printf '%s\n' "$response" | awk -F'"' '/^ARCUP_INSTALLER_VERSION=/ {print $2; exit}')
 
     if [[ -z "$remote_version" ]]; then
         return
@@ -143,14 +433,12 @@ check_installer_up_to_date() {
 update_arcup() {
     info "Updating arcup..."
 
-    if ! command -v curl >/dev/null 2>&1; then
-        error "curl not found. Please install curl."
-    fi
+    require_command curl "curl not found. Please install curl."
 
     _ARCUP_TMP_FILE=$(mktemp)
 
     info "Downloading latest arcup..."
-    if ! curl -fsSL "${CURL_HEADERS[@]}" -o "$_ARCUP_TMP_FILE" "$ARCUP_BIN_URL"; then
+    if ! curl_with_headers -fsSL -o "$_ARCUP_TMP_FILE" "$ARCUP_BIN_URL"; then
         error "Failed to download arcup update"
     fi
 
@@ -174,7 +462,52 @@ update_arcup() {
     fi
 
     echo ""
-    info "✓ Arcup updated successfully to version $remote_version"
+    info "Arcup updated successfully to version $remote_version"
+    exit 0
+}
+
+# Remove arc binaries and env files
+uninstall() {
+    local found=0
+    local items=()
+
+    for binary in "${BINARIES[@]}"; do
+        [[ -f "$BIN_DIR/$binary" ]] && items+=("  $BIN_DIR/$binary") && found=1
+    done
+    [[ -f "$ARCUP_BIN_PATH" ]] && items+=("  $ARCUP_BIN_PATH") && found=1
+    [[ -f "$ARC_DIR/env" ]] && items+=("  $ARC_DIR/env") && found=1
+    [[ -f "$ARC_DIR/env.fish" ]] && items+=("  $ARC_DIR/env.fish") && found=1
+
+    if [[ "$found" -eq 0 ]]; then
+        info "Nothing to uninstall — no arc binaries found in $BIN_DIR"
+        exit 0
+    fi
+
+    echo "The following will be removed:"
+    for item in "${items[@]}"; do
+        echo "$item"
+    done
+    echo ""
+
+    printf "Proceed? [y/N] "
+    read -r confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        info "Uninstall cancelled."
+        exit 0
+    fi
+
+    for binary in "${BINARIES[@]}"; do
+        rm -f "$BIN_DIR/$binary"
+    done
+    rm -f "$ARCUP_BIN_PATH"
+    rm -f "$ARC_DIR/env" "$ARC_DIR/env.fish"
+
+    # Remove BIN_DIR only if empty
+    rmdir "$BIN_DIR" 2>/dev/null || true
+
+    echo ""
+    info "Arc binaries removed."
+    info "You may also want to remove the PATH entries from your shell config (~/.zshenv, ~/.bashrc, etc.)."
     exit 0
 }
 
@@ -195,20 +528,25 @@ while [[ $# -gt 0 ]]; do
         -U|--self-update)
             update_arcup
             ;;
+        --uninstall)
+            uninstall
+            ;;
         -h|--help)
             echo "Usage: arcup [OPTIONS]"
             echo ""
             echo "Options:"
             echo "  -v, --version         Print arcup installer version"
             echo "  -i, --install <VER>   Install specific arc-node version (e.g., v1.0.0)"
-            echo "  -U, --self-update          Update arcup to the latest version"
+            echo "  -U, --self-update     Update arcup to the latest version"
+            echo "      --uninstall       Remove arc binaries and env files"
             echo "  -h, --help            Show this help message"
             echo ""
             echo "Examples:"
             echo "  arcup                   # Install latest release"
             echo "  arcup -i v1.0.0         # Install specific version"
             echo "  arcup -v                # Print installer version"
-            echo "  arcup --self-update          # Update arcup itself"
+            echo "  arcup --self-update     # Update arcup itself"
+            echo "  arcup --uninstall       # Remove arc installation"
             exit 0
             ;;
         *)
@@ -217,8 +555,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -n "$VERSION" ]] && [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
-    error "Invalid version format: '$VERSION' (expected e.g. v1.2.3)"
+if [[ -n "$VERSION" ]]; then
+    VERSION="$(normalize_version "$VERSION")"
 fi
 
 # Detect platform
@@ -257,8 +595,7 @@ detect_arch() {
             echo "arm64"
             ;;
         *)
-            warn "Unknown architecture: $arch, defaulting to amd64"
-            echo "amd64"
+            error "Unsupported architecture: $arch"
             ;;
     esac
 }
@@ -272,7 +609,7 @@ detect_target() {
         darwin)
             case "$arch" in
                 arm64) echo "aarch64-apple-darwin" ;;
-                amd64) echo "x86_64-apple-darwin" ;;
+                amd64) error "macOS Intel release builds are not supported" ;;
                 *) error "Unsupported Darwin architecture: $arch" ;;
             esac
             ;;
@@ -291,24 +628,87 @@ detect_target() {
 
 # Get latest release tag from GitHub
 get_latest_version() {
-    if ! command -v curl >/dev/null 2>&1; then
-        error "curl not found. Please install curl."
-    fi
+    require_command curl "curl not found. Please install curl."
 
-    local api_url="https://api.github.com/repos/$REPO/releases/latest"
-    local response
-    if ! response=$(curl -fsSL "${CURL_HEADERS[@]}" "$api_url" 2>&1); then
-        error "Failed to fetch latest version from '$api_url': $response"
+    local response token_error
+    if ! response=$(fetch_latest_release_json 2>&1); then
+        token_error="$(safe_curl_error "$response")"
+        if [[ -n "$GITHUB_AUTH_TOKEN" ]] && response=$(fetch_latest_release_json_anonymous 2>&1); then
+            :
+        else
+            error "Failed to fetch latest version from '$GITHUB_API_URL/repos/$REPO/releases/latest': $token_error"
+        fi
     fi
 
     local version
-    version=$(echo "$response" | grep '"tag_name":' | head -n 1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    version=$(printf '%s\n' "$response" | extract_json_string_field "tag_name")
 
     if [[ -z "$version" ]]; then
         error "Failed to parse version from GitHub API response"
     fi
 
-    echo "$version"
+    normalize_version "$version"
+}
+
+verify_checksum_file() {
+    local archive_path="$1"
+    local checksum_path="$2"
+    local archive_name="$3"
+    local expected_checksum expected_name actual_checksum
+
+    if ! read -r expected_checksum expected_name < "$checksum_path"; then
+        error "Checksum file is empty: $checksum_path"
+    fi
+
+    if [[ ! "$expected_checksum" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+        error "Checksum file has invalid SHA-256 hash: $checksum_path"
+    fi
+
+    if [[ -n "$expected_name" ]]; then
+        expected_name="${expected_name#\*}"
+        expected_name="${expected_name##*/}"
+        if [[ "$expected_name" != "$archive_name" ]]; then
+            error "Checksum file is for '$expected_name', expected '$archive_name'"
+        fi
+    fi
+
+    actual_checksum=$(compute_sha256 "$archive_path")
+
+    if [[ "$expected_checksum" != "$actual_checksum" ]]; then
+        error "Checksum verification failed
+  Expected: $expected_checksum
+  Actual:   $actual_checksum"
+    fi
+}
+
+validate_archive_contents() {
+    local archive_path="$1"
+    local listing metadata entry type
+
+    if ! listing=$(tar -tzf "$archive_path"); then
+        error "Failed to read archive: $archive_path"
+    fi
+
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        case "$entry" in
+            /* | .. | ../* | */../* | */.. )
+                error "Archive contains unsafe path: $entry" ;;
+        esac
+    done <<< "$listing"
+
+    if ! metadata=$(tar -tvzf "$archive_path"); then
+        error "Failed to inspect archive metadata: $archive_path"
+    fi
+
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        type="${entry:0:1}"
+        case "$type" in
+            l | h )
+                error "Archive contains unsupported link entry: $entry" ;;
+        esac
+    done <<< "$metadata"
 }
 
 # Install a single binary from TMP_DIR to BIN_DIR
@@ -316,8 +716,8 @@ install_binary() {
     local name="$1"
     local src="$TMP_DIR/$name"
 
-    if [[ ! -f "$src" ]]; then
-        error "Binary not found in archive: $name"
+    if [[ -L "$src" || ! -f "$src" ]]; then
+        error "Binary not found as a regular file in archive: $name"
     fi
 
     local dst="$BIN_DIR/$name"
@@ -338,6 +738,7 @@ install_binary() {
 
 # Main installation logic
 main() {
+    require_install_prerequisites
     check_installer_up_to_date
 
     info "Installing arc-node binaries..."
@@ -349,10 +750,12 @@ main() {
 
     mkdir -p "$BIN_DIR"
 
+    check_disk_space "$BIN_DIR"
+
     PLATFORM=$(detect_platform)
     ARCH=$(detect_arch)
     TARGET=$(detect_target "$PLATFORM" "$ARCH")
-    info "Detected platform: $PLATFORM ($ARCH)"
+    info "Detected platform: $PLATFORM ($ARCH); release target: $TARGET"
 
     if [[ -z "$VERSION" ]]; then
         info "Fetching latest release version..."
@@ -377,16 +780,9 @@ main() {
     info "Verifying checksum..."
     download_file "$VERSION_TAG" "${ARCHIVE_NAME}.sha256" "$TMP_DIR"
 
-    EXPECTED_CHECKSUM=$(head -n1 "$TMP_DIR/${ARCHIVE_NAME}.sha256" | awk '{print $1}')
-    ACTUAL_CHECKSUM=$(compute_sha256 "$ARCHIVE_PATH")
+    verify_checksum_file "$ARCHIVE_PATH" "$TMP_DIR/${ARCHIVE_NAME}.sha256" "$ARCHIVE_NAME"
 
-    if [ "$EXPECTED_CHECKSUM" != "$ACTUAL_CHECKSUM" ]; then
-        error "Checksum verification failed
-  Expected: $EXPECTED_CHECKSUM
-  Actual:   $ACTUAL_CHECKSUM"
-    fi
-
-    info "Checksum verified ✓"
+    info "Checksum verified"
 
     # GPG signature verification
     if [[ -n "$GPG_KEY_FINGERPRINT" ]]; then
@@ -404,7 +800,7 @@ main() {
 
             if gpg --list-keys "$GPG_KEY_FINGERPRINT" >/dev/null 2>&1; then
                 if gpg --batch --verify "$TMP_DIR/${ARCHIVE_NAME}.asc" "$ARCHIVE_PATH" 2>/dev/null; then
-                    info "GPG signature verified ✓"
+                    info "GPG signature verified"
                 else
                     error "GPG signature verification failed. The binary may have been tampered with."
                 fi
@@ -415,13 +811,7 @@ main() {
         fi
     fi
 
-    # Validate archive contents before extracting (guard against path traversal)
-    while IFS= read -r entry; do
-        case "$entry" in
-            /* | .. | ../* | */../* | */.. )
-                error "Archive contains unsafe path: $entry" ;;
-        esac
-    done < <(tar -tzf "$ARCHIVE_PATH")
+    validate_archive_contents "$ARCHIVE_PATH"
 
     # Extract archive
     info "Extracting archive..."
@@ -433,7 +823,7 @@ main() {
     done
 
     echo ""
-    info "✓ Arc node $VERSION_TAG installed successfully!"
+    info "Arc node $VERSION_TAG installed successfully!"
     echo ""
 
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
@@ -446,4 +836,6 @@ main() {
     fi
 }
 
-main
+if [[ "${ARCUP_SKIP_MAIN:-}" != "1" ]]; then
+    main
+fi

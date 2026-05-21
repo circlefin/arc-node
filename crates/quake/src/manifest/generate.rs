@@ -235,8 +235,10 @@ impl Manifest {
         nodes = Self::apply_region_strategy(nodes, config.region_strategy, &mut rng)
             .context("Failed to apply region strategy")?;
 
-        for (_name, node) in nodes.iter_mut() {
-            node.cl_config = Self::random_cl_node_config(&mut rng, &node.node_type);
+        for (name, node) in nodes.iter_mut() {
+            let allow_no_consensus =
+                Self::can_skip_consensus(config.topology, name, &node.node_type);
+            node.cl_config = Self::random_cl_node_config(&mut rng, allow_no_consensus);
             node.el_config = Self::random_el_node_config(&mut rng);
         }
 
@@ -264,11 +266,39 @@ impl Manifest {
             nodes,
             node_groups: IndexMap::new(),
             el_init_hardfork,
+            node_size: None,
+            cc_size: None,
+            node_disk_gb: None,
+            cc_disk_gb: None,
+            extra_account_balance_usdc: None,
+            block_gas_limit: None,
+            node_volume_type: None,
+            node_volume_iops: None,
+            el_cpu_limit: None,
+            el_memory_limit_gb: None,
+            cl_cpu_limit: None,
+            cl_memory_limit_gb: None,
         })
     }
 
+    /// Whether a node may roll `no_consensus = true` without partitioning consensus.
+    ///
+    /// Validators are never eligible. In the complex topology, sentry-1, sentry-2, and the
+    /// relayer all sit on the only path between validator clusters; disabling consensus on
+    /// any of them leaves at least one cluster unable to reach quorum. Only `full-*` leaves
+    /// are safe to opt out.
+    fn can_skip_consensus(topology: NetworkTopology, name: &str, node_type: &NodeType) -> bool {
+        if !matches!(node_type, NodeType::NonValidator) {
+            return false;
+        }
+        match topology {
+            NetworkTopology::Complex => name.starts_with("full"),
+            NetworkTopology::Single | NetworkTopology::FiveNodes => false,
+        }
+    }
+
     /// Build random per-node CL (Consensus Layer) config.
-    fn random_cl_node_config(rng: &mut StdRng, node_type: &NodeType) -> manifest::NodeClConfig {
+    fn random_cl_node_config(rng: &mut StdRng, allow_no_consensus: bool) -> manifest::NodeClConfig {
         use malachitebft_config::{LogFormat, LogLevel};
 
         // Runtime: 30% single_threaded, 70% multi_threaded; worker_threads 1-16 when multi.
@@ -307,8 +337,7 @@ impl Manifest {
 
         let log_format = [LogFormat::Plaintext, LogFormat::Json].choose(rng).copied();
 
-        // Only non-validators can skip consensus; setting this on a validator would break liveness.
-        let no_consensus = matches!(node_type, NodeType::NonValidator) && rng.gen_bool(0.1);
+        let no_consensus = allow_no_consensus && rng.gen_bool(0.1);
 
         manifest::NodeClConfig::Modern(StartCmd {
             runtime_flavor,
@@ -993,6 +1022,49 @@ mod tests {
             matches!(conn, EngineApiConnection::Rpc | EngineApiConnection::Ipc),
             "engine_api_connection = {conn:?}"
         );
+    }
+
+    /// Regression: complex topology routes inter-cluster consensus traffic through
+    /// sentry-1, sentry-2, and the relayer. If any of them rolls `no_consensus = true`
+    /// the network partitions and no validator ever reaches height 1. Only `full-*`
+    /// leaves may opt out. Sweep many seeds to make sure the per-node 10% roll never
+    /// hits a bridge.
+    #[test]
+    fn test_complex_topology_bridges_always_participate_in_consensus() {
+        let config = GenerationConfig {
+            topology: NetworkTopology::Complex,
+            height_strategy: HeightStrategy::AllZero,
+            region_strategy: RegionStrategy::SingleRegion,
+        };
+
+        for seed in 0..200 {
+            let manifest = Manifest::generate_random(seed, &config).unwrap();
+            for name in ["sentry-1", "sentry-2", "relayer"] {
+                let node = manifest
+                    .nodes
+                    .get(name)
+                    .unwrap_or_else(|| panic!("seed {seed}: {name} missing"));
+                let manifest::NodeClConfig::Modern(cmd) = &node.cl_config else {
+                    panic!("seed {seed}: {name} expected Modern cl_config");
+                };
+                assert!(
+                    !cmd.no_consensus,
+                    "seed {seed}: {name} must keep no_consensus=false (would partition consensus)"
+                );
+            }
+            for (name, node) in &manifest.nodes {
+                if node.node_type != NodeType::Validator {
+                    continue;
+                }
+                let manifest::NodeClConfig::Modern(cmd) = &node.cl_config else {
+                    panic!("seed {seed}: validator {name} expected Modern cl_config");
+                };
+                assert!(
+                    !cmd.no_consensus,
+                    "seed {seed}: validator {name} must never have no_consensus=true"
+                );
+            }
+        }
     }
 
     #[test]

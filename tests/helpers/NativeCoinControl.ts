@@ -14,8 +14,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { Address, parseAbi, PublicClient, RpcSchema, Transport, Chain, Account } from 'viem'
+import { Address, Hex, parseAbi, PublicClient, RpcSchema, Transport, Chain, Account, toHex } from 'viem'
 import { nativeCoinControlAddress } from '../../scripts/genesis'
+import { slotForAddressMap } from '../../scripts/genesis/types'
+
+const BLOCKLIST_MAPPING_SLOT = 2n
+const UNBLOCKLISTED_STATUS: Hex = toHex(0n, { size: 32 })
 
 export const ERR_BLOCKED_ADDRESS = /Blocked address/
 
@@ -29,6 +33,23 @@ export class NativeCoinControl {
     'event Blocklisted(address indexed account)',
     'event UnBlocklisted(address indexed account)',
   ])
+
+  /**
+   * State override that clears the blocklist entry for `address` in
+   * NativeCoinControl's `isBlocklisted` mapping. Needed for simulations where
+   * a blocklisted address (e.g. the NativeFiatToken contract, per genesis)
+   * appears as the tx caller; the EVM handler's pre-execution sender check
+   * would otherwise reject the tx.
+   */
+  static unblockStateOverride = (address: Address) => ({
+    address: NativeCoinControl.address,
+    stateDiff: [
+      {
+        slot: slotForAddressMap(BLOCKLIST_MAPPING_SLOT, address),
+        value: UNBLOCKLISTED_STATUS,
+      },
+    ],
+  })
 
   static isBlocklisted = async <
     T extends Transport,

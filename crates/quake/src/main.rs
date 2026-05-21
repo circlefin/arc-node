@@ -37,7 +37,6 @@ use crate::manifest::{generate_manifests, EngineApiConnection};
 use crate::perturb::{PERTURB_MAX_TIME_OFF, PERTURB_MIN_TIME_OFF};
 use crate::valset::ValidatorPowerUpdate;
 
-use clean::{clean_scope, CleanScope};
 use perturb::Perturbation;
 use testnet::{Testnet, TestnetError};
 
@@ -48,6 +47,7 @@ mod genesis;
 mod info;
 mod infra;
 mod latency;
+mod load;
 mod manifest;
 mod mcp;
 mod mesh;
@@ -65,6 +65,7 @@ mod tests;
 mod util;
 mod valset;
 mod wait;
+mod web;
 
 const DEFAULT_NUM_EXTRA_PREFUNDED_ACCOUNTS: usize = 100;
 
@@ -177,6 +178,11 @@ enum Commands {
         #[command(subcommand)]
         command: RemoteSubcommand,
     },
+    /// Manage monitoring services (Prometheus, Grafana, Blockscout)
+    Monitoring {
+        #[command(subcommand)]
+        command: MonitoringSubcommand,
+    },
     /// Send transaction load to the testnet (backpressure mode: waits for each
     /// response and only advances the nonce on success).
     /// Use --mix to blend transaction types (e.g., --mix transfer=70,erc20=30).
@@ -231,7 +237,7 @@ enum Commands {
     /// IMPORTANT: Quote patterns to prevent shell expansion, e.g., 'n*:*peer*'
     ///
     /// Examples:
-    ///   quake test                       - Run all tests
+    ///   quake test                       - Run all tests (except excluded groups: validation, health, validator_set, perf)
     ///   quake test probe                 - Run all tests in probe group
     ///   quake test 'n*'                  - Run tests in groups starting with n
     ///   quake test 'n*:*peer*'           - Run tests containing 'peer' in groups starting with n
@@ -322,6 +328,36 @@ enum Commands {
         #[clap(long = "set", value_parser = parse_key_value)]
         params: Vec<(String, String)>,
     },
+    /// Start a web server to visualize the testnet network topology (local mode only)
+    Web {
+        /// Host/IP address to bind the web server to
+        #[clap(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port for the web server
+        #[clap(long, default_value = "7777")]
+        port: u16,
+        /// Frontend topology poll interval in milliseconds
+        ///
+        /// A WebSocket subscriber polls new block headers to update block
+        /// heights in real-time as blocks arrive. When the chain stalls (no new
+        /// blocks being produced), the WS stream goes silent, and no data
+        /// flows. For that we have the EL peer refresh poller.
+        ///
+        /// CL data (/network-state and /status) is fetched inline during each
+        /// topology refresh request.
+        #[clap(long, default_value = "1000")]
+        refresh_ms: u64,
+        /// EL peer refresh poller interval in milliseconds
+        ///
+        /// Polls admin_peers to update EL peer connection data (who is
+        /// connected, trusted, inbound, static). This runs independently of
+        /// block production, so peer data stays fresh even during chain stalls.
+        #[clap(long, default_value = "1000")]
+        el_refresh_ms: u64,
+        /// Docker container status poller interval in milliseconds
+        #[clap(long, default_value = "1000")]
+        container_refresh_ms: u64,
+    },
     /// Start an MCP (Model Context Protocol) server for AI-assisted testnet management.
     ///
     /// By default uses stdio transport (for Claude Code, Cursor, etc.).
@@ -347,6 +383,12 @@ struct SetupArgs {
     /// Number of extra pre-funded accounts to generate in the genesis file (for sending transaction load)
     #[clap(short = 'e', long, default_value_t = DEFAULT_NUM_EXTRA_PREFUNDED_ACCOUNTS)]
     num_extra_accounts: usize,
+    /// Initial balance for each prefunded account in whole token units (overrides manifest value, default 1_000_000)
+    #[clap(long, value_parser = clap::value_parser!(u64).range(1..))]
+    extra_account_balance: Option<u64>,
+    /// ProtocolConfig blockGasLimit and genesis header gas limit (overrides manifest value, default 30_000_000)
+    #[clap(long, value_parser = clap::value_parser!(u64).range(1..))]
+    block_gas_limit: Option<u64>,
 }
 
 #[derive(Args)]
@@ -407,25 +449,32 @@ pub(crate) struct InfraArgs {
     /// Long runs need more than the default root volume when debug logs fill the disk;
     /// pair with `--node-size` for RAM headroom. When set, must be at least **8** (typical
     /// lower bound vs AMI snapshot size; AWS may still require a larger minimum for a given AMI).
-    #[clap(long, value_name = "GIB", value_parser = clap::value_parser!(u32).range(8..))]
+    #[clap(long, value_name = "GIB", value_parser = clap::value_parser!(u32).range(crate::manifest::MIN_DISK_GB as i64..))]
     node_disk_gb: Option<u32>,
     /// Root EBS volume size for the Control Center (GiB). Omit to use the AMI default.
     ///
     /// When set, must be at least **8** (see `--node-disk-gb`).
-    #[clap(long, value_name = "GIB", value_parser = clap::value_parser!(u32).range(8..))]
+    #[clap(long, value_name = "GIB", value_parser = clap::value_parser!(u32).range(crate::manifest::MIN_DISK_GB as i64..))]
     cc_disk_gb: Option<u32>,
+    /// Root EBS volume type for nodes (e.g. `gp3`, `io2`). Omit to use the Terraform default (`gp3`).
+    ///
+    /// Pair with `--node-volume-iops` for `gp3`/`io1`/`io2`. Validated against AWS-supported types.
+    #[clap(long, value_name = "TYPE")]
+    node_volume_type: Option<String>,
+    /// Provisioned IOPS for the node root EBS volume.
+    ///
+    /// Only meaningful for `gp3`, `io1`, and `io2` volumes. AWS will reject finer-grained
+    /// violations (per-type maxima, volume-size ratio) at apply time.
+    #[clap(long, value_name = "IOPS", value_parser = clap::value_parser!(u32).range(100..=256_000))]
+    node_volume_iops: Option<u32>,
 }
 
 #[derive(Args)]
 struct CleanArgs {
     /// Remove all data, including the testnet directory and monitoring services
     #[clap(short = 'a', long, default_value = "false")]
-    #[clap(conflicts_with_all = ["data", "execution_data", "consensus_data", "monitoring"])]
+    #[clap(conflicts_with_all = ["data", "execution_data", "consensus_data"])]
     all: bool,
-
-    /// Stop monitoring services and remove their data
-    #[clap(short = 'm', long, default_value = "false")]
-    monitoring: bool,
     /// Remove only execution and consensus layer data, preserving configuration
     #[clap(short = 'd', long, default_value = "false")]
     #[clap(conflicts_with_all = ["execution_data", "consensus_data"])]
@@ -439,12 +488,12 @@ struct CleanArgs {
 }
 
 impl CleanArgs {
-    fn scope(&self) -> CleanScope {
-        clean_scope(
+    fn scope(&self) -> clean::Scope {
+        clean::Scope::from_cli_flags(
+            self.all,
             self.data,
             self.execution_data,
             self.consensus_data,
-            self.monitoring,
         )
     }
 }
@@ -608,27 +657,16 @@ pub(crate) enum RemoteSubcommand {
         /// Command to run on the node or CC server; if not provided, will open an interactive shell
         command: Vec<String>,
     },
+    /// [Deprecated: use `quake load` directly — it now works for both local and remote testnets]
+    ///
     /// Send transaction load to the nodes by running `quake load` from the Control
     /// Center (backpressure mode).
-    ///
-    /// It accepts the same arguments as the `load` command.
-    ///
-    /// Examples:
-    ///   Local network:
-    ///   `./quake load --targets validator1,validator2 -r 200 -t 60`
-    ///   Remote network:
-    ///   `./quake remote load -- --targets validator1,validator2 -r 200 -t 60`
     #[command(verbatim_doc_comment)]
     Load { args: Vec<String> },
+    /// [Deprecated: use `quake spam` directly — it now works for both local and remote testnets]
+    ///
     /// Send transaction load to the nodes by running `quake spam` from the Control Center
     /// (fire-and-forget mode).
-    ///
-    /// It accepts the same arguments as the `spam` command.
-    /// Example:
-    ///   Local network:
-    ///   `./quake spam --targets validator1,validator2 -r 200 -t 60`
-    ///   Remote network:
-    ///   `./quake remote spam -- --targets validator1,validator2 -r 200 -t 60`
     #[command(verbatim_doc_comment)]
     Spam { args: Vec<String> },
     /// Export a JSON file with everything needed for another user to access this remote testnet
@@ -649,6 +687,16 @@ pub(crate) enum RemoteSubcommand {
         #[clap(subcommand)]
         command: DownloadSubcommand,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MonitoringSubcommand {
+    /// Start monitoring services
+    Start,
+    /// Stop monitoring services
+    Stop,
+    /// Stop monitoring services and clean monitoring data
+    Clean,
 }
 
 /// A datetime accepted by `--from`/`--to` flags, converted to a Unix timestamp.
@@ -746,22 +794,20 @@ pub(crate) enum SSMSubcommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+
     let cli = Cli::parse();
 
-    // Initialize tracing
     let level = cli.verbosity.tracing_level_filter();
     let filter = EnvFilter::builder()
         .with_default_directive(level.into())
         .from_env()?
         .add_directive("hyper_util::client=info".parse()?)
         .add_directive("arc_node_consensus_cli::new=info".parse()?);
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_ansi(std::io::stdout().is_terminal())
+    tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .context("Failed to set tracing subscriber")?;
+        .with_ansi(std::io::stdout().is_terminal())
+        .init();
 
     tracing::info!(
         version = arc_version::GIT_VERSION,
@@ -837,7 +883,13 @@ async fn main() -> Result<()> {
             let rpc = args.rpc || rpc_manifest;
             testnet
                 .with_seed(cli.seed)
-                .setup(args.force, rpc, args.num_extra_accounts)
+                .setup(
+                    args.force,
+                    rpc,
+                    args.num_extra_accounts,
+                    args.extra_account_balance,
+                    args.block_gas_limit,
+                )
                 .await?;
         }
         Commands::Build { args } => {
@@ -862,18 +914,12 @@ async fn main() -> Result<()> {
         Commands::Stop {
             nodes_or_containers,
         } => testnet.stop(nodes_or_containers).await?,
-        Commands::Clean { clean_args } => {
-            testnet
-                .clean(clean_args.scope(), clean_args.all || clean_args.monitoring)
-                .await?
-        }
+        Commands::Clean { clean_args } => testnet.clean(clean_args.scope()).await?,
         Commands::Restart {
             clean_args,
             start_args,
         } => {
-            testnet
-                .clean(clean_args.scope(), clean_args.all || clean_args.monitoring)
-                .await?;
+            testnet.clean(clean_args.scope()).await?;
             pre_start(
                 &mut testnet,
                 &start_args,
@@ -899,23 +945,28 @@ async fn main() -> Result<()> {
         Commands::Logs { names, follow } => testnet.logs(names, follow).await?,
         Commands::Info { command } => testnet.info(command).await?,
         Commands::Remote { command } => testnet.remote(command).await?,
+        Commands::Monitoring { command } => testnet.monitoring(command).await?,
         Commands::Load { targets, args } => {
-            if testnet.is_remote() {
-                bail!("Remote infrastructure does not support the `load` command. Please run `remote load` instead.");
-            }
-            let config = args.to_config(cli.verbosity.is_silent(), false);
-            config.validate()?;
             let target_nodes = targets.unwrap_or_default();
-            testnet.load(target_nodes, &config).await?;
+            load::run(
+                &testnet,
+                target_nodes,
+                &args,
+                false,
+                cli.verbosity.is_silent(),
+            )
+            .await?;
         }
         Commands::Spam { targets, args } => {
-            if testnet.is_remote() {
-                bail!("Remote infrastructure does not support the `spam` command. Please run `remote spam` instead.");
-            }
-            let config = args.to_config(cli.verbosity.is_silent(), true);
-            config.validate()?;
             let target_nodes = targets.unwrap_or_default();
-            testnet.load(target_nodes, &config).await?;
+            load::run(
+                &testnet,
+                target_nodes,
+                &args,
+                true,
+                cli.verbosity.is_silent(),
+            )
+            .await?;
         }
         Commands::ValSet { updates } => testnet.valset_update(updates).await?,
         Commands::Test {
@@ -961,6 +1012,26 @@ async fn main() -> Result<()> {
                     .await?
             }
         },
+        Commands::Web {
+            host,
+            port,
+            refresh_ms,
+            el_refresh_ms,
+            container_refresh_ms,
+        } => {
+            if !testnet.is_local() {
+                bail!("Web server is currently only supported in local mode.");
+            }
+            crate::web::run_server(
+                testnet,
+                host,
+                port,
+                refresh_ms,
+                el_refresh_ms,
+                container_refresh_ms,
+            )
+            .await?;
+        }
         Commands::Mcp { http, port } => {
             crate::mcp::run_server(testnet, http, port).await?;
         }
@@ -994,16 +1065,64 @@ async fn pre_start(
     seed: Option<u64>,
     rpc_manifest: bool,
 ) -> Result<()> {
+    // Warn if sizing fields are set in the manifest but we're running locally — they are ignored.
+    if !args.remote {
+        let m = &testnet.manifest;
+        if m.node_size.is_some()
+            || m.cc_size.is_some()
+            || m.node_disk_gb.is_some()
+            || m.cc_disk_gb.is_some()
+            || m.node_volume_type.is_some()
+            || m.node_volume_iops.is_some()
+        {
+            warn!(
+                "Manifest sets remote-only infrastructure fields (node_size/cc_size/\
+                 node_disk_gb/cc_disk_gb/node_volume_type/node_volume_iops), but these \
+                 are only applied when creating remote infrastructure (--remote). They \
+                 are ignored in local mode."
+            );
+        }
+    }
+
     // Create remote infrastructure, if requested and not already created
     if args.remote && !testnet.dir.join(INFRA_DATA_FILENAME).exists() {
         info!("Creating remote infrastructure...");
+        let node_size = args
+            .infra_args
+            .node_size
+            .as_deref()
+            .or(testnet.manifest.node_size.as_deref());
+        let cc_size = args
+            .infra_args
+            .cc_size
+            .as_deref()
+            .or(testnet.manifest.cc_size.as_deref());
+        let node_disk_gb = args
+            .infra_args
+            .node_disk_gb
+            .or(testnet.manifest.node_disk_gb);
+        let cc_disk_gb = args.infra_args.cc_disk_gb.or(testnet.manifest.cc_disk_gb);
+        let node_volume_type = args
+            .infra_args
+            .node_volume_type
+            .as_deref()
+            .or(testnet.manifest.node_volume_type.as_deref());
+        let node_volume_iops = args
+            .infra_args
+            .node_volume_iops
+            .or(testnet.manifest.node_volume_iops);
+        // CLI overrides can mix freely with manifest fields, so re-validate
+        // the merged pair before reaching Terraform.
+        crate::manifest::validate_node_volume(node_volume_type, node_volume_iops)?;
         testnet.remote_infra()?.terraform.create(
             false,
             true,
-            args.infra_args.node_size.as_deref(),
-            args.infra_args.cc_size.as_deref(),
-            args.infra_args.node_disk_gb,
-            args.infra_args.cc_disk_gb,
+            node_size,
+            cc_size,
+            node_disk_gb,
+            cc_disk_gb,
+            node_volume_type,
+            node_volume_iops,
         )?;
 
         // Reload testnet with the recently created infra files
@@ -1020,7 +1139,13 @@ async fn pre_start(
         warn!("Testnet not set up: {err}; Running setup...");
         testnet
             .with_seed(seed)
-            .setup(setup_args.force, rpc, setup_args.num_extra_accounts)
+            .setup(
+                setup_args.force,
+                rpc,
+                setup_args.num_extra_accounts,
+                setup_args.extra_account_balance,
+                setup_args.block_gas_limit,
+            )
             .await?;
     }
 
@@ -1039,6 +1164,12 @@ async fn pre_start(
 mod cli_tests {
     use super::*;
     use clap::error::ErrorKind;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_command_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
 
     #[test]
     fn cli_parses_load_targets() {

@@ -235,7 +235,7 @@ async fn build_and_validate_block(
     .await?;
 
     let validator = EnginePayloadValidator::new(engine, metrics);
-    let validity = validate_consensus_block(&validator, &block, store)
+    let validity = validate_consensus_block(&validator, &block, store, metrics)
         .await
         .wrap_err_with(|| {
             format!(

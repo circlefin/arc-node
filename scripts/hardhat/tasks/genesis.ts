@@ -21,6 +21,7 @@ import localBuilder, { localBuilderOptionsSchema } from '../../../assets/localde
 import devnetBuilder from '../../../assets/devnet/genesis.config'
 import testnetBuilder from '../../../assets/testnet/genesis.config'
 import { hardforkNameSchema, initialHardforksByName } from '../../genesis'
+import { bigintReplacer } from '../../genesis/types'
 
 type GenesisArgs = {
   numValidators?: number
@@ -31,6 +32,8 @@ type GenesisArgs = {
   validatorNames?: string
   votingPowers?: string
   hardfork: string
+  extraAccountBalance?: string
+  blockGasLimit?: number
 }
 
 task('genesis', 'Generate the genesis file')
@@ -51,7 +54,19 @@ task('genesis', 'Generate the genesis file')
     undefined,
     types.string,
   )
-  .addOptionalParam('hardfork', 'hardfork to use, available: zero3, zero4, zero5, zero6', 'zero6', types.string)
+  .addOptionalParam('hardfork', 'hardfork to use, available: zero3, zero4, zero5, zero6, zero7', 'zero7', types.string)
+  .addOptionalParam(
+    'extraAccountBalance',
+    'Initial balance for each prefunded account in whole token units (default: 1000000)',
+    undefined,
+    types.string,
+  )
+  .addOptionalParam(
+    'blockGasLimit',
+    'ProtocolConfig blockGasLimit and genesis header gas limit (default: 30000000)',
+    undefined,
+    types.int,
+  )
   .setAction(async (args: GenesisArgs, hre) => {
     const root = hre.config.paths.root
     const net = hre.network.name
@@ -61,6 +76,8 @@ task('genesis', 'Generate the genesis file')
       validatorNames,
       votingPowers,
       hardfork,
+      extraAccountBalance,
+      blockGasLimit,
       ...buildOptions
     } = args
     const outputPathWithSuffix = (name: string) =>
@@ -88,21 +105,27 @@ task('genesis', 'Generate the genesis file')
             ...buildOptions,
             ...(parsedValidatorNames && parsedValidatorNames.length > 0
               ? {
-                  validatorNames: parsedValidatorNames,
-                  outputControllersConfig: outputPathWithSuffix('controllers-config'),
-                }
+                validatorNames: parsedValidatorNames,
+                outputControllersConfig: outputPathWithSuffix('controllers-config'),
+              }
               : {}),
             ...(parsedVotingPowers && parsedVotingPowers.length > 0 ? { votingPowers: parsedVotingPowers } : {}),
             outputGenesisConfig: outputPathWithSuffix('config'),
             hardforks: initialHardforksByName(hardforkName),
+            ...(extraAccountBalance !== undefined ? { extraAccountBalance: BigInt(extraAccountBalance) } : {}),
+            ...(blockGasLimit !== undefined ? { blockGasLimit: BigInt(blockGasLimit) } : {}),
           })
-          console.log(`Options: ${JSON.stringify(options)}`)
+          console.log(`Options: ${JSON.stringify(options, bigintReplacer)}`)
           return localBuilder(options)
         }
         case 'devnet':
           return devnetBuilder()
         case 'testnet':
           return testnetBuilder()
+        case 'mainnet': {
+          const { default: mainnetBuilder } = await import('../../../assets/mainnet/genesis.config')
+          return mainnetBuilder()
+        }
         default:
           throw new Error(`Unsupported network: ${net}`)
       }

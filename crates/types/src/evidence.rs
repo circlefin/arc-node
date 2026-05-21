@@ -61,47 +61,43 @@ impl StoredMisbehaviorEvidence {
         let mut validator_map: BTreeMap<Address, ValidatorEvidence> = BTreeMap::new();
 
         // Process vote evidence
-        for addr in evidence.votes.iter() {
-            if let Some(double_votes) = evidence.votes.get(addr) {
-                let double_votes = double_votes
-                    .iter()
-                    .map(|(first, second)| DoubleVote {
-                        first: first.to_owned(),
-                        second: second.to_owned(),
-                    })
-                    .collect();
+        for (addr, double_votes) in evidence.votes.iter() {
+            let double_votes = double_votes
+                .iter()
+                .map(|(first, second)| DoubleVote {
+                    first: first.to_owned(),
+                    second: second.to_owned(),
+                })
+                .collect();
 
-                validator_map
-                    .entry(addr.to_owned())
-                    .or_insert_with(|| ValidatorEvidence {
-                        address: addr.to_owned(),
-                        double_votes: Vec::new(),
-                        double_proposals: Vec::new(),
-                    })
-                    .double_votes = double_votes;
-            }
+            validator_map
+                .entry(addr.to_owned())
+                .or_insert_with(|| ValidatorEvidence {
+                    address: addr.to_owned(),
+                    double_votes: Vec::new(),
+                    double_proposals: Vec::new(),
+                })
+                .double_votes = double_votes;
         }
 
         // Process proposal evidence
-        for addr in evidence.proposals.iter() {
-            if let Some(double_proposals) = evidence.proposals.get(addr) {
-                let double_proposals = double_proposals
-                    .iter()
-                    .map(|(first, second)| DoubleProposal {
-                        first: first.to_owned(),
-                        second: second.to_owned(),
-                    })
-                    .collect();
+        for (addr, double_proposals) in evidence.proposals.iter() {
+            let double_proposals = double_proposals
+                .iter()
+                .map(|(first, second)| DoubleProposal {
+                    first: first.to_owned(),
+                    second: second.to_owned(),
+                })
+                .collect();
 
-                validator_map
-                    .entry(addr.to_owned())
-                    .or_insert_with(|| ValidatorEvidence {
-                        address: addr.to_owned(),
-                        double_votes: Vec::new(),
-                        double_proposals: Vec::new(),
-                    })
-                    .double_proposals = double_proposals;
-            }
+            validator_map
+                .entry(addr.to_owned())
+                .or_insert_with(|| ValidatorEvidence {
+                    address: addr.to_owned(),
+                    double_votes: Vec::new(),
+                    double_proposals: Vec::new(),
+                })
+                .double_proposals = double_proposals;
         }
 
         Self {

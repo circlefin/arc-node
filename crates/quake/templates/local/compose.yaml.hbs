@@ -24,6 +24,13 @@ services:
     cap_add:
       - NET_ADMIN
     restart: unless-stopped
+    init: true
+    {{#if ../el_cpu_limit}}
+    cpus: "{{../el_cpu_limit}}"
+    {{/if}}
+    {{#if ../el_memory_limit_gb}}
+    mem_limit: {{../el_memory_limit_gb}}G
+    {{/if}}
     extra_hosts:
       - host.docker.internal:host-gateway
     healthcheck:
@@ -97,6 +104,13 @@ services:
     cap_add:
       - NET_ADMIN
     restart: unless-stopped
+    init: true
+    {{#if ../cl_cpu_limit}}
+    cpus: "{{../cl_cpu_limit}}"
+    {{/if}}
+    {{#if ../cl_memory_limit_gb}}
+    mem_limit: {{../cl_memory_limit_gb}}G
+    {{/if}}
     networks:
       {{#each consensus.inner.subnet_ips}}
       {{@key}}:
@@ -154,6 +168,13 @@ services:
     cap_add:
       - NET_ADMIN
     restart: unless-stopped
+    init: true
+    {{#if ../el_cpu_limit}}
+    cpus: "{{../el_cpu_limit}}"
+    {{/if}}
+    {{#if ../el_memory_limit_gb}}
+    mem_limit: {{../el_memory_limit_gb}}G
+    {{/if}}
     extra_hosts:
       - host.docker.internal:host-gateway
     healthcheck:
@@ -230,6 +251,13 @@ services:
     cap_add:
       - NET_ADMIN
     restart: unless-stopped
+    init: true
+    {{#if ../cl_cpu_limit}}
+    cpus: "{{../cl_cpu_limit}}"
+    {{/if}}
+    {{#if ../cl_memory_limit_gb}}
+    mem_limit: {{../cl_memory_limit_gb}}G
+    {{/if}}
     networks:
       {{#each consensus.inner.subnet_ips}}
       {{@key}}:

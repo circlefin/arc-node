@@ -136,6 +136,29 @@ contract ValidatorManagementTest is TestUtils {
         assertEq(uint256(_validator.status), 1); // Registered
     }
 
+    function test_RequirePublicKeyBasicSanity_AcceptsValidKey() public view {
+        validatorManagement.requirePublicKeyBasicSanity(newValidatorPublicKey);
+    }
+
+    function test_RequirePublicKeyBasicSanity_RejectsWrongLengthKey() public {
+        // 31-byte key — one short of the required 32.
+        bytes memory tooShort = hex"c992c8696818bda11d628f38584022a6332c144b7f929b4d972bd39a23244a";
+        vm.expectRevert("Public key must be 32 bytes");
+        validatorManagement.requirePublicKeyBasicSanity(tooShort);
+
+        // 33-byte key — one longer than the required 32.
+        bytes memory tooLong =
+            hex"c992c8696818bda11d628f38584022a6332c144b7f929b4d972bd39a23244aecbc";
+        vm.expectRevert("Public key must be 32 bytes");
+        validatorManagement.requirePublicKeyBasicSanity(tooLong);
+    }
+
+    function test_RequirePublicKeyBasicSanity_RejectsAllZeroKey() public {
+        bytes memory allZero = new bytes(32);
+        vm.expectRevert("Public key must not be all zero");
+        validatorManagement.requirePublicKeyBasicSanity(allZero);
+    }
+
     function test_ConfigureController_Succeeds() public {
         uint256 _registrationId = _registerValidator();
         _configureController(_registrationId);

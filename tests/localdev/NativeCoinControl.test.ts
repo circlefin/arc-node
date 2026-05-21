@@ -17,18 +17,38 @@
 import { expect } from 'chai'
 import { EventsVerifier, expectGasUSedApproximately, getClients } from '../helpers'
 import { CallHelper } from '../helpers/CallHelper'
-import { encodeFunctionData } from 'viem'
-import { NativeCoinControl } from '../helpers/NativeCoinControl'
+import { encodeFunctionData, TransactionExecutionError } from 'viem'
+import { ERR_BLOCKED_ADDRESS, NativeCoinControl } from '../helpers/NativeCoinControl'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { USDC } from '../helpers/FiatToken'
 
+// USDC (NativeFiatToken) is blocklisted in NativeCoinControl at genesis; undo
+// that for simulations where USDC appears as the tx caller.
+const unblockUsdc = [NativeCoinControl.unblockStateOverride(USDC.address)]
+
 describe('NativeCoinControl', () => {
+  it('USDC is blocklisted at genesis', async () => {
+    // Mirrors FiatTokenV2_2.initialize() — prevents accidental native coin
+    // transfers to the USDC contract itself.
+    const { client } = await getClients()
+    expect(await NativeCoinControl.isBlocklisted(client, USDC.address)).to.be.true
+  })
+
+  it('cannot send native coin to USDC', async () => {
+    const { sender } = await getClients()
+    await expect(sender.sendTransaction({ to: USDC.address, value: 1n, gas: 600000n })).to.be.rejectedWith(
+      TransactionExecutionError,
+      ERR_BLOCKED_ADDRESS,
+    )
+  })
+
   it('simulate blocklist', async () => {
     const { client } = await getClients()
     const randAccount = privateKeyToAccount(generatePrivateKey())
 
     const res = await client.simulateCalls({
       account: USDC.address,
+      stateOverrides: unblockUsdc,
       calls: [
         {
           to: NativeCoinControl.address,
@@ -63,9 +83,7 @@ describe('NativeCoinControl', () => {
       ],
     })
     expect(res.results[0].status).to.be.eq('success')
-    // Zero5: cold SLOAD = 2100 for blocklist check
-    expect(res.results[0].gasUsed).to.be.greaterThanOrEqual(21000n + 100n)
-    expectGasUSedApproximately(res.results[0].gasUsed, 24180n)
+    expectGasUSedApproximately(res.results[0].gasUsed, 22080n)
   })
 
   it('invalid selector', async () => {
@@ -165,6 +183,7 @@ describe('NativeCoinControl', () => {
 
     const res = await client.simulateCalls({
       account: USDC.address,
+      stateOverrides: unblockUsdc,
       calls: [
         {
           to: helper.address,

@@ -25,7 +25,6 @@ use arc_consensus_types::block::DecidedBlock;
 pub trait DecidedBlocksRepository {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    #[allow(dead_code)] // unused for now
     async fn get(&self, height: Height) -> Result<Option<DecidedBlock>, Self::Error>;
 
     async fn store(

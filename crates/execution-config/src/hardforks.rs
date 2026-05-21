@@ -32,6 +32,7 @@ hardfork!(
         Zero5, // v0.5 hardfork, align to Ethereum Prague
         #[default]
         Zero6, // v0.6 hardfork
+        Zero7, // v0.7 hardfork — batch (Multicall3From) and memo contracts
     }
 );
 
@@ -48,6 +49,11 @@ pub struct ArcGenesisInfo {
     pub zero_5_block: Option<u64>,
     /// v0.6 hardfork block
     pub zero_6_block: Option<u64>,
+    /// v0.7 hardfork timestamp for genesis-configured chains.
+    ///
+    /// Built-in network schedules are defined in `ARC_*_HARDFORKS` and may activate
+    /// earlier Arc hardforks by timestamp, e.g. testnet Zero5/Zero6.
+    pub zero_7_time: Option<u64>,
 }
 
 impl ArcGenesisInfo {
@@ -67,6 +73,10 @@ impl ArcGenesisInfo {
             if let Some(fork_block) = fork_block {
                 hardforks.push((hardfork, ForkCondition::Block(fork_block)));
             }
+        }
+        // Zero7+ activate by timestamp (see field doc on ArcGenesisInfo).
+        if let Some(time) = self.zero_7_time {
+            hardforks.push((ArcHardfork::Zero7, ForkCondition::Timestamp(time)));
         }
         hardforks
     }
@@ -90,6 +100,7 @@ pub struct ArcHardforkFlags {
     zero4: bool,
     zero5: bool,
     zero6: bool,
+    zero7: bool,
 }
 
 impl ArcHardforkFlags {
@@ -99,6 +110,7 @@ impl ArcHardforkFlags {
         ArcHardfork::Zero4,
         ArcHardfork::Zero5,
         ArcHardfork::Zero6,
+        ArcHardfork::Zero7,
     ];
 
     /// Check if a specific hardfork is active.
@@ -108,6 +120,7 @@ impl ArcHardforkFlags {
             ArcHardfork::Zero4 => self.zero4,
             ArcHardfork::Zero5 => self.zero5,
             ArcHardfork::Zero6 => self.zero6,
+            ArcHardfork::Zero7 => self.zero7,
         }
     }
 
@@ -118,14 +131,21 @@ impl ArcHardforkFlags {
             ArcHardfork::Zero4 => self.zero4 = value,
             ArcHardfork::Zero5 => self.zero5 = value,
             ArcHardfork::Zero6 => self.zero6 = value,
+            ArcHardfork::Zero7 => self.zero7 = value,
         }
     }
 
-    /// Create flags from chain hardforks at a given block height.
-    pub fn from_chain_hardforks(hardforks: &ChainHardforks, block: u64) -> Self {
+    /// Create flags from chain hardforks at a given (block, timestamp).
+    ///
+    /// Arc hardfork activation is network-specific: some forks activate by block and
+    /// others by timestamp. Evaluate both dimensions so timestamp-based testnet
+    /// Zero5/Zero6 and block-based devnet Zero5/Zero6 are both handled correctly.
+    pub fn from_chain_hardforks(hardforks: &ChainHardforks, block: u64, timestamp: u64) -> Self {
         let mut flags = Self::default();
         for &hf in Self::ALL_HARDFORKS {
-            if hardforks.is_fork_active_at_block(hf, block) {
+            if hardforks.is_fork_active_at_block(hf, block)
+                || hardforks.is_fork_active_at_timestamp(hf, timestamp)
+            {
                 flags.set(hf, true);
             }
         }
@@ -161,6 +181,29 @@ impl ArcHardforkFlags {
             flags
         })
     }
+}
+
+/// Checks whether an Arc hardfork is active at the given `(block_number, block_timestamp)`,
+/// covering both block-based and timestamp-based activation.
+///
+/// **Use this for any runtime gating of Arc hardforks.** Zero7+ activates by timestamp on
+/// every network, and Zero5/Zero6 activate by timestamp on testnet. A bare
+/// `is_fork_active_at_block(hf, n)` silently returns `false` for timestamp-activated forks,
+/// so the corresponding EVM/validation behaviour would never trigger.
+///
+/// The OR is safe by construction: `ForkCondition::active_at_block` and `active_at_timestamp`
+/// both pattern-match the variant before comparing values, so a `Timestamp(_)` fork never
+/// matches the block branch and vice versa — the two checks are mutually exclusive per fork.
+///
+/// Mirrors the dual-check pattern in [`ArcHardforkFlags::from_chain_hardforks`].
+pub fn is_arc_fork_active<CS: reth_chainspec::Hardforks>(
+    chain_spec: &CS,
+    fork: ArcHardfork,
+    block_number: u64,
+    block_timestamp: u64,
+) -> bool {
+    chain_spec.is_fork_active_at_block(fork, block_number)
+        || chain_spec.is_fork_active_at_timestamp(fork, block_timestamp)
 }
 
 // Reference Ethereum forks
@@ -231,6 +274,22 @@ pub static ARC_LOCALDEV_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
     forks.insert(EthereumHardfork::Osaka.boxed(), ForkCondition::Timestamp(0));
     forks.insert(ArcHardfork::Zero5.boxed(), ForkCondition::Block(0));
     forks.insert(ArcHardfork::Zero6.boxed(), ForkCondition::Block(0));
+    // Zero7+ activate by timestamp to keep the EIP-2124 fork-id stable across
+    // mixed-version peers (block-based forks declared after a timestamp fork break
+    // ForkFilter's BTreeMap ordering).
+    forks.insert(ArcHardfork::Zero7.boxed(), ForkCondition::Timestamp(0));
+    forks
+});
+
+/// Arc Mainnet network (5042) hardforks.
+pub static ARC_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
+    let mut forks = BASE_FORKS.clone();
+    forks.insert(ArcHardfork::Zero3.boxed(), ForkCondition::Block(0));
+    forks.insert(ArcHardfork::Zero4.boxed(), ForkCondition::Block(0));
+    // Zero5 : Osaka — paired per convention above
+    forks.insert(EthereumHardfork::Osaka.boxed(), ForkCondition::Timestamp(0));
+    forks.insert(ArcHardfork::Zero5.boxed(), ForkCondition::Block(0));
+    forks.insert(ArcHardfork::Zero6.boxed(), ForkCondition::Block(0));
     forks
 });
 
@@ -253,6 +312,10 @@ pub static ARC_DEVNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
         ArcHardfork::Zero5.boxed(),
         ForkCondition::Block(ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET),
     );
+    forks.insert(
+        ArcHardfork::Zero6.boxed(),
+        ForkCondition::Block(ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET),
+    );
     forks
 });
 
@@ -267,8 +330,22 @@ pub static ARC_TESTNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
         ArcHardfork::Zero4.boxed(),
         ForkCondition::Block(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET),
     );
-    // TODO: When Zero5 is activated on testnet, add Osaka at the same activation point:
-    // forks.insert(EthereumHardfork::Osaka.boxed(), ForkCondition::Timestamp(<zero5_timestamp>));
+    forks.insert(
+        EthereumHardfork::Osaka.boxed(),
+        ForkCondition::Timestamp(ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET),
+    );
+    // Zero5/Zero6 must activate by timestamp
+    // (not block) — declaring them as Block-after-Osaka would trigger the EIP-2124
+    // BTreeMap-ordering bug for any peer that doesn't have them declared yet.
+    forks.insert(
+        ArcHardfork::Zero5.boxed(),
+        ForkCondition::Timestamp(ARC_ZERO5_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET),
+    );
+    forks.insert(
+        ArcHardfork::Zero6.boxed(),
+        ForkCondition::Timestamp(ARC_ZERO6_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET),
+    );
+
     forks
 });
 
@@ -281,8 +358,13 @@ pub const ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET: u64 = 19491165;
 pub const ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET: u64 = 26148086;
 /// Zero5
 pub const ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET: u64 = 32371192;
+pub const ARC_ZERO5_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET: u64 = 1779894517;
+/// Zero6
+pub const ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET: u64 = 40033853;
+pub const ARC_ZERO6_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET: u64 = 1779894517;
 /// Osaka (paired with Zero5)
 pub const ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET: u64 = 1775483400;
+pub const ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET: u64 = 1779890400;
 
 #[cfg(test)]
 mod tests {
@@ -295,6 +377,7 @@ mod tests {
         assert_eq!(ArcHardfork::Zero4.name(), "Zero4");
         assert_eq!(ArcHardfork::Zero5.name(), "Zero5");
         assert_eq!(ArcHardfork::Zero6.name(), "Zero6");
+        assert_eq!(ArcHardfork::Zero7.name(), "Zero7");
     }
 
     #[test]
@@ -305,28 +388,33 @@ mod tests {
         assert!(!flags.is_active(ArcHardfork::Zero4));
         assert!(!flags.is_active(ArcHardfork::Zero5));
         assert!(!flags.is_active(ArcHardfork::Zero6));
+        assert!(!flags.is_active(ArcHardfork::Zero7));
 
-        // Test from chain hardforks - localdev has Zero3-Zero5 and PQC active at block 0
-        let flags = ArcHardforkFlags::from_chain_hardforks(&ARC_LOCALDEV_HARDFORKS, 0);
+        // Test from chain hardforks - localdev has all Arc hardforks active at genesis
+        let flags = ArcHardforkFlags::from_chain_hardforks(&ARC_LOCALDEV_HARDFORKS, 0, 0);
         assert!(flags.is_active(ArcHardfork::Zero3));
         assert!(flags.is_active(ArcHardfork::Zero4));
         assert!(flags.is_active(ArcHardfork::Zero5));
         assert!(flags.is_active(ArcHardfork::Zero6));
+        assert!(flags.is_active(ArcHardfork::Zero7));
 
         // Test from chain hardforks - devnet has Zero3 and Zero4 active after their activation blocks
         let flags = ArcHardforkFlags::from_chain_hardforks(
             &ARC_DEVNET_HARDFORKS,
             ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET,
+            0,
         );
         assert!(flags.is_active(ArcHardfork::Zero3));
         assert!(flags.is_active(ArcHardfork::Zero4));
         assert!(!flags.is_active(ArcHardfork::Zero5));
         assert!(!flags.is_active(ArcHardfork::Zero6));
+        assert!(!flags.is_active(ArcHardfork::Zero7));
 
         // Test from chain hardforks - devnet before Zero4 activation
         let flags = ArcHardforkFlags::from_chain_hardforks(
             &ARC_DEVNET_HARDFORKS,
             ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1,
+            0,
         );
         assert!(flags.is_active(ArcHardfork::Zero3));
         assert!(!flags.is_active(ArcHardfork::Zero4));
@@ -335,6 +423,7 @@ mod tests {
         let flags = ArcHardforkFlags::from_chain_hardforks(
             &ARC_DEVNET_HARDFORKS,
             ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1,
+            0,
         );
         assert!(!flags.is_active(ArcHardfork::Zero3));
         assert!(!flags.is_active(ArcHardfork::Zero4));
@@ -356,9 +445,9 @@ mod tests {
         assert!(!flags.is_active(ArcHardfork::Zero3));
         assert!(!flags.is_active(ArcHardfork::Zero4));
 
-        // Test all_combinations() helper - should yield 16 combinations (2^4)
+        // Test all_combinations() helper - should yield 32 combinations (2^5)
         let combinations: Vec<_> = ArcHardforkFlags::all_combinations().collect();
-        assert_eq!(combinations.len(), 16);
+        assert_eq!(combinations.len(), 32);
 
         // Verify some key combinations are present
         assert!(combinations.contains(&ArcHardforkFlags::with(&[])));
@@ -373,12 +462,13 @@ mod tests {
             ArcHardfork::Zero4,
             ArcHardfork::Zero5,
             ArcHardfork::Zero6,
+            ArcHardfork::Zero7,
         ])));
     }
 
     #[test]
     fn test_parse_arc_hardfork_from_genesis() {
-        let s = r#"{ "config": { "zero3Block": 123123, "zero4Block": 223881, "zero5Block": 323496, "zero6Block": 423000 } }"#;
+        let s = r#"{ "config": { "zero3Block": 123123, "zero4Block": 223881, "zero5Block": 323496, "zero6Block": 423000, "zero7Time": 1800000000 } }"#;
 
         let genesis = serde_json::from_str::<Genesis>(s).expect("Failed to parse genesis");
         let info = ArcGenesisInfo::extract_from(&genesis.config.extra_fields)
@@ -387,6 +477,7 @@ mod tests {
         assert_eq!(info.zero_4_block, Some(223881));
         assert_eq!(info.zero_5_block, Some(323496));
         assert_eq!(info.zero_6_block, Some(423000));
+        assert_eq!(info.zero_7_time, Some(1800000000));
     }
 
     // Verify ethereum hardforks are supported for all networks.
@@ -429,7 +520,7 @@ mod tests {
     fn test_arc_localdev_forks() {
         let forks = ARC_LOCALDEV_HARDFORKS.clone();
         assert_base_hardforks(&forks);
-        assert_eq!(forks.len(), 22);
+        assert_eq!(forks.len(), 23);
 
         // verify hardfork zero3 block
         assert!(!forks.is_fork_active_at_timestamp(ArcHardfork::Zero3, 0));
@@ -446,13 +537,17 @@ mod tests {
         // verify hardfork zero6 block
         assert!(!forks.is_fork_active_at_timestamp(ArcHardfork::Zero6, 0));
         assert!(forks.is_fork_active_at_block(ArcHardfork::Zero6, 0));
+
+        // Zero7 activates by timestamp (Arc convention from Zero7 onward).
+        assert!(forks.is_fork_active_at_timestamp(ArcHardfork::Zero7, 0));
+        assert!(!forks.is_fork_active_at_block(ArcHardfork::Zero7, 0));
     }
 
     #[test]
     fn test_arc_devnet_forks() {
         let forks = ARC_DEVNET_HARDFORKS.clone();
         assert_base_hardforks(&forks);
-        assert_eq!(forks.len(), 21);
+        assert_eq!(forks.len(), 22);
 
         // verify hardfork zero3 block
         assert_eq!(
@@ -517,13 +612,29 @@ mod tests {
             EthereumHardfork::Osaka,
             ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET
         ));
+
+        // verify hardfork zero6 block
+        assert_eq!(
+            forks.get(ArcHardfork::Zero6),
+            Some(ForkCondition::Block(
+                ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET
+            ))
+        );
+        assert!(!forks.is_fork_active_at_block(
+            ArcHardfork::Zero6,
+            ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1
+        ));
+        assert!(forks.is_fork_active_at_block(
+            ArcHardfork::Zero6,
+            ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET
+        ));
     }
 
     #[test]
     fn test_arc_testnet_forks() {
         let forks = ARC_TESTNET_HARDFORKS.clone();
         assert_base_hardforks(&forks);
-        assert_eq!(forks.len(), 19);
+        assert_eq!(forks.len(), 22);
 
         // verify hardfork zero3 block
         assert_eq!(
@@ -555,6 +666,151 @@ mod tests {
         assert!(forks.is_fork_active_at_block(
             ArcHardfork::Zero4,
             ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET
+        ));
+
+        // verify osaka timestamp
+        assert_eq!(
+            forks.get(EthereumHardfork::Osaka),
+            Some(ForkCondition::Timestamp(
+                ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET
+            ))
+        );
+        assert!(!forks.is_fork_active_at_timestamp(
+            EthereumHardfork::Osaka,
+            ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET - 1
+        ));
+        assert!(forks.is_fork_active_at_timestamp(
+            EthereumHardfork::Osaka,
+            ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET
+        ));
+
+        // verify hardfork zero5 timestamp (testnet activates Zero5 by timestamp)
+        assert_eq!(
+            forks.get(ArcHardfork::Zero5),
+            Some(ForkCondition::Timestamp(
+                ARC_ZERO5_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET
+            ))
+        );
+        assert!(!forks.is_fork_active_at_timestamp(
+            ArcHardfork::Zero5,
+            ARC_ZERO5_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET - 1
+        ));
+        assert!(forks.is_fork_active_at_timestamp(
+            ArcHardfork::Zero5,
+            ARC_ZERO5_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET
+        ));
+
+        // verify hardfork zero6 timestamp (testnet activates Zero6 by timestamp)
+        assert_eq!(
+            forks.get(ArcHardfork::Zero6),
+            Some(ForkCondition::Timestamp(
+                ARC_ZERO6_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET
+            ))
+        );
+        assert!(!forks.is_fork_active_at_timestamp(
+            ArcHardfork::Zero6,
+            ARC_ZERO6_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET - 1
+        ));
+        assert!(forks.is_fork_active_at_timestamp(
+            ArcHardfork::Zero6,
+            ARC_ZERO6_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET
+        ));
+    }
+
+    /// Per-network policy: from a given cutoff hardfork (inclusive) onward, all
+    /// declarations MUST activate by timestamp.
+    ///
+    /// Background — once any timestamp-based fork is in a network's `ChainHardforks`,
+    /// adding a future `ForkCondition::Block(n>0)` to the same table breaks EIP-2124
+    /// peering with binaries that don't have the new fork declared (the BTreeMap
+    /// ordering in alloy-eip2124 folds the new Block key into the existing Time
+    /// entry's cumulative hash). The cutoff is per-network:
+    ///
+    ///  - mainnet: Zero7+ (Zero3-Zero6 are at Block(0), filtered out by alloy
+    ///    before the cumulative hash is built — they don't trigger the bug).
+    ///  - devnet: Zero7+. Zero5/Zero6 were declared as Block before this invariant
+    ///    was understood; the v0.6.1↔v0.7.1 mismatch was the operational cost.
+    ///    Going forward, Zero7+ MUST be Timestamp to prevent recurrence.
+    ///  - testnet: Zero5+. Testnet has external validators we cannot coordinate
+    ///    a chainspec change with, so the cutoff is stricter — every fork after
+    ///    Osaka must be Timestamp.
+    ///
+    /// Localdev is intentionally omitted: it activates everything at genesis, and
+    /// `Block(0)` / `Timestamp(0)` keys are filtered out by alloy-eip2124, so no
+    /// future-block-fork shape can arise.
+    #[test]
+    fn test_no_future_block_forks_per_network() {
+        // `ArcHardfork::VARIANTS` is the canonical ordering (Zero3, Zero4, ..., Zero7,
+        // and any future variants appended to the enum). The cutoff names where the
+        // timestamp-only invariant starts taking effect.
+        let policy: &[(&str, &ChainHardforks, ArcHardfork)] = &[
+            ("devnet", &*ARC_DEVNET_HARDFORKS, ArcHardfork::Zero7),
+            ("testnet", &*ARC_TESTNET_HARDFORKS, ArcHardfork::Zero5),
+            ("mainnet", &*ARC_MAINNET_HARDFORKS, ArcHardfork::Zero7),
+        ];
+
+        for &(name, forks, cutoff) in policy {
+            let cutoff_idx = ArcHardfork::VARIANTS
+                .iter()
+                .position(|hf| *hf == cutoff)
+                .expect("cutoff hardfork must be in ArcHardfork::VARIANTS");
+
+            for hf in ArcHardfork::VARIANTS[cutoff_idx..].iter().copied() {
+                let Some(cond) = forks.get(hf) else { continue };
+                match cond {
+                    ForkCondition::Timestamp(_) => {}
+                    ForkCondition::Block(0) => {} // genesis-equivalent, filtered by alloy-eip2124
+                    other => panic!(
+                        "{name}: hardfork {hf:?} must activate by timestamp \
+                         (or be Block(0)), got {other:?}. Cutoff for this network \
+                         is {cutoff:?}+. See test_arc_hardfork_ids for the EIP-2124 \
+                         invariant.",
+                    ),
+                }
+            }
+        }
+    }
+
+    /// `is_arc_fork_active` must dispatch on the fork's condition variant — a block-based
+    /// fork only cares about `block_number`, a timestamp-based fork only cares about
+    /// `block_timestamp`. The OR cannot cross-talk between dimensions.
+    #[test]
+    fn test_is_arc_fork_active_dispatches_by_variant() {
+        // Build a minimal chainspec with Zero3 as Block(100) and Zero5 as Timestamp(2_000).
+        let mut forks = BASE_FORKS.clone();
+        forks.insert(ArcHardfork::Zero3.boxed(), ForkCondition::Block(100));
+        forks.insert(ArcHardfork::Zero5.boxed(), ForkCondition::Timestamp(2_000));
+        let spec = crate::chainspec::ArcChainSpec::new(reth_chainspec::ChainSpec {
+            hardforks: forks,
+            ..reth_chainspec::ChainSpec::from_genesis(alloy_genesis::Genesis::default())
+        });
+
+        // Zero3 is Block(100). Only block_number matters.
+        assert!(!is_arc_fork_active(&spec, ArcHardfork::Zero3, 99, 0));
+        assert!(is_arc_fork_active(&spec, ArcHardfork::Zero3, 100, 0));
+        // A block_timestamp huge enough to exceed Zero5's Timestamp(2_000) must NOT
+        // accidentally activate Zero3 — Zero3's variant is Block, so the timestamp branch
+        // returns false for it regardless of value.
+        assert!(!is_arc_fork_active(&spec, ArcHardfork::Zero3, 99, u64::MAX));
+
+        // Zero5 is Timestamp(2_000). Only block_timestamp matters.
+        assert!(!is_arc_fork_active(&spec, ArcHardfork::Zero5, 0, 1_999));
+        assert!(is_arc_fork_active(&spec, ArcHardfork::Zero5, 0, 2_000));
+        // Likewise a block_number that coincidentally exceeds Zero5's u64 value (2_000)
+        // must NOT activate Zero5 — Zero5's variant is Timestamp, the block branch is false.
+        assert!(!is_arc_fork_active(
+            &spec,
+            ArcHardfork::Zero5,
+            u64::MAX,
+            1_999
+        ));
+
+        // Undeclared fork: both branches false.
+        assert!(!is_arc_fork_active(
+            &spec,
+            ArcHardfork::Zero7,
+            u64::MAX,
+            u64::MAX
         ));
     }
 }

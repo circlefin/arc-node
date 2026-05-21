@@ -183,7 +183,7 @@ async fn crash_and_restart(#[case] layer: Layer) {
 
 #[tokio::test]
 async fn validators_and_full_nodes() {
-    scenarios::validators_and_full_nodes_reach_height(2, 2, 3)
+    scenarios::validators_and_full_nodes_reach_height(2, 4, 2, 3)
         .run::<MockRunner>(Duration::from_secs(10))
         .await;
 }

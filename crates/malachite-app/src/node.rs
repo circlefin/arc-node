@@ -63,7 +63,7 @@ use arc_signer::ArcSigningProvider;
 
 use crate::env_config::EnvConfig;
 use crate::hardcoded_config::{GossipLoad, GossipMeshParams};
-use crate::metrics::{AppMetrics, DbMetrics, ProcessMetrics};
+use crate::metrics::{AppMetrics, DbMetrics, ProcessMetrics, ValidatorSetMetrics};
 use crate::request::AppRequest;
 use crate::state::State;
 use crate::store::Store;
@@ -152,12 +152,13 @@ impl ConsensusIdentity {
     }
 }
 
-impl From<ConsensusIdentity> for ConsensusContext<ArcContext, ArcSigningProvider> {
+impl From<ConsensusIdentity> for ConsensusContext<ArcContext> {
     fn from(identity: ConsensusIdentity) -> Self {
-        ConsensusContext {
-            address: identity.address,
-            signing_provider: identity.signing_provider,
-        }
+        ConsensusContext::new_validator(
+            identity.address,
+            Box::new(identity.signing_provider.clone()),
+            Box::new(identity.signing_provider),
+        )
     }
 }
 
@@ -392,6 +393,10 @@ impl App {
         let db_metrics = DbMetrics::register(&self.registry);
         let process_metrics = ProcessMetrics::register(&self.registry);
 
+        // Wire the global recorder for `arc_validator_set_skipped_total` so the counter
+        // emitted from `abi_decode_validator_set` lands on the consensus `/metrics` endpoint.
+        ValidatorSetMetrics::register(&self.registry).install_global();
+
         (app_metrics, db_metrics, process_metrics)
     }
 
@@ -437,6 +442,19 @@ impl App {
         if let Some(interval) = env_config.status_update_interval {
             self.config.value_sync.status_update_interval = interval;
         }
+    }
+
+    /// Must run after `resolve_chain_identity` and before the engine is started,
+    /// so the overrides are observed when `self.config` is cloned into the engine.
+    fn apply_chain_specific_config(&mut self, chain_id: ChainId) {
+        let protocol_names = crate::hardcoded_config::consensus::p2p::protocol_names(chain_id);
+        info!(
+            ?chain_id,
+            consensus = %protocol_names.consensus,
+            sync = %protocol_names.sync,
+            "Applying chain-specific libp2p protocol names",
+        );
+        self.config.consensus.p2p.protocol_names = protocol_names;
     }
 
     fn apply_state_overrides(&self, state: &mut State) {
@@ -615,7 +633,7 @@ impl App {
     }
 
     #[tracing::instrument(name = "node", skip_all, fields(moniker = %self.config.moniker))]
-    async fn start(&mut self) -> eyre::Result<Handle> {
+    pub async fn start(&mut self) -> eyre::Result<Handle> {
         let ctx = ArcContext::new();
 
         // Read environment-based configuration once at startup
@@ -642,6 +660,8 @@ impl App {
             .resolve_chain_identity(&engine)
             .await
             .wrap_err("Failed to resolve chain identity from execution engine")?;
+
+        self.apply_chain_specific_config(chain_id);
 
         let consensus_spec = ConsensusSpec::from(chain_id);
 
@@ -893,6 +913,29 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[tokio::test]
+    async fn start_requires_execution_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let start_config = StartConfig {
+            rpc_sync_enabled: true,
+            rpc_sync_endpoints: vec!["http://unused:8545".parse().unwrap()],
+            ..Default::default()
+        };
+        let mut app = App::new(
+            Config::default(),
+            tmp.path().to_path_buf(),
+            tmp.path().join("unused.key"),
+            start_config,
+        );
+        match app.start().await {
+            Err(err) => assert!(
+                format!("{err:?}").contains("engine"),
+                "unexpected error: {err:?}"
+            ),
+            Ok(_) => panic!("should fail without execution engine"),
+        }
+    }
+
     fn write_key_file(dir: &std::path::Path) -> (PathBuf, PrivateKey) {
         let key = PrivateKey::generate(OsRng);
         let path = dir.join("priv_validator_key.json");
@@ -944,7 +987,6 @@ mod tests {
     async fn validator_loads_consensus_identity_from_key_file() {
         let dir = tempdir().unwrap();
         let (key_path, original_key) = write_key_file(dir.path());
-
         let app = test_app(key_path, true);
         let identity = app.setup_node_identity().await.unwrap();
 

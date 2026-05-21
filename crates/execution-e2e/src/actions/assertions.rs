@@ -21,9 +21,9 @@ use alloy_consensus::TxReceipt;
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Address, U256};
 use alloy_rpc_types_eth::BlockNumberOrTag;
-use arc_execution_config::hardforks::ArcHardfork;
+use arc_execution_config::hardforks::{is_arc_fork_active, ArcHardfork};
 use futures_util::future::BoxFuture;
-use reth_chainspec::{ChainSpecProvider, EthereumHardfork, EthereumHardforks, Hardforks};
+use reth_chainspec::{ChainSpecProvider, EthereumHardfork, EthereumHardforks};
 use reth_node_api::Block;
 use reth_provider::{BlockReaderIdExt, ReceiptProvider};
 use reth_rpc_api::EthApiClient;
@@ -103,13 +103,24 @@ impl AssertHardfork {
 impl Action for AssertHardfork {
     fn execute<'a>(&'a mut self, env: &'a mut ArcEnvironment) -> BoxFuture<'a, eyre::Result<()>> {
         Box::pin(async move {
-            let block_number = env.block_number();
+            let block = env.current_block();
+            let block_number = block.number;
+            let block_timestamp = block.timestamp;
             let chain_spec = env.node().inner.provider().chain_spec();
-            let is_active = chain_spec.is_fork_active_at_block(self.hardfork, block_number);
+            // An Arc hardfork can be configured as either Block or Timestamp,
+            // so check both — the underlying `is_fork_active_at_*` returns false
+            // for the wrong condition type, and we OR them together.
+            let is_active = is_arc_fork_active(
+                chain_spec.as_ref(),
+                self.hardfork,
+                block_number,
+                block_timestamp,
+            );
 
             info!(
                 hardfork = ?self.hardfork,
                 block_number,
+                block_timestamp,
                 is_active,
                 expected_active = self.expected_active,
                 "Asserting hardfork status"
@@ -117,9 +128,10 @@ impl Action for AssertHardfork {
 
             if is_active != self.expected_active {
                 return Err(eyre::eyre!(
-                    "Hardfork {:?} at block {}: expected active={}, got active={}",
+                    "Hardfork {:?} at block {} (ts {}): expected active={}, got active={}",
                     self.hardfork,
                     block_number,
+                    block_timestamp,
                     self.expected_active,
                     is_active
                 ));
@@ -222,6 +234,8 @@ pub struct AssertTxIncluded {
     name: String,
     /// Expected execution status (success or reverted).
     expected_status: TxStatus,
+    /// Expected gas used.
+    expected_gas_used: Option<u64>,
     /// Specific block number to check. If None, uses current block.
     block_number: Option<u64>,
 }
@@ -234,6 +248,7 @@ impl AssertTxIncluded {
         Self {
             name: name.into(),
             expected_status: TxStatus::default(),
+            expected_gas_used: None,
             block_number: None,
         }
     }
@@ -241,6 +256,12 @@ impl AssertTxIncluded {
     /// Sets the expected transaction execution status.
     pub fn expect(mut self, expected_status: TxStatus) -> Self {
         self.expected_status = expected_status;
+        self
+    }
+
+    /// Sets the expected transaction gas used.
+    pub fn expect_gas_used(mut self, expected_gas_used: u64) -> Self {
+        self.expected_gas_used = Some(expected_gas_used);
         self
     }
 
@@ -285,16 +306,19 @@ impl Action for AssertTxIncluded {
                 .map(|tx| tx.trie_hash())
                 .collect();
 
-            if !tx_hashes.contains(&tx_hash) {
-                return Err(eyre::eyre!(
-                    "Transaction '{}' ({}) not found in block {}. Block contains {} transactions: {:?}",
-                    self.name,
-                    tx_hash,
-                    block_number,
-                    tx_hashes.len(),
-                    tx_hashes
-                ));
-            }
+            let tx_index = tx_hashes
+                .iter()
+                .position(|h| *h == tx_hash)
+                .ok_or_else(|| {
+                    eyre::eyre!(
+                        "Transaction '{}' ({}) not found in block {}, Block contains {} transactions: {:?}",
+                        self.name,
+                        tx_hash,
+                        block_number,
+                        tx_hashes.len(),
+                        tx_hashes
+                    )
+                })?;
 
             // Get the receipt to check execution status
             let receipt = node
@@ -323,6 +347,49 @@ impl Action for AssertTxIncluded {
                     self.expected_status,
                     actual_status
                 ));
+            }
+            if let Some(expected_gas_used) = self.expected_gas_used {
+                // Consensus receipts only store cumulative gas in the block. Per-tx gas (what
+                // JSON-RPC reports as `gasUsed`) is the delta from the previous tx in the same
+                // block, not `cumulative_gas_used` on the receipt alone.
+                let prev_cumulative_gas_used = if tx_index == 0 {
+                    0
+                } else {
+                    let prev_tx_hash = tx_hashes[tx_index - 1];
+                    node.inner
+                        .provider()
+                        .receipt_by_hash(prev_tx_hash)?
+                        .ok_or_else(|| {
+                            eyre::eyre!(
+                                "Previous receipt not found for transaction '{}' ({})",
+                                self.name,
+                                prev_tx_hash
+                            )
+                        })?
+                        .cumulative_gas_used()
+                };
+                let cumulative_gas_used = receipt.cumulative_gas_used();
+                let actual_gas_used = cumulative_gas_used
+                    .checked_sub(prev_cumulative_gas_used)
+                    .ok_or_else(|| {
+                        eyre::eyre!(
+                            "Cumulative gas regression for tx '{}' ({}): \
+                             prev_cumulative={}, current_cumulative={}",
+                            self.name,
+                            tx_hash,
+                            prev_cumulative_gas_used,
+                            cumulative_gas_used,
+                        )
+                    })?;
+                if actual_gas_used != expected_gas_used {
+                    return Err(eyre::eyre!(
+                        "Transaction '{}' ({}) gas used mismatch: expected {}, got {}",
+                        self.name,
+                        tx_hash,
+                        expected_gas_used,
+                        actual_gas_used
+                    ));
+                }
             }
 
             info!(

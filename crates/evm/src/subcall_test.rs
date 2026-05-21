@@ -106,6 +106,7 @@ impl SubcallPrecompile for SubcallTestPrecompile {
                     Bytes::new()
                 },
                 success: false,
+                gas_overhead: 0,
             });
         }
 
@@ -115,7 +116,64 @@ impl SubcallPrecompile for SubcallTestPrecompile {
         Ok(SubcallCompletionResult {
             output: encoded_output,
             success: true,
+            gas_overhead: 0,
         })
+    }
+}
+
+/// Address for the CostlyCompleteSubcallPrecompile test precompile.
+pub const COSTLY_COMPLETE_SUBCALL_ADDRESS: Address =
+    address!("1800000000000000000000000000000000000096");
+
+/// Known gas_overhead reported by CostlyCompleteSubcallPrecompile for testing.
+pub const COSTLY_COMPLETE_GAS_OVERHEAD: u64 = 500;
+
+/// Test precompile identical to SubcallTestPrecompile but reports a known nonzero gas_overhead.
+/// Used to verify the framework actually charges the reported completion gas.
+#[derive(Debug)]
+pub struct CostlyCompleteSubcallPrecompile;
+
+impl SubcallPrecompile for CostlyCompleteSubcallPrecompile {
+    fn init_subcall(&self, inputs: &CallInputs) -> Result<SubcallInitResult, SubcallError> {
+        SubcallTestPrecompile.init_subcall(inputs)
+    }
+
+    fn complete_subcall(
+        &self,
+        continuation_data: SubcallContinuationData,
+        child_result: &FrameResult,
+    ) -> Result<SubcallCompletionResult, SubcallError> {
+        let mut result = SubcallTestPrecompile.complete_subcall(continuation_data, child_result)?;
+        result.gas_overhead = COSTLY_COMPLETE_GAS_OVERHEAD;
+        Ok(result)
+    }
+}
+
+/// Address for the ExcessiveCompleteSubcallPrecompile test precompile.
+pub const EXCESSIVE_COMPLETE_SUBCALL_ADDRESS: Address =
+    address!("1800000000000000000000000000000000000095");
+
+/// Large gas_overhead reported by ExcessiveCompleteSubcallPrecompile for OOG tests.
+pub const EXCESSIVE_COMPLETE_GAS_OVERHEAD: u64 = 5_000;
+
+/// Test precompile that behaves like SubcallTestPrecompile but reports a large
+/// completion gas overhead.
+#[derive(Debug)]
+pub struct ExcessiveCompleteSubcallPrecompile;
+
+impl SubcallPrecompile for ExcessiveCompleteSubcallPrecompile {
+    fn init_subcall(&self, inputs: &CallInputs) -> Result<SubcallInitResult, SubcallError> {
+        SubcallTestPrecompile.init_subcall(inputs)
+    }
+
+    fn complete_subcall(
+        &self,
+        continuation_data: SubcallContinuationData,
+        child_result: &FrameResult,
+    ) -> Result<SubcallCompletionResult, SubcallError> {
+        let mut result = SubcallTestPrecompile.complete_subcall(continuation_data, child_result)?;
+        result.gas_overhead = EXCESSIVE_COMPLETE_GAS_OVERHEAD;
+        Ok(result)
     }
 }
 
@@ -165,10 +223,74 @@ impl SubcallPrecompile for FailingCompleteSubcallPrecompile {
     fn complete_subcall(
         &self,
         _continuation_data: SubcallContinuationData,
-        _child_result: &FrameResult,
+        child_result: &FrameResult,
     ) -> Result<SubcallCompletionResult, SubcallError> {
+        // Assert child succeeded
+        let child_ok = matches!(child_result, FrameResult::Call(o) if o.result.result.is_ok());
+        assert!(child_ok, "expected successful child, got: {child_result:?}");
         Err(SubcallError::InternalError(
             "intentional complete_subcall failure".into(),
         ))
+    }
+}
+
+/// Address for the RejectingCompleteSubcallPrecompile test precompile.
+pub const REJECTING_COMPLETE_SUBCALL_ADDRESS: Address =
+    address!("1800000000000000000000000000000000000097");
+
+/// Test precompile whose complete_subcall returns `success: false` when the child succeeds.
+/// Used to verify that the child's committed state is reverted.
+#[derive(Debug)]
+pub struct RejectingCompleteSubcallPrecompile;
+
+impl SubcallPrecompile for RejectingCompleteSubcallPrecompile {
+    fn init_subcall(&self, inputs: &CallInputs) -> Result<SubcallInitResult, SubcallError> {
+        let input_bytes = match &inputs.input {
+            CallInput::Bytes(b) => b.clone(),
+            CallInput::SharedBuffer(_) => {
+                return Err(SubcallError::AbiDecodeError(
+                    "unexpected shared buffer".into(),
+                ));
+            }
+        };
+
+        let decoded = <InitSubcallInput as SolType>::abi_decode(&input_bytes).map_err(|e| {
+            SubcallError::AbiDecodeError(format!("rejecting_complete_subcall: {e}"))
+        })?;
+        let (target, calldata) = decoded;
+
+        Ok(SubcallInitResult {
+            child_inputs: Box::new(CallInputs {
+                scheme: CallScheme::Call,
+                target_address: target,
+                bytecode_address: target,
+                known_bytecode: None,
+                value: CallValue::Transfer(alloy_primitives::U256::ZERO),
+                input: CallInput::Bytes(calldata),
+                gas_limit: 50_000,
+                is_static: false,
+                caller: inputs.caller,
+                return_memory_offset: 0..0,
+            }),
+            continuation_data: SubcallContinuationData {
+                state: Box::new(()),
+            },
+            gas_overhead: 0,
+        })
+    }
+
+    fn complete_subcall(
+        &self,
+        _continuation_data: SubcallContinuationData,
+        child_result: &FrameResult,
+    ) -> Result<SubcallCompletionResult, SubcallError> {
+        // Assert child succeeded
+        let child_ok = matches!(child_result, FrameResult::Call(o) if o.result.result.is_ok());
+        assert!(child_ok, "expected successful child, got: {child_result:?}");
+        Ok(SubcallCompletionResult {
+            output: Bytes::new(),
+            success: false,
+            gas_overhead: 0,
+        })
     }
 }

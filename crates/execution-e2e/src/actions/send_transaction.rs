@@ -96,7 +96,7 @@ impl SendTransaction {
             create: false,
             data: None,
             data_resolver: None,
-            gas_limit: 26000,
+            gas_limit: 21000,
             wallet_index: 0,
         }
     }

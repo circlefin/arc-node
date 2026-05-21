@@ -27,7 +27,7 @@ use alloy_sol_types::SolEvent;
 use arc_evm::ArcEvm;
 use arc_precompiles::NATIVE_COIN_AUTHORITY_ADDRESS;
 use common::NativeCoinAuthority;
-use reth_chainspec::{EthChainSpec, DEV};
+use reth_chainspec::{EthChainSpec, ForkCondition, DEV};
 use reth_e2e_test_utils::wallet::Wallet;
 use reth_ethereum::evm::revm::{inspector::Inspector, interpreter::interpreter::EthInterpreter};
 use reth_evm::Evm;
@@ -61,17 +61,12 @@ where
     let sender = wallet.wallet_gen()[WALLET_SENDER_INDEX].clone();
     let receiver = wallet.wallet_gen()[WALLET_RECEIVER_INDEX].clone();
     let amount = U256::from(42);
-    // Zero6 hardfork requires extra gas for blocklist SLOAD checks:
-    // - Base intrinsic gas: 21000
-    // - Caller blocklist check: 2100
-    // - Recipient blocklist check (value > 0): 2100
-    // Total: 25200
     let tx = TxEnv {
         chain_id: Some(DEV.chain_id()),
         caller: sender.address(),
         kind: TxKind::Call(receiver.address()),
         value: amount,
-        gas_limit: 26_000, // Must exceed 25200 for Zero6 blocklist gas
+        gas_limit: 21_000,
         gas_price: 0,
         ..Default::default()
     };
@@ -126,7 +121,7 @@ fn inspect_evm_native_transfer() {
     let (tx, exec) = test_native_transfer(&mut evm, &wallet);
 
     let frame = inspector
-        .with_transaction_gas_limit(26_000)
+        .with_transaction_gas_limit(21_000)
         .into_geth_builder()
         .geth_call_traces(call_config, exec.result.gas_used());
 
@@ -135,7 +130,7 @@ fn inspect_evm_native_transfer() {
     assert_eq!(frame.value, Some(tx.value));
     assert_eq!(frame.input, Bytes::new());
     assert_eq!(frame.output, None);
-    assert_eq!(frame.gas, 26_000);
+    assert_eq!(frame.gas, 21_000);
     assert_eq!(frame.error, None);
     assert_eq!(frame.revert_reason, None);
     assert_eq!(frame.calls.len(), 0);
@@ -149,9 +144,9 @@ fn inspect_evm_native_transfer() {
 fn chainspec_with_zero5() -> std::sync::Arc<arc_execution_config::chainspec::ArcChainSpec> {
     use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
     localdev_with_hardforks(&[
-        (ArcHardfork::Zero3, 0),
-        (ArcHardfork::Zero4, 0),
-        (ArcHardfork::Zero5, 0),
+        (ArcHardfork::Zero3, ForkCondition::Block(0)),
+        (ArcHardfork::Zero4, ForkCondition::Block(0)),
+        (ArcHardfork::Zero5, ForkCondition::Block(0)),
     ])
 }
 
@@ -170,7 +165,7 @@ fn evm_native_transfer_zero5_eip7708_log() {
         caller: sender.address(),
         kind: TxKind::Call(receiver.address()),
         value: amount,
-        gas_limit: 26_000,
+        gas_limit: 21_000,
         gas_price: 0,
         ..Default::default()
     };
@@ -201,7 +196,10 @@ fn evm_native_transfer_zero5_eip7708_log() {
 fn evm_native_transfer_pre_zero5_emits_native_coin_transferred() {
     use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
     // Zero4 active but NOT Zero5
-    let chain_spec = localdev_with_hardforks(&[(ArcHardfork::Zero3, 0), (ArcHardfork::Zero4, 0)]);
+    let chain_spec = localdev_with_hardforks(&[
+        (ArcHardfork::Zero3, ForkCondition::Block(0)),
+        (ArcHardfork::Zero4, ForkCondition::Block(0)),
+    ]);
     let (mut evm, wallet) = common::setup_evm_with_chainspec(chain_spec);
 
     let sender = wallet.wallet_gen()[WALLET_SENDER_INDEX].clone();
@@ -213,7 +211,7 @@ fn evm_native_transfer_pre_zero5_emits_native_coin_transferred() {
         caller: sender.address(),
         kind: TxKind::Call(receiver.address()),
         value: amount,
-        gas_limit: 26_000,
+        gas_limit: 21_000,
         gas_price: 0,
         ..Default::default()
     };
@@ -241,7 +239,10 @@ fn evm_native_transfer_pre_zero5_emits_native_coin_transferred() {
 /// Helper to create a chainspec with Zero4 active but NOT Zero5.
 fn chainspec_pre_zero5() -> std::sync::Arc<arc_execution_config::chainspec::ArcChainSpec> {
     use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
-    localdev_with_hardforks(&[(ArcHardfork::Zero3, 0), (ArcHardfork::Zero4, 0)])
+    localdev_with_hardforks(&[
+        (ArcHardfork::Zero3, ForkCondition::Block(0)),
+        (ArcHardfork::Zero4, ForkCondition::Block(0)),
+    ])
 }
 
 /// B1: Zero5 self-transfer (sender == receiver) with non-zero value produces no logs.
@@ -260,7 +261,7 @@ fn evm_native_transfer_zero5_self_transfer_no_log() {
         caller: sender.address(),
         kind: TxKind::Call(sender.address()),
         value: amount,
-        gas_limit: 26_000,
+        gas_limit: 21_000,
         gas_price: 0,
         ..Default::default()
     };
@@ -306,7 +307,7 @@ fn evm_native_transfer_zero5_zero_value_no_log() {
         caller: sender.address(),
         kind: TxKind::Call(receiver.address()),
         value: U256::ZERO,
-        gas_limit: 26_000,
+        gas_limit: 21_000,
         gas_price: 0,
         ..Default::default()
     };
@@ -384,7 +385,7 @@ fn evm_native_transfer_zero5_to_zero_address_reverts() {
         caller: sender.address(),
         kind: TxKind::Call(alloy_primitives::Address::ZERO),
         value: amount,
-        gas_limit: 26_000,
+        gas_limit: 21_000,
         gas_price: 0,
         ..Default::default()
     };
@@ -434,7 +435,7 @@ fn evm_native_transfer_event_ordering_preserved_across_zero5() {
         caller: sender.address(),
         kind: TxKind::Call(receiver.address()),
         value: amount,
-        gas_limit: 26_000,
+        gas_limit: 21_000,
         gas_price: 0,
         ..Default::default()
     };
@@ -453,7 +454,7 @@ fn evm_native_transfer_event_ordering_preserved_across_zero5() {
         caller: sender_z5.address(),
         kind: TxKind::Call(receiver_z5.address()),
         value: amount,
-        gas_limit: 26_000,
+        gas_limit: 21_000,
         gas_price: 0,
         ..Default::default()
     };
@@ -513,7 +514,7 @@ fn evm_native_transfer_zero5_amsterdam_eip7708_log() {
         caller: sender.address(),
         kind: TxKind::Call(receiver.address()),
         value: amount,
-        gas_limit: 26_000,
+        gas_limit: 21_000,
         gas_price: 0,
         ..Default::default()
     };
@@ -554,9 +555,9 @@ fn evm_native_transfer_hardfork_boundary_zero5_activation() {
     use reth_evm::ConfigureEvm;
 
     let chain_spec = localdev_with_hardforks(&[
-        (ArcHardfork::Zero3, 0),
-        (ArcHardfork::Zero4, 0),
-        (ArcHardfork::Zero5, 10),
+        (ArcHardfork::Zero3, ForkCondition::Block(0)),
+        (ArcHardfork::Zero4, ForkCondition::Block(0)),
+        (ArcHardfork::Zero5, ForkCondition::Block(10)),
     ]);
 
     let amount = U256::from(42);
@@ -575,7 +576,7 @@ fn evm_native_transfer_hardfork_boundary_zero5_activation() {
         caller: sender.address(),
         kind: TxKind::Call(receiver.address()),
         value: amount,
-        gas_limit: 26_000,
+        gas_limit: 21_000,
         gas_price: 0,
         ..Default::default()
     };
@@ -619,7 +620,7 @@ fn evm_native_transfer_hardfork_boundary_zero5_activation() {
         caller: sender.address(),
         kind: TxKind::Call(receiver.address()),
         value: amount,
-        gas_limit: 26_000,
+        gas_limit: 21_000,
         gas_price: 0,
         ..Default::default()
     };
@@ -866,6 +867,8 @@ fn evm_native_create2_with_value_zero5_emits_eip7708_log() {
         },
     );
 
+    let trace_db = db.clone();
+    let trace_evm_env = evm_env.clone();
     let mut evm = evm_config.evm_with_env(db, evm_env);
 
     let tx = TxEnv {
@@ -878,7 +881,9 @@ fn evm_native_create2_with_value_zero5_emits_eip7708_log() {
         ..Default::default()
     };
 
-    let exec = evm.transact_raw(tx).expect("CREATE2 tx should be accepted");
+    let exec = evm
+        .transact_raw(tx.clone())
+        .expect("CREATE2 tx should be accepted");
     assert!(
         exec.result.is_success(),
         "CREATE2 with value should succeed: {:?}",
@@ -920,4 +925,37 @@ fn evm_native_create2_with_value_zero5_emits_eip7708_log() {
         decoded_create2.value, endowment,
         "CREATE2 Transfer amount should match the endowment"
     );
+
+    let call_config = CallConfig {
+        with_log: Some(true),
+        only_top_call: Some(false),
+    };
+    let mut inspector =
+        TracingInspector::new(TracingInspectorConfig::from_geth_call_config(&call_config));
+    let mut trace_evm =
+        evm_config.evm_with_env_and_inspector(trace_db, trace_evm_env, &mut inspector);
+    let trace_exec = trace_evm
+        .transact_raw(tx.clone())
+        .expect("inspected CREATE2 tx should be accepted");
+    assert!(
+        trace_exec.result.is_success(),
+        "inspected CREATE2 with value should succeed: {:?}",
+        trace_exec.result
+    );
+    drop(trace_evm);
+
+    let frame = inspector
+        .with_transaction_gas_limit(tx.gas_limit)
+        .into_geth_builder()
+        .geth_call_traces(call_config, trace_exec.result.gas_used());
+    assert_eq!(frame.typ, "CALL");
+    assert_eq!(frame.to, Some(factory));
+    assert_eq!(
+        frame.calls.len(),
+        1,
+        "factory should have exactly one CREATE2 child frame"
+    );
+    let create2_frame = &frame.calls[0];
+    assert_eq!(create2_frame.typ, "CREATE2");
+    assert_eq!(create2_frame.to, Some(expected_create2_addr));
 }

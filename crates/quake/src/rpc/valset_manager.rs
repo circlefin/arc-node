@@ -54,7 +54,7 @@ sol! {
 impl ContractValidator {
     pub fn public_key(&self) -> Result<PublicKey> {
         let key_bytes: [u8; 32] = self.publicKey[..].try_into()?;
-        Ok(PublicKey::from_bytes(key_bytes))
+        PublicKey::from_bytes(key_bytes).wrap_err("Failed to decode public key bytes")
     }
 
     pub fn address(&self) -> Result<MalachiteAddress> {

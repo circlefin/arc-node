@@ -338,7 +338,11 @@ contract ValidatorRegistryTest is TestUtils {
         vm.startPrank(owner);
 
         // Registration should fail because validator1 public key is already in genesis
-        vm.expectRevert(abi.encodeWithSelector(ValidatorRegistry.ValidatorAlreadyRegistered.selector, keccak256(validator1PublicKey)));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ValidatorRegistry.ValidatorAlreadyRegistered.selector, keccak256(validator1PublicKey)
+            )
+        );
         registry.registerValidator(validator1PublicKey, 200);
 
         vm.stopPrank();
@@ -476,7 +480,11 @@ contract ValidatorRegistryTest is TestUtils {
         _validatorRegistry.activateValidator(registrationId);
 
         // Try to activate the same validator again (should fail)
-        vm.expectRevert(abi.encodeWithSelector(ValidatorRegistry.InvalidRegistrationId.selector, registrationId));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ValidatorRegistry.InvalidValidatorStatus.selector, registrationId, ValidatorStatus.Active
+            )
+        );
         _validatorRegistry.activateValidator(registrationId);
 
         vm.stopPrank();

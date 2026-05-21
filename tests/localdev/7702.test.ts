@@ -99,7 +99,7 @@ describe('eip-7702', () => {
         authorizationList: [authorization],
       })
       .then(ReceiptVerifier.waitSuccess)
-    delegateReceipt.verifyGasUsedApproximately(50255n).verifyEvents((ev) => {
+    delegateReceipt.verifyGasUsedApproximately(46055n).verifyEvents((ev) => {
       ev.expectCount(1).expectNativeTransfer({
         from: sender.account.address,
         to: wallet.account.address,

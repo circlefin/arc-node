@@ -23,6 +23,7 @@ use alloy_primitives::Bytes;
 use alloy_sol_types::sol;
 use alloy_sol_types::SolCall;
 use reth_evm::Evm;
+use revm::handler::SYSTEM_ADDRESS;
 use revm::DatabaseCommit;
 use revm_primitives::Address;
 
@@ -106,8 +107,8 @@ where
 
     let result_and_state = evm
         .transact_system_call(
-            Address::ZERO,           // caller (use zero address to avoid RejectCallerWithCode)
-            PROTOCOL_CONFIG_ADDRESS, // contract address
+            SYSTEM_ADDRESS,
+            PROTOCOL_CONFIG_ADDRESS,
             Bytes::from(call_data),
         )
         .map_err(|e| ProtocolConfigError::EvmError(format!("{e:?}")))?;

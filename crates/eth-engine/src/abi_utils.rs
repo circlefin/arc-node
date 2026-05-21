@@ -16,10 +16,11 @@
 
 use std::time::Duration;
 
-use tracing::debug;
+use tracing::{debug, error};
 
 use arc_consensus_types::signing::PublicKey;
 use arc_consensus_types::{Address, ConsensusParams, Validator, ValidatorSet};
+use arc_shared::metrics::validator_set::record_skipped_validator;
 use malachitebft_core_types::{LinearTimeouts, VotingPower};
 
 use alloy_sol_macro::sol;
@@ -51,32 +52,55 @@ sol! {
     function consensusParams() external view override returns (ContractConsensusParams memory);
 }
 
-/// Decode validator set from ABI-encoded result
+/// Decode validator set from ABI-encoded result.
+///
+/// Validators with malformed public keys are skipped (logged at ERROR and counted in
+/// `arc_validator_set_skipped_total`) rather than aborting the whole decode. The chain
+/// keeps making progress on the surviving validators, even if they represent a small
+/// fraction of the contract's advertised voting power — losing liveness while the
+/// registry is corrupted is worse than running at reduced security until governance
+/// removes the bad registrations. The empty-set case still errors, since consensus
+/// cannot proceed with zero validators.
+///
+/// **Operator alerting on `arc_validator_set_skipped_total` is load-bearing here.**
+/// A non-zero rate is the only signal that the on-chain set has malformed keys and
+/// the chain is operating with a degraded validator set; without an alert, the
+/// degradation is silent.
+///
+/// `PublicKey::from_bytes` is deterministic, so every node reaches the same filtered
+/// set — there is no fork risk.
 pub fn abi_decode_validator_set(result: Vec<u8>) -> eyre::Result<ValidatorSet> {
     // Decode the function's return payload exactly as the ABI defines it.
     let active_validators: Vec<ContractValidator> =
         getActiveValidatorSetCall::abi_decode_returns(&result)?;
 
-    // Map contract validators to use Malachite's domain type
-    let validators = active_validators
-        .into_iter()
-        .filter(|cv| cv.status == ContractValidatorStatus::Active && cv.votingPower > 0)
-        .map(|cv| {
-            // Convert contract publicKey bytes to Malachite's domain type
-            if cv.publicKey.len() != 32 {
-                eyre::bail!(
-                    "Public key must be exactly 32 bytes, got {}",
-                    cv.publicKey.len()
-                );
-            }
-            let mut pk = [0u8; 32];
-            pk.copy_from_slice(&cv.publicKey);
+    let mut validators: Vec<Validator> = Vec::new();
+    let mut skipped: usize = 0;
 
-            let public_key = PublicKey::from_bytes(pk);
-            let voting_power: VotingPower = cv.votingPower;
-            Ok(Validator::new(public_key, voting_power))
-        })
-        .collect::<eyre::Result<Vec<_>>>()?;
+    for cv in &active_validators {
+        if cv.status != ContractValidatorStatus::Active || cv.votingPower == 0 {
+            continue;
+        }
+
+        match try_decode_validator(cv) {
+            Ok(validator) => validators.push(validator),
+            Err(e) => {
+                error!(
+                    public_key = %format!("0x{}", hex::encode(&cv.publicKey)),
+                    "Skipping active validator with malformed public key: {e:#}",
+                );
+                record_skipped_validator();
+                skipped = skipped.saturating_add(1);
+            }
+        }
+    }
+
+    if validators.is_empty() {
+        eyre::bail!(
+            "No active validators with valid public keys — validator set would be empty \
+             ({skipped} active validator(s) skipped due to malformed public keys)"
+        );
+    }
 
     debug!("ABI decoded validators:");
     for validator in &validators {
@@ -89,6 +113,23 @@ pub fn abi_decode_validator_set(result: Vec<u8>) -> eyre::Result<ValidatorSet> {
     }
 
     Ok(ValidatorSet::new(validators))
+}
+
+/// Convert a single `ContractValidator` from the ABI payload into the domain `Validator` type.
+fn try_decode_validator(cv: &ContractValidator) -> eyre::Result<Validator> {
+    if cv.publicKey.len() != 32 {
+        eyre::bail!(
+            "Public key must be exactly 32 bytes, got {}",
+            cv.publicKey.len()
+        );
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&cv.publicKey);
+
+    let public_key = PublicKey::from_bytes(pk)
+        .map_err(|e| eyre::eyre!("Failed to decode public key bytes: {e}"))?;
+    let voting_power: VotingPower = cv.votingPower;
+    Ok(Validator::new(public_key, voting_power))
 }
 
 pub fn abi_decode_consensus_params(result: Vec<u8>) -> eyre::Result<ConsensusParams> {
@@ -159,8 +200,8 @@ mod tests {
         pub_keys.sort_unstable_by(|pk, pk2| {
             let pk_bytes: [u8; 32] = hex::decode(pk).unwrap().try_into().unwrap();
             let pk2_bytes: [u8; 32] = hex::decode(pk2).unwrap().try_into().unwrap();
-            let a1 = Address::from_public_key(&PublicKey::from_bytes(pk_bytes));
-            let a2 = Address::from_public_key(&PublicKey::from_bytes(pk2_bytes));
+            let a1 = Address::from_public_key(&PublicKey::from_bytes(pk_bytes).unwrap());
+            let a2 = Address::from_public_key(&PublicKey::from_bytes(pk2_bytes).unwrap());
             a1.cmp(&a2)
         });
 
@@ -179,8 +220,119 @@ mod tests {
         }
     }
 
+    /// A known-good ed25519 public key used to populate valid test validators.
+    const VALID_PK_A: &str = "c992c8696818bda11d628f38584022a6332c144b7f929b4d972bd39a23244aec";
+    /// A second known-good ed25519 public key.
+    const VALID_PK_B: &str = "35121369a803f64463e1688af1ba5d963a40b7d71eeffadd8496f1d5b8d61d53";
+    /// A third known-good ed25519 public key.
+    const VALID_PK_C: &str = "eda755457e2e7b8cb56956372611f5b5d37698eef26aa7fdb01616a6e7824f22";
+
+    /// Build an Active `ContractValidator` with the given 32-byte public key and voting power.
+    fn active_validator(pk_bytes: [u8; 32], voting_power: u64) -> ContractValidator {
+        ContractValidator {
+            status: ContractValidatorStatus::Active,
+            publicKey: pk_bytes.to_vec().into(),
+            votingPower: voting_power,
+        }
+    }
+
+    fn pk(hex_str: &str) -> [u8; 32] {
+        hex::decode(hex_str).unwrap().try_into().unwrap()
+    }
+
+    /// A 32-byte blob that `PublicKey::from_bytes` rejects as malformed. Derived from
+    /// `VALID_PK_A` by flipping bit 3 of byte 13 (`0x40` → `0x48`) — the same technique
+    /// used by `test_corrupted_public_key_leaves_set_empty_and_errors`. The result is
+    /// distinct from all `VALID_PK_*` constants so it can be combined with any of them
+    /// in the same test.
+    const MALFORMED_PK: &str = "c992c8696818bda11d628f38584822a6332c144b7f929b4d972bd39a23244aec";
+
+    fn malformed_pk_bytes() -> [u8; 32] {
+        let pk_bytes = pk(MALFORMED_PK);
+        assert!(
+            PublicKey::from_bytes(pk_bytes).is_err(),
+            "test precondition: MALFORMED_PK must be rejected by PublicKey::from_bytes",
+        );
+        pk_bytes
+    }
+
+    fn encode_validators(validators: Vec<ContractValidator>) -> Vec<u8> {
+        getActiveValidatorSetCall::abi_encode_returns(&validators)
+    }
+
     #[test]
-    fn test_corrupted_public_key_validation_fails() {
+    fn test_skip_single_malformed_validator_in_set() {
+        // 3 active validators, middle one has a malformed public key. The decoder should
+        // drop the malformed validator and return a set of 2 with accurate voting power.
+        let validators = vec![
+            active_validator(pk(VALID_PK_A), 10),
+            active_validator(malformed_pk_bytes(), 10),
+            active_validator(pk(VALID_PK_B), 10),
+        ];
+        let encoded = encode_validators(validators);
+
+        let valset = abi_decode_validator_set(encoded).expect("set should decode");
+
+        assert_eq!(valset.validators.len(), 2);
+        // Total voting power reflects only the retained validators; the malformed one is excluded.
+        assert_eq!(valset.total_voting_power(), 20);
+    }
+
+    #[test]
+    fn test_majority_malformed_still_decodes_reduced_set() {
+        // 3 active validators with equal voting power; 2 are malformed. Even though malformed
+        // VP (2/3) far exceeds the BFT byzantine threshold, the surviving validator is
+        // returned — we prefer reduced security over a halted chain, and rely on operators
+        // alerting on `arc_validator_set_skipped_total` to drive recovery.
+        let validators = vec![
+            active_validator(pk(VALID_PK_A), 10),
+            active_validator(malformed_pk_bytes(), 10),
+            active_validator(malformed_pk_bytes(), 10),
+        ];
+        let encoded = encode_validators(validators);
+
+        let valset = abi_decode_validator_set(encoded).expect("set should decode");
+
+        assert_eq!(valset.validators.len(), 1);
+        assert_eq!(valset.total_voting_power(), 10);
+    }
+
+    #[test]
+    fn test_minority_malformed_decodes_reduced_set() {
+        // 4 active validators with equal voting power; 1 is malformed. Returns the reduced
+        // set with 3 validators and a recomputed total voting power.
+        let validators = vec![
+            active_validator(pk(VALID_PK_A), 10),
+            active_validator(pk(VALID_PK_B), 10),
+            active_validator(pk(VALID_PK_C), 10),
+            active_validator(malformed_pk_bytes(), 10),
+        ];
+        let encoded = encode_validators(validators);
+
+        let valset = abi_decode_validator_set(encoded).expect("set should decode");
+
+        assert_eq!(valset.validators.len(), 3);
+        assert_eq!(valset.total_voting_power(), 30);
+    }
+
+    #[test]
+    fn test_lopsided_voting_power_decodes_reduced_set() {
+        // Heavy-VP validator survives, light-VP one is malformed. Confirms that the
+        // returned total reflects only the survivors, not the contract's advertised total.
+        let validators = vec![
+            active_validator(pk(VALID_PK_A), 90),
+            active_validator(malformed_pk_bytes(), 10),
+        ];
+        let encoded = encode_validators(validators);
+
+        let valset = abi_decode_validator_set(encoded).expect("set should decode");
+
+        assert_eq!(valset.validators.len(), 1);
+        assert_eq!(valset.total_voting_power(), 90);
+    }
+
+    #[test]
+    fn test_corrupted_public_key_leaves_set_empty_and_errors() {
         let pub_key = "c992c8696818bda11d628f38584022a6332c144b7f929b4d972bd39a23244aec";
 
         let raw_valset = [
@@ -201,21 +353,14 @@ mod tests {
         let flip_byte_index = bytes.len() - 19; // Flip a bit to corrupt the public key
         bytes[flip_byte_index] ^= 0b0000_1000;
 
-        // Then, try with corrupted pubkey
-        let result = std::panic::catch_unwind(|| {
-            let _ = abi_decode_validator_set(bytes.clone());
-        });
-        assert!(result.is_err(), "Expected panic on malformed public key");
-
-        let payload = result.unwrap_err();
-        let panic_msg = payload
-            .downcast_ref::<String>()
-            .map(|s| s.as_str())
-            .or_else(|| payload.downcast_ref::<&str>().copied())
-            .unwrap_or("<unknown panic>");
+        // With only one validator and that validator malformed, the filtered set is empty —
+        // abi_decode_validator_set returns an error rather than producing an empty ValidatorSet.
+        let err = abi_decode_validator_set(bytes)
+            .expect_err("decoding a sole malformed public key should fail");
+        let msg = format!("{err:#}");
         assert!(
-            panic_msg.contains("MalformedPublicKey"),
-            "Expected panic with 'MalformedPublicKey', got: {panic_msg}",
+            msg.contains("validator set would be empty"),
+            "unexpected error: {msg}",
         );
     }
 

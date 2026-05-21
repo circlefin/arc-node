@@ -16,7 +16,7 @@
 
 //! Transaction sending e2e tests for Arc Chain.
 
-use alloy_primitives::{address, bytes};
+use alloy_primitives::{address, bytes, U256};
 use arc_execution_e2e::{
     actions::{AssertTxIncluded, ProduceBlocks, SendTransaction, TxStatus},
     ArcSetup, ArcTestBuilder,
@@ -64,6 +64,7 @@ async fn test_reverted_transaction() -> Result<()> {
         .with_action(
             SendTransaction::new("tx1")
                 .with_to(address!("0x3600000000000000000000000000000000000000"))
+                .with_value(U256::ZERO) // Value must be 0 — FiatTokenProxy (0x3600…0000) is pre-blocklisted in NativeCoinControl
                 .with_data(bytes!("0x1234abcd"))
                 .with_gas_limit(100_000),
         )

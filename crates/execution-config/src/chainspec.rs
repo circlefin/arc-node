@@ -42,13 +42,13 @@ use crate::{
     gas_fee::decode_base_fee_from_bytes,
     hardforks::{
         ArcGenesisInfo, ArcHardforkFlags, ARC_DEVNET_HARDFORKS, ARC_LOCALDEV_HARDFORKS,
-        ARC_TESTNET_HARDFORKS,
+        ARC_MAINNET_HARDFORKS, ARC_TESTNET_HARDFORKS,
     },
 };
 
 use crate::chain_ids::*;
 
-const ARC_SUPPORTED: &[&str] = &["arc-testnet", "arc-localdev", "arc-devnet"];
+const ARC_SUPPORTED: &[&str] = &["arc-mainnet", "arc-testnet", "arc-localdev", "arc-devnet"];
 const ARC_BASE_FEE_MAX_CHANGE_DENOMINATOR: u128 = 50; // 1/50 = 2%
 
 #[derive(Debug, Clone, Default)]
@@ -65,6 +65,7 @@ impl ChainSpecParser for ArcChainSpecParser {
             "arc-localdev" => Ok(LOCAL_DEV.clone()),
             "arc-devnet" => Ok(DEVNET.clone()),
             "arc-testnet" => Ok(TESTNET.clone()),
+            "arc-mainnet" => Ok(MAINNET.clone()),
             _ => {
                 let genesis = parse_genesis(s)?;
                 Ok(Arc::new(ArcChainSpec::from(genesis)))
@@ -276,24 +277,34 @@ impl ArcChainSpec {
         Self { inner }
     }
 
-    /// Get the hardfork flags for a given block height.
+    /// Get the hardfork flags for a given (block height, timestamp).
     ///
-    /// Returns feature flags indicating which Arc hardforks are active at the given block.
-    /// Each hardfork is independently queryable without implying other hardforks.
-    pub fn get_hardfork_flags(&self, height: u64) -> ArcHardforkFlags {
-        ArcHardforkFlags::from_chain_hardforks(&self.inner.hardforks, height)
+    /// Returns feature flags indicating which Arc hardforks are active at the given
+    /// head. Both inputs are required because Arc hardfork schedules are
+    /// network-specific and may use either block heights or timestamps.
+    pub fn get_hardfork_flags(&self, height: u64, timestamp: u64) -> ArcHardforkFlags {
+        ArcHardforkFlags::from_chain_hardforks(&self.inner.hardforks, height, timestamp)
     }
 }
 
 impl BlockGasLimitProvider for ArcChainSpec {
     fn block_gas_limit_config(&self, _block_height: u64) -> BlockGasLimitConfig {
         let (min, max) = match self.chain().id() {
+            MAINNET_CHAIN_ID => (10_000_000, 200_000_000),
             TESTNET_CHAIN_ID => (10_000_000, 200_000_000),
             _ => (1_000_000, 1_000_000_000),
         };
         BlockGasLimitConfig::new(min, max, 30_000_000)
     }
 }
+
+const BASE_FEE_CONFIG_MAINNET: BaseFeeConfig = BaseFeeConfig::new(
+    BoundedParam::new(1, 20, 100),
+    BoundedParam::new(1, 200, 1_000),
+    BoundedParam::new(1, 5000, 9_000),
+    1,
+    20_000_000_000_000, // 20,000 gwei
+);
 
 const BASE_FEE_CONFIG_TESTNET: BaseFeeConfig = BaseFeeConfig::new(
     BoundedParam::new(1, 20, 100),
@@ -308,13 +319,14 @@ const BASE_FEE_CONFIG_DEFAULT: BaseFeeConfig = BaseFeeConfig::new(
     BoundedParam::new(1, 200, 10_000),
     BoundedParam::new(1, 5000, 10_000),
     1,
-    u64::MAX - 1, // helpful to test bounds conditions
+    u64::MAX - 1,
 );
 
 impl BaseFeeConfigProvider for ArcChainSpec {
     // While the same config is used for all blockheights, it is available to ease future hardfork transitions
     fn base_fee_config(&self, _block_height: u64) -> BaseFeeConfig {
         match self.chain().id() {
+            MAINNET_CHAIN_ID => BASE_FEE_CONFIG_MAINNET,
             TESTNET_CHAIN_ID => BASE_FEE_CONFIG_TESTNET,
             _ => BASE_FEE_CONFIG_DEFAULT,
         }
@@ -334,29 +346,30 @@ const PROXY_IMPLEMENTATION_SLOT: B256 =
 /// Creates a custom localdev chain spec for testing with specific hardfork activations.
 ///
 /// This starts with base Ethereum forks and adds only the specified Arc hardforks.
-/// This is useful for testing hardfork transitions without creating static constants
-/// for every combination.
+/// Each entry pairs a hardfork with the [`ForkCondition`] that activates it — use
+/// `ForkCondition::Block(n)` for block-gated forks and `ForkCondition::Timestamp(t)`
+/// for timestamp-gated ones.
 ///
 /// # Example
 /// ```ignore
 /// use arc_execution_config::chainspec::localdev_with_hardforks;
 /// use arc_execution_config::hardforks::ArcHardfork;
+/// use reth_chainspec::ForkCondition;
 ///
 /// // Create a chain spec with Zero3 and Zero4 active at genesis
 /// let spec = localdev_with_hardforks(&[
-///     (ArcHardfork::Zero3, 0),
-///     (ArcHardfork::Zero4, 0),
+///     (ArcHardfork::Zero3, ForkCondition::Block(0)),
+///     (ArcHardfork::Zero4, ForkCondition::Block(0)),
 /// ]);
 ///
-/// // Test Zero5 activation at block 5
+/// // Test Zero7 activating at a future timestamp
 /// let spec = localdev_with_hardforks(&[
-///     (ArcHardfork::Zero3, 0),
-///     (ArcHardfork::Zero4, 0),
-///     (ArcHardfork::Zero5, 5),
+///     (ArcHardfork::Zero3, ForkCondition::Block(0)),
+///     (ArcHardfork::Zero7, ForkCondition::Timestamp(1_800_000_000)),
 /// ]);
 /// ```
 #[cfg(any(feature = "test-utils", test))]
-pub fn localdev_with_hardforks(hardforks: &[(ArcHardfork, u64)]) -> Arc<ArcChainSpec> {
+pub fn localdev_with_hardforks(hardforks: &[(ArcHardfork, ForkCondition)]) -> Arc<ArcChainSpec> {
     use crate::hardforks::BASE_FORKS;
 
     let genesis: Genesis =
@@ -364,26 +377,26 @@ pub fn localdev_with_hardforks(hardforks: &[(ArcHardfork, u64)]) -> Arc<ArcChain
             .expect("Can't deserialize localdev genesis json");
 
     let mut inner = ChainSpec::from_genesis(genesis);
-    // Start with base Ethereum forks only
     inner.hardforks = BASE_FORKS.clone();
 
-    // Add only the specified Arc hardforks
-    for &(hardfork, block) in hardforks {
-        // We match to access the constant value for .boxed()
-        // This requires listing variants but is needed for the 'static lifetime
+    for &(hardfork, condition) in hardforks {
+        // Match to access the constant value for .boxed() — needed for the 'static lifetime.
         match hardfork {
             ArcHardfork::Zero3 => inner
                 .hardforks
-                .insert(ArcHardfork::Zero3.boxed(), ForkCondition::Block(block)),
+                .insert(ArcHardfork::Zero3.boxed(), condition),
             ArcHardfork::Zero4 => inner
                 .hardforks
-                .insert(ArcHardfork::Zero4.boxed(), ForkCondition::Block(block)),
+                .insert(ArcHardfork::Zero4.boxed(), condition),
             ArcHardfork::Zero5 => inner
                 .hardforks
-                .insert(ArcHardfork::Zero5.boxed(), ForkCondition::Block(block)),
+                .insert(ArcHardfork::Zero5.boxed(), condition),
             ArcHardfork::Zero6 => inner
                 .hardforks
-                .insert(ArcHardfork::Zero6.boxed(), ForkCondition::Block(block)),
+                .insert(ArcHardfork::Zero6.boxed(), condition),
+            ArcHardfork::Zero7 => inner
+                .hardforks
+                .insert(ArcHardfork::Zero7.boxed(), condition),
         };
     }
 
@@ -525,6 +538,27 @@ pub static TESTNET: LazyLock<Arc<ArcChainSpec>> = LazyLock::new(|| {
     ArcChainSpec::new(inner).into()
 });
 
+pub static MAINNET: LazyLock<Arc<ArcChainSpec>> = LazyLock::new(|| {
+    let genesis: Genesis =
+        serde_json::from_str(include_str!("../../../assets/mainnet/genesis.json"))
+            .expect("Can't deserialize Mainnet genesis json");
+    let mut inner = ChainSpec::from_genesis(genesis);
+    inner.hardforks = ARC_MAINNET_HARDFORKS.clone();
+    ArcChainSpec::new(inner).into()
+});
+
+/// Returns the bundled chainspec for a known Arc chain ID, or `None` if the
+/// chain ID is unknown.
+pub fn bundled_chainspec_for_chain_id(chain_id: u64) -> Option<Arc<ArcChainSpec>> {
+    match chain_id {
+        LOCALDEV_CHAIN_ID => Some(LOCAL_DEV.clone()),
+        MAINNET_CHAIN_ID => Some(MAINNET.clone()),
+        DEVNET_CHAIN_ID => Some(DEVNET.clone()),
+        TESTNET_CHAIN_ID => Some(TESTNET.clone()),
+        _ => None,
+    }
+}
+
 impl From<ChainSpec> for ArcChainSpec {
     fn from(inner: ChainSpec) -> Self {
         Self::new(inner)
@@ -535,14 +569,17 @@ impl From<Genesis> for ArcChainSpec {
     fn from(genesis: Genesis) -> Self {
         let mut inner = ChainSpec::from_genesis(genesis);
 
-        // For devnet and testnet, we don't read the fork configuration from genesis.
-        // Patch the hardfork table from the predefined value instead.
+        // For mainnet, devnet, and testnet, we don't read the fork configuration from
+        // genesis. Patch the hardfork table from the predefined value instead.
         //
         // Localdev is intentionally NOT hardcoded here so that genesis.json controls
         // hardfork activation — the nightly-upgrade test patches genesis.json with jq
         // and relies on the node reading those values.  The named network "arc-localdev"
         // (LOCAL_DEV static) still uses ARC_LOCALDEV_HARDFORKS directly.
         match inner.chain().id() {
+            MAINNET_CHAIN_ID => {
+                inner.hardforks = ARC_MAINNET_HARDFORKS.clone();
+            }
             DEVNET_CHAIN_ID => {
                 inner.hardforks = ARC_DEVNET_HARDFORKS.clone();
             }
@@ -784,11 +821,18 @@ impl EthExecutorSpec for ArcChainSpec {
 mod tests {
     use super::*;
 
-    use crate::chain_ids::{DEVNET_CHAIN_ID, LOCALDEV_CHAIN_ID, TESTNET_CHAIN_ID};
+    use crate::chain_ids::{
+        DEVNET_CHAIN_ID, LOCALDEV_CHAIN_ID, MAINNET_CHAIN_ID, TESTNET_CHAIN_ID,
+    };
     use crate::hardforks::{
-        ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET, ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_DEVNET,
-        ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_TESTNET, ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET,
-        ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET, ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET,
+        ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET,
+        ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET,
+        ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_DEVNET, ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_TESTNET,
+        ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET, ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET,
+        ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET,
+        ARC_ZERO5_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET,
+        ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET,
+        ARC_ZERO6_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET, BASE_FORKS,
     };
 
     fn assert_arc_chainspec_evm_hardforks(spec: &ArcChainSpec) {
@@ -907,7 +951,7 @@ mod tests {
             .expect("Failed to parse arc-localdev");
         assert_eq!(spec.chain().id(), LOCALDEV_CHAIN_ID);
         assert_arc_chainspec_evm_hardforks(&spec);
-        assert_eq!(spec.forks_iter().count(), 22);
+        assert_eq!(spec.forks_iter().count(), 23);
         assert!(spec.is_osaka_active_at_timestamp(0));
 
         // verify zero3 hardfork block
@@ -931,11 +975,17 @@ mod tests {
             spec.is_fork_active_at_block(ArcHardfork::Zero6, 0),
             "Zero6 should be active at block 0 in hardfork.rs, and load by chainspec"
         );
-        let flags = spec.get_hardfork_flags(0);
+        // Zero7 activates by timestamp (Arc convention from Zero7 onward).
+        assert!(
+            spec.is_fork_active_at_timestamp(ArcHardfork::Zero7, 0),
+            "Zero7 should be active at timestamp 0 in hardfork.rs, and load by chainspec"
+        );
+        let flags = spec.get_hardfork_flags(0, 0);
         assert!(flags.is_active(ArcHardfork::Zero3));
         assert!(flags.is_active(ArcHardfork::Zero4));
         assert!(flags.is_active(ArcHardfork::Zero5));
         assert!(flags.is_active(ArcHardfork::Zero6));
+        assert!(flags.is_active(ArcHardfork::Zero7));
     }
 
     #[test]
@@ -944,7 +994,7 @@ mod tests {
         assert_eq!(spec.chain().id(), LOCALDEV_CHAIN_ID);
         assert_arc_chainspec_evm_hardforks(&spec);
         assert!(spec.is_osaka_active_at_timestamp(0));
-        assert_eq!(spec.forks_iter().count(), 22);
+        assert_eq!(spec.forks_iter().count(), 23);
 
         // verify zero3 hardfork block
         assert!(!spec.is_fork_active_at_timestamp(ArcHardfork::Zero3, 1762732800));
@@ -958,11 +1008,72 @@ mod tests {
         // verify zero6 hardfork block
         assert!(!spec.is_fork_active_at_timestamp(ArcHardfork::Zero6, 1762732800));
         assert!(spec.is_fork_active_at_block(ArcHardfork::Zero6, 0));
-        let flags = spec.get_hardfork_flags(0);
+        // Zero7 activates by timestamp (Arc convention from Zero7 onward).
+        assert!(spec.is_fork_active_at_timestamp(ArcHardfork::Zero7, 0));
+        assert!(!spec.is_fork_active_at_block(ArcHardfork::Zero7, 0));
+        let flags = spec.get_hardfork_flags(0, 0);
         assert!(flags.is_active(ArcHardfork::Zero3));
         assert!(flags.is_active(ArcHardfork::Zero4));
         assert!(flags.is_active(ArcHardfork::Zero5));
         assert!(flags.is_active(ArcHardfork::Zero6));
+        assert!(flags.is_active(ArcHardfork::Zero7));
+        assert_eq!(
+            spec.display_hardforks().to_string(),
+            r#"Pre-merge hard forks (block based):
+- Frontier                         @0
+- Homestead                        @0
+- Tangerine                        @0
+- SpuriousDragon                   @0
+- Byzantium                        @0
+- Constantinople                   @0
+- Petersburg                       @0
+- Istanbul                         @0
+- MuirGlacier                      @0
+- Berlin                           @0
+- London                           @0
+- ArrowGlacier                     @0
+- GrayGlacier                      @0
+- Zero3                            @0
+- Zero4                            @0
+- Zero5                            @0
+- Zero6                            @0
+Merge hard forks:
+- Paris                            @0 (network is known to be merged)
+Post-merge hard forks (timestamp based):
+- Shanghai                         @0          blob: (target: 6, max: 9, fraction: 5007716)
+- Cancun                           @0          blob: (target: 6, max: 9, fraction: 5007716)
+- Prague                           @0          blob: (target: 6, max: 9, fraction: 5007716)
+- Osaka                            @0          blob: (target: 6, max: 9, fraction: 5007716)
+- Zero7                            @0          blob: (target: 6, max: 9, fraction: 5007716)"#
+        );
+    }
+
+    #[test]
+    fn test_arc_mainnet_chainspec() {
+        let spec = ArcChainSpecParser::parse("arc-mainnet").expect("Failed to parse arc-mainnet");
+        assert_eq!(spec.chain().id(), MAINNET_CHAIN_ID);
+
+        // Pin the genesis hash to catch any unintended drift in
+        // assets/mainnet/genesis.json. Update only when a deliberate respin
+        // happens (e.g. revised admin set, additional prefund, hardfork shift).
+        assert_eq!(
+            spec.genesis_hash().to_string(),
+            "0x09944e07412986bb417fd0006c89ffb71ee523d68ce2017ec2dabc944c42edad",
+            "the genesis hash of assets/mainnet/genesis.json changed unexpectedly"
+        );
+
+        assert_arc_chainspec_evm_hardforks(&spec);
+        assert!(spec.is_osaka_active_at_timestamp(0));
+        assert_eq!(spec.forks_iter().count(), 22);
+
+        // Mainnet launches at Zero6: Zero3..Zero6 active at block 0, Zero7 not.
+        let flags = spec.get_hardfork_flags(0, 0);
+        assert!(flags.is_active(ArcHardfork::Zero3));
+        assert!(flags.is_active(ArcHardfork::Zero4));
+        assert!(flags.is_active(ArcHardfork::Zero5));
+        assert!(flags.is_active(ArcHardfork::Zero6));
+        assert!(!flags.is_active(ArcHardfork::Zero7));
+
         assert_eq!(
             spec.display_hardforks().to_string(),
             r#"Pre-merge hard forks (block based):
@@ -994,6 +1105,90 @@ Post-merge hard forks (timestamp based):
     }
 
     #[test]
+    fn test_bundled_chainspec_for_chain_id() {
+        // Round-trip: looking up a chain ID must return the matching spec —
+        // guards against a regression like the helper returning Some(LOCAL_DEV)
+        // for DEVNET_CHAIN_ID.
+        assert_eq!(
+            bundled_chainspec_for_chain_id(LOCALDEV_CHAIN_ID)
+                .expect("localdev bundled")
+                .chain()
+                .id(),
+            LOCALDEV_CHAIN_ID
+        );
+        assert_eq!(
+            bundled_chainspec_for_chain_id(DEVNET_CHAIN_ID)
+                .expect("devnet bundled")
+                .chain()
+                .id(),
+            DEVNET_CHAIN_ID
+        );
+        assert_eq!(
+            bundled_chainspec_for_chain_id(TESTNET_CHAIN_ID)
+                .expect("testnet bundled")
+                .chain()
+                .id(),
+            TESTNET_CHAIN_ID
+        );
+        assert!(bundled_chainspec_for_chain_id(999_999).is_none());
+
+        assert_eq!(
+            bundled_chainspec_for_chain_id(MAINNET_CHAIN_ID)
+                .expect("mainnet bundled")
+                .chain()
+                .id(),
+            MAINNET_CHAIN_ID
+        );
+    }
+
+    /// Expected activations are pinned here.
+    #[test]
+    fn test_mainnet_chainspec_paths_agree() {
+        use alloy_genesis::Genesis;
+
+        let from_parser = ArcChainSpecParser::parse("arc-mainnet").expect("named parser path");
+        let from_helper = bundled_chainspec_for_chain_id(MAINNET_CHAIN_ID).expect("helper path");
+        let from_genesis = ArcChainSpec::from(
+            serde_json::from_str::<Genesis>(&format!(
+                r#"{{ "config": {{ "chainId": {} }}, "alloc": {{}} }}"#,
+                MAINNET_CHAIN_ID
+            ))
+            .expect("synthetic mainnet genesis parses"),
+        );
+
+        assert!(
+            Arc::ptr_eq(&from_parser, &from_helper),
+            "parser and helper must return the same MAINNET Arc"
+        );
+
+        let expected_active: &[(ArcHardfork, bool)] = &[
+            (ArcHardfork::Zero3, true),
+            (ArcHardfork::Zero4, true),
+            (ArcHardfork::Zero5, true),
+            (ArcHardfork::Zero6, true),
+            (ArcHardfork::Zero7, false), // deferred — not active at launch
+        ];
+        let paths: [(&str, &ArcChainSpec); 3] = [
+            ("parser", &from_parser),
+            ("helper", &from_helper),
+            ("From<Genesis>", &from_genesis),
+        ];
+        for (label, spec) in paths {
+            for &(fork, want) in expected_active {
+                assert_eq!(
+                    spec.get_hardfork_flags(0, 0).is_active(fork),
+                    want,
+                    "{label}: {fork:?} active={want}"
+                );
+            }
+            assert!(
+                spec.is_osaka_active_at_timestamp(0),
+                "{label}: Osaka must be active at timestamp 0"
+            );
+        }
+    }
+
+    #[test]
     fn test_arc_devnet_chainspec() {
         let spec = ArcChainSpecParser::parse("arc-devnet").expect("Failed to parse arc-devnet");
         assert_eq!(spec.chain().id(), DEVNET_CHAIN_ID);
@@ -1005,39 +1200,54 @@ Post-merge hard forks (timestamp based):
             "0x41c417868fee948f58602b01a84ce0ddb5ffe2184f7e9ab43b9c8d7e5eb47067",
             "the genesis hash of assets/devnet/genesis.json changed unexpectedly"
         );
-        assert_eq!(spec.forks_iter().count(), 21);
+        assert_eq!(spec.forks_iter().count(), 22);
         assert_arc_chainspec_evm_hardforks(&spec);
         assert!(!spec.is_osaka_active_at_timestamp(0));
         assert!(spec.is_osaka_active_at_timestamp(ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET));
 
-        let flags_before = spec.get_hardfork_flags(ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1);
+        let flags_before =
+            spec.get_hardfork_flags(ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1, 0);
         assert!(!flags_before.is_active(ArcHardfork::Zero3));
         assert!(!flags_before.is_active(ArcHardfork::Zero4));
 
-        let flags_at = spec.get_hardfork_flags(ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_DEVNET);
+        let flags_at = spec.get_hardfork_flags(ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_DEVNET, 0);
         assert!(flags_at.is_active(ArcHardfork::Zero3));
         assert!(!flags_at.is_active(ArcHardfork::Zero4));
 
         let flags_before_zero4 =
-            spec.get_hardfork_flags(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1);
+            spec.get_hardfork_flags(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1, 0);
         assert!(flags_before_zero4.is_active(ArcHardfork::Zero3));
         assert!(!flags_before_zero4.is_active(ArcHardfork::Zero4));
 
-        let flags_at_zero4 = spec.get_hardfork_flags(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET);
+        let flags_at_zero4 = spec.get_hardfork_flags(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET, 0);
         assert!(flags_at_zero4.is_active(ArcHardfork::Zero3));
         assert!(flags_at_zero4.is_active(ArcHardfork::Zero4));
         assert!(!flags_at_zero4.is_active(ArcHardfork::Zero5));
 
         let flags_before_zero5 =
-            spec.get_hardfork_flags(ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1);
+            spec.get_hardfork_flags(ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1, 0);
         assert!(flags_before_zero5.is_active(ArcHardfork::Zero3));
         assert!(flags_before_zero5.is_active(ArcHardfork::Zero4));
         assert!(!flags_before_zero5.is_active(ArcHardfork::Zero5));
 
-        let flags_at_zero5 = spec.get_hardfork_flags(ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET);
+        let flags_at_zero5 = spec.get_hardfork_flags(ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET, 0);
         assert!(flags_at_zero5.is_active(ArcHardfork::Zero3));
         assert!(flags_at_zero5.is_active(ArcHardfork::Zero4));
         assert!(flags_at_zero5.is_active(ArcHardfork::Zero5));
+        assert!(!flags_at_zero5.is_active(ArcHardfork::Zero6));
+
+        let flags_before_zero6 =
+            spec.get_hardfork_flags(ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET - 1, 0);
+        assert!(flags_before_zero6.is_active(ArcHardfork::Zero3));
+        assert!(flags_before_zero6.is_active(ArcHardfork::Zero4));
+        assert!(flags_before_zero6.is_active(ArcHardfork::Zero5));
+        assert!(!flags_before_zero6.is_active(ArcHardfork::Zero6));
+
+        let flags_at_zero6 = spec.get_hardfork_flags(ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET, 0);
+        assert!(flags_at_zero6.is_active(ArcHardfork::Zero3));
+        assert!(flags_at_zero6.is_active(ArcHardfork::Zero4));
+        assert!(flags_at_zero6.is_active(ArcHardfork::Zero5));
+        assert!(flags_at_zero6.is_active(ArcHardfork::Zero6));
 
         assert_eq!(
             spec.display_hardforks().to_string(),
@@ -1058,6 +1268,7 @@ Post-merge hard forks (timestamp based):
 - Zero3                            @7437594
 - Zero4                            @19491165
 - Zero5                            @32371192
+- Zero6                            @40033853
 Merge hard forks:
 - Paris                            @0 (network is known to be merged)
 Post-merge hard forks (timestamp based):
@@ -1078,6 +1289,10 @@ Post-merge hard forks (timestamp based):
             spec.fork(ArcHardfork::Zero5),
             ForkCondition::Block(ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET)
         );
+        assert_eq!(
+            spec.fork(ArcHardfork::Zero6),
+            ForkCondition::Block(ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET)
+        );
     }
 
     #[test]
@@ -1093,15 +1308,17 @@ Post-merge hard forks (timestamp based):
         );
         assert_arc_chainspec_evm_hardforks(&spec);
         assert!(!spec.is_osaka_active_at_timestamp(0));
-        assert_eq!(spec.forks_iter().count(), 19);
+        assert!(spec.is_osaka_active_at_timestamp(ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET));
+        assert_eq!(spec.forks_iter().count(), 22);
 
         // Zero3
         let flags_before_zero3 =
-            spec.get_hardfork_flags(ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_TESTNET - 1);
+            spec.get_hardfork_flags(ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_TESTNET - 1, 0);
         assert!(!flags_before_zero3.is_active(ArcHardfork::Zero3));
         assert!(!flags_before_zero3.is_active(ArcHardfork::Zero4));
 
-        let flags_at_zero3 = spec.get_hardfork_flags(ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_TESTNET);
+        let flags_at_zero3 =
+            spec.get_hardfork_flags(ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_TESTNET, 0);
         assert!(flags_at_zero3.is_active(ArcHardfork::Zero3));
         assert!(!flags_at_zero3.is_active(ArcHardfork::Zero4));
         assert_eq!(
@@ -1111,14 +1328,59 @@ Post-merge hard forks (timestamp based):
 
         // Zero4
         let flags_before_zero4 =
-            spec.get_hardfork_flags(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET - 1);
+            spec.get_hardfork_flags(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET - 1, 0);
         assert!(!flags_before_zero4.is_active(ArcHardfork::Zero4));
 
-        let flags_at_zero4 = spec.get_hardfork_flags(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET);
+        let flags_at_zero4 =
+            spec.get_hardfork_flags(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET, 0);
         assert!(flags_at_zero4.is_active(ArcHardfork::Zero4));
         assert_eq!(
             spec.fork(ArcHardfork::Zero4),
             ForkCondition::Block(ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET)
+        );
+
+        // Zero5 — activates by timestamp on testnet. Use a block past Zero4's activation
+        // so Zero4 still reads as active in the snapshot.
+        let post_zero4_block = ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET + 1;
+        let flags_before_zero5 = spec.get_hardfork_flags(
+            post_zero4_block,
+            ARC_ZERO5_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET - 1,
+        );
+        assert!(flags_before_zero5.is_active(ArcHardfork::Zero4));
+        assert!(!flags_before_zero5.is_active(ArcHardfork::Zero5));
+
+        let flags_at_zero5 = spec.get_hardfork_flags(
+            post_zero4_block,
+            ARC_ZERO5_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET,
+        );
+        assert!(flags_at_zero5.is_active(ArcHardfork::Zero4));
+        assert!(flags_at_zero5.is_active(ArcHardfork::Zero5));
+        assert_eq!(
+            spec.fork(ArcHardfork::Zero5),
+            ForkCondition::Timestamp(ARC_ZERO5_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET)
+        );
+
+        // Zero6 — activates by timestamp on testnet (same timestamp as Zero5 by current schedule).
+        let flags_before_zero6 = spec.get_hardfork_flags(
+            post_zero4_block,
+            ARC_ZERO6_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET - 1,
+        );
+        assert!(!flags_before_zero6.is_active(ArcHardfork::Zero6));
+
+        let flags_at_zero6 = spec.get_hardfork_flags(
+            post_zero4_block,
+            ARC_ZERO6_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET,
+        );
+        assert!(flags_at_zero6.is_active(ArcHardfork::Zero5));
+        assert!(flags_at_zero6.is_active(ArcHardfork::Zero6));
+        assert_eq!(
+            spec.fork(ArcHardfork::Zero6),
+            ForkCondition::Timestamp(ARC_ZERO6_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET)
+        );
+
+        assert_eq!(
+            spec.fork(EthereumHardfork::Osaka),
+            ForkCondition::Timestamp(ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET)
         );
 
         assert_eq!(
@@ -1144,7 +1406,10 @@ Merge hard forks:
 Post-merge hard forks (timestamp based):
 - Shanghai                         @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Cancun                           @0          blob: (target: 6, max: 9, fraction: 5007716)
-- Prague                           @0          blob: (target: 6, max: 9, fraction: 5007716)"#
+- Prague                           @0          blob: (target: 6, max: 9, fraction: 5007716)
+- Osaka                            @1779890400          blob: (target: 6, max: 9, fraction: 5007716)
+- Zero5                            @1779894517          blob: (target: 6, max: 9, fraction: 5007716)
+- Zero6                            @1779894517          blob: (target: 6, max: 9, fraction: 5007716)"#
         );
     }
 
@@ -1176,6 +1441,77 @@ Post-merge hard forks (timestamp based):
             config,
             BlockGasLimitConfig::new(1_000_000, 1_000_000_000, 30_000_000)
         );
+    }
+
+    #[test]
+    fn test_gas_limit_config_mainnet() {
+        // Mainnet has no parseable chainspec name (genesis.json is gitignored), so build
+        // a synthetic spec by cloning localdev and overriding the chain id.
+        let mut spec =
+            (*ArcChainSpecParser::parse("arc-localdev").expect("localdev parses")).clone();
+        spec.inner.chain = Chain::from_id(MAINNET_CHAIN_ID);
+        let config = spec.block_gas_limit_config(0);
+        assert_eq!(
+            config,
+            BlockGasLimitConfig::new(10_000_000, 200_000_000, 30_000_000)
+        );
+    }
+
+    #[test]
+    fn test_base_fee_config_mainnet() {
+        let mut spec =
+            (*ArcChainSpecParser::parse("arc-localdev").expect("localdev parses")).clone();
+        spec.inner.chain = Chain::from_id(MAINNET_CHAIN_ID);
+        let cfg = spec.base_fee_config(0);
+
+        assert_eq!(cfg.absolute_min_base_fee, 1);
+        assert_eq!(cfg.absolute_max_base_fee, 20_000_000_000_000); // 20,000 gwei
+        assert_eq!(cfg.alpha, BoundedParam::new(1, 20, 100));
+        assert_eq!(cfg.k_rate, BoundedParam::new(1, 200, 1_000));
+        assert_eq!(
+            cfg.inverse_elasticity_multiplier,
+            BoundedParam::new(1, 5000, 9_000)
+        );
+    }
+
+    /// Exercises the named-chain arms of the match (the
+    /// alternative path to the `arc-mainnet` / `arc-devnet` / `arc-testnet`
+    /// parser, used when someone passes `--chain <path>`).
+    #[test]
+    fn test_from_genesis_named_chain_ids_apply_predefined_hardforks() {
+        use alloy_genesis::Genesis;
+        fn parse_with_chain_id(chain_id: u64) -> ArcChainSpec {
+            let s = format!(
+                r#"{{ "config": {{ "chainId": {} }}, "alloc": {{}} }}"#,
+                chain_id
+            );
+            let genesis: Genesis = serde_json::from_str(&s).expect("parse genesis");
+            ArcChainSpec::from(genesis)
+        }
+
+        // Mainnet
+        let spec = parse_with_chain_id(MAINNET_CHAIN_ID);
+        let flags = spec.get_hardfork_flags(0, 0);
+        assert!(flags.is_active(ArcHardfork::Zero3));
+        assert!(flags.is_active(ArcHardfork::Zero4));
+        assert!(flags.is_active(ArcHardfork::Zero5));
+        assert!(flags.is_active(ArcHardfork::Zero6));
+        assert!(!flags.is_active(ArcHardfork::Zero7));
+        assert!(spec.is_osaka_active_at_timestamp(0));
+
+        // Devnet
+        let spec = parse_with_chain_id(DEVNET_CHAIN_ID);
+        assert!(spec
+            .get_hardfork_flags(ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_DEVNET, 0)
+            .is_active(ArcHardfork::Zero3));
+        assert!(!spec.get_hardfork_flags(0, 0).is_active(ArcHardfork::Zero3));
+
+        // Testnet
+        let spec = parse_with_chain_id(TESTNET_CHAIN_ID);
+        assert!(spec
+            .get_hardfork_flags(ARC_ZERO3_HARDFORK_BLOCK_ACTIVATION_TESTNET, 0)
+            .is_active(ArcHardfork::Zero3));
+        assert!(!spec.get_hardfork_flags(0, 0).is_active(ArcHardfork::Zero3));
     }
 
     /// Simulates the nightly-upgrade scenario: genesis.json with a future osakaTime.
@@ -1440,5 +1776,156 @@ Post-merge hard forks (timestamp based):
     #[should_panic(expected = "invalid BoundedParam")]
     fn test_bounded_param_inverted_bounds_panics() {
         BoundedParam::new(100u64, 20, 50);
+    }
+
+    static MOCK_ARC_HARDFORKS: LazyLock<[(Box<dyn Hardfork>, ForkCondition); 6]> =
+        LazyLock::new(|| {
+            [
+                (ArcHardfork::Zero3.boxed(), ForkCondition::Block(0)),
+                (ArcHardfork::Zero4.boxed(), ForkCondition::Block(10)),
+                (
+                    EthereumHardfork::Osaka.boxed(),
+                    ForkCondition::Timestamp(1779244750),
+                ),
+                (
+                    ArcHardfork::Zero5.boxed(),
+                    ForkCondition::Timestamp(1779244760),
+                ),
+                (
+                    ArcHardfork::Zero6.boxed(),
+                    ForkCondition::Timestamp(1779244770),
+                ),
+                (
+                    ArcHardfork::Zero7.boxed(),
+                    ForkCondition::Timestamp(1779244780),
+                ),
+            ]
+        });
+
+    #[test]
+    fn test_arc_hardfork_ids() {
+        use reth_chainspec::Hardforks;
+
+        let genesis: Genesis =
+            serde_json::from_str(include_str!("../../../assets/devnet/genesis.json"))
+                .expect("Can't deserialize Devnet genesis json");
+
+        let mut prev_head = Head {
+            number: 0,
+            timestamp: 0,
+            ..Default::default()
+        };
+        let make_spec = |i: usize| -> ArcChainSpec {
+            let mut inner = ChainSpec::from_genesis(genesis.clone());
+            inner.hardforks = BASE_FORKS.clone();
+            for (hardfork, cond) in MOCK_ARC_HARDFORKS[0..i + 1].iter() {
+                inner.hardforks.insert(hardfork, *cond);
+            }
+            ArcChainSpec::new(inner)
+        };
+        let mut prev_spec = make_spec(0);
+        let mut prev_hardfork = MOCK_ARC_HARDFORKS[0].0.clone();
+
+        for i in 1..MOCK_ARC_HARDFORKS.len() {
+            let hardfork = MOCK_ARC_HARDFORKS[i].0.clone();
+            let spec = make_spec(i);
+            // simulate the next head according to the current fork condition
+            let head = match MOCK_ARC_HARDFORKS[i].1 {
+                ForkCondition::Block(block) => Head {
+                    timestamp: prev_head.timestamp,
+                    number: block,
+                    ..Default::default()
+                },
+                ForkCondition::TTD {
+                    fork_block: Some(block),
+                    ..
+                } => Head {
+                    number: block,
+                    ..Default::default()
+                },
+                ForkCondition::Timestamp(timestamp) => Head {
+                    number: prev_head.number,
+                    timestamp,
+                    ..Default::default()
+                },
+                _ => panic!("unexpected fork condition"),
+            };
+            let msg = format!(
+                "[iter={i}, {hardfork:?}, prev_head=({},{}), head=({},{})]",
+                prev_head.number, prev_head.timestamp, head.number, head.timestamp
+            );
+            println!("{}", msg);
+
+            let prev_filter = prev_spec.fork_filter(prev_head);
+            let mut filter = spec.fork_filter(prev_head);
+
+            // make sure when we add the next hardfork, it could still valid for previos version.
+            let prev_fork_id = prev_filter.current();
+            let fork_id = filter.current();
+
+            assert_eq!(
+                prev_fork_id.hash, fork_id.hash,
+                "[{msg}] fork hash should be the same when add a new hardfork",
+            );
+            assert_eq!(
+                filter.validate(prev_fork_id),
+                Ok(()),
+                "[{msg}] fork id for the prev verions should validate by new version"
+            );
+            assert_eq!(
+                prev_filter.validate(fork_id),
+                Ok(()),
+                "[{msg}] fork id for the new verions should validate by previous version"
+            );
+
+            // fork_id() use a different compute path, verify the value is the same as filter
+            assert_eq!(
+                prev_spec.fork_id(&prev_head),
+                prev_fork_id,
+                "[{msg}] computed fork id should be the same as it from previous filter"
+            );
+            assert_eq!(
+                spec.fork_id(&prev_head),
+                fork_id,
+                "[{msg}] spec.fork_id(&prev_head) mismatched"
+            );
+            let next_fork_id = spec.fork_id(&head);
+
+            // Verify the fork ID by hardfork
+            assert_eq!(
+                prev_spec.inner.hardfork_fork_id(prev_hardfork.clone()),
+                Some(prev_fork_id),
+                "[{msg}] computed fork id by hardfork mismatched for previous spec"
+            );
+            assert_eq!(
+                spec.inner.hardfork_fork_id(prev_hardfork.clone()),
+                Some(fork_id)
+            );
+            assert_eq!(
+                spec.inner.hardfork_fork_id(hardfork.clone()),
+                Some(next_fork_id)
+            );
+
+            // Set the new head.
+            let transition: Option<reth_chainspec::ForkTransition> = filter.set_head(head);
+            assert!(
+                transition.is_some(),
+                "[{msg}] transition should be happened on next head"
+            );
+
+            // Verify the fork ID is the same as filter on next head
+            assert_eq!(
+                spec.fork_id(&head),
+                filter.current(),
+                "[{msg}] spec.fork_id(&head) mismatched on next head"
+            );
+            assert_eq!(
+                next_fork_id,
+                filter.current(),
+                "[{msg}] computed fork ID mismatched on next head"
+            );
+
+            (prev_head, prev_spec, prev_hardfork) = (head, spec, hardfork);
+        }
     }
 }

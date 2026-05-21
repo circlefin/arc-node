@@ -144,7 +144,7 @@ mod tests {
 
     fn funded_tx(provider: &MockEthProvider, nonce: u64) -> MockTransaction {
         let tx = MockTransaction::legacy()
-            .with_gas_limit(26_000)
+            .with_gas_limit(21_000)
             .with_gas_price(1_000_000_000)
             .with_value(U256::from(1000))
             .with_nonce(nonce);

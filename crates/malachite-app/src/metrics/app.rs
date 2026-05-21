@@ -98,6 +98,10 @@ pub struct Inner {
     /// Number of times the node fell behind and transitioned from InSync to CatchingUp
     sync_fell_behind_count: Counter,
 
+    /// Number of invalid payloads observed and persisted for forensics,
+    /// labelled by source (engine reject, assembly failure, sync decode).
+    invalid_payloads_count: Family<InvalidPayloadSourceLabel, Counter>,
+
     /// Number of pending proposal parts waiting to be processed at a future height or round
     pending_proposal_parts_count: Gauge,
 
@@ -137,6 +141,7 @@ impl Inner {
             }),
             height_restart_count: Counter::default(),
             sync_fell_behind_count: Counter::default(),
+            invalid_payloads_count: Family::default(),
             pending_proposal_parts_count: Gauge::default(),
             consensus_params: Family::default(),
             handshake_replay_blocks: Gauge::default(),
@@ -255,6 +260,12 @@ impl AppMetrics {
                 "sync_fell_behind_count",
                 "Number of times the node fell behind and transitioned from InSync to CatchingUp",
                 metrics.sync_fell_behind_count.clone(),
+            );
+
+            registry.register(
+                "invalid_payloads_count",
+                "Number of invalid payloads observed and persisted for forensics",
+                metrics.invalid_payloads_count.clone(),
             );
 
             registry.register(
@@ -418,6 +429,30 @@ impl AppMetrics {
         self.sync_fell_behind_count.inc();
     }
 
+    /// Increment the invalid-payload counter for the given source.
+    pub fn inc_invalid_payloads_count(&self, source: InvalidPayloadSource) {
+        self.invalid_payloads_count
+            .get_or_create(&InvalidPayloadSourceLabel::new(source))
+            .inc();
+    }
+
+    /// Total number of invalid payloads across all sources.
+    #[cfg(test)]
+    pub fn get_invalid_payloads_count(&self) -> u64 {
+        InvalidPayloadSource::ALL
+            .iter()
+            .map(|source| self.get_invalid_payloads_count_by_source(*source))
+            .sum()
+    }
+
+    /// Number of invalid payloads recorded for a specific source.
+    #[cfg(test)]
+    pub fn get_invalid_payloads_count_by_source(&self, source: InvalidPayloadSource) -> u64 {
+        self.invalid_payloads_count
+            .get_or_create(&InvalidPayloadSourceLabel::new(source))
+            .get()
+    }
+
     /// Observe the number of pending proposal parts
     pub fn observe_pending_proposal_parts_count(&self, count: usize) {
         self.pending_proposal_parts_count.set(count as i64);
@@ -489,6 +524,45 @@ struct EngineApiLabel {
 impl EngineApiLabel {
     fn new(api: &'static str) -> Self {
         Self { api }
+    }
+}
+
+/// Source of an invalid-payload record, used to label the counter.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum InvalidPayloadSource {
+    /// Execution engine rejected the payload.
+    EngineReject,
+    /// Assembling a block from proposal parts failed (malformed parts or SSZ
+    /// decode error on the concatenated data).
+    AssemblyFailure,
+    /// SSZ decode of a value received via sync failed.
+    SyncDecode,
+}
+
+impl InvalidPayloadSource {
+    #[cfg(test)]
+    pub(super) const ALL: [InvalidPayloadSource; 3] =
+        [Self::EngineReject, Self::AssemblyFailure, Self::SyncDecode];
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::EngineReject => "engine_reject",
+            Self::AssemblyFailure => "assembly_failure",
+            Self::SyncDecode => "sync_decode",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct InvalidPayloadSourceLabel {
+    source: &'static str,
+}
+
+impl InvalidPayloadSourceLabel {
+    fn new(source: InvalidPayloadSource) -> Self {
+        Self {
+            source: source.as_str(),
+        }
     }
 }
 

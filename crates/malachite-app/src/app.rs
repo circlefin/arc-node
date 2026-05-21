@@ -183,7 +183,16 @@ async fn handle_consensus(
         }
 
         // Notification that consensus has decided a value.
-        AppMsg::Decided { certificate, .. } => {
+        //
+        // The reply acknowledges that the certificate has been durably stored so the sync
+        // actor can advertise the new tip height. Without it, peers never learn we advanced
+        // beyond startup and late joiners cannot value-sync from us. `decided::handle`
+        // consumes the channel at the durability point.
+        AppMsg::Decided {
+            certificate,
+            extensions: _,
+            reply,
+        } => {
             let _guard = state.metrics.start_msg_process_timer("Decided");
 
             let height = certificate.height;
@@ -193,7 +202,7 @@ async fn handle_consensus(
 
             info!(%height, %round, %value_id, %signatures, "🎉 Consensus has decided on value");
 
-            decided::handle(state, engine, certificate).await?;
+            decided::handle(state, engine, certificate, reply).await?;
         }
 
         // Notification that a height has been finalized.

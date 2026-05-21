@@ -5,7 +5,7 @@
 | Status        | Draft          |
 | Author(s)     | @asoghoian     |
 | Created       | 2026-02-20     |
-| Updated       | 2026-02-24     |
+| Updated       | 2026-05-12     |
 | Supersedes    | -              |
 | Superseded by | -              |
 
@@ -111,4 +111,5 @@ def pre_execution(block):
 | localdev  | 30,000,000 | 1,000,000 | 1,000,000,000 |
 | devnet    | 30,000,000 | 1,000,000 | 1,000,000,000 |
 | testnet   | 30,000,000 | 10,000,000 | 200,000,000   |
+| mainnet   | 30,000,000 | 10,000,000 | 200,000,000   |
 

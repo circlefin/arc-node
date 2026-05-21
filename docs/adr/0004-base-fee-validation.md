@@ -5,7 +5,7 @@
 | Status        | Draft          |
 | Author(s)     | @asoghoian     |
 | Created       | 2026-03-03     |
-| Updated       | 2026-03-03     |
+| Updated       | 2026-05-12     |
 | Supersedes    | -              |
 | Superseded by | -              |
 
@@ -67,17 +67,19 @@ The two absolute bounds control the *output*: after computation and after the Pr
 
 | Network | min | default | max |
 |---------|-----|---------|-----|
-| localdev | 0 | 20 | 100 |
-| devnet | 0 | 20 | 100 |
-| testnet | 0 | 20 | 100 |
+| localdev | 1 | 20 | 100 |
+| devnet | 1 | 20 | 100 |
+| testnet | 1 | 20 | 100 |
+| mainnet | 1 | 20 | 100 |
 
 **k_rate** — max base fee change rate per block (basis points). 200 = 2%.
 
 | Network | min | default | max |
 |---------|-----|---------|-----|
-| localdev | 0 | 200 | 10000 |
-| devnet | 0 | 200 | 10000 |
-| testnet | 1 | 200 | 500 |
+| localdev | 1 | 200 | 10000 |
+| devnet | 1 | 200 | 10000 |
+| testnet | 1 | 200 | 1000 |
+| mainnet | 1 | 200 | 1000 |
 
 **elasticity_multiplier** — target gas utilization (basis points). 5000 = 50%.
 
@@ -86,6 +88,7 @@ The two absolute bounds control the *output*: after computation and after the Pr
 | localdev | 1 | 5000 | 10000 |
 | devnet | 1 | 5000 | 10000 |
 | testnet | 1 | 5000 | 9000 |
+| mainnet | 1 | 5000 | 9000 |
 
 #### Absolute base fee bounds
 
@@ -93,9 +96,10 @@ Live ProtocolConfig values (devnet and testnet, queried 2026-03-03): `minBaseFee
 
 | Network | `absolute_min_base_fee` | `absolute_max_base_fee` |
 |---------|-------------------------|-------------------------|
-| localdev | 1 | u64::MAX |
-| devnet | 1 | u64::MAX |
+| localdev | 1 | u64::MAX - 1 |
+| devnet | 1 | u64::MAX - 1 |
 | testnet | 1 | 20,000,000,000,000 (20,000 gwei) |
+| mainnet | 1 | 20,000,000,000,000 (20,000 gwei) |
 
 ### Executor flow
 

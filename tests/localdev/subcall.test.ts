@@ -20,7 +20,18 @@ import { balancesSnapshot, NativeCoinAuthority, ReceiptVerifier, getClients } fr
 import { USDC } from '../helpers/FiatToken'
 import { CallHelper } from '../helpers/CallHelper'
 import { callFromAddress, memoAddress, multicall3FromAddress } from '../../scripts/genesis'
-import { encodeErrorResult, encodeFunctionData, erc20Abi, keccak256, pad, toHex, maxUint256, Address, parseAbi, parseEther } from 'viem'
+import {
+  encodeErrorResult,
+  encodeFunctionData,
+  erc20Abi,
+  keccak256,
+  pad,
+  toHex,
+  maxUint256,
+  Address,
+  parseAbi,
+  parseEther,
+} from 'viem'
 
 const memoArtifact = hre.artifacts.readArtifactSync('Memo')
 const multicall3FromArtifact = hre.artifacts.readArtifactSync('Multicall3From')
@@ -300,9 +311,7 @@ describe('Memo', () => {
     })
     const memoData = encodeMemo(callHelper.address, revertData, keccak256(toHex('revert-test')), toHex('will revert'))
 
-    await expect(
-      sender.sendTransaction({ to: memoAddress, data: memoData }),
-    ).to.be.rejectedWith('execution reverted')
+    await expect(sender.sendTransaction({ to: memoAddress, data: memoData })).to.be.rejectedWith('execution reverted')
 
     // memoIndex unchanged — the increment was inside the reverted frame
     const memoIndexAfter = await readMemoIndex()
@@ -322,13 +331,23 @@ describe('Memo', () => {
     const memoData = encodeMemo(callHelper.address, revertData, keccak256(toHex('error-prop')), toHex('error test'))
 
     // Build the expected nested error: MemoFailed(abi.encode(ErrorMessage('custom error message')))
-    const innerError = encodeErrorResult({ abi: CallHelper.abi, errorName: 'ErrorMessage', args: ['custom error message'] })
+    const innerError = encodeErrorResult({
+      abi: CallHelper.abi,
+      errorName: 'ErrorMessage',
+      args: ['custom error message'],
+    })
     const expectedError = encodeErrorResult({ abi: memoArtifact.abi, errorName: 'MemoFailed', args: [innerError] })
 
     // eth_call surfaces raw revert data (sendTransaction doesn't via viem)
-    interface ChainedError { data?: string; cause?: ChainedError }
-    const err = await client.call({ account: sender.account.address, to: memoAddress, data: memoData }).catch((e: unknown) => e as ChainedError)
-    const findData = (e?: ChainedError): string | undefined => e?.data?.startsWith('0x') ? e.data : e?.cause ? findData(e.cause) : undefined
+    interface ChainedError {
+      data?: string
+      cause?: ChainedError
+    }
+    const err = await client
+      .call({ account: sender.account.address, to: memoAddress, data: memoData })
+      .catch((e: unknown) => e as ChainedError)
+    const findData = (e?: ChainedError): string | undefined =>
+      e?.data?.startsWith('0x') ? e.data : e?.cause ? findData(e.cause) : undefined
     const rawRevert = findData(err as ChainedError)
     expect(rawRevert).to.equal(expectedError, 'revert data should be MemoFailed(ErrorMessage)')
   })
@@ -680,5 +699,4 @@ describe('Memo + Multicall3From', () => {
       .increase({ receiver: totalTransferred })
       .verify()
   })
-
 })

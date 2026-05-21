@@ -17,7 +17,7 @@
 import { z } from 'zod'
 import { buildNativeFiatTokenGenesisAllocs, FIAT_TOKEN_ADDRESS, schemaNativeFiatToken } from './NativeFiatToken'
 import {
-  addressToBytes32,
+  Bytes32,
   buildAccountAlloc,
   buildImplContractAlloc,
   GenesisAccountAlloc,
@@ -91,6 +91,7 @@ export const schemaGenesisConfig = z
         zero4Block: z.number().optional(),
         zero5Block: z.number().optional(),
         zero6Block: z.number().optional(),
+        zero7Time: z.number().optional(),
         osakaTime: z.number().optional(),
       })
       .optional(),
@@ -126,7 +127,7 @@ export const schemaGenesisConfig = z
 export type GenesisConfig = z.infer<typeof schemaGenesisConfig>
 
 // Defines hardfork name, this is used for genesis builder command line arguments.
-export const hardforkNameSchema = z.enum(['zero3', 'zero4', 'zero5', 'zero6'])
+export const hardforkNameSchema = z.enum(['zero3', 'zero4', 'zero5', 'zero6', 'zero7'])
 
 // Defines the mapping from hardfork name to genesis hardforks initialize setting.
 export function initialHardforksByName(hardforkName: z.infer<typeof hardforkNameSchema>): GenesisConfig['hardforks'] {
@@ -135,6 +136,7 @@ export function initialHardforksByName(hardforkName: z.infer<typeof hardforkName
     zero4: { zero3Block: 0, zero4Block: 0 },
     zero5: { zero3Block: 0, zero4Block: 0, zero5Block: 0, osakaTime: 0 },
     zero6: { zero3Block: 0, zero4Block: 0, zero5Block: 0, zero6Block: 0, osakaTime: 0 },
+    zero7: { zero3Block: 0, zero4Block: 0, zero5Block: 0, zero6Block: 0, zero7Time: 0, osakaTime: 0 },
   }[hardforkName]
 }
 
@@ -238,8 +240,9 @@ export const buildGenesis = async (ctx: BuilderContext, config: GenesisConfig) =
     insert([address, alloc])
   }
 
-  // Fill empty precompiles
-  const defaultPrecompile = { balance: 0n, nonce: 1n, code: '0x01' as Hex }
+  // 0xef is the EIP-3541 reserved prefix — non-deployable via CREATE/CREATE2
+  // and rejects 7702 delegation, so no contract can shadow these addresses.
+  const defaultPrecompile = { balance: 0n, nonce: 1n, code: '0xef' as Hex }
   for (let i = emptyPrecompileStart; i <= emptyPrecompileEnd; i++) {
     insert(buildAccountAlloc({ ...defaultPrecompile, address: toHex(i, { size: 20 }) }))
   }
@@ -257,22 +260,24 @@ export const buildGenesis = async (ctx: BuilderContext, config: GenesisConfig) =
     buildAccountAlloc({
       ...defaultPrecompile,
       address: nativeCoinAutorityAddress,
-      storage: [
-        // deprecated since Zero5
-        StorageSlot(slotIndex(1n), addressToBytes32(nativeFiatToken.proxy.address ?? FIAT_TOKEN_ADDRESS)),
-        StorageSlot(slotIndex(2n), toBytes32(totalSupply)),
-      ],
+      storage: [StorageSlot(slotIndex(2n), toBytes32(totalSupply))],
     }),
   )
 
   // Setup native coin control precompile with FiatToken contract address as caller.
+  // FiatTokenV2_2.initialize() blocklists the token contract itself in
+  // NativeCoinControl. Since genesis bakes state directly instead of running
+  // initialize(), we seed the entry here. Mapping slot 2, value 1 =
+  // BLOCKLISTED_STATUS.
+  const fiatTokenAddress = nativeFiatToken.proxy.address ?? FIAT_TOKEN_ADDRESS
+  const NATIVE_COIN_CONTROL_BLOCKLIST_SLOT = 2n
+  const BLOCKLISTED_STATUS: Bytes32 = toBytes32(1n)
   insert(
     buildAccountAlloc({
       ...defaultPrecompile,
       address: nativeCoinControlAddress,
       storage: [
-        // deprecated since Zero5
-        StorageSlot(slotIndex(1n), addressToBytes32(nativeFiatToken.proxy.address ?? FIAT_TOKEN_ADDRESS)),
+        StorageSlot(slotForAddressMap(NATIVE_COIN_CONTROL_BLOCKLIST_SLOT, fiatTokenAddress), BLOCKLISTED_STATUS),
       ],
     }),
   )

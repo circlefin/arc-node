@@ -452,7 +452,7 @@ mod tests {
             BlocklistTestCase {
                 name: "valid_sender_and_recipient",
                 tx: MockTransaction::legacy()
-                    .with_gas_limit(26_000)
+                    .with_gas_limit(21_000)
                     .with_gas_price(1_000_000_000)
                     .with_value(U256::from(1000)),
                 sender_blocklisted: false,
@@ -462,7 +462,7 @@ mod tests {
             BlocklistTestCase {
                 name: "blocklisted_sender",
                 tx: MockTransaction::legacy()
-                    .with_gas_limit(26_000)
+                    .with_gas_limit(21_000)
                     .with_gas_price(1_000_000_000)
                     .with_value(U256::from(1000)),
                 sender_blocklisted: true,
@@ -472,7 +472,7 @@ mod tests {
             BlocklistTestCase {
                 name: "blocklisted_to_with_value",
                 tx: MockTransaction::legacy()
-                    .with_gas_limit(26_000)
+                    .with_gas_limit(21_000)
                     .with_gas_price(1_000_000_000)
                     .with_value(U256::from(1000)),
                 sender_blocklisted: false,
@@ -482,7 +482,7 @@ mod tests {
             BlocklistTestCase {
                 name: "blocklisted_to_with_zero_value",
                 tx: MockTransaction::legacy()
-                    .with_gas_limit(26_000)
+                    .with_gas_limit(21_000)
                     .with_gas_price(1_000_000_000)
                     .with_value(U256::ZERO),
                 sender_blocklisted: false,
@@ -544,7 +544,7 @@ mod tests {
     async fn invalid_tx_list_disabled_allows_tx() {
         // Build a validator with invalid_tx_list None and ensure tx is not rejected for invalid_tx reason.
         let tx = MockTransaction::legacy()
-            .with_gas_limit(26_000)
+            .with_gas_limit(21_000)
             .with_gas_price(1_000_000_000)
             .with_value(U256::from(777));
         let provider = MockEthProvider::default();
@@ -575,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_tx_hash_is_rejected() {
         let tx = MockTransaction::legacy()
-            .with_gas_limit(26_000)
+            .with_gas_limit(21_000)
             .with_gas_price(1_000_000_000)
             .with_value(U256::from(1234));
 
@@ -619,7 +619,7 @@ mod tests {
     async fn addresses_denylist_config_none_accepts_tx() {
         // When addresses_denylist_config is None, no address denylist check; tx is accepted.
         let tx = MockTransaction::legacy()
-            .with_gas_limit(26_000)
+            .with_gas_limit(21_000)
             .with_gas_price(1_000_000_000)
             .with_value(U256::from(100));
         let provider = MockEthProvider::default();
@@ -647,7 +647,7 @@ mod tests {
     async fn addresses_denylist_enabled_sender_excluded_accepts_tx() {
         // When denylist is enabled but sender is in address exclusions, tx is accepted.
         let tx = MockTransaction::legacy()
-            .with_gas_limit(26_000)
+            .with_gas_limit(21_000)
             .with_gas_price(1_000_000_000)
             .with_value(U256::from(200));
         let sender = tx.sender();
@@ -683,7 +683,7 @@ mod tests {
     async fn addresses_denylist_denylisted_address_rejected() {
         // When denylist is enabled and sender or recipient is denylisted in contract storage, tx is rejected.
         let tx = MockTransaction::legacy()
-            .with_gas_limit(26_000)
+            .with_gas_limit(21_000)
             .with_gas_price(1_000_000_000)
             .with_value(U256::from(300));
         let contract = Address::from([0x36u8; 20]);

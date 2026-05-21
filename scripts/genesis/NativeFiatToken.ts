@@ -19,6 +19,7 @@ import { Address, concat, toHex } from 'viem'
 import {
   schemaAddress,
   addressToBytes32,
+  enforceOperatorsNotProxyAdmin,
   slotForAddressMap,
   slotIndex,
   StorageSlot,
@@ -62,11 +63,11 @@ export const schemaNativeFiatToken = z
     blacklister: schemaAddress,
     masterMinter: schemaAddress,
     rescuer: schemaAddress,
-    minters: z.array(z.object({ address: schemaAddress, allowance: schemaBigInt }).strict()).min(1),
+    minters: z.array(z.object({ address: schemaAddress, allowance: schemaBigInt }).strict()),
   })
   .strict()
   .superRefine((data, ctx) => {
-    const operators = [
+    enforceOperatorsNotProxyAdmin(ctx, 'NativeFiatToken', data.proxy.admin, [
       ...['owner', 'pauser', 'blacklister', 'masterMinter'].map((key) => ({
         key,
         value: data[key as keyof typeof data] as Address,
@@ -75,15 +76,7 @@ export const schemaNativeFiatToken = z
         key: `minters[${i}]`,
         value: minter.address,
       })),
-    ]
-    for (const { key, value } of operators) {
-      if (value === data.proxy.admin) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `Operator ${key} cannot be the same as the proxy admin`,
-        })
-      }
-    }
+    ])
 
     const minterSet = new Set()
     for (const minter of data.minters) {

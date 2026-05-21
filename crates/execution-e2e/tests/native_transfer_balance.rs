@@ -40,9 +40,9 @@ fn transfer_value() -> U256 {
     U256::from(100u64) * U256::from(10u64).pow(U256::from(18u64))
 }
 
-/// Max gas cost per tx: gas_limit(26_000) * max_fee_per_gas(1000e9).
+/// Max gas cost per tx: gas_limit(21_000) * max_fee_per_gas(1000e9).
 fn max_gas_cost() -> U256 {
-    U256::from(26_000u64) * U256::from(1_000_000_000_000u64)
+    U256::from(21_000u64) * U256::from(1_000_000_000_000u64)
 }
 
 /// Recipient balance goes from 0 to the transferred value.

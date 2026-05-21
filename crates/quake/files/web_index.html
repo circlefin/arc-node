@@ -1,0 +1,2145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quake Live</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #0d1117; color: #c9d1d9; }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; position: relative; }
+  .header-title { font-size: 15px; font-weight: 600; min-width: 80px; font-variant: small-caps; }
+  .header-testnet { font-size: 14px; font-weight: 600; color: #8b949e; position: absolute; left: 50%; transform: translateX(-50%); }
+  .tab-bar { display: flex; gap: 2px; padding: 8px 20px 0; background: #161b22; overflow-x: auto;
+             border-bottom: 1px solid #30363d; }
+  .tab { padding: 8px 16px; font-size: 13px; cursor: pointer; border: 1px solid transparent;
+         border-bottom: none; border-radius: 6px 6px 0 0; background: transparent; color: #8b949e;
+         display: flex; align-items: center; gap: 6px; min-width: 0; flex-shrink: 1; }
+  .tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tab:hover { color: #c9d1d9; }
+  .tab.active { background: #0d1117; color: #c9d1d9; border-color: #30363d; }
+  .tab .badge { font-size: 11px; background: #30363d; color: #8b949e; padding: 1px 6px;
+                border-radius: 10px; margin-left: 6px; }
+  .tab.active .badge { background: #21262d; color: #c9d1d9; }
+  .tab.tab-disabled { opacity: 0.3; cursor: default; pointer-events: none; }
+  .tab-spacer { flex: 1; }
+  .tab.view-tab { font-size: 11px; padding: 6px 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .tab.view-tab.active { border-color: #388bfd; color: #58a6ff; }
+  .graph-container { width: 100%; height: calc(100vh - 90px); position: relative; }
+  .graph-container > svg { width: 100%; height: 100%; }
+  text { pointer-events: none; }
+  .legend { position: absolute; bottom: 16px; left: 16px; background: #161b22; border: 1px solid #30363d;
+            border-radius: 6px; padding: 12px; font-size: 12px; }
+  .legend-title { font-weight: 600; margin-bottom: 6px; color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .legend-item { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .legend-item:last-child { margin-bottom: 0; }
+  .legend-subnet:hover { text-decoration: underline; }
+  .legend-swatch { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+  .legend-line { width: 20px; height: 3px; flex-shrink: 0; border-radius: 1px; }
+  .legend-section { margin-bottom: 8px; }
+  .legend-section:last-child { margin-bottom: 0; }
+  .errors { max-width: 300px; font-size: 11px; }
+  .error-item { background: #3d1a1a; border: 1px solid #da3633; border-radius: 4px;
+                padding: 4px 8px; margin-bottom: 4px; word-break: break-word; }
+  .empty-state { display: flex; align-items: center; justify-content: center; height: 100%;
+                 color: #484f58; font-size: 14px; }
+  /* Sidebar */
+  .sidebar { position: absolute; top: 12px; left: 12px; z-index: 10; display: flex; flex-direction: column; gap: 6px;
+             max-height: calc(100% - 24px); }
+  .sidebar-panel { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px 12px;
+                   font-size: 12px; min-width: 180px; display: flex; flex-direction: column; overflow: hidden; }
+  .sidebar-panel-title { font-weight: 600; font-size: 14px; color: #c9d1d9; margin-bottom: 2px; }
+  .sidebar-panel-subtitle { font-size: 11px; color: #8b949e; font-weight: 600; text-transform: uppercase;
+                            letter-spacing: 0.5px; margin-bottom: 6px; margin-top: 10px; }
+  .sidebar-panel-header { display: flex; justify-content: space-between; align-items: center;
+                          user-select: none; margin-bottom: 6px; }
+  .sidebar-panel-header .sidebar-panel-subtitle { margin: 0; }
+  .sidebar-heights { overflow-y: auto; max-height: 50vh; flex: 1; min-height: 0; }
+  .sidebar-heights::-webkit-scrollbar { width: 6px; }
+  .sidebar-heights::-webkit-scrollbar-track { background: transparent; }
+  .sidebar-heights::-webkit-scrollbar-thumb { background: #484f56; border-radius: 3px; }
+  .sidebar-resize-handle { height: 6px; cursor: ns-resize; margin: 4px -12px -10px;
+                            border-top: 1px solid #30363d; display: flex; justify-content: center;
+                            align-items: center; }
+  .sidebar-resize-handle::after { content: ''; width: 32px; height: 3px;
+                                   border-radius: 2px; background: #484f56; }
+  .sidebar-resize-handle:hover::after { background: #8b949e; }
+  .sidebar-height-row { display: flex; justify-content: space-between; align-items: center; padding: 2px 0;
+                        font-variant-numeric: tabular-nums; }
+  .sidebar-height-row .node-name { color: #8b949e; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; cursor: pointer; }
+  .sidebar-height-row .node-name:hover { text-decoration: underline; }
+  .sidebar-height-row .node-height { color: #58a6ff; font-weight: 600; margin-left: 6px; text-align: right; width: 50px; flex-shrink: 0; }
+  .sidebar-height-row .node-round { color: #8b949e; font-weight: 600; text-align: right; width: 36px; flex-shrink: 0; margin-left: 6px; }
+  .sidebar-height-row .node-round.round-1 { color: #d29922; }
+  .sidebar-height-row .node-round.round-high { color: #f85149; }
+  .sidebar-height-row .node-pending { color: #ffd86d; text-align: right; width: 36px; flex-shrink: 0; margin-left: 6px; }
+  .sidebar-height-row .node-queued { color: #e3a008; text-align: right; width: 36px; flex-shrink: 0; margin-left: 6px; }
+  .sidebar-height-row .node-height.behind-1 { color: #79c0ff; }
+  .sidebar-height-row .node-height.behind-few { color: #d29922; }
+  .sidebar-height-row .node-height.behind-many { color: #f85149; }
+  .sidebar-height-row .node-height.err { color: #da3633; }
+  .sidebar-height-row.proposer .node-name { color: #d2a8ff; font-weight: 600; }
+  .fit-btn { position: absolute; bottom: 16px; right: 16px; background: #21262d; color: #c9d1d9;
+             border: 1px solid #30363d; border-radius: 6px; padding: 4px 10px; font-size: 11px;
+             cursor: pointer; z-index: 5; }
+  .fit-btn:hover { background: #30363d; }
+  .sidebar-toggle { display: flex; align-items: center; gap: 8px; background: #21262d; border: 1px solid #30363d;
+                    border-radius: 6px; padding: 6px 12px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .sidebar-toggle:hover { background: #30363d; }
+  .info-btn { width: 16px; height: 16px; border-radius: 50%; border: 1px solid #484f56; background: transparent;
+              color: #8b949e; font-size: 10px; font-weight: 700; cursor: pointer; display: inline-flex;
+              align-items: center; justify-content: center; padding: 0; margin-left: auto; flex-shrink: 0;
+              font-style: italic; font-family: Georgia, serif; line-height: 1; }
+  .info-btn:hover { border-color: #8b949e; color: #c9d1d9; }
+  .info-popup { display: none; position: absolute; top: calc(100% + 6px); left: 0; width: 260px;
+                background: #1c2128; border: 1px solid #444c56; border-radius: 6px; padding: 10px;
+                font-size: 11px; color: #c9d1d9; line-height: 1.5; z-index: 30; cursor: default;
+                text-transform: none; font-weight: 400; letter-spacing: normal; }
+  .info-popup.visible { display: block; }
+  .toggle-switch { position: relative; width: 28px; height: 16px; flex-shrink: 0; }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; }
+  .toggle-slider { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: #484f58;
+                   border-radius: 8px; transition: background 0.2s; }
+  .toggle-slider::before { content: ''; position: absolute; width: 12px; height: 12px; left: 2px; bottom: 2px;
+                           background: #c9d1d9; border-radius: 50%; transition: transform 0.2s; }
+  .toggle-switch input:checked + .toggle-slider { background: #388bfd; }
+  .toggle-switch input:checked + .toggle-slider::before { transform: translateX(12px); }
+  /* Right-side stack: detail panel + errors */
+  .right-stack { position: absolute; top: 12px; right: 12px; z-index: 10;
+                 display: flex; flex-direction: column; gap: 6px; max-width: 340px; }
+  .detail-panel { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+                  padding: 12px 14px; font-size: 12px; min-width: 200px; display: none;
+                  max-height: 80vh; overflow: hidden; flex-direction: column; }
+  .detail-panel > * { flex-shrink: 0; }
+  .detail-resize-handle { height: 6px; cursor: ns-resize; margin: 4px -14px -12px;
+                          border-top: 1px solid #30363d; display: flex; justify-content: center;
+                          align-items: center; }
+  .detail-resize-handle::after { content: ''; width: 32px; height: 3px;
+                                  border-radius: 2px; background: #484f56; }
+  .detail-resize-handle:hover::after { background: #8b949e; }
+  .detail-panel-title { font-weight: 600; font-size: 14px; color: #c9d1d9; margin-bottom: 8px;
+                        padding-bottom: 6px; border-bottom: 1px solid #30363d;
+                        display: flex; align-items: center; gap: 6px; }
+  .detail-panel-title .title-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .detail-panel-empty { color: #484f58; font-style: italic; }
+  /* Node action buttons row */
+  .detail-actions { display: flex; align-items: center; gap: 6px; padding: 4px 0; }
+  .detail-actions .action-label { color: #8b949e; font-size: 11px; font-weight: 600;
+                                  min-width: 20px; text-transform: uppercase; }
+  .detail-action-btn { background: #21262d; border: 1px solid #30363d; border-radius: 4px;
+                       width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
+                       cursor: pointer; padding: 0; color: #8b949e; transition: background 0.1s, color 0.1s;
+                       position: relative; flex-shrink: 0; }
+  .detail-action-btn:hover { background: #30363d; color: #c9d1d9; }
+  .detail-action-btn.act-start:hover { color: #3fb950; }
+  .detail-action-btn.act-stop:hover { color: #f85149; }
+  .detail-action-btn.act-restart:hover { color: #58a6ff; }
+  .detail-action-btn.act-kill:hover { color: #f85149; }
+  .detail-action-btn.act-pause:hover { color: #d29922; }
+  .detail-action-btn.act-unpause:hover { color: #3fb950; }
+  .detail-action-btn.act-disconnect:hover { color: #f85149; }
+  .detail-action-btn.act-reconnect:hover { color: #3fb950; }
+  .detail-action-btn svg { width: 14px; height: 14px; fill: currentColor; pointer-events: none; }
+  .detail-action-btn.disabled { pointer-events: none; opacity: 0.25; }
+  .detail-action-btn.spinning { pointer-events: none; opacity: 0.5; cursor: not-allowed; }
+  .detail-action-btn.spinning svg { animation: spin 0.8s linear infinite; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  .spinner-icon { width: 14px; height: 14px; pointer-events: none; }
+  .detail-action-btn::after { content: attr(data-tip); position: absolute; bottom: calc(100% + 4px); left: 50%;
+                              transform: translateX(-50%); background: #1c2128; color: #c9d1d9; border: 1px solid #444c56;
+                              border-radius: 4px; padding: 2px 6px; font-size: 11px; white-space: nowrap;
+                              pointer-events: none; opacity: 0; transition: opacity 0.1s; }
+  .detail-action-btn:hover::after { opacity: 1; }
+  .detail-panel-title .detail-action-btn::after { bottom: auto; top: calc(100% + 4px); }
+  .container-status { font-size: 10px; padding: 1px 5px; border-radius: 8px; font-weight: 600; margin-right: auto;
+                      min-width: 72px; text-align: center; }
+  .container-status.running { background: #1a3d1a; color: #3fb950; }
+  .container-status.exited { background: #3d1a1a; color: #f85149; }
+  .container-status.paused { background: #3d2e00; color: #d29922; }
+  .container-status.starting, .container-status.stopping, .container-status.restarting, .container-status.killing,
+  .container-status.pausing, .container-status.unpausing, .container-status.disconnecting, .container-status.reconnecting { background: #0c2d6b; color: #58a6ff; }
+  .container-status.disconnected { background: #3d2e00; color: #d29922; }
+  .container-status.unknown { background: #21262d; color: #8b949e; }
+  .detail-actions-separator { border: none; border-top: 1px solid #30363d; margin: 4px 0; }
+  .detail-row { display: flex; justify-content: space-between; align-items: flex-start; padding: 3px 0;
+                gap: 12px; }
+  .detail-row .detail-key { color: #8b949e; white-space: nowrap; flex-shrink: 0; }
+  .detail-row .detail-value { color: #c9d1d9; text-align: right; word-break: break-word; }
+  .detail-peers-section { margin-top: 4px; position: relative;
+                          flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+  .detail-peers-section::-webkit-scrollbar { width: 6px; }
+  .detail-peers-section::-webkit-scrollbar-track { background: transparent; }
+  .detail-peers-section::-webkit-scrollbar-thumb { background: #484f56; border-radius: 3px; }
+  .detail-peers-title { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase;
+                        letter-spacing: 0.5px; padding: 4px 0 2px; display: flex; align-items: center;
+                        position: relative; }
+  .detail-peer { display: flex; align-items: center; padding: 2px 0; font-size: 12px; gap: 4px; }
+  .detail-peer-header { font-size: 10px; color: #8b949e; font-weight: 600; padding-bottom: 0; }
+  .detail-peer-name { color: #c9d1d9; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .detail-peer-dir { width: 16px; text-align: center; color: #8b949e; font-size: 11px; flex-shrink: 0; }
+  .detail-peer-score { width: 32px; text-align: right; color: #8b949e; font-size: 11px; flex-shrink: 0; }
+  .detail-peer-el { display: inline-flex; gap: 2px; flex-shrink: 0; min-width: 28px; justify-content: center;
+                    padding-left: 8px; margin-left: 8px; }
+  .detail-peer-name[data-peer] { cursor: pointer; }
+  .detail-peer-name[data-peer]:hover { text-decoration: underline; }
+  .detail-peer-mesh { display: inline-flex; gap: 2px; flex-shrink: 0; min-width: 38px; justify-content: center; }
+  .mesh-dot { width: 8px; height: 8px; border-radius: 50%; border: 1px solid #30363d;
+              background: #21262d; display: inline-block; }
+  .mesh-dot.active { background: #3fb950; border-color: #3fb950; }
+  .mesh-dot.inbound { background: #58a6ff; border-color: #58a6ff; }
+  .mesh-dot.static { background: #d29922; border-color: #d29922; }
+  .dot-label { width: 8px; display: inline-block; text-align: center; font-size: 9px; }
+  .detail-peer.cl-down .detail-peer-dir { color: #f85149; }
+  .detail-peer.cl-down .detail-peer-mesh .mesh-dot { background: #f85149; border-color: #f85149; }
+  .detail-peer.cl-down .detail-peer-score { color: #f85149; }
+  .detail-peer.el-down .detail-peer-el .mesh-dot { background: #f85149; border-color: #f85149; }
+  .detail-peer.cl-down.el-down .detail-peer-name { color: #f85149; text-decoration: line-through; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="header-title">Quake Live</span>
+  <span class="header-testnet" id="headerTitle"></span>
+</header>
+
+<div class="tab-bar" id="tabBar"></div>
+<div class="info-popup" id="tabInfoPopup" style="position:fixed;left:auto;width:280px">
+  <b>Manifest</b> expected topology from manifest configuration<br>
+  <b>CL Consensus</b> gossipsub mesh for consensus messages<br>
+  <b>CL Liveness</b> gossipsub mesh for liveness/keep-alive<br>
+  <b>CL Proposal Parts</b> gossipsub mesh for block proposals<br>
+  <b>EL Peers</b> execution layer devp2p peer connections
+</div>
+
+<div class="info-popup" id="peersInfoFloating" style="position:fixed;z-index:100">
+  <b>Dir</b> CL connection direction: &#8592; inbound, &#8594; outbound (who initiated the TCP connection)<br>
+  <b>C L P</b> CL gossipsub mesh membership per topic:
+  <span style="color:#3fb950">&#9679;</span> connected,
+  <span style="color:#484f56">&#9679;</span> not connected<br>
+  &nbsp;&nbsp;C = Consensus, L = Liveness, P = Proposal Parts<br>
+  <b>E</b> CL explicit/persistent peer (direct delivery, bypasses mesh)<br>
+  <b>Score</b> CL gossipsub peer score<br>
+  <b>T I S</b> EL peer flags from admin_peers:<br>
+  &nbsp;&nbsp;<span style="color:#3fb950">T</span> = Trusted,
+  <span style="color:#58a6ff">I</span> = Inbound,
+  <span style="color:#d29922">S</span> = Static<br>
+  <span style="color:#f85149">&#9679;</span> red dots = layer disconnected<br>
+  <span style="color:#f85149;text-decoration:line-through">name</span> = both CL and EL disconnected<br>
+  <br>
+  <b>Data sources:</b><br>
+  CL columns from each node's <b>/network-state</b> endpoint (gossipsub mesh, peer scores).<br>
+  EL columns from each node's <b>admin_peers</b> RPC via WebSocket.<br>
+  Peer list = manifest peers + any additional live peers discovered via gossipsub or devp2p.
+</div>
+
+<div class="graph-container" id="graphContainer">
+  <div class="empty-state" id="emptyState">No topology data yet</div>
+  <div class="legend" id="legend" style="display:none"></div>
+  <button class="fit-btn" id="recenterBtn">Fit to page</button>
+  <div class="right-stack">
+    <div class="detail-panel" id="detailPanel"></div>
+    <div class="errors" id="errors"></div>
+  </div>
+  <div class="sidebar">
+    <div class="sidebar-panel" id="heightsPanel">
+      <div class="sidebar-heights" id="heightsList"></div>
+      <div class="sidebar-resize-handle"></div>
+    </div>
+    <div style="position:relative">
+      <label class="sidebar-toggle" id="proposerToggle">
+        <span class="toggle-switch"><input type="checkbox" id="showProposer"><span class="toggle-slider"></span></span>
+        Show proposer
+        <button class="info-btn" id="proposerInfoBtn" type="button">i</button>
+      </label>
+      <div class="info-popup" id="proposerInfoPopup">
+        The proposer is queried from each CL node's <b>/status</b> endpoint.
+        Each node reports its own address and the current proposer address.
+        The first non-zero proposer address is resolved to a node name.
+        The proposer node is highlighted with a star on the graph and a purple name in the heights list.
+        Updated on every topology poll.
+      </div>
+    </div>
+    <div style="position:relative">
+      <label class="sidebar-toggle">
+        <span class="toggle-switch"><input type="checkbox" id="showMempool"><span class="toggle-slider"></span></span>
+        Show mempools
+        <button class="info-btn" id="mempoolInfoBtn" type="button">i</button>
+      </label>
+      <div class="info-popup" id="mempoolInfoPopup">
+        Shows two vertical bars to the left of each node representing EL transaction pool fill levels.<br>
+        <span style="color:#e3a008">&#9632;</span> <b>Left bar</b> = queued transactions (orange)<br>
+        <span style="color:#ffd86d">&#9632;</span> <b>Right bar</b> = pending transactions (yellow)<br>
+        Each square = 1000 txs. Max squares derived from manifest txpool config (default 10000 txs = 10 squares).<br>
+        Data from <b>txpool_status</b> RPC on each EL node. Polling starts when this toggle is enabled.
+      </div>
+    </div>
+    <div style="position:relative">
+      <label class="sidebar-toggle">
+        <span class="toggle-switch"><input type="checkbox" id="showLatencies"><span class="toggle-slider"></span></span>
+        Show latencies
+        <button class="info-btn" id="latencyInfoBtn" type="button">i</button>
+      </label>
+      <div class="info-popup" id="latencyInfoPopup">
+        Shows one-way network latency (ms) on each graph edge based on the AWS region
+        assigned to each node.<br>
+        Values come from the <b>AWS inter-region latency matrix</b> (cloudping.co P50 medians, RTT/2).<br>
+        Nodes in the same region show 0ms. Only visible when latency emulation is enabled in the manifest.
+      </div>
+    </div>
+    <div style="position:relative">
+      <label class="sidebar-toggle">
+        <span class="toggle-switch"><input type="checkbox" id="showSubnets"><span class="toggle-slider"></span></span>
+        Show subnets
+        <button class="info-btn" id="subnetInfoBtn" type="button">i</button>
+      </label>
+      <div class="info-popup" id="subnetInfoPopup">
+        Draws dashed shapes around nodes that belong to the same subnet.<br>
+        Subnets define network isolation boundaries. Nodes on different subnets
+        can only communicate through bridge nodes present on both subnets.<br>
+        Only available in Graph view.
+      </div>
+    </div>
+    <div style="position:relative" id="persistentPeersToggle">
+      <label class="sidebar-toggle">
+        <span class="toggle-switch"><input type="checkbox" id="showPersistentPeers"><span class="toggle-slider"></span></span>
+        Show CL persistent peers
+        <button class="info-btn" id="persistentPeersInfoBtn" type="button">i</button>
+      </label>
+      <div class="info-popup" id="persistentPeersInfoPopup">
+        Overlays CL persistent peer connections on the graph with directional arrows.<br>
+        A&#8594;B means A has B configured as a persistent peer in the manifest.<br>
+        Persistent peers use direct gossipsub delivery, bypassing mesh routing.<br>
+        Data from the manifest's <b>cl_persistent_peers</b> field.
+      </div>
+    </div>
+    <div style="position:relative" id="elTrustedPeersToggle">
+      <label class="sidebar-toggle">
+        <span class="toggle-switch"><input type="checkbox" id="showElTrustedPeers"><span class="toggle-slider"></span></span>
+        Show EL trusted peers
+        <button class="info-btn" id="elTrustedPeersInfoBtn" type="button">i</button>
+      </label>
+      <div class="info-popup" id="elTrustedPeersInfoPopup">
+        Overlays EL trusted peer connections on the graph with directional arrows.<br>
+        A&#8594;B means A has B configured as a trusted peer in the manifest.<br>
+        Trusted peers bypass the default peer scoring and are always maintained.<br>
+        Data from the manifest's <b>el_trusted_peers</b> field.
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3"></script>
+<script>
+(function() {
+  let data = null;
+  let activeTab = null;     // network key (e.g. "/consensus", "EL Peers")
+  let userSelectedTab = false; // true when the user explicitly clicked a tab
+  let svg = null;
+  let g = null;
+  let userPinned = {};
+  let showProposer = false;
+  let showPersistentPeers = false;
+  let showElTrustedPeers = false;
+  let showMempool = false;
+  let showLatencies = false;
+  let showSubnets = false;
+  let viewMode = 'graph'; // 'graph' or 'world'
+  let worldZoomInitialized = false;
+  let selectedNode = null; // node id when a node is clicked for highlight
+  let selectedSubnet = null; // subnet name clicked in legend for filtering
+  let userPanelHeight = null; // persisted panel height after user resize
+
+  // Pending button actions: key = "nodeName:target", value = { action, prevStatus, ts }
+  // Used to show spinning buttons until Docker status confirms the state change.
+  const pendingActions = {};
+
+  // Client-side transport/action errors that should be shown in the banner.
+  let transientErrors = [];
+
+  // Track disconnected containers client-side (Docker doesn't reflect network state).
+  // Key: "nodeName:target" (e.g. "validator1:cl", "validator1:el", "validator1:").
+
+
+  // Shake animation state: previous container statuses for change detection
+  let prevNodeStatuses = {};
+  const lastShakeTime = {};
+  // Active shakes: nodeName -> { startTime, rafId }
+  // Survives renderGraph() re-renders by restarting the rAF loop on new DOM elements
+  const shakingNodes = {};
+  const SHAKE_DURATION = 3000; // ms
+  const SHAKE_AMPLITUDE = 4;   // max pixel offset
+
+  function shakeNode(nodeName) {
+    if (shakingNodes[nodeName]) cancelAnimationFrame(shakingNodes[nodeName].rafId);
+    shakingNodes[nodeName] = { startTime: performance.now(), rafId: 0 };
+    lastShakeTime[nodeName] = Date.now();
+    runShakeLoop(nodeName);
+  }
+
+  function runShakeLoop(nodeName) {
+    const entry = shakingNodes[nodeName];
+    if (!entry) return;
+    const el = document.querySelector('[data-node-id="' + nodeName + '"]');
+    if (!el) { delete shakingNodes[nodeName]; return; }
+    const d = d3.select(el).datum();
+    if (!d) { delete shakingNodes[nodeName]; return; }
+    const cx = d.x, cy = d.y;
+    function frame(now) {
+      const elapsed = now - entry.startTime;
+      if (elapsed >= SHAKE_DURATION) {
+        el.setAttribute('transform', 'translate(' + cx + ',' + cy + ')');
+        delete shakingNodes[nodeName];
+        return;
+      }
+      const decay = 1 - elapsed / SHAKE_DURATION;
+      const dx = (Math.random() * 2 - 1) * SHAKE_AMPLITUDE * decay;
+      const dy = (Math.random() * 2 - 1) * SHAKE_AMPLITUDE * decay;
+      el.setAttribute('transform', 'translate(' + (cx + dx) + ',' + (cy + dy) + ')');
+      entry.rafId = requestAnimationFrame(frame);
+    }
+    entry.rafId = requestAnimationFrame(frame);
+  }
+
+  // Resume shake animations after renderGraph() recreates DOM nodes
+  function resumeShakes() {
+    const now = performance.now();
+    for (const nodeName of Object.keys(shakingNodes)) {
+      const entry = shakingNodes[nodeName];
+      if (now - entry.startTime >= SHAKE_DURATION) {
+        delete shakingNodes[nodeName];
+      } else {
+        cancelAnimationFrame(entry.rafId);
+        runShakeLoop(nodeName);
+      }
+    }
+  }
+
+  // Cache networks across fetches so transient RPC timeouts don't flicker tabs.
+  // Key: network name, value: { network, missCount }.
+  // A network is kept for MISS_THRESHOLD consecutive absences before removal.
+  const MISS_THRESHOLD = 5;
+  let cachedNetworks = {};
+
+  // Node type colors — distinct hues for validators vs non-validators
+  const NODE_COLORS = {
+    validator:     { fill: '#2ea043', stroke: '#3fb950' },  // green
+    non_validator: { fill: '#388bfd', stroke: '#58a6ff' },  // blue
+    unreachable:   { fill: '#da3633', stroke: '#f85149' },  // red
+    disconnected:  { stroke: '#d29922' },                   // orange (border only)
+  };
+
+  // AWS inter-region one-way latency matrix (ms). Source: cloudping.co P50, RTT/2.
+  const LATENCY_REGIONS = [
+    'ap-northeast-1','ap-northeast-2','ap-south-1','ap-southeast-1','ap-southeast-2',
+    'ca-central-1','eu-central-1','eu-west-1','eu-west-2','sa-east-1',
+    'us-east-1','us-east-2','us-west-1','us-west-2'];
+  const LATENCY_MATRIX = [
+    [0,19,66,36,53,79,116,103,108,131,76,70,56,51],
+    [19,0,67,37,77,93,117,121,126,149,93,86,70,65],
+    [66,67,0,33,78,95,62,63,58,150,95,100,118,112],
+    [36,37,33,0,48,115,82,88,84,165,109,103,88,83],
+    [53,77,78,48,0,100,127,129,133,157,101,94,70,71],
+    [79,93,95,115,100,0,48,36,41,64,10,15,41,32],
+    [116,117,62,82,127,48,0,12,9,103,48,52,78,73],
+    [103,121,63,88,129,36,12,0,8,90,36,41,67,61],
+    [108,126,58,84,133,41,9,8,0,95,40,45,75,66],
+    [131,149,150,165,157,64,103,90,95,0,58,63,88,89],
+    [76,93,95,109,101,10,48,36,40,58,0,10,35,34],
+    [70,86,100,103,94,15,52,41,45,63,10,0,29,27],
+    [56,70,118,88,70,41,78,67,75,88,35,29,0,12],
+    [51,65,112,83,71,32,73,61,66,89,34,27,12,0]];
+  function getLatency(regionA, regionB) {
+    const i = LATENCY_REGIONS.indexOf(regionA);
+    const j = LATENCY_REGIONS.indexOf(regionB);
+    if (i < 0 || j < 0) return null;
+    return LATENCY_MATRIX[i][j];
+  }
+
+  // AWS region display names (city, country)
+  const REGION_LABELS = {
+    'ap-northeast-1': 'Tokyo, Japan',
+    'ap-northeast-2': 'Seoul, South Korea',
+    'ap-south-1': 'Mumbai, India',
+    'ap-southeast-1': 'Singapore',
+    'ap-southeast-2': 'Sydney, Australia',
+    'ca-central-1': 'Montreal, Canada',
+    'eu-central-1': 'Frankfurt, Germany',
+    'eu-west-1': 'Dublin, Ireland',
+    'eu-west-2': 'London, UK',
+    'sa-east-1': 'Sao Paulo, Brazil',
+    'us-east-1': 'N. Virginia, USA',
+    'us-east-2': 'Ohio, USA',
+    'us-west-1': 'N. California, USA',
+    'us-west-2': 'Oregon, USA',
+  };
+
+  // AWS region city coordinates for the world map view
+  const REGION_COORDS = {
+    'ap-northeast-1': { lat: 35.68, lng: 139.69 },  // Tokyo
+    'ap-northeast-2': { lat: 37.57, lng: 126.98 },  // Seoul
+    'ap-south-1':     { lat: 19.08, lng: 72.88 },   // Mumbai
+    'ap-southeast-1': { lat: 1.35,  lng: 103.82 },  // Singapore
+    'ap-southeast-2': { lat: -33.87, lng: 151.21 },  // Sydney
+    'ca-central-1':   { lat: 45.50, lng: -73.57 },  // Montreal
+    'eu-central-1':   { lat: 50.11, lng: 8.68 },    // Frankfurt
+    'eu-west-1':      { lat: 53.35, lng: -6.26 },   // Dublin
+    'eu-west-2':      { lat: 51.51, lng: -0.13 },   // London
+    'sa-east-1':      { lat: -23.55, lng: -46.63 },  // Sao Paulo
+    'us-east-1':      { lat: 38.95, lng: -77.45 },  // N. Virginia
+    'us-east-2':      { lat: 39.96, lng: -82.99 },  // Ohio
+    'us-west-1':      { lat: 37.35, lng: -121.96 }, // N. California
+    'us-west-2':      { lat: 45.59, lng: -122.60 }, // Oregon
+  };
+
+  // Subnet palette — 8 visually distinct hues for dark backgrounds
+  const SUBNET_PALETTE = [
+    { fill: 'rgba(88,166,255,0.08)', stroke: '#58a6ff', text: '#58a6ff' },  // blue
+    { fill: 'rgba(210,153,34,0.08)', stroke: '#d29922', text: '#d29922' },  // amber
+    { fill: 'rgba(163,113,247,0.08)', stroke: '#a371f7', text: '#a371f7' }, // purple
+    { fill: 'rgba(63,185,80,0.08)',  stroke: '#3fb950', text: '#3fb950' },  // green
+    { fill: 'rgba(248,129,102,0.08)', stroke: '#f8816a', text: '#f8816a' }, // coral
+    { fill: 'rgba(121,192,255,0.08)', stroke: '#79c0ff', text: '#79c0ff' }, // sky
+    { fill: 'rgba(219,171,255,0.08)', stroke: '#dbabff', text: '#dbabff' }, // lavender
+    { fill: 'rgba(255,216,109,0.08)', stroke: '#ffd86d', text: '#ffd86d' }, // gold
+  ];
+
+  const container = document.getElementById('graphContainer');
+  const tabBarEl = document.getElementById('tabBar');
+  const emptyEl = document.getElementById('emptyState');
+  const legendEl = document.getElementById('legend');
+  const errorsEl = document.getElementById('errors');
+  const headerTitle = document.getElementById('headerTitle');
+  const heightsList = document.getElementById('heightsList');
+  const detailPanel = document.getElementById('detailPanel');
+  const heightsPanel = document.getElementById('heightsPanel');
+  const peersInfoFloating = document.getElementById('peersInfoFloating');
+
+  function bindVerticalResize(panelEl, handleSelector, minHeight, onResize) {
+    panelEl.addEventListener('mousedown', (event) => {
+      if (!event.target.closest(handleSelector)) return;
+      event.preventDefault();
+      const startY = event.clientY;
+      const startHeight = panelEl.offsetHeight;
+      const onMove = (moveEvent) => {
+        const nextHeight = Math.max(minHeight, startHeight + moveEvent.clientY - startY);
+        panelEl.style.height = nextHeight + 'px';
+        panelEl.style.maxHeight = nextHeight + 'px';
+        if (onResize) onResize(nextHeight, panelEl);
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+  }
+
+  function bindPopupToggle(buttonEl, popupEl, onShow) {
+    if (!buttonEl || !popupEl) return;
+    buttonEl.onclick = function(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      popupEl.classList.toggle('visible');
+      if (popupEl.classList.contains('visible') && onShow) onShow(buttonEl, popupEl);
+    };
+  }
+
+  function hidePopups(popups) {
+    popups.forEach((popup) => {
+      if (popup) popup.classList.remove('visible');
+    });
+  }
+
+  function bindCheckboxToggle(elementId, onToggle) {
+    document.getElementById(elementId).onchange = function() {
+      onToggle(this.checked);
+    };
+  }
+
+  bindVerticalResize(detailPanel, '.detail-resize-handle', 120, (nextHeight) => {
+    userPanelHeight = nextHeight;
+  });
+  bindVerticalResize(heightsPanel, '.sidebar-resize-handle', 80, (_, panelEl) => {
+    panelEl.style.overflow = 'hidden';
+  });
+
+  // Click a subnet name in the legend to filter nodes
+  legendEl.addEventListener('click', (e) => {
+    const item = e.target.closest('[data-subnet]');
+    if (!item) return;
+    const name = item.dataset.subnet;
+    selectedSubnet = (selectedSubnet === name) ? null : name;
+    selectedNode = null;
+    renderGraph();
+    updateDetailPanel();
+  });
+
+  // Click a node name in the heights list to select it on the graph
+  heightsList.addEventListener('click', (e) => {
+    const el = e.target.closest('[data-peer]');
+    if (el) selectNode(el.dataset.peer);
+  });
+
+  // Delegated click handler for tabs. Using delegation on the stable parent
+  // element avoids lost clicks when fetchTopology() rebuilds tab DOM mid-click.
+  tabBarEl.addEventListener('click', (e) => {
+    const viewTab = e.target.closest('[data-view]');
+    if (viewTab) {
+      viewMode = viewTab.dataset.view;
+      worldZoomInitialized = false;
+      initialZoomDone = false;
+      updateTabs();
+      renderGraph();
+      return;
+    }
+    const tab = e.target.closest('[data-tab]');
+    if (!tab) return;
+    activeTab = tab.dataset.tab;
+    userSelectedTab = true;
+    updateTabs();
+    renderGraph();
+  });
+
+  svg = d3.select(container).append('svg');
+  g = svg.append('g');
+
+  const zoom = d3.zoom()
+    .scaleExtent([0.1, 5])
+    .on('zoom', (event) => g.attr('transform', event.transform));
+  svg.call(zoom);
+
+  let initialZoomDone = false;
+
+  function zoomToFitInstant() {
+    const transform = computeZoomToFitTransform();
+    if (transform) svg.call(zoom.transform, transform);
+  }
+
+  function computeZoomToFitTransform() {
+    if (viewMode === 'world') return d3.zoomIdentity;
+    const allNodes = Object.values(userPinned);
+    if (allNodes.length === 0) return null;
+    const fullW = container.clientWidth, h = container.clientHeight;
+    // Account for sidebar (left) and detail panel (right) overlays
+    const sidebarW = heightsPanel.parentElement.offsetWidth + 24;
+    const panelW = 340 + 24; // always reserve space for detail panel
+    const w = fullW - sidebarW - panelW;
+    const pad = 40;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    allNodes.forEach(n => {
+      if (n.x < minX) minX = n.x;
+      if (n.y < minY) minY = n.y;
+      if (n.x > maxX) maxX = n.x;
+      if (n.y > maxY) maxY = n.y;
+    });
+    const bw = maxX - minX + pad * 2;
+    const bh = maxY - minY + pad * 2;
+    const scale = Math.min(w / bw, h / bh, 2);
+    // Center in the visible area between sidebar and detail panel
+    const cx = sidebarW + (fullW - sidebarW - panelW) / 2;
+    const tx = cx - scale * (minX + maxX) / 2;
+    const ty = h / 2 - scale * (minY + maxY) / 2;
+    return d3.zoomIdentity.translate(tx, ty).scale(scale);
+  }
+
+  function zoomToFit() {
+    const transform = computeZoomToFitTransform();
+    if (transform) svg.transition().duration(300).call(zoom.transform, transform);
+  }
+
+  document.getElementById('recenterBtn').onclick = zoomToFit;
+  const proposerPopup = document.getElementById('proposerInfoPopup');
+  const tabInfoPopup = document.getElementById('tabInfoPopup');
+  const mempoolInfoPopup = document.getElementById('mempoolInfoPopup');
+  const persistentPeersInfoPopup = document.getElementById('persistentPeersInfoPopup');
+  const elTrustedPeersInfoPopup = document.getElementById('elTrustedPeersInfoPopup');
+  const latencyInfoPopup = document.getElementById('latencyInfoPopup');
+  const subnetInfoPopup = document.getElementById('subnetInfoPopup');
+
+  bindCheckboxToggle('showProposer', (checked) => {
+    showProposer = checked;
+    renderGraph();
+    updateHeightsList();
+  });
+  bindPopupToggle(document.getElementById('proposerInfoBtn'), proposerPopup);
+  bindPopupToggle(document.getElementById('mempoolInfoBtn'), mempoolInfoPopup);
+  bindPopupToggle(document.getElementById('persistentPeersInfoBtn'), persistentPeersInfoPopup);
+  bindPopupToggle(document.getElementById('elTrustedPeersInfoBtn'), elTrustedPeersInfoPopup);
+  bindPopupToggle(document.getElementById('latencyInfoBtn'), latencyInfoPopup);
+  bindPopupToggle(document.getElementById('subnetInfoBtn'), subnetInfoPopup);
+  document.addEventListener('click', () => {
+    hidePopups([
+      proposerPopup,
+      tabInfoPopup,
+      mempoolInfoPopup,
+      peersInfoFloating,
+      latencyInfoPopup,
+      subnetInfoPopup,
+      persistentPeersInfoPopup,
+      elTrustedPeersInfoPopup,
+    ]);
+  });
+  bindCheckboxToggle('showPersistentPeers', (checked) => {
+    showPersistentPeers = checked;
+    renderGraph();
+  });
+  bindCheckboxToggle('showElTrustedPeers', (checked) => {
+    showElTrustedPeers = checked;
+    renderGraph();
+  });
+  bindCheckboxToggle('showMempool', (checked) => {
+    showMempool = checked;
+    fetch('/api/mempool/' + (showMempool ? 'on' : 'off'), { method: 'POST' })
+      .catch(e => {
+        transientErrors = ['Mempool toggle failed: ' + String((e && e.message) || e)];
+        updateErrors();
+      });
+    renderGraph();
+    updateHeightsList();
+  });
+  bindCheckboxToggle('showLatencies', (checked) => {
+    showLatencies = checked;
+    renderGraph();
+  });
+  bindCheckboxToggle('showSubnets', (checked) => {
+    showSubnets = checked;
+    renderGraph();
+  });
+
+  // Track subnet color assignments persistently
+  let subnetColorMap = {};
+
+  function getSubnetColor(name) {
+    if (!subnetColorMap[name]) {
+      subnetColorMap[name] = SUBNET_PALETTE[Object.keys(subnetColorMap).length % SUBNET_PALETTE.length];
+    }
+    return subnetColorMap[name];
+  }
+
+  // Generate a 5-point star path centered at (0,0)
+  function starPath(outerR, innerR) {
+    const pts = [];
+    for (let i = 0; i < 5; i++) {
+      const outerAngle = (i * 2 * Math.PI / 5) - Math.PI / 2;
+      const innerAngle = outerAngle + Math.PI / 5;
+      pts.push([Math.cos(outerAngle) * outerR, Math.sin(outerAngle) * outerR]);
+      pts.push([Math.cos(innerAngle) * innerR, Math.sin(innerAngle) * innerR]);
+    }
+    return 'M' + pts.map(p => p.join(',')).join('L') + 'Z';
+  }
+
+  async function fetchTopology() {
+    try {
+      const resp = await fetch('/api/topology');
+      if (!resp.ok) {
+        transientErrors = ['Topology API HTTP ' + resp.status];
+        updateErrors();
+        return;
+      }
+      transientErrors = [];
+      data = await resp.json();
+      if (data && data.nodes) {
+        const perturbedStatuses = ['exited','paused','disconnected'];
+        for (const node of data.nodes) {
+          const prev = prevNodeStatuses[node.name];
+          const curCl = node.cl_status || '';
+          const curEl = node.el_status || '';
+          const recentlyShaken = lastShakeTime[node.name] && (Date.now() - lastShakeTime[node.name] < 5000);
+          if (prev && !recentlyShaken) {
+            const clChanged = curCl !== prev.cl && perturbedStatuses.includes(curCl);
+            const elChanged = curEl !== prev.el && perturbedStatuses.includes(curEl);
+            if (clChanged || elChanged) shakeNode(node.name);
+          }
+          prevNodeStatuses[node.name] = { cl: curCl, el: curEl };
+          // Clear pending actions when status changes or after timeout
+          for (const t of ['cl', 'el']) {
+            const key = node.name + ':' + t;
+            const pa = pendingActions[key];
+            if (!pa) continue;
+            const curSt = t === 'cl' ? curCl : curEl;
+            if (curSt !== pa.prevStatus || Date.now() - pa.ts > 10000) {
+              delete pendingActions[key];
+            }
+          }
+        }
+      }
+      mergeNetworks();
+      updateStatus();
+      updateTabs();
+      updateErrors();
+      renderGraph();
+      updateDetailPanel();
+    } catch (e) {
+      transientErrors = ['Topology fetch failed: ' + String((e && e.message) || e)];
+      updateErrors();
+      console.debug('topology fetch failed:', e);
+    }
+  }
+
+  // Merge incoming networks with the cache. Present networks reset their miss
+  // count; absent ones increment it. Networks exceeding MISS_THRESHOLD are dropped.
+  function mergeNetworks() {
+    if (!data) return;
+    const incoming = data.networks;
+    for (const name of Object.keys(incoming)) {
+      cachedNetworks[name] = { network: incoming[name], missCount: 0 };
+    }
+    for (const name of Object.keys(cachedNetworks)) {
+      if (!(name in incoming)) {
+        cachedNetworks[name].missCount++;
+        if (cachedNetworks[name].missCount >= MISS_THRESHOLD) {
+          delete cachedNetworks[name];
+        }
+      }
+    }
+    // Replace data.networks with the cached (stable) set
+    const merged = {};
+    for (const name of Object.keys(cachedNetworks)) {
+      merged[name] = cachedNetworks[name].network;
+    }
+    data.networks = merged;
+  }
+
+  function updateStatus() {
+    if (!data) return;
+    if (data.testnet_name) {
+      headerTitle.textContent = data.testnet_name;
+      document.title = data.testnet_name + ' — Quake Live';
+    }
+    updateHeightsList();
+  }
+
+  function updateHeightsList() {
+    if (!data || !data.nodes) { heightsList.innerHTML = ''; return; }
+    const maxHeight = data.latest_height;
+    let html = '<div class="sidebar-height-row" style="font-size:10px;padding-bottom:4px">'
+      + '<span class="node-name" style="color:#484f56"></span>'
+      + '<span class="node-height" style="color:#484f56;font-weight:400">Height</span>'
+      + '<span class="node-round" style="color:#484f56;font-weight:400">Round</span>'
+      + (showMempool ? '<span class="node-queued" style="color:#484f56;font-weight:400">Queue</span>'
+        + '<span class="node-pending" style="color:#484f56;font-weight:400">Pend</span>' : '')
+      + '</div>';
+    for (const node of data.nodes) {
+      const h = node.height;
+      let heightText, heightClass;
+      if (h == null) {
+        heightText = '--';
+        heightClass = 'err';
+      } else {
+        heightText = h.toLocaleString();
+        if (maxHeight != null && h < maxHeight) {
+          const diff = maxHeight - h;
+          heightClass = diff <= 1 ? 'behind-1' : diff <= 5 ? 'behind-few' : 'behind-many';
+        } else {
+          heightClass = '';
+        }
+      }
+      const roundText = node.round != null ? String(node.round) : '--';
+      const roundClass = node.round > 1 ? 'round-high' : node.round === 1 ? 'round-1' : '';
+      const mp = node.mempool;
+      const pendingText = mp ? String(mp[0]) : '';
+      const queuedText = mp ? String(mp[1]) : '';
+      const isProposer = showProposer && data.current_proposer === node.name;
+      const nodeDisconnected = node.cl_status === 'disconnected' || node.el_status === 'disconnected';
+      const dotColor = node.status === 'unreachable' ? '#f85149'
+        : nodeDisconnected ? '#d29922'
+        : node.node_type === 'validator' ? '#3fb950' : '#58a6ff';
+      html += '<div class="sidebar-height-row' + (isProposer ? ' proposer' : '') + '">'
+        + '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:'
+        + dotColor + ';flex-shrink:0;margin-right:4px"></span>'
+        + '<span class="node-name" title="' + escapeHtml(node.name) + '" data-peer="' + escapeHtml(node.name) + '">' + escapeHtml(node.name) + '</span>'
+        + '<span class="node-height ' + heightClass + '">' + heightText + '</span>'
+        + '<span class="node-round ' + roundClass + '">' + roundText + '</span>'
+        + (showMempool ? '<span class="node-queued">' + queuedText + '</span>'
+          + '<span class="node-pending">' + pendingText + '</span>' : '')
+        + '</div>';
+    }
+    heightsList.innerHTML = html;
+  }
+
+  // Friendly display name for a network key, prefixed with its layer.
+  // "/consensus" (cl) → "CL Consensus", "EL Peers" stays as-is.
+  function networkDisplayName(key, layer) {
+    const prefix = (layer || 'cl').toUpperCase();
+    if (key.startsWith('/')) {
+      const name = key.slice(1).replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      return prefix + ' ' + name;
+    }
+    // Already prefixed (e.g. "CL Persistent", "EL Peers")
+    return key;
+  }
+
+  // Preferred tab display order. Networks not listed here appear at the end.
+  const TAB_ORDER = ['Manifest', '/consensus', '/liveness', '/proposal_parts', 'EL Peers'];
+
+  function updateTabs() {
+    if (!data) return;
+    const allNames = Object.keys(data.networks);
+    if (allNames.length === 0) { emptyEl.style.display = 'flex'; legendEl.style.display = 'none'; return; }
+    emptyEl.style.display = 'none';
+    legendEl.style.display = 'block';
+
+    // Sort tabs into preferred order
+    const orderedNames = allNames.slice().sort((a, b) => {
+      const ia = TAB_ORDER.indexOf(a), ib = TAB_ORDER.indexOf(b);
+      if (ia >= 0 && ib >= 0) return ia - ib;
+      if (ia >= 0) return -1;
+      if (ib >= 0) return 1;
+      return 0;
+    });
+
+    // Auto-select when no tab is set or the user's pick has been evicted.
+    const inNetworks = activeTab && (activeTab in data.networks);
+    const inCache = activeTab && (activeTab in cachedNetworks);
+    if (!activeTab || (!inNetworks && (!userSelectedTab || !inCache))) {
+      activeTab = orderedNames[0] || null;
+      userSelectedTab = false;
+    }
+
+    // Single flat tab bar with all networks. Only rebuild DOM when content changes
+    // to avoid destroying elements mid-click.
+    let tabHtml = '<span style="font-size:9px;color:#484f56;font-variant:small-caps;padding:8px 6px 8px 0;align-self:center">topologies</span>';
+    // Show all expected tabs; dim empty ones
+    const allTabNames = [...new Set([...TAB_ORDER, ...orderedNames])];
+    for (const name of allTabNames) {
+      const net = data.networks[name];
+      const edgeCount = net ? net.edges.length : 0;
+      const layer = net ? net.layer : (name === 'EL Peers' ? 'el' : 'cl');
+      const active = name === activeTab ? ' active' : '';
+      const disabled = !net ? ' tab-disabled' : '';
+      tabHtml += '<div class="tab' + active + disabled + '" data-tab="' + escapeHtml(name) + '">'
+        + '<span class="tab-label">' + escapeHtml(networkDisplayName(name, layer)) + '</span>'
+        + '<span class="badge">' + edgeCount + '</span></div>';
+    }
+    tabHtml += '<div style="margin-left:8px;display:flex;align-items:center">'
+      + '<button class="info-btn" id="tabInfoBtn" type="button">i</button></div>';
+    tabHtml += '<div class="tab-spacer"></div>';
+    tabHtml += '<div class="tab view-tab' + (viewMode === 'graph' ? ' active' : '') + '" data-view="graph">Graph</div>';
+    tabHtml += '<div class="tab view-tab' + (viewMode === 'world' ? ' active' : '') + '" data-view="world">Map</div>';
+    if (tabBarEl.dataset.html !== tabHtml) {
+      tabBarEl.dataset.html = tabHtml;
+      tabBarEl.innerHTML = tabHtml;
+      bindPopupToggle(document.getElementById('tabInfoBtn'), tabInfoPopup, (buttonEl) => {
+        const rect = buttonEl.getBoundingClientRect();
+        tabInfoPopup.style.top = (rect.bottom + 4) + 'px';
+        tabInfoPopup.style.left = Math.max(4, rect.right - 280) + 'px';
+      });
+    }
+
+    document.getElementById('persistentPeersToggle').style.display = (activeTab === 'Manifest') ? '' : 'none';
+    document.getElementById('elTrustedPeersToggle').style.display = (activeTab === 'Manifest') ? '' : 'none';
+  }
+
+  function updateErrors() {
+    const serverErrors = data && Array.isArray(data.errors) ? data.errors : [];
+    const mergedErrors = [...transientErrors, ...serverErrors];
+    if (mergedErrors.length === 0) { errorsEl.innerHTML = ''; return; }
+    errorsEl.innerHTML = mergedErrors.slice(0, 20)
+      .map(e => '<div class="error-item">' + escapeHtml(e) + '</div>').join('');
+  }
+
+  function buildLegend(subnetNames) {
+    const valCount = data ? data.nodes.filter(n => n.node_type === 'validator').length : 0;
+    const nonValCount = data ? data.nodes.filter(n => n.node_type !== 'validator').length : 0;
+    let html = '';
+    // Node types
+    html += '<div class="legend-section"><div class="legend-title">Nodes</div>';
+    html += '<div class="legend-item"><div class="legend-swatch" style="background:' + NODE_COLORS.validator.fill + ';border:2px solid ' + NODE_COLORS.validator.stroke + '"></div> Validator (' + valCount + ')</div>';
+    html += '<div class="legend-item"><div class="legend-swatch" style="background:' + NODE_COLORS.non_validator.fill + ';border:2px solid ' + NODE_COLORS.non_validator.stroke + '"></div> Non-validator (' + nonValCount + ')</div>';
+    html += '<div class="legend-item"><div class="legend-swatch" style="background:#21262d;border:2px solid ' + NODE_COLORS.unreachable.stroke + '"></div> Unreachable</div>';
+    html += '<div class="legend-item"><div class="legend-swatch" style="background:#21262d;border:2px solid ' + NODE_COLORS.disconnected.stroke + '"></div> Disconnected</div>';
+    html += '</div>';
+
+    // Subnets
+    if (subnetNames.length > 0 && !(subnetNames.length === 1 && subnetNames[0] === '_default')) {
+      html += '<div class="legend-section"><div class="legend-title">Subnets</div>';
+      for (const name of subnetNames) {
+        if (name === '_default') continue;
+        const c = getSubnetColor(name);
+        const count = data ? data.nodes.filter(n => (n.subnets || []).includes(name)).length : 0;
+        const sel = selectedSubnet === name ? ';text-decoration:underline' : '';
+        html += '<div class="legend-item legend-subnet" data-subnet="' + escapeHtml(name) + '" style="cursor:pointer' + sel + '"><div class="legend-line" style="background:' + c.stroke + '"></div> ' + escapeHtml(name) + ' (' + count + ')</div>';
+      }
+      html += '</div>';
+    }
+
+    legendEl.innerHTML = html;
+  }
+
+  function getSubnetNames(nodes) {
+    const names = new Set();
+    nodes.forEach(n => {
+      const subs = n.subnets && n.subnets.length > 0 ? n.subnets : ['_default'];
+      subs.forEach(s => names.add(s));
+    });
+    return [...names];
+  }
+
+  // Arrange subnet center points for initial node positioning.
+  // Detects hub-and-spoke topologies: the subnet connected to the most other
+  // subnets (via bridge nodes) is placed at the center, with peripheral
+  // subnets arranged in a ring around it.
+  function computeSubnetCenters(subnetNames, width, height) {
+    const subs = subnetNames.filter(s => s !== '_default');
+    if (subs.length === 0) return {};
+    const cx = width / 2, cy = height / 2;
+    const radius = Math.min(width, height) * 0.30;
+
+    if (subs.length === 1) {
+      return { [subs[0]]: { x: cx, y: cy } };
+    }
+
+    // Build subnet membership: subnet → set of node names
+    const members = {};
+    subs.forEach(s => { members[s] = new Set(); });
+    if (data && data.nodes) {
+      data.nodes.forEach(n => {
+        (n.subnets || []).forEach(s => { if (members[s]) members[s].add(n.name); });
+      });
+    }
+
+    // Count cross-subnet connections per subnet (bridge nodes link two subnets)
+    const connectivity = {};
+    subs.forEach(s => { connectivity[s] = new Set(); });
+    if (data && data.nodes) {
+      data.nodes.forEach(n => {
+        const nodeSubs = (n.subnets || []).filter(s => members[s]);
+        if (nodeSubs.length > 1) {
+          // This node bridges multiple subnets
+          for (const a of nodeSubs) {
+            for (const b of nodeSubs) {
+              if (a !== b) connectivity[a].add(b);
+            }
+          }
+        }
+      });
+    }
+
+    // Hub = subnet connected to the most other subnets; break ties by member count
+    const sorted = subs.slice().sort((a, b) => {
+      const diff = connectivity[b].size - connectivity[a].size;
+      if (diff !== 0) return diff;
+      return members[b].size - members[a].size;
+    });
+    const hub = sorted[0];
+    const spokes = sorted.slice(1);
+
+    const centers = {};
+    centers[hub] = { x: cx, y: cy };
+    spokes.forEach((name, i) => {
+      const angle = (2 * Math.PI * i / spokes.length) - Math.PI / 2;
+      centers[name] = { x: cx + radius * Math.cos(angle), y: cy + radius * Math.sin(angle) };
+    });
+    return centers;
+  }
+
+  function getSubnetPullTarget(subnets, subnetCenters) {
+    const activeSubnets = (subnets || []).filter(s => s !== '_default' && subnetCenters[s]);
+    if (activeSubnets.length === 0) return null;
+    let totalX = 0;
+    let totalY = 0;
+    activeSubnets.forEach((subnet) => {
+      totalX += subnetCenters[subnet].x;
+      totalY += subnetCenters[subnet].y;
+    });
+    return {
+      x: totalX / activeSubnets.length,
+      y: totalY / activeSubnets.length,
+    };
+  }
+
+  // Format a snake_case config key for display: "cl_persistent_peers" → "CL Persistent"
+  function formatConfigKey(key) {
+    return key.replace(/_/g, ' ').replace(/\b(cl|el)\b/gi, s => s.toUpperCase())
+              .replace(/\b\w/g, c => c.toUpperCase());
+  }
+
+  // Format a config value for display
+  function formatConfigValue(val) {
+    if (Array.isArray(val)) return val.join(', ');
+    if (typeof val === 'boolean') return val ? 'yes' : 'no';
+    return String(val);
+  }
+
+  // SVG icons for node action buttons (14×14 viewBox)
+  const ACTION_ICONS = {
+    start: '<svg viewBox="0 0 16 16"><polygon points="4,2 14,8 4,14"/></svg>',
+    stop: '<svg viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="10" rx="1"/></svg>',
+    restart: '<svg viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-2-4.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><polyline points="11,1 14,4 11,5.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    kill: '<svg viewBox="0 0 16 16"><line x1="3" y1="3" x2="13" y2="13" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><line x1="13" y1="3" x2="3" y2="13" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>',
+    pause: '<svg viewBox="0 0 16 16"><rect x="3" y="2" width="3.5" height="12" rx="0.8"/><rect x="9.5" y="2" width="3.5" height="12" rx="0.8"/></svg>',
+    unpause: '<svg viewBox="0 0 16 16"><polygon points="4,2 14,8 4,14"/><rect x="1" y="1" width="14" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>',
+    disconnect: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.8"/><line x1="3.5" y1="3.5" x2="12.5" y2="12.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+    reconnect: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="8" cy="8" r="2" fill="currentColor"/></svg>',
+  };
+  const SPINNER_ICON = '<svg viewBox="0 0 16 16" class="spinner-icon"><path d="M8 1.5a6.5 6.5 0 1 0 6.5 6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+
+  // Build a single action button; spinning replaces icon with animated spinner
+  function actionBtn(nodeName, act, target, tipSuffix, spinning, disabled) {
+    const cls = 'detail-action-btn act-' + act
+      + (spinning ? ' spinning' : '') + (disabled ? ' disabled' : '');
+    const icon = spinning ? SPINNER_ICON : ACTION_ICONS[act];
+    return '<button class="' + cls + '" data-tip="' + act.charAt(0).toUpperCase() + act.slice(1) + (tipSuffix || '')
+      + '" data-node="' + escapeHtml(nodeName) + '" data-action="' + act + '" data-target="' + (target || '') + '">'
+      + icon + '</button>';
+  }
+
+  // Statuses where the node is considered "up" (start disabled, stop/kill enabled)
+  const UP_STATUSES = new Set([
+    'running', 'paused', 'disconnected', 'starting', 'stopping', 'restarting',
+    'killing', 'pausing', 'unpausing', 'disconnecting', 'reconnecting',
+  ]);
+  // Statuses where the node is considered "down" (start enabled, stop/kill disabled)
+  const DOWN_STATUSES = new Set(['exited', 'stopped', 'dead', 'removing', 'created']);
+
+  function isUp(st) { return UP_STATUSES.has(st); }
+  function isDown(st) { return DOWN_STATUSES.has(st) || !st || st === 'unknown'; }
+
+  function buildActionSpecs(containerStatus, isDisconnected) {
+    const isPaused = containerStatus === 'paused';
+    const up = isUp(containerStatus);
+    const down = isDown(containerStatus);
+    return [
+      { act: 'start', disabled: up },
+      { act: 'stop', disabled: down },
+      { act: 'kill', disabled: down },
+      { act: 'restart', disabled: false },
+      { act: isPaused ? 'unpause' : 'pause', disabled: false },
+      { act: isDisconnected ? 'reconnect' : 'disconnect', disabled: false },
+    ];
+  }
+
+  function buildActionButtonsHtml(nodeName, target, tipSuffix, spinAct, actions) {
+    return actions
+      .map((action) => actionBtn(nodeName, action.act, target, tipSuffix, action.act === spinAct, action.disabled))
+      .join('');
+  }
+
+  // Full set of action buttons for the node-level row (both containers)
+  function nodeActionButtonsHtml(nodeName, containerStatus, clSt, elSt) {
+    const bothDisconnected = clSt === 'disconnected' && elSt === 'disconnected';
+    const paCl = pendingActions[nodeName + ':cl'];
+    const paEl = pendingActions[nodeName + ':el'];
+    const spinAct = (paCl && paCl.action) || (paEl && paEl.action) || null;
+    const actions = buildActionSpecs(containerStatus, bothDisconnected);
+    return buildActionButtonsHtml(nodeName, '', ' both layers', spinAct, actions);
+  }
+
+  // Per-layer buttons: same order and enable/disable logic
+  function layerActionButtonsHtml(nodeName, target, containerStatus) {
+    const isDisconnected = containerStatus === 'disconnected';
+    const pa = pendingActions[nodeName + ':' + target];
+    const spinAct = (pa && pa.action) || null;
+    const actions = buildActionSpecs(containerStatus, isDisconnected);
+    return buildActionButtonsHtml(nodeName, target, '', spinAct, actions);
+  }
+
+  // Show or hide the detail panel for the selected node
+  function updateDetailPanel() {
+    if (!selectedNode || !data) {
+      detailPanel.style.display = 'none';
+      detailPanel.dataset.html = '';
+      return;
+    }
+    const node = data.nodes.find(n => n.name === selectedNode);
+    if (!node) { detailPanel.style.display = 'none'; detailPanel.dataset.html = ''; return; }
+
+    // Title + node-level action buttons
+    const clSt = node.cl_status || 'unknown';
+    const elSt = node.el_status || 'unknown';
+    // Derive a combined status: paused if either is paused, down if both are down, else use CL status
+    const nodeSt = (clSt === 'paused' || elSt === 'paused') ? 'paused'
+      : (isDown(clSt) && isDown(elSt)) ? clSt
+      : clSt;
+    let html = '<div class="detail-panel-title"><span class="title-name">' + escapeHtml(node.name) + '</span>'
+      + nodeActionButtonsHtml(node.name, nodeSt, clSt, elSt) + '</div>';
+    // Per-layer action buttons with container status between label and buttons
+    html += '<div class="detail-actions"><span class="action-label">CL</span>'
+      + '<span class="container-status ' + escapeHtml(clSt) + '">' + escapeHtml(clSt) + '</span>'
+      + layerActionButtonsHtml(node.name, 'cl', clSt) + '</div>';
+    html += '<div class="detail-actions"><span class="action-label">EL</span>'
+      + '<span class="container-status ' + escapeHtml(elSt) + '">' + escapeHtml(elSt) + '</span>'
+      + layerActionButtonsHtml(node.name, 'el', elSt) + '</div>';
+    html += '<hr class="detail-actions-separator">';
+
+    const cfg = node.config || {};
+
+    // Build maps of currently live peers (name → peer data) for tag display
+    const liveClMap = {};
+    (node.cl_peers || []).forEach(p => { liveClMap[p.name] = p; });
+    const liveElMap = {};
+    (node.el_peers || []).forEach(p => { liveElMap[p.name] = p; });
+
+    // Peers: manifest peers plus any additional live peers not in the manifest
+    const peerNames = [...new Set([
+      ...(node.manifest_cl_peers || []),
+      ...(node.manifest_el_peers || []),
+      ...Object.keys(liveClMap),
+      ...Object.keys(liveElMap),
+    ])];
+    const explicitSet = new Set(node.explicit_cl_peers || []);
+    if (peerNames.length > 0) {
+      html += '<hr class="detail-actions-separator">';
+      html += '<div class="detail-peer detail-peers-title">'
+        + '<span class="detail-peer-name">Peers (' + peerNames.length + ')'
+        + '<button class="info-btn peers-info-btn" type="button" style="margin-left:8px">i</button></span>'
+        + '<span class="detail-peer-dir"></span>'
+        + '<span class="detail-peer-mesh">CL</span>'
+        + '<span class="detail-peer-score"></span>'
+        + '<span class="detail-peer-el">EL</span>'
+        + '</div>';
+      html += '<div class="detail-peer detail-peer-header">'
+        + '<span class="detail-peer-name"></span>'
+        + '<span class="detail-peer-dir" title="CL connection direction: inbound or outbound">Dir</span>'
+        + '<span class="detail-peer-mesh" title="CL gossipsub mesh: Consensus / Liveness / Proposal Parts / Explicit peer">'
+        + '<span class="dot-label">C</span><span class="dot-label">L</span><span class="dot-label">P</span><span class="dot-label">E</span></span>'
+        + '<span class="detail-peer-score" title="CL gossipsub peer score">Score</span>'
+        + '<span class="detail-peer-el" title="EL peer flags: Trusted / Inbound / Static">'
+        + '<span class="dot-label">T</span><span class="dot-label">I</span><span class="dot-label">S</span></span>'
+        + '</div>';
+      html += '<div class="detail-peers-section">';
+      for (const name of peerNames) {
+        const cl = liveClMap[name];
+        const el = liveElMap[name];
+        const clDown = !cl;
+        const elDown = !el;
+        const topics = (cl && cl.topics) || [];
+        const topicSet = new Set(topics);
+        const meshCol = '<span class="detail-peer-mesh" title="Consensus / Liveness / Proposal Parts / Explicit">'
+          + '<span class="mesh-dot' + (topicSet.has('/consensus') ? ' active' : '') + '"></span>'
+          + '<span class="mesh-dot' + (topicSet.has('/liveness') ? ' active' : '') + '"></span>'
+          + '<span class="mesh-dot' + (topicSet.has('/proposal_parts') ? ' active' : '') + '"></span>'
+          + '<span class="mesh-dot' + (explicitSet.has(name) ? ' active' : '') + '"></span>'
+          + '</span>';
+        const scoreCol = '<span class="detail-peer-score">' + (cl && cl.score != null ? cl.score.toFixed(1) : '') + '</span>';
+        const elCol = '<span class="detail-peer-el" title="Trusted / Inbound / Static">'
+          + '<span class="mesh-dot' + (el && el.trusted ? ' active' : '') + '"></span>'
+          + '<span class="mesh-dot' + (el && el.inbound ? ' inbound' : '') + '"></span>'
+          + '<span class="mesh-dot' + (el && el.static_node ? ' static' : '') + '"></span>'
+          + '</span>';
+        const dir = cl && cl.direction ? (cl.direction === 'inbound' ? '&#8592;' : '&#8594;') : '';
+        const dirCol = '<span class="detail-peer-dir">' + dir + '</span>';
+        const rowCls = (clDown ? ' cl-down' : '') + (elDown ? ' el-down' : '');
+        html += '<div class="detail-peer' + rowCls + '">'
+          + '<span class="detail-peer-name" data-peer="' + escapeHtml(name) + '">' + escapeHtml(name) + '</span>'
+          + dirCol + meshCol + scoreCol + elCol + '</div>';
+      }
+      html += '</div>';
+    }
+
+    // Configuration (below peers)
+    const keys = Object.keys(cfg).filter(k => k !== 'region');
+    html += '<hr class="detail-actions-separator">';
+    if (keys.length > 0) {
+      html += '<div class="detail-peers-title">Configuration</div>';
+      for (const key of keys) {
+        html += '<div class="detail-row">'
+          + '<span class="detail-key">' + escapeHtml(formatConfigKey(key)) + '</span>'
+          + '<span class="detail-value">' + escapeHtml(formatConfigValue(cfg[key])) + '</span>'
+          + '</div>';
+      }
+    } else {
+      html += '<div class="detail-peers-title">Configuration</div>';
+      html += '<div class="detail-row"><span class="detail-key" style="font-style:italic">default</span></div>';
+    }
+    // Region (below configuration)
+    const region = cfg.region || '--';
+    const regionCity = REGION_LABELS[region] ? ' (' + REGION_LABELS[region] + ')' : '';
+    html += '<hr class="detail-actions-separator">';
+    html += '<div class="detail-row">'
+      + '<span class="detail-key">Region</span>'
+      + '<span class="detail-value">' + escapeHtml(String(region) + regionCity) + '</span>'
+      + '</div>';
+    html += '<div class="detail-resize-handle"></div>';
+
+    detailPanel.style.display = 'flex';
+    // Only rebuild DOM if content changed — preserves hover/tooltip state
+    if (detailPanel.dataset.html !== html) {
+      detailPanel.dataset.html = html;
+      detailPanel.innerHTML = html;
+      // Wire up action button clicks (only needed after DOM rebuild)
+      // Wire up peer name clicks to navigate to that node
+      detailPanel.querySelectorAll('[data-peer]').forEach(el => {
+        el.onclick = (e) => { e.stopPropagation(); selectNode(el.dataset.peer); };
+      });
+      const pInfoBtn = detailPanel.querySelector('.peers-info-btn');
+      if (pInfoBtn) {
+        bindPopupToggle(pInfoBtn, peersInfoFloating, (buttonEl, popupEl) => {
+          const panelRect = detailPanel.getBoundingClientRect();
+          const buttonRect = buttonEl.getBoundingClientRect();
+          popupEl.style.top = buttonRect.top + 'px';
+          popupEl.style.left = (panelRect.left - popupEl.offsetWidth - 6) + 'px';
+          popupEl.style.right = 'auto';
+        });
+      }
+      detailPanel.querySelectorAll('.detail-action-btn').forEach(btn => {
+        btn.onclick = async (e) => {
+          e.stopPropagation();
+          if (btn.classList.contains('disabled')) return;
+          const nodeName = btn.dataset.node;
+          const action = btn.dataset.action;
+          const target = btn.dataset.target;
+          const qs = target ? '?target=' + target : '';
+          const url = '/api/node/' + encodeURIComponent(nodeName) + '/' + action + qs;
+          const shakeActions = ['restart', 'stop', 'kill', 'pause', 'disconnect'];
+          if (shakeActions.includes(action)) shakeNode(nodeName);
+          try {
+            const resp = await fetch(url, { method: 'POST' });
+            let payload = null;
+            try {
+              payload = await resp.json();
+            } catch (_) {
+              // Keep payload null; error message falls back to HTTP status below.
+            }
+            const ok = resp.ok && payload && payload.ok === true;
+            if (!ok) {
+              const errMsg = payload && payload.error ? payload.error : ('HTTP ' + resp.status);
+              transientErrors = ['Node action failed for ' + nodeName + ': ' + errMsg];
+              updateErrors();
+              console.warn('Node action failed:', errMsg);
+              return;
+            }
+            transientErrors = [];
+            updateErrors();
+          } catch (err) {
+            transientErrors = ['Node action failed for ' + nodeName + ': ' + String((err && err.message) || err)];
+            updateErrors();
+            console.warn('Node action failed:', err);
+            return;
+          }
+          // Track pending action to show spinning button until status changes
+          const nd = data && data.nodes.find(n => n.name === nodeName);
+          if (nd) {
+            const targets = target ? [target] : ['cl', 'el'];
+            for (const t of targets) {
+              const key = nodeName + ':' + t;
+              const prevSt = t === 'cl' ? (nd.cl_status || '') : (nd.el_status || '');
+              pendingActions[key] = { action, prevStatus: prevSt, ts: Date.now() };
+            }
+          }
+          updateDetailPanel();
+        };
+      });
+    }
+    // Apply user-resized height when set
+    if (userPanelHeight) {
+      detailPanel.style.height = userPanelHeight + 'px';
+      detailPanel.style.maxHeight = userPanelHeight + 'px';
+    } else {
+      detailPanel.style.height = '';
+      detailPanel.style.maxHeight = '';
+    }
+  }
+
+  let simulation = null;
+
+  function drawSubnetHulls(nodes, subnetNames) {
+    // Group node positions by subnet
+    const subnetPoints = {};
+    nodes.forEach(n => {
+      const subs = n.subnets && n.subnets.length > 0 ? n.subnets : ['_default'];
+      subs.forEach(s => {
+        if (!subnetPoints[s]) subnetPoints[s] = [];
+        subnetPoints[s].push([n.x, n.y]);
+      });
+    });
+
+    // Graph center (centroid of all nodes) used to push subnet labels outward
+    const graphCx = d3.mean(nodes, n => n.x) || 0;
+    const graphCy = d3.mean(nodes, n => n.y) || 0;
+
+    // Insert hull layer as first child of g so it renders behind links and nodes
+    const hullLayer = g.insert('g', ':first-child');
+
+    for (const name of subnetNames) {
+      if (name === '_default') continue;
+      const points = subnetPoints[name];
+      if (!points || points.length === 0) continue;
+
+      const sc = getSubnetColor(name);
+      const pad = 35;
+
+      if (points.length >= 3) {
+        const hull = d3.polygonHull(points);
+        if (hull) {
+          const hcx = d3.mean(hull, d => d[0]);
+          const hcy = d3.mean(hull, d => d[1]);
+          const expanded = hull.map(([px, py]) => {
+            const dx = px - hcx, dy = py - hcy;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            return [px + (dx / len) * pad, py + (dy / len) * pad];
+          });
+          hullLayer.append('polygon')
+            .attr('points', expanded.map(p => p.join(',')).join(' '))
+            .attr('fill', 'none')
+            .attr('stroke', sc.stroke)
+            .attr('stroke-width', 1)
+            .attr('stroke-dasharray', '6 3')
+            .attr('stroke-opacity', 0.5);
+        }
+      } else if (points.length === 2) {
+        // 2 nodes: draw a rotated ellipse spanning both nodes
+        const cx = (points[0][0] + points[1][0]) / 2;
+        const cy = (points[0][1] + points[1][1]) / 2;
+        const dx = points[1][0] - points[0][0];
+        const dy = points[1][1] - points[0][1];
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+        const rx = dist / 2 + pad;
+        const ry = pad;
+        hullLayer.append('ellipse')
+          .attr('cx', cx).attr('cy', cy)
+          .attr('rx', rx).attr('ry', ry)
+          .attr('transform', `rotate(${angle}, ${cx}, ${cy})`)
+          .attr('fill', 'none')
+          .attr('stroke', sc.stroke)
+          .attr('stroke-width', 1)
+          .attr('stroke-dasharray', '6 3')
+          .attr('stroke-opacity', 0.5);
+      } else {
+        // 1 node: draw a dashed circle around it
+        hullLayer.append('circle')
+          .attr('cx', points[0][0]).attr('cy', points[0][1]).attr('r', pad + 10)
+          .attr('fill', 'none')
+          .attr('stroke', sc.stroke)
+          .attr('stroke-width', 1)
+          .attr('stroke-dasharray', '6 3')
+          .attr('stroke-opacity', 0.5);
+      }
+
+      // Subnet label on the far side from the graph center
+      const groupCx = d3.mean(points, p => p[0]);
+      const groupCy = d3.mean(points, p => p[1]);
+      const dx = groupCx - graphCx;
+      const dy = groupCy - graphCy;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      // Place the label at the edge of the bounding box along the outward direction
+      const minX = Math.min(...points.map(p => p[0]));
+      const maxX = Math.max(...points.map(p => p[0]));
+      const minY = Math.min(...points.map(p => p[1]));
+      const maxY = Math.max(...points.map(p => p[1]));
+      // Normalized outward direction from graph center through group center
+      const ndx = dx / dist;
+      const ndy = dy / dist;
+      // Pick the bounding box edge in the outward direction
+      const labelX = ndx >= 0 ? maxX + pad + 4 : minX - pad - 4;
+      const labelY = ndy >= 0 ? maxY + pad + 4 : minY - pad - 4;
+      // Determine anchor: if label is to the right, anchor start; left, anchor end; vertical, center
+      const absDx = Math.abs(ndx);
+      const absDy = Math.abs(ndy);
+      let lx, ly, anchor;
+      if (absDx > absDy) {
+        // Primarily horizontal displacement: place label to the side
+        lx = labelX;
+        ly = groupCy;
+        anchor = ndx >= 0 ? 'start' : 'end';
+      } else {
+        // Primarily vertical displacement: place label above or below
+        lx = groupCx;
+        ly = labelY;
+        anchor = 'middle';
+      }
+      hullLayer.append('text')
+        .attr('x', lx).attr('y', ly)
+        .attr('text-anchor', anchor)
+        .attr('dominant-baseline', ndy >= 0 && absDy >= absDx ? 'hanging' : 'auto')
+        .attr('fill', sc.text)
+        .attr('fill-opacity', 0.7)
+        .style('font-size', '11px')
+        .style('font-weight', '600')
+        .text(name);
+    }
+  }
+
+  let dragging = false;
+
+  // ── Shared rendering helpers (used by both graph and world views) ──
+
+  function resolveEdges(net) {
+    return { edges: net.edges, directedMode: false };
+  }
+
+  function buildNodeData(n, activeNodeNames, currentProposer) {
+    const disconnected = n.cl_status === 'disconnected' || n.el_status === 'disconnected';
+    return {
+      id: n.name,
+      node_type: n.node_type,
+      status: n.status,
+      disconnected,
+      consensus_enabled: n.consensus_enabled,
+      subnets: n.subnets,
+      active: activeNodeNames.has(n.name) || Object.keys(data.networks).length <= 1,
+      isProposer: n.name === currentProposer,
+      mempool: n.mempool || null,
+    };
+  }
+
+  function renderNodeCircles(node) {
+    node.append('circle')
+      .attr('r', d => d.consensus_enabled ? 8 : 6)
+      .attr('fill', d => (NODE_COLORS[d.node_type] || NODE_COLORS.non_validator).fill)
+      .attr('stroke', d => {
+        if (d.status === 'unreachable') return NODE_COLORS.unreachable.stroke;
+        if (d.disconnected) return NODE_COLORS.disconnected.stroke;
+        return (NODE_COLORS[d.node_type] || NODE_COLORS.non_validator).stroke;
+      })
+      .attr('stroke-width', 2.5);
+  }
+
+  function renderProposerStar(node, currentProposer) {
+    if (showProposer && currentProposer) {
+      node.filter(d => d.isProposer)
+        .append('path')
+        .attr('d', starPath(14, 6))
+        .attr('fill', '#ffd86d')
+        .attr('fill-opacity', 0.9)
+        .attr('stroke', '#e3a008')
+        .attr('stroke-width', 1);
+    }
+  }
+
+  function renderMempoolBars(node) {
+    if (!showMempool || !data.mempool_max) return;
+    const [pendingMax, queuedMax] = data.mempool_max;
+    const maxPendingSq = Math.ceil(pendingMax / 1000);
+    const maxQueuedSq = Math.ceil(queuedMax / 1000);
+    const sq = 4, gap = 1, colGap = 2, r = 8;
+    node.each(function(d) {
+      if (!d.mempool) return;
+      const [pending, queued] = d.mempool;
+      const pendingSq = Math.min(Math.ceil(pending / 1000), maxPendingSq);
+      const queuedSq = Math.min(Math.ceil(queued / 1000), maxQueuedSq);
+      const mg = d3.select(this).append('g')
+        .attr('transform', 'translate(' + (-(r + 3 + 2 * sq + colGap)) + ',' + r + ')');
+      for (let i = 0; i < maxQueuedSq; i++) {
+        mg.append('rect').attr('x', 0).attr('y', -(i + 1) * (sq + gap) + gap)
+          .attr('width', sq).attr('height', sq).attr('rx', 0.5)
+          .attr('fill', i < queuedSq ? '#e3a008' : '#30363d');
+      }
+      for (let i = 0; i < maxPendingSq; i++) {
+        mg.append('rect').attr('x', sq + colGap).attr('y', -(i + 1) * (sq + gap) + gap)
+          .attr('width', sq).attr('height', sq).attr('rx', 0.5)
+          .attr('fill', i < pendingSq ? '#ffd86d' : '#30363d');
+      }
+    });
+  }
+
+  function renderNodeLabels(node) {
+    node.append('text')
+      .attr('dx', 12).attr('dy', 4)
+      .attr('fill', '#ffffff')
+      .attr('stroke', '#000000')
+      .attr('stroke-width', '4px')
+      .attr('paint-order', 'stroke')
+      .attr('stroke-linecap', 'round')
+      .attr('stroke-linejoin', 'round')
+      .style('font-size', '12px')
+      .text(d => d.id);
+  }
+
+  function wireNodeInteraction(node, link) {
+    node.on('click', (event, d) => {
+      event.stopPropagation();
+      selectedNode = (selectedNode === d.id) ? null : d.id;
+      selectedSubnet = null;
+      applyHighlight(node, link);
+      updateDetailPanel();
+    });
+    svg.on('click', () => {
+      if (selectedNode || selectedSubnet) {
+        selectedNode = null;
+        selectedSubnet = null;
+        applyHighlight(node, link);
+        updateDetailPanel();
+      }
+    });
+    applyHighlight(node, link);
+  }
+
+  // World land GeoJSON (loaded once from CDN for the world map view)
+  let worldGeoData = null;
+  fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json')
+    .then(r => r.json())
+    .then(topo => { worldGeoData = topojson.feature(topo, topo.objects.land); })
+    .catch(e => {
+      console.warn('Failed to load world map data:', e);
+      transientErrors = ['Map view unavailable: failed to load world map data'];
+      updateErrors();
+    });
+
+  function renderWorldView() {
+    if (!data || !activeTab || !data.networks[activeTab]) return;
+    g.selectAll('*').remove();
+
+    const width = container.clientWidth;
+    const height = container.clientHeight;
+
+    // Draw world map background using D3 geo projection
+    const projection = d3.geoNaturalEarth1()
+      .fitSize([width * 0.9, height * 0.9], { type: 'Sphere' })
+      .translate([width / 2, height / 2]);
+    const geoPath = d3.geoPath(projection);
+
+    // Ocean background
+    g.append('path')
+      .attr('d', geoPath({ type: 'Sphere' }))
+      .attr('fill', '#0d1117')
+      .attr('stroke', '#21262d')
+      .attr('stroke-width', 0.5);
+
+    // Graticule (grid lines)
+    g.append('path')
+      .attr('d', geoPath(d3.geoGraticule10()))
+      .attr('fill', 'none')
+      .attr('stroke', '#161b22')
+      .attr('stroke-width', 0.3);
+
+    // Land masses
+    if (worldGeoData) {
+      g.append('path')
+        .attr('d', geoPath(worldGeoData))
+        .attr('fill', '#1c2128')
+        .attr('stroke', '#30363d')
+        .attr('stroke-width', 0.5);
+    }
+
+    // Compute node positions from regions
+    const nodeRegions = data.node_regions || {};
+    const net = data.networks[activeTab];
+    const currentProposer = data.current_proposer;
+
+    // Group nodes by region for spreading
+    const regionGroups = {};
+    const nodeSet = new Set(data.nodes.map(n => n.name));
+    for (const n of data.nodes) {
+      const r = nodeRegions[n.name];
+      if (!r || !REGION_COORDS[r]) continue;
+      if (!regionGroups[r]) regionGroups[r] = [];
+      regionGroups[r].push(n.name);
+    }
+
+    // Build node position map using the D3 projection
+    const nodePositions = {};
+    for (const [region, names] of Object.entries(regionGroups)) {
+      const coords = REGION_COORDS[region];
+      const projected = projection([coords.lng, coords.lat]);
+      const center = { x: projected[0], y: projected[1] };
+      const count = names.length;
+      names.forEach((name, i) => {
+        if (count === 1) {
+          nodePositions[name] = { x: center.x, y: center.y };
+        } else {
+          const angle = (2 * Math.PI * i) / count - Math.PI / 2;
+          const radius = Math.min(20, 8 + count * 3);
+          nodePositions[name] = {
+            x: center.x + Math.cos(angle) * radius,
+            y: center.y + Math.sin(angle) * radius,
+          };
+        }
+      });
+    }
+
+    // Build D3 data arrays
+    const activeNodeNames = new Set(net.edges.flatMap(e => [e.from, e.to]));
+    const nodes = data.nodes
+      .filter(n => nodePositions[n.name])
+      .map(n => {
+        const nd = buildNodeData(n, activeNodeNames, currentProposer);
+        nd.x = nodePositions[n.name].x;
+        nd.y = nodePositions[n.name].y;
+        return nd;
+      });
+
+    const nodeById = {};
+    nodes.forEach(n => { nodeById[n.id] = n; });
+
+    const { edges, directedMode } = resolveEdges(net);
+
+    const links = edges
+      .filter(e => nodeById[e.from] && nodeById[e.to])
+      .map(e => ({ source: nodeById[e.from], target: nodeById[e.to] }));
+
+    // Draw edges
+    const link = g.append('g')
+      .selectAll('line')
+      .data(links)
+      .join('line')
+      .attr('stroke', '#8b949e')
+      .attr('stroke-opacity', 0.4)
+      .attr('stroke-width', 1)
+      .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+
+    // Latency labels
+    if (showLatencies && data.node_regions) {
+      g.append('g').selectAll('text')
+        .data(links.filter(l => {
+          const rA = nodeRegions[l.source.id];
+          const rB = nodeRegions[l.target.id];
+          return rA && rB && rA !== rB;
+        }))
+        .join('text')
+        .attr('fill', '#8b949e')
+        .attr('font-size', '8px')
+        .attr('text-anchor', 'middle')
+        .attr('dy', -3)
+        .attr('x', d => (d.source.x + d.target.x) / 2)
+        .attr('y', d => (d.source.y + d.target.y) / 2)
+        .text(d => {
+          const ms = getLatency(nodeRegions[d.source.id], nodeRegions[d.target.id]);
+          return ms != null ? ms + 'ms' : '';
+        });
+    }
+
+    // Draw nodes
+    const node = g.append('g')
+      .selectAll('g')
+      .data(nodes, d => d.id)
+      .join('g')
+      .attr('transform', d => 'translate(' + d.x + ',' + d.y + ')')
+      .style('opacity', d => d.active ? 1 : 0.3);
+
+    renderNodeCircles(node);
+    renderProposerStar(node, currentProposer);
+    renderMempoolBars(node);
+    renderNodeLabels(node);
+
+    // Region labels
+    const drawnRegions = new Set();
+    for (const [region, names] of Object.entries(regionGroups)) {
+      if (drawnRegions.has(region)) continue;
+      drawnRegions.add(region);
+      const coords = REGION_COORDS[region];
+      const projected = projection([coords.lng, coords.lat]);
+      g.append('text')
+        .attr('x', projected[0])
+        .attr('y', projected[1] - 28)
+        .attr('text-anchor', 'middle')
+        .attr('fill', '#484f56')
+        .attr('font-size', '9px')
+        .text(region);
+    }
+
+    // Subnet hulls
+    if (showSubnets) {
+      const subnetNames = [...new Set(data.nodes.flatMap(n => n.subnets || []))];
+      drawSubnetHulls(nodes, subnetNames);
+    }
+
+    wireNodeInteraction(node, link);
+    node.attr('data-node-id', d => d.id);
+    const drag = d3.drag()
+      .on('start', () => { dragging = true; })
+      .on('drag', (event, d) => {
+        d.x = event.x; d.y = event.y;
+        d3.select(event.sourceEvent.target.closest('g[data-node-id]'))
+          .attr('transform', 'translate(' + d.x + ',' + d.y + ')');
+      })
+      .on('end', () => { dragging = false; });
+    node.call(drag);
+
+    // Reset zoom only on first world render (not on every poll)
+    if (!worldZoomInitialized) {
+      worldZoomInitialized = true;
+      svg.call(zoom.transform, d3.zoomIdentity);
+    }
+
+    resumeShakes();
+  }
+
+  function renderGraph() {
+    if (dragging) return;
+    if (viewMode === 'world') { renderWorldView(); return; }
+    if (!data || !activeTab || !data.networks[activeTab]) return;
+
+    const net = data.networks[activeTab];
+    const { edges, directedMode } = resolveEdges(net);
+
+    const activeNodeNames = new Set();
+    edges.forEach(e => { activeNodeNames.add(e.from); activeNodeNames.add(e.to); });
+
+    // Preserve positions from previous simulation
+    const oldPositions = {};
+    if (simulation) {
+      simulation.nodes().forEach(n => {
+        oldPositions[n.id] = { x: n.x, y: n.y, vx: n.vx, vy: n.vy };
+      });
+      simulation.stop();
+    }
+
+    const currentProposer = data.current_proposer;
+
+    const width = container.clientWidth;
+    const height = container.clientHeight;
+
+    // Compute subnet centers for initial positioning on multi-subnet testnets
+    const allSubnetNames = getSubnetNames(data.nodes);
+    const subnetCenters = computeSubnetCenters(allSubnetNames, width, height);
+    const hasExistingPositions = Object.keys(oldPositions).length > 0 || Object.keys(userPinned).length > 0;
+
+    const nodes = data.nodes.map(n => {
+      const old = oldPositions[n.name] || userPinned[n.name];
+      const nd = buildNodeData(n, activeNodeNames, currentProposer);
+      if (old) {
+        nd.x = old.x; nd.y = old.y; nd.vx = old.vx || 0; nd.vy = old.vy || 0;
+      } else if (!hasExistingPositions && Object.keys(subnetCenters).length > 0) {
+        // Seed position from subnet centers (first render on multi-subnet testnets)
+        const target = getSubnetPullTarget(n.subnets, subnetCenters);
+        if (target) {
+          nd.x = target.x + (Math.random() - 0.5) * 30;
+          nd.y = target.y + (Math.random() - 0.5) * 30;
+        }
+      }
+      if (userPinned[nd.id]) { nd.fx = userPinned[nd.id].x; nd.fy = userPinned[nd.id].y; }
+      return nd;
+    });
+
+    const links = edges
+      .map(e => ({ source: e.from, target: e.to }));
+
+    g.selectAll('*').remove();
+
+    const subnetNames = allSubnetNames;
+    subnetNames.forEach(name => getSubnetColor(name));
+    buildLegend(subnetNames);
+
+    // SVG defs (markers for directed edges)
+    const defs = g.append('defs');
+    if (directedMode) {
+      defs.append('marker')
+        .attr('id', 'arrowhead')
+        .attr('viewBox', '0 0 10 6')
+        .attr('refX', 18).attr('refY', 3)
+        .attr('markerWidth', 8).attr('markerHeight', 6)
+        .attr('orient', 'auto')
+        .append('path').attr('d', 'M0,0 L10,3 L0,6 Z').attr('fill', '#8b949e');
+    }
+
+    // Links
+    const link = g.append('g')
+      .selectAll('line')
+      .data(links)
+      .join('line')
+      .attr('stroke', '#8b949e')
+      .attr('stroke-opacity', 0.6)
+      .attr('stroke-width', 1.5)
+      .attr('marker-end', directedMode ? 'url(#arrowhead)' : null);
+
+    // Latency labels on edges
+    let latencyLabels = null;
+    if (showLatencies && data.node_regions && Object.keys(data.node_regions).length > 0) {
+      latencyLabels = g.append('g')
+        .selectAll('text')
+        .data(links.filter(l => {
+          const rA = data.node_regions[l.source.id || l.source];
+          const rB = data.node_regions[l.target.id || l.target];
+          return rA && rB;
+        }))
+        .join('text')
+        .attr('fill', '#8b949e')
+        .attr('font-size', '8px')
+        .attr('text-anchor', 'middle')
+        .attr('dy', -3)
+        .text(d => {
+          const rA = data.node_regions[d.source.id || d.source];
+          const rB = data.node_regions[d.target.id || d.target];
+          const ms = getLatency(rA, rB);
+          return ms != null ? ms + 'ms' : '';
+        });
+    }
+
+    // Persistent peers overlay (Manifest tab only)
+    let persistentPeerLinks = null;
+    if (showPersistentPeers && activeTab === 'Manifest' && data.nodes) {
+      const ppEdges = [];
+      for (const n of data.nodes) {
+        for (const peer of (n.explicit_cl_peers || [])) {
+          ppEdges.push({ source: n.name, target: peer });
+        }
+      }
+      const ppGroup = g.append('g').attr('class', 'pp-links');
+      persistentPeerLinks = ppGroup
+        .selectAll('line')
+        .data(ppEdges)
+        .join('line')
+        .attr('stroke', '#d2a8ff')
+        .attr('stroke-opacity', 0.7)
+        .attr('stroke-width', 2);
+      // Inline arrowheads as path elements (not SVG markers, which don't respond to opacity)
+      ppGroup.selectAll('path.pp-arrow')
+        .data(ppEdges)
+        .join('path')
+        .attr('class', 'pp-arrow')
+        .attr('fill', '#d2a8ff')
+        .attr('fill-opacity', 0.7)
+        .attr('d', 'M-8,-4 L0,0 L-8,4 Z');
+    }
+
+    // EL trusted peers overlay (Manifest tab only)
+    let elTrustedPeerLinks = null;
+    if (showElTrustedPeers && activeTab === 'Manifest' && data.nodes) {
+      const etEdges = [];
+      for (const n of data.nodes) {
+        for (const peer of (n.explicit_el_peers || [])) {
+          etEdges.push({ source: n.name, target: peer });
+        }
+      }
+      const etGroup = g.append('g').attr('class', 'et-links');
+      elTrustedPeerLinks = etGroup
+        .selectAll('line')
+        .data(etEdges)
+        .join('line')
+        .attr('stroke', '#e3a008')
+        .attr('stroke-opacity', 0.7)
+        .attr('stroke-width', 2);
+      etGroup.selectAll('path.et-arrow')
+        .data(etEdges)
+        .join('path')
+        .attr('class', 'et-arrow')
+        .attr('fill', '#e3a008')
+        .attr('fill-opacity', 0.7)
+        .attr('d', 'M-8,-4 L0,0 L-8,4 Z');
+    }
+
+    // Nodes
+    const node = g.append('g')
+      .selectAll('g')
+      .data(nodes, d => d.id)
+      .join('g')
+      .attr('data-node-id', d => d.id)
+      .style('opacity', d => d.active ? 1 : 0.3);
+
+    renderNodeCircles(node);
+    renderProposerStar(node, currentProposer);
+    renderMempoolBars(node);
+    renderNodeLabels(node);
+
+    // Seed positions from subnet centers before simulation starts.
+    // Bridge nodes (multiple subnets) get the average of their subnet centers.
+    if (Object.keys(subnetCenters).length > 0) {
+      nodes.forEach(n => {
+        if (n.fx != null) return; // pinned by user
+        const target = getSubnetPullTarget(n.subnets, subnetCenters);
+        if (!target) return;
+        n.x = target.x + (Math.random() - 0.5) * 40;
+        n.y = target.y + (Math.random() - 0.5) * 40;
+      });
+    }
+
+    // Force simulation — run to completion synchronously, then stop.
+    // The subnet force continuously pulls nodes toward their cluster center
+    // so the hub-and-spoke structure is preserved despite charge repulsion.
+    simulation = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(links).id(d => d.id).distance(120))
+      .force('charge', d3.forceManyBody().strength(-400))
+      .force('center', d3.forceCenter(width / 2, height / 2))
+      .force('collide', d3.forceCollide(50))
+      .force('subnet', () => {
+        if (Object.keys(subnetCenters).length === 0) return;
+        nodes.forEach(n => {
+          const target = getSubnetPullTarget(n.subnets, subnetCenters);
+          if (!target) return;
+          // Constant pull (not alpha-scaled) so structure persists through simulation
+          n.vx += (target.x - n.x) * 0.08;
+          n.vy += (target.y - n.y) * 0.08;
+        });
+      })
+      .stop();
+
+    // Run simulation to equilibrium without animating
+    for (let i = 0; i < 300; i++) simulation.tick();
+
+    // Render final positions once
+    // For directed mode, detect bidirectional pairs to offset them
+    const biDirectional = new Set();
+    if (directedMode) {
+      const edgeSet = new Set(links.map(l => l.source.id + '>' + l.target.id));
+      links.forEach(l => {
+        if (edgeSet.has(l.target.id + '>' + l.source.id)) {
+          biDirectional.add(l.source.id + '>' + l.target.id);
+        }
+      });
+    }
+    const OFFSET = 3;
+    function updatePositions() {
+      link.each(function(d) {
+        const sx = d.source.x, sy = d.source.y, tx = d.target.x, ty = d.target.y;
+        if (directedMode && biDirectional.has(d.source.id + '>' + d.target.id)) {
+          const dx = tx - sx, dy = ty - sy;
+          const len = Math.sqrt(dx * dx + dy * dy) || 1;
+          const nx = -dy / len * OFFSET, ny = dx / len * OFFSET;
+          d3.select(this).attr('x1', sx + nx).attr('y1', sy + ny).attr('x2', tx + nx).attr('y2', ty + ny);
+        } else {
+          d3.select(this).attr('x1', sx).attr('y1', sy).attr('x2', tx).attr('y2', ty);
+        }
+      });
+      node.attr('transform', d => `translate(${d.x},${d.y})`);
+      if (latencyLabels) {
+        latencyLabels
+          .attr('x', d => (d.source.x + d.target.x) / 2)
+          .attr('y', d => (d.source.y + d.target.y) / 2);
+      }
+      const nodeMap = {};
+      node.each(function(d) { nodeMap[d.id] = d; });
+      if (persistentPeerLinks) {
+        persistentPeerLinks.each(function(d) {
+          const s = nodeMap[d.source] || nodeMap[d.source.id];
+          const t = nodeMap[d.target] || nodeMap[d.target.id];
+          if (s && t) d3.select(this).attr('x1', s.x).attr('y1', s.y).attr('x2', t.x).attr('y2', t.y);
+        });
+        // Position inline arrowheads at the end of each line, rotated to match direction
+        g.select('.pp-links').selectAll('path.pp-arrow').each(function(d) {
+          const s = nodeMap[d.source] || nodeMap[d.source.id];
+          const t = nodeMap[d.target] || nodeMap[d.target.id];
+          if (!s || !t) return;
+          const dx = t.x - s.x, dy = t.y - s.y;
+          const len = Math.sqrt(dx * dx + dy * dy) || 1;
+          const r = t.consensus_enabled ? 8 : 6;
+          const ex = t.x - (dx / len) * (r + 2), ey = t.y - (dy / len) * (r + 2);
+          const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+          d3.select(this).attr('transform', 'translate(' + ex + ',' + ey + ') rotate(' + angle + ')');
+        });
+      }
+      if (elTrustedPeerLinks) {
+        elTrustedPeerLinks.each(function(d) {
+          const s = nodeMap[d.source] || nodeMap[d.source.id];
+          const t = nodeMap[d.target] || nodeMap[d.target.id];
+          if (s && t) d3.select(this).attr('x1', s.x).attr('y1', s.y).attr('x2', t.x).attr('y2', t.y);
+        });
+        g.select('.et-links').selectAll('path.et-arrow').each(function(d) {
+          const s = nodeMap[d.source] || nodeMap[d.source.id];
+          const t = nodeMap[d.target] || nodeMap[d.target.id];
+          if (!s || !t) return;
+          const dx = t.x - s.x, dy = t.y - s.y;
+          const len = Math.sqrt(dx * dx + dy * dy) || 1;
+          const r = t.consensus_enabled ? 8 : 6;
+          const ex = t.x - (dx / len) * (r + 2), ey = t.y - (dy / len) * (r + 2);
+          const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+          d3.select(this).attr('transform', 'translate(' + ex + ',' + ey + ') rotate(' + angle + ')');
+        });
+      }
+    }
+    updatePositions();
+
+    // Save settled positions so they persist across refreshes
+    nodes.forEach(n => { userPinned[n.id] = { x: n.x, y: n.y }; });
+
+    // Draw subnet hulls behind links and nodes
+    if (showSubnets) drawSubnetHulls(nodes, subnetNames);
+
+    // Zoom to fit on first render
+    if (!initialZoomDone && nodes.length > 0) {
+      initialZoomDone = true;
+      zoomToFitInstant();
+    }
+
+    wireNodeInteraction(node, link);
+
+    const drag = d3.drag()
+      .on('start', () => { dragging = true; })
+      .on('drag', (event, d) => {
+        d.x = event.x; d.y = event.y;
+        userPinned[d.id] = { x: event.x, y: event.y };
+        updatePositions();
+      })
+      .on('end', () => { dragging = false; });
+    node.call(drag);
+
+    // Resume any in-progress shake animations on the newly created DOM nodes
+    resumeShakes();
+  }
+
+  function applyHighlight(node, link) {
+    const ppLinks = g.select('.pp-links').selectAll('line');
+    const etLinks = g.select('.et-links').selectAll('line');
+    if (!selectedNode && !selectedSubnet) {
+      // Reset: restore original opacity and styling
+      node.style('opacity', d => d.active ? 1 : 0.3);
+      link.attr('stroke', '#8b949e').attr('stroke-opacity', 0.6).attr('stroke-width', 1.5);
+      ppLinks.attr('stroke-opacity', 0.7);
+      g.select('.pp-links').selectAll('path.pp-arrow').attr('fill-opacity', 0.7);
+      etLinks.attr('stroke-opacity', 0.7);
+      g.select('.et-links').selectAll('path.et-arrow').attr('fill-opacity', 0.7);
+      return;
+    }
+    if (!selectedNode && selectedSubnet) {
+      // Subnet filter: dim nodes not in the selected subnet
+      node.style('opacity', d => (d.subnets || []).includes(selectedSubnet) ? 1 : 0.1);
+      node.select('text').style('font-weight', null).style('font-size', '12px');
+      link
+        .attr('stroke-opacity', d => {
+          const src = typeof d.source === 'object' ? d.source : { subnets: [] };
+          const tgt = typeof d.target === 'object' ? d.target : { subnets: [] };
+          const srcIn = (src.subnets || []).includes(selectedSubnet);
+          const tgtIn = (tgt.subnets || []).includes(selectedSubnet);
+          return (srcIn && tgtIn) ? 0.8 : 0.05;
+        })
+        .attr('stroke-width', 1.5);
+      ppLinks.attr('stroke-opacity', 0.1);
+      g.select('.pp-links').selectAll('path.pp-arrow').attr('fill-opacity', 0.0);
+      etLinks.attr('stroke-opacity', 0.1);
+      g.select('.et-links').selectAll('path.et-arrow').attr('fill-opacity', 0.0);
+      return;
+    }
+    // Build set of neighbors
+    const neighbors = new Set();
+    neighbors.add(selectedNode);
+    link.each(function(d) {
+      const src = typeof d.source === 'object' ? d.source.id : d.source;
+      const tgt = typeof d.target === 'object' ? d.target.id : d.target;
+      if (src === selectedNode) neighbors.add(tgt);
+      if (tgt === selectedNode) neighbors.add(src);
+    });
+    // Dim non-connected nodes, brighten connected
+    node.style('opacity', d => neighbors.has(d.id) ? 1 : 0.1);
+    // Highlight connected edges, dim others
+    link
+      .attr('stroke', d => {
+        const src = typeof d.source === 'object' ? d.source.id : d.source;
+        const tgt = typeof d.target === 'object' ? d.target.id : d.target;
+        return (src === selectedNode || tgt === selectedNode) ? '#58a6ff' : '#8b949e';
+      })
+      .attr('stroke-opacity', d => {
+        const src = typeof d.source === 'object' ? d.source.id : d.source;
+        const tgt = typeof d.target === 'object' ? d.target.id : d.target;
+        return (src === selectedNode || tgt === selectedNode) ? 1 : 0.1;
+      })
+      .attr('stroke-width', d => {
+        const src = typeof d.source === 'object' ? d.source.id : d.source;
+        const tgt = typeof d.target === 'object' ? d.target.id : d.target;
+        return (src === selectedNode || tgt === selectedNode) ? 2.5 : 1.5;
+      });
+    // Dim overlay links not connected to selected node
+    const isConnected = d => {
+      const src = typeof d.source === 'object' ? d.source.id : d.source;
+      const tgt = typeof d.target === 'object' ? d.target.id : d.target;
+      return src === selectedNode || tgt === selectedNode;
+    };
+    ppLinks.attr('stroke-opacity', d => isConnected(d) ? 0.9 : 0.05);
+    g.select('.pp-links').selectAll('path.pp-arrow').attr('fill-opacity', d => isConnected(d) ? 0.9 : 0.0);
+    etLinks.attr('stroke-opacity', d => isConnected(d) ? 0.9 : 0.05);
+    g.select('.et-links').selectAll('path.et-arrow').attr('fill-opacity', d => isConnected(d) ? 0.9 : 0.0);
+  }
+
+  // Select a node from outside renderGraph (used by peer name clicks and height list)
+  function selectNode(name) {
+    selectedNode = name;
+    const node = g.selectAll('[data-node-id]');
+    const link = g.selectAll('line');
+    applyHighlight(node, link);
+    updateDetailPanel();
+  }
+
+  function escapeHtml(text) {
+    return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  fetchTopology();
+  setInterval(fetchTopology, /*REFRESH_MS*/500);
+})();
+</script>
+</body>
+</html>

@@ -13,15 +13,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-// NOTE: Post-quantum signature schemes and their underlying libraries are
-// relatively new. Algorithm parameters, gas costs, and the precompile interface
-// may change in future hardforks as the ecosystem matures. Do not rely on
-// stability of this precompile across network upgrades without checking the
-// changelog.
-
 use crate::helpers::{
     record_cost_or_out_of_gas, PrecompileErrorOrRevert, ERR_EXECUTION_REVERTED,
-    PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY,
+    PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
 };
 use crate::precompile;
 use alloy_primitives::{address, Address};
@@ -48,11 +42,16 @@ const VERIFY_BASE_GAS: u64 = 230_000;
 const GAS_PER_MSG_WORD: u64 = KECCAK256WORD;
 
 sol! {
-    /// PQ Signature Verifier precompile interface
+    /// Experimental PQ Signature Verifier precompile interface.
     interface IPQ {
-        /// Verify an SLH-DSA-SHA2-128s signature
+        /// Verify an SLH-DSA-SHA2-128s signature.
+        ///
+        /// Since PQ signatures are still very new, we recommend not to solely
+        /// rely on them for authentication, but pair them with classical
+        /// signatures.
+        ///
         /// Gas cost: 230,000 base + 6 per 32-byte word of message (same as KECCAK256)
-        function verifySlhDsaSha2128s(bytes calldata vk, bytes calldata msg, bytes calldata sig) external returns (bool isValid);
+        function verifySlhDsaSha2128s(bytes calldata vk, bytes calldata message, bytes calldata sig) external returns (bool isValid);
     }
 }
 
@@ -62,10 +61,10 @@ precompile!(run_pq, precompile_input, hardfork_flags; {
             let _ = hardfork_flags;
             let mut gas_counter = Gas::new(precompile_input.gas);
 
-            let args = IPQ::verifySlhDsaSha2128sCall::abi_decode_raw(input).map_err(|_| {
+            let args = IPQ::verifySlhDsaSha2128sCall::abi_decode_raw_validate(input).map_err(|_| {
                 PrecompileErrorOrRevert::new_reverted_with_penalty(
                     gas_counter,
-                    PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY,
+                    PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
                     ERR_EXECUTION_REVERTED,
                 )
             })?;
@@ -75,7 +74,7 @@ precompile!(run_pq, precompile_input, hardfork_flags; {
 
             // GAS_PER_MSG_WORD (6) < 32, so the product cannot exceed u64::MAX
             #[allow(clippy::arithmetic_side_effects)]
-            let msg_word_gas = (args.msg.len() as u64).div_ceil(32) * GAS_PER_MSG_WORD;
+            let msg_word_gas = (args.message.len() as u64).div_ceil(32) * GAS_PER_MSG_WORD;
             record_cost_or_out_of_gas(&mut gas_counter, msg_word_gas)?;
 
             // SLH-DSA-SHA2-128s constants from FIPS 205
@@ -102,7 +101,7 @@ precompile!(run_pq, precompile_input, hardfork_flags; {
             let signature = Signature::<Sha2_128s>::try_from(args.sig.as_ref())
                 .map_err(|_| PrecompileErrorOrRevert::new_reverted(gas_counter, "Failed to parse signature"))?;
 
-            let is_valid = verifying_key.verify(args.msg.as_ref(), &signature).is_ok();
+            let is_valid = verifying_key.verify(args.message.as_ref(), &signature).is_ok();
 
             Ok(PrecompileOutput::new(gas_counter.used(), is_valid.abi_encode().into()))
         })()
@@ -162,11 +161,11 @@ mod tests {
     }
 
     /// Helper to call SLH-DSA-SHA2-128s verifier with given inputs.
-    /// Param order matches the ABI: (vk, msg, sig).
+    /// Param order matches the ABI: (vk, message, sig).
     fn transact_slh_dsa_verifier(
         evm: &mut TestEvm,
         vk: Vec<u8>,
-        msg: Vec<u8>,
+        message: Vec<u8>,
         sig: Vec<u8>,
     ) -> Result<ExecResultAndState<ExecutionResult<HaltReason>>, EVMError<std::convert::Infallible>>
     {
@@ -175,7 +174,7 @@ mod tests {
             kind: TxKind::Call(PQ_ADDRESS),
             data: IPQ::verifySlhDsaSha2128sCall {
                 vk: vk.into(),
-                msg: msg.into(),
+                message: message.into(),
                 sig: sig.into(),
             }
             .abi_encode()

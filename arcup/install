@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 # Arcup bootstrap installer
 # Downloads arcup and arc-node binaries to ~/.arc/bin
 
-ARC_DIR="${ARC_DIR:-$HOME/.arc}"
+ARC_DIR="${ARC_DIR:-${ARC_HOME:-$HOME/.arc}}"
 BIN_DIR="${ARC_BIN_DIR:-$ARC_DIR/bin}"
 ENV_FILE="$ARC_DIR/env"
 ARCUP_URL="https://raw.githubusercontent.com/circlefin/arc-node/main/arcup/arcup"
+CURL_RETRY_ARGS=(--retry 3 --retry-delay 2 --connect-timeout 15)
 CURL_HEADERS=()
 if [ "${CURL_HEADER:-}" ]; then
     CURL_HEADERS=(-H "$CURL_HEADER")
@@ -34,6 +35,14 @@ warn() {
 error() {
     echo -e "${RED}error${NC}: $1" >&2
     exit 1
+}
+
+curl_with_headers() {
+    if ((${#CURL_HEADERS[@]} > 0)); then
+        curl "${CURL_RETRY_ARGS[@]}" "${CURL_HEADERS[@]}" "$@"
+    else
+        curl "${CURL_RETRY_ARGS[@]}" "$@"
+    fi
 }
 
 install_bin() {
@@ -63,7 +72,7 @@ main() {
         error "curl not found. Please install curl."
     fi
 
-    if ! curl -#fL "${CURL_HEADERS[@]}" -o "$_INSTALL_TMP_FILE" "$ARCUP_URL" ; then
+    if ! curl_with_headers -#fL --max-time 300 -o "$_INSTALL_TMP_FILE" "$ARCUP_URL" ; then
         error "failed to download arcup from '$ARCUP_URL'"
     fi
 
@@ -94,7 +103,7 @@ ENVEOF
 
     echo ""
     local user_shell
-    user_shell="$(basename "$SHELL")"
+    user_shell="$(basename "${SHELL:-sh}")"
     info "Arc binaries are in your PATH for this session."
     info "To make that permanent, add to your shell config file:"
     echo ""
@@ -114,4 +123,6 @@ EOF
     echo ""
 }
 
-main
+if [[ "${ARCUP_INSTALL_SKIP_MAIN:-}" != "1" ]]; then
+    main
+fi

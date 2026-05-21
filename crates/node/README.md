@@ -204,7 +204,8 @@ All three methods bypass the middleware. Pending-block queries additionally depe
 
 The execution layer is built on top of [Reth][reth], extending it with Arc-specific functionality:
 
-- **Custom Precompiles** - Native implementations for Arc-specific operations (native coin control, post-quantum signatures, system accounting)
+- **Custom Precompiles** - Native implementations for Arc-specific operations (native coin control,
+  post-quantum signatures, system accounting).
 - **Custom EVM Configuration** - Specialized gas calculations and execution logic
 - **Transaction Pool Enhancements** - Custom validation
 - **Block Executor** - Optimized block execution with Arc-specific features

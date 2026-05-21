@@ -20,7 +20,25 @@ Consult the table below to confirm which version to run for each network.
 ## Pre-built Binary
 
 This repository includes `arcup`, a script that installs Arc node binaries
-into `$ARC_BIN_DIR` directory, defaulting to `~/.arc/bin`:
+into `$ARC_BIN_DIR`, defaulting to `$ARC_HOME/bin` and then `~/.arc/bin`.
+The pre-built archives include `arc-node-execution`, `arc-node-consensus`,
+and `arc-snapshots`.
+
+Supported release targets:
+
+| Operating system | CPU architecture | Release target |
+|------------------|------------------|----------------|
+| Linux | x86_64 / amd64 | `x86_64-unknown-linux-gnu` |
+| Linux | arm64 / aarch64 | `aarch64-unknown-linux-gnu` |
+| macOS | Apple silicon | `aarch64-apple-darwin` |
+
+Linux pre-built binaries are dynamically linked against GNU libc. The current
+release artifacts require glibc 2.39 or newer; Ubuntu 24.04 is known to work.
+Older distributions, such as Debian 12/bookworm, may fail with errors like
+`GLIBC_2.38 not found` or `GLIBC_2.39 not found`. In that case, use a newer
+Linux distribution/container, Docker images, or build from source.
+
+Install the latest release:
 
 ```sh
 curl -L https://raw.githubusercontent.com/circlefin/arc-node/main/arcup/install | bash
@@ -36,7 +54,14 @@ To be sure that the binaries installed under `$ARC_BIN_DIR` are available in
 the `PATH`, load the produced environment file:
 
 ```sh
-source $ARC_HOME/env
+export ARC_HOME="${ARC_HOME:-$HOME/.arc}"
+source "$ARC_HOME/env"
+```
+
+To install a specific version, run `arcup` with `--install`:
+
+```sh
+arcup --install v0.6.0
 ```
 
 Next, verify that the three Arc binaries are installed:
@@ -53,6 +78,52 @@ and can be used to update Arc binaries:
 ```sh
 arcup
 ```
+
+To update the installer script itself:
+
+```sh
+arcup --self-update
+```
+
+To remove `arcup`, the installed Arc binaries, and the generated shell env
+files without deleting node data:
+
+```sh
+arcup --uninstall
+```
+
+`arcup` always verifies the downloaded archive against its `.sha256` file.
+GPG signature verification is disabled until the Arc release signing key is
+published. If an archive for your operating system or CPU architecture is not
+available in the selected release, `arcup` prints the expected asset name and
+the available release assets.
+For private repository testing, set `ARC_GITHUB_TOKEN`, `GH_TOKEN`, or
+`GITHUB_TOKEN` to a token with release access. `arcup` uses that token with the
+GitHub release asset API before trying other download methods. If no token is
+set but the GitHub CLI (`gh`) is installed and logged in, `arcup` tries
+`gh release download`. Public releases continue to work through direct `curl`
+downloads without extra setup.
+
+Private repository testing also needs `ARC_REPO` if the target release is not
+in the default repository:
+
+```sh
+ARC_REPO=owner/repo \
+ARC_GITHUB_TOKEN="<token-with-release-access>" \
+arcup --install v0.0.0-test.abcdef12
+```
+
+Troubleshooting:
+
+- `Unsupported architecture`: use one of the supported targets above, or build
+  from source.
+- `Failed to download ...`: confirm the selected version exists and includes
+  an archive for your platform.
+- `Checksum verification failed`: retry the install; if it persists, do not run
+  the downloaded binaries.
+- On macOS, if manually copied binaries are blocked by quarantine attributes,
+  run `xattr -dr com.apple.quarantine "$ARC_BIN_DIR"` after reviewing the
+  downloaded files.
 
 ## Build from Source
 
@@ -83,7 +154,8 @@ source ~/.cargo/env
 With Rust installed, install the dependencies for your operating system:
 
 - **Ubuntu:** `sudo apt-get install libclang-dev pkg-config build-essential`
-- **macOS:** `brew install llvm pkg-config`
+- **macOS:** `brew install llvm pkg-config` and then
+  `export LIBCLANG_PATH="$(brew --prefix llvm)/lib"`
 - **Windows:** `choco install llvm` or `winget install LLVM.LLVM`
 
 These are needed to build bindings for Arc node execution's database.

@@ -25,6 +25,14 @@ import { getClients, LOCALDEV_FEE_RECIPIENT, LOCALDEV_FEE_RECIPIENTS } from '../
 ;(process.env.ARC_SMOKE_SCENARIO === 'malachite' ? describe : describe.skip)(
   'per-validator fee accrual (malachite)',
   () => {
+    // Scenario: localdev validators each advertise a distinct fee recipient, so
+    // proposer rotation should route transaction fees to every configured
+    // recipient.
+    // Call flow: sender → localdev txpool → Malachite proposer rotation → EL
+    // block beneficiary.
+    // Assertions: all validator recipients are observed as block miners within
+    // a bounded block window and accrue fees; fallback and zero-address
+    // recipients do not accrue fees.
     it('routes fees to every per-validator recipient as proposer rotates', async function () {
       this.timeout(180_000)
 
@@ -36,11 +44,21 @@ import { getClients, LOCALDEV_FEE_RECIPIENT, LOCALDEV_FEE_RECIPIENTS } from '../
         client.getBalance({ address: zeroAddress }),
       ])
 
-      // Send sequentially so each tx lands in its own block; collect the proposer
-      // of every landed block directly from block.miner.
-      const numTxs = 25
-      const miners = new Set<Address>()
-      for (let i = 0; i < numTxs; i++) {
+      // Send sequentially until the landed blocks cover every validator
+      // recipient, rather than assuming a fixed transaction count samples a
+      // uniform proposer rotation. Multiple txs can share a block and round
+      // changes can skew short windows, so bound the sample by block span.
+      const expectedValidatorCount = LOCALDEV_FEE_RECIPIENTS.length
+      const expectedRecipientSet = new Set<Address>(LOCALDEV_FEE_RECIPIENTS)
+      const maxBlockSpan = 100n
+      const startBlock = await client.getBlockNumber()
+      const lastAllowedBlock = startBlock + maxBlockSpan
+      const expectedMiners = new Set<Address>()
+      const unexpectedMiners = new Set<Address>()
+      let txsSent = 0
+      let lastSampledBlock = startBlock
+      while (expectedMiners.size < expectedValidatorCount && lastSampledBlock < lastAllowedBlock) {
+        txsSent += 1
         const hash = await sender.sendTransaction({
           to: sender.account.address,
           value: 1n,
@@ -48,8 +66,13 @@ import { getClients, LOCALDEV_FEE_RECIPIENT, LOCALDEV_FEE_RECIPIENTS } from '../
           maxPriorityFeePerGas: parseGwei('10'),
         })
         const receipt = await client.waitForTransactionReceipt({ hash })
+        lastSampledBlock = receipt.blockNumber
         const block = await client.getBlock({ blockNumber: receipt.blockNumber })
-        miners.add(block.miner)
+        if (expectedRecipientSet.has(block.miner)) {
+          expectedMiners.add(block.miner)
+        } else {
+          unexpectedMiners.add(block.miner)
+        }
       }
 
       const [finalPerValidator, finalDefault, finalZero] = await Promise.all([
@@ -61,31 +84,46 @@ import { getClients, LOCALDEV_FEE_RECIPIENT, LOCALDEV_FEE_RECIPIENTS } from '../
       const deltas = finalPerValidator.map((final, i) => final - initialPerValidator[i])
       const accrued = deltas.filter((d) => d > 0n).length
       const deltaSummary = deltas.map((d, i) => `recipient${i + 1}=${d}`).join(', ')
+      const defaultDelta = finalDefault - initialDefault
+      const zeroDelta = finalZero - initialZero
 
-      // Every one of our txs landed in a block proposed by one of the 5 validators;
-      // observing all 5 proves rotation covered our sample (not just the chain's
-      // history).
-      expect(miners.size).to.equal(
-        5,
-        `Expected all 5 proposers to produce blocks we landed in; observed ${miners.size} (${[...miners].join(', ')}).`,
+      const observedBlockSpan = lastSampledBlock - startBlock
+      const expectedMinerSummary = [...expectedMiners].join(', ')
+      const unexpectedMinerSummary = [...unexpectedMiners].join(', ')
+
+      expect(unexpectedMiners.size).to.equal(
+        0,
+        [
+          `Unexpected miners observed: ${unexpectedMinerSummary}.`,
+          `Expected only LOCALDEV_FEE_RECIPIENTS: ${[...expectedRecipientSet].join(', ')}.`,
+        ].join(' '),
+      )
+
+      expect(expectedMiners.size).to.equal(
+        expectedValidatorCount,
+        [
+          `Expected all ${expectedValidatorCount} proposers to produce blocks we landed in`,
+          `within ${maxBlockSpan} blocks;`,
+          `observed ${expectedMiners.size} expected (${expectedMinerSummary}) after ${txsSent} txs over a ${observedBlockSpan}-block span.`,
+        ].join(' '),
       )
 
       expect(accrued).to.equal(
-        5,
-        `Expected all 5 per-validator recipients to accrue fees; ${accrued} did. ${deltaSummary}.`,
+        expectedValidatorCount,
+        [
+          `Expected all ${expectedValidatorCount} per-validator recipients to accrue fees;`,
+          `${accrued} did. ${deltaSummary}.`,
+        ].join(' '),
       )
 
       // Negative controls: fees must not leak to the single-recipient fallback
       // or to the zero address. A mis-configured validator (missing
       // cl_suggested_fee_recipient) would fall back to LOCALDEV_FEE_RECIPIENT.
-      expect(finalDefault - initialDefault).to.equal(
+      expect(defaultDelta).to.equal(
         0n,
-        `LOCALDEV_FEE_RECIPIENT received ${finalDefault - initialDefault} wei; should be zero under per-validator routing.`,
+        `LOCALDEV_FEE_RECIPIENT received ${defaultDelta} wei; should be zero under per-validator routing.`,
       )
-      expect(finalZero - initialZero).to.equal(
-        0n,
-        `zeroAddress received ${finalZero - initialZero} wei; should be zero.`,
-      )
+      expect(zeroDelta).to.equal(0n, `zeroAddress received ${zeroDelta} wei; should be zero.`)
     })
   },
 )

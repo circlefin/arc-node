@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use schnellru::{ByLength, LruMap};
-use tracing::{error, warn};
+use tracing::warn;
 
-use arc_consensus_types::{Height, ProposalPart, ProposalParts, Round};
+use arc_consensus_types::{Height, ProposalPart, ProposalParts, ProposalPartsError, Round};
 use malachitebft_app_channel::app::streaming::{Sequence, StreamId, StreamMessage};
 use malachitebft_app_channel::app::types::PeerId;
 
@@ -84,6 +84,8 @@ pub enum InsertResult {
 pub enum InsertError {
     /// The stream_id is not exactly [`STREAM_ID_LEN`] bytes.
     InvalidStreamIdLength { actual: usize, expected: usize },
+    /// A completed stream failed final assembly into [`ProposalParts`].
+    AssemblyFailed(ProposalPartsError),
 }
 
 impl std::fmt::Display for InsertError {
@@ -94,6 +96,9 @@ impl std::fmt::Display for InsertError {
                     f,
                     "invalid stream_id length: {actual} bytes (expected {expected})"
                 )
+            }
+            InsertError::AssemblyFailed(err) => {
+                write!(f, "failed to assemble proposal parts: {err}")
             }
         }
     }
@@ -428,15 +433,17 @@ impl PartStreamsMap {
             }
         };
 
-        // StreamState guarantees Init and Fin are present and no duplicates exist,
-        // so ProposalParts::new should never fail on a complete stream.
+        // `StreamState` guarantees that an `Init` and a stream-end `Fin` are
+        // observed before the stream is marked complete, but it deduplicates
+        // only by message `sequence` — not by part *type*. A misbehaving peer
+        // can send multiple `ProposalPart::Init` (or `ProposalPart::Fin`)
+        // envelopes at distinct sequence numbers, complete the stream, and
+        // reach this branch with `ProposalPartsError::DuplicatePart(..)`.
+        // Surface the failure as `Invalid` so the caller can act on the
+        // misbehaviour rather than silently dropping the stream.
         match ProposalParts::new(parts) {
             Ok(proposal_parts) => InsertResult::Complete(proposal_parts),
-            Err(e) => {
-                debug_assert!(false, "unreachable: complete stream failed assembly: {e}");
-                error!(%peer_id, %stream_id, "Failed to assemble proposal parts: {e}");
-                InsertResult::Pending
-            }
+            Err(e) => InsertResult::Invalid(InsertError::AssemblyFailed(e)),
         }
     }
 
@@ -717,6 +724,77 @@ mod tests {
                 "Map should be empty after stream is complete"
             );
         }
+    }
+
+    #[test]
+    fn test_insert_returns_invalid_with_duplicate_init() {
+        let peer = PeerId::random();
+        let stream = make_stream_id(101);
+
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        // First Init
+        assert!(map
+            .must_insert(peer, make_message(&stream, 0, make_init_part()))
+            .is_none());
+
+        // Second Init
+        assert!(map
+            .must_insert(peer, make_message(&stream, 1, make_init_part()))
+            .is_none());
+
+        // Complete the stream
+        let result = map.insert(peer, make_fin_message(&stream, 2));
+
+        // Insert fails with DuplicatePart("Init")
+        assert!(matches!(
+            result,
+            InsertResult::Invalid(InsertError::AssemblyFailed(
+                ProposalPartsError::DuplicatePart("Init")
+            ))
+        ));
+        assert!(
+            map.streams.is_empty(),
+            "completed stream must be removed even when assembly fails"
+        );
+    }
+
+    #[test]
+    fn test_insert_returns_invalid_with_duplicate_fin() {
+        let peer = PeerId::random();
+        let stream = make_stream_id(101);
+
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        // Init
+        assert!(map
+            .must_insert(peer, make_message(&stream, 0, make_init_part()))
+            .is_none());
+
+        // First Fin
+        assert!(map
+            .must_insert(peer, make_message(&stream, 1, make_fin_part()))
+            .is_none());
+
+        // Second Fin
+        assert!(map
+            .must_insert(peer, make_message(&stream, 2, make_fin_part()))
+            .is_none());
+
+        // Complete the stream
+        let result = map.insert(peer, make_fin_message(&stream, 3));
+
+        // Insert fails with DuplicatePart("Fin")
+        assert!(matches!(
+            result,
+            InsertResult::Invalid(InsertError::AssemblyFailed(
+                ProposalPartsError::DuplicatePart("Fin")
+            ))
+        ));
+        assert!(
+            map.streams.is_empty(),
+            "completed stream must be removed even when assembly fails"
+        );
     }
 
     #[test]

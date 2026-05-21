@@ -1,0 +1,35 @@
+[package]
+name = "arc-test-integration"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+alloy-primitives.workspace = true
+arc-consensus-types.workspace = true
+arc-evm-node.workspace = true
+arc-execution-config = { workspace = true, features = ["test-utils"] }
+arc-execution-txpool.workspace = true
+arc-node-consensus.workspace = true
+arc-node-consensus-cli.workspace = true
+arc-signer.workspace = true
+arc-test-framework.workspace = true
+async-trait.workspace = true
+eyre.workspace = true
+malachitebft-app-channel.workspace = true
+reth-node-builder = { workspace = true, features = ["test-utils"] }
+reth-tasks.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+
+[lints]
+workspace = true

@@ -157,22 +157,29 @@ abstract contract Controller is Ownable2StepUpgradeable {
     }
 
     /**
-     * @notice Get the registration ID for a controller
+     * @notice Get the registration ID for a configured controller.
+     * @dev Reverts with ControllerNotConfigured if the address is not a controller.
+     * Use {isController} for a non-reverting configuration check.
      * @param controller The address to get the registration ID for
      * @return The registration ID for the controller
      */
     function getRegistrationId(address controller) external view returns (uint256) {
         ControllerStorage storage $ = _getControllerStorage();
-        return $.registrationOf[controller];
+        uint256 registrationId = $.registrationOf[controller];
+        require(registrationId != 0, ControllerNotConfigured());
+        return registrationId;
     }
 
     /**
-     * @notice Get the voting power limit for a controller
+     * @notice Get the voting power limit for a configured controller.
+     * @dev Reverts with ControllerNotConfigured if the address is not a controller.
+     * Use {isController} for a non-reverting configuration check.
      * @param controller The address to get the limit for
      * @return The voting power limit for the controller
      */
     function getVotingPowerLimit(address controller) external view returns (uint64) {
         ControllerStorage storage $ = _getControllerStorage();
+        require($.registrationOf[controller] != 0, ControllerNotConfigured());
         return $.votingPowerLimitOf[controller];
     }
 

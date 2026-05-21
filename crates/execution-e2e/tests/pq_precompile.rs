@@ -60,7 +60,7 @@ enum PqExpected {
 #[derive(Clone, Debug)]
 struct PqVerifyVector {
     call_label: &'static str,
-    msg: Bytes,
+    message: Bytes,
     vk: Bytes,
     sig: Bytes,
     expected: PqExpected,
@@ -79,7 +79,7 @@ fn build_vectors() -> Vec<(&'static str, PqVerifyVector)> {
             "valid_signature",
             PqVerifyVector {
                 call_label: "pq_valid_sig",
-                msg: Bytes::copy_from_slice(MSG_HELLO_WORLD),
+                message: Bytes::copy_from_slice(MSG_HELLO_WORLD),
                 vk: vk.clone(),
                 sig: sig_hello.clone(),
                 expected: PqExpected::ReturnTrue,
@@ -89,7 +89,7 @@ fn build_vectors() -> Vec<(&'static str, PqVerifyVector)> {
             "valid_empty_message",
             PqVerifyVector {
                 call_label: "pq_valid_empty_msg",
-                msg: Bytes::copy_from_slice(MSG_EMPTY),
+                message: Bytes::copy_from_slice(MSG_EMPTY),
                 vk: vk.clone(),
                 sig: sig_empty,
                 expected: PqExpected::ReturnTrue,
@@ -99,7 +99,7 @@ fn build_vectors() -> Vec<(&'static str, PqVerifyVector)> {
             "invalid_wrong_message",
             PqVerifyVector {
                 call_label: "pq_invalid_sig",
-                msg: Bytes::copy_from_slice(MSG_GOODBYE_WORLD),
+                message: Bytes::copy_from_slice(MSG_GOODBYE_WORLD),
                 vk: vk.clone(),
                 sig: sig_hello.clone(),
                 expected: PqExpected::ReturnFalse,
@@ -109,7 +109,7 @@ fn build_vectors() -> Vec<(&'static str, PqVerifyVector)> {
             "wrong_verifying_key_value",
             PqVerifyVector {
                 call_label: "pq_wrong_vk_value",
-                msg: Bytes::copy_from_slice(MSG_HELLO_WORLD),
+                message: Bytes::copy_from_slice(MSG_HELLO_WORLD),
                 vk: wrong_vk,
                 sig: sig_hello.clone(),
                 expected: PqExpected::ReturnFalse,
@@ -119,7 +119,7 @@ fn build_vectors() -> Vec<(&'static str, PqVerifyVector)> {
             "bad_verifying_key_len",
             PqVerifyVector {
                 call_label: "pq_bad_vk_len",
-                msg: Bytes::copy_from_slice(MSG_HELLO_WORLD),
+                message: Bytes::copy_from_slice(MSG_HELLO_WORLD),
                 vk: Bytes::copy_from_slice(&MALFORMED_100),
                 sig: sig_hello.clone(),
                 expected: PqExpected::Revert,
@@ -129,7 +129,7 @@ fn build_vectors() -> Vec<(&'static str, PqVerifyVector)> {
             "bad_signature_len",
             PqVerifyVector {
                 call_label: "pq_bad_sig_len",
-                msg: Bytes::copy_from_slice(MSG_HELLO_WORLD),
+                message: Bytes::copy_from_slice(MSG_HELLO_WORLD),
                 vk,
                 sig: Bytes::copy_from_slice(&MALFORMED_100),
                 expected: PqExpected::Revert,
@@ -156,7 +156,7 @@ async fn test_pq_precompile(#[case] index: usize) -> Result<()> {
 
     let data: Bytes = IPQ::verifySlhDsaSha2128sCall {
         vk: vector.vk.clone(),
-        msg: vector.msg.clone(),
+        message: vector.message.clone(),
         sig: vector.sig.clone(),
     }
     .abi_encode()

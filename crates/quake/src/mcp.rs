@@ -34,12 +34,11 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::clean::{clean_scope, CleanScope};
 use crate::infra::remote;
 use crate::perturb::Perturbation;
-use crate::rpc;
 use crate::testnet::{Testnet, LAST_MANIFEST_FILENAME};
 use crate::valset::ValidatorPowerUpdate;
+use crate::{clean, rpc};
 
 /// Overall timeout for RPC-based observability queries. Prevents tools from
 /// hanging when the proxy or SSM tunnel is degraded in remote mode.
@@ -455,8 +454,10 @@ impl QuakeMcpServer {
     /// - `data`: remove both execution and consensus layer data, preserving configuration.
     /// - `execution_data`: remove only Reth (execution layer) data.
     /// - `consensus_data`: remove only Malachite (consensus layer) data.
-    /// - `monitoring`: stop monitoring services and remove their data (combinable with data flags).
     /// - `all`: remove everything including monitoring; cannot be combined with other flags.
+    ///
+    /// Cleanup is best-effort: this tool returns success after attempting the
+    /// requested cleanup, while failed or skipped steps are reported in Quake logs.
     #[tool(
         name = "clean_testnet",
         annotations(read_only_hint = false, open_world_hint = false)
@@ -467,29 +468,25 @@ impl QuakeMcpServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.ensure_ssm_tunnels().await?;
         let p = &params.0;
-        let all = p.all.unwrap_or(false);
-        let monitoring = p.monitoring.unwrap_or(false);
-        let mode = if all {
-            CleanScope::Full
+        let scope = clean::Scope::from_cli_flags(
+            p.all.unwrap_or(false),
+            p.data.unwrap_or(false),
+            p.execution_data.unwrap_or(false),
+            p.consensus_data.unwrap_or(false),
+        );
+        let scope_description = if scope.testnet_infra && scope.monitoring_data {
+            "all resources, including monitoring"
+        } else if scope.testnet_infra {
+            "testnet infrastructure and node data; monitoring may remain"
         } else {
-            clean_scope(
-                p.data.unwrap_or(false),
-                p.execution_data.unwrap_or(false),
-                p.consensus_data.unwrap_or(false),
-                monitoring,
-            )
-        };
-        let scope = if matches!(mode, CleanScope::Full) {
-            "full"
-        } else {
-            "partial"
+            "selected node data only; monitoring may remain"
         };
         let testnet = self.testnet.read().await;
-        testnet.clean(mode, all || monitoring).await.map_err(|e| {
+        testnet.clean(scope).await.map_err(|e| {
             rmcp::ErrorData::internal_error(format!("Failed to clean testnet: {e}"), None)
         })?;
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Testnet cleaned ({scope})"
+            "Best-effort cleanup attempted ({scope_description}). Review Quake logs for warnings about failed or skipped steps."
         ))]))
     }
 
@@ -988,9 +985,6 @@ struct StartNodeParams {
 struct CleanParams {
     /// If true, remove all data, including the testnet directory and monitoring services.
     all: Option<bool>,
-
-    /// If true, also stop monitoring services and remove monitoring data.
-    monitoring: Option<bool>,
     /// If true, remove both Reth and Malachite data, preserving testnet configuration.
     /// The testnet can be restarted immediately without re-running setup.
     data: Option<bool>,

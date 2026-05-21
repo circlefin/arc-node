@@ -232,7 +232,7 @@ Custom precompiles are defined in [crates/precompiles/src/](../crates/precompile
 - **Native Coin Control** (`0x1800..0001`) - Address blocklist
 - **System Accounting** (`0x1800..0002`) - Gas fee ring buffer
 - **Call From** (`0x1800..0003`) - Plumbing to support native batch and memo txns.
-- **PQ Signature Verify** (`0x1800..0004`) - Post-quantum SLH-DSA-SHA2-128s verification
+- **PQ Signature Verify** (`0x1800..0004`) - Post-quantum SLH-DSA-SHA2-128s verification.
 
 ### Transaction Pool
 

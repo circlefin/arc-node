@@ -43,6 +43,7 @@ use directories::BaseDirs;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum::cli::interface::{Cli as RethCli, Commands};
 use reth_node_core::version::default_extra_data;
+use reth_rpc_builder::config::RethRpcServerConfig;
 use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection};
 use tracing::info;
 
@@ -85,10 +86,9 @@ impl ArcCli {
                 return Err("--builder.extradata is not supported");
             }
 
-            // The middleware intercepts `eth_getBlockByNumber("pending")` on single
-            // calls only; batch calls fall through to Reth and rely on
-            // `--rpc.pending-block=none` to return null. Reject the asymmetric
-            // combination that would leak pending-block data via batch.
+            // The middleware intercepts pending-block and pool-based queries in both
+            // single and batch paths. Enforce `--rpc.pending-block=none` so reth
+            // replaces pending data with finalized data for all other queries.
             if compute_filter_pending_txs(&node_cmd.ext)
                 && node_cmd.rpc.rpc_pending_block
                     != reth_rpc_eth_types::builder::config::PendingBlockKind::None
@@ -259,8 +259,9 @@ struct ArcExtraCli {
     ///
     /// Off by default: the middleware blocks `eth_subscribe("newPendingTransactions")`,
     /// `eth_newPendingTransactionFilter`, and returns null for
-    /// `eth_getBlockByNumber("pending")`. Set this flag on trusted / internal
-    /// nodes where exposing pending-tx state is desired (e.g. debugging).
+    /// `eth_getBlockByNumber("pending")` and `eth_getTransactionBySenderAndNonce`.
+    /// Set this flag on trusted / internal nodes where exposing pending-tx state
+    /// is desired (e.g. debugging).
     #[arg(
         long = "arc.expose-pending-txs",
         default_value_t = false,
@@ -552,6 +553,7 @@ fn main() {
 
             let wait_for_payload = ext.wait_for_payload;
             let filter_pending_txs = compute_filter_pending_txs(&ext);
+            let max_response_body_size = builder.config().rpc.rpc_max_response_size_bytes();
             let rebroadcast_interval =
                 std::time::Duration::from_secs(ext.txpool_rebroadcast_interval);
             let handle = builder
@@ -562,6 +564,7 @@ fn main() {
                     payload_builder_deadline_ms,
                     wait_for_payload,
                     filter_pending_txs,
+                    max_response_body_size,
                     rebroadcast_interval,
                 ))
                 .launch_with_debug_capabilities()

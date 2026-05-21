@@ -17,6 +17,7 @@
 pragma solidity ^0.8.29;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {console} from "forge-std/console.sol";
 import {ProtocolConfig} from "../../src/protocol-config/ProtocolConfig.sol";
 import {IProtocolConfig} from "../../src/protocol-config/interfaces/IProtocolConfig.sol";
@@ -1006,6 +1007,32 @@ contract ProtocolConfigTest is Test {
         // Operations should work again after unpause
         vm.prank(controller);
         protocolConfig.updateFeeParams(params);
+    }
+
+    function test_pauseAndUnpause_IdempotentNoDuplicateEvents() public {
+        protocolConfig = deployProtocolConfig(owner, controller, pauser);
+
+        vm.prank(pauser);
+        protocolConfig.pause();
+        assertTrue(protocolConfig.paused());
+
+        vm.recordLogs();
+        vm.prank(pauser);
+        protocolConfig.pause();
+        Vm.Log[] memory pauseLogs = vm.getRecordedLogs();
+        assertEq(pauseLogs.length, 0, "repeated pause should not emit");
+        assertTrue(protocolConfig.paused());
+
+        vm.prank(pauser);
+        protocolConfig.unpause();
+        assertFalse(protocolConfig.paused());
+
+        vm.recordLogs();
+        vm.prank(pauser);
+        protocolConfig.unpause();
+        Vm.Log[] memory unpauseLogs = vm.getRecordedLogs();
+        assertEq(unpauseLogs.length, 0, "repeated unpause should not emit");
+        assertFalse(protocolConfig.paused());
     }
 
     // ============================================================================

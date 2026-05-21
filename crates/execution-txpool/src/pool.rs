@@ -125,7 +125,7 @@ mod tests {
     /// Helper function to create a test transaction
     fn create_test_transaction() -> MockTransaction {
         MockTransaction::legacy()
-            .with_gas_limit(26_000)
+            .with_gas_limit(21_000)
             .with_gas_price(1_000_000_000) // 1 gwei
             .with_value(U256::from(1000))
     }

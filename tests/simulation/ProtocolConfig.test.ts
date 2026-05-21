@@ -17,12 +17,7 @@
 import { expect } from 'chai'
 import hre from 'hardhat'
 import { getChain } from '../../scripts/hardhat/viem-helper'
-import {
-  ProtocolConfig,
-  loadGenesisConfig,
-  type FeeParams,
-  type ConsensusParams,
-} from '../helpers'
+import { ProtocolConfig, loadGenesisConfig, type FeeParams, type ConsensusParams } from '../helpers'
 import { Address, decodeFunctionResult, encodeFunctionData, parseAbi, zeroAddress } from 'viem'
 import { multicall3Address } from '../../scripts/genesis'
 import { schemaHex } from '../../scripts/genesis/types'

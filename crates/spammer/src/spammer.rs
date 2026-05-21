@@ -14,10 +14,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::fs::create_dir_all;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// WebSocket request timeout for each `eth_sendRawTransaction` call.
+/// Kept short so that EL backpressure (stalled sends) surfaces quickly as warnings
+/// rather than silently inflating per-transaction latency measurements.
+const WS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// WebSocket connect timeout. Long enough to tolerate slow node startup during
+/// experiment ramp-up while still failing hard if the node never comes up.
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_mins(30);
 
 use color_eyre::eyre::{self, Result};
 use tokio::sync::mpsc::{self, Sender};
@@ -47,6 +57,27 @@ const LATENCY_CHANNEL_CAPACITY: usize = 100_000;
 /// Captured generator state from a completed spammer run.
 pub struct SpammerState {
     generators: Vec<TxGenerator>,
+}
+
+/// Result of a completed [`Spammer::run_capturing_state`] run.
+pub struct SpammerRunResult {
+    /// Generator state to feed into the next [`Spammer::new_resuming`] call.
+    pub state: SpammerState,
+    /// JSON-RPC error counts grouped by `(code, head_message)`, collected in
+    /// fire-and-forget mode from drained server responses. Empty when the
+    /// spammer ran in backpressure mode (which surfaces errors directly).
+    pub rpc_errors: HashMap<String, u64>,
+    /// Average TPS as observed locally by the spammer: total transactions
+    /// submitted (regardless of server acceptance) divided by wall-clock run
+    /// duration. Distinct from any server-side or chain-confirmed rate — this
+    /// is what the load generator actually offered. Ideally matches the
+    /// configured `max_rate`.
+    pub actual_offered_tps: f64,
+    /// Average bytes-per-second locally offered by the spammer: total tx
+    /// bytes submitted divided by wall-clock run duration. Together with
+    /// `actual_offered_tps` this distinguishes "high TPS, tiny transfers"
+    /// from "high TPS, fat ERC20/guzzler payloads."
+    pub actual_offered_bytes_per_sec: f64,
 }
 
 impl SpammerState {
@@ -123,8 +154,8 @@ impl Spammer {
         let mut ws_client_builders = Vec::new();
         for (_, url) in target_ws_urls {
             ws_client_builders.push(
-                WsClientBuilder::new(url.clone(), Duration::from_secs(10))
-                    .with_connect_timeout(Duration::from_mins(30)),
+                WsClientBuilder::new(url.clone(), WS_REQUEST_TIMEOUT)
+                    .with_connect_timeout(WS_CONNECT_TIMEOUT),
             );
         }
 
@@ -387,7 +418,7 @@ impl Spammer {
 
     /// Run the Spammer and return captured generator state for reuse in [`new_resuming`](Self::new_resuming).
     /// Nonces cached during this run are preserved.
-    pub async fn run_capturing_state(mut self) -> Result<SpammerState> {
+    pub async fn run_capturing_state(mut self) -> Result<SpammerRunResult> {
         let latency_handle = self
             .latency_tracker
             .map(|tracker| tokio::spawn(async move { tracker.run().await }));
@@ -423,13 +454,22 @@ impl Spammer {
         }
 
         let _ = self.finish_sender.send(()).await;
-        tracker_handle.await??;
+        let summary = tracker_handle.await??;
 
         if let Some(handle) = latency_handle {
             handle.await??;
         }
 
-        Ok(SpammerState { generators })
+        let elapsed_secs = summary.elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+        let actual_offered_tps = summary.total_sent as f64 / elapsed_secs;
+        let actual_offered_bytes_per_sec = summary.total_bytes as f64 / elapsed_secs;
+
+        Ok(SpammerRunResult {
+            state: SpammerState { generators },
+            rpc_errors: summary.errors,
+            actual_offered_tps,
+            actual_offered_bytes_per_sec,
+        })
     }
 
     /// Create a spammer that reuses generators from a previous run.
@@ -445,8 +485,8 @@ impl Spammer {
         let mut ws_client_builders = Vec::new();
         for (_, url) in &target_ws_urls {
             ws_client_builders.push(
-                WsClientBuilder::new(url.clone(), Duration::from_secs(10))
-                    .with_connect_timeout(Duration::from_mins(30)),
+                WsClientBuilder::new(url.clone(), WS_REQUEST_TIMEOUT)
+                    .with_connect_timeout(WS_CONNECT_TIMEOUT),
             );
         }
         for tx_gen in &mut state.generators {

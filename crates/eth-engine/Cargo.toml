@@ -24,6 +24,7 @@ alloy-sol-macro         = { workspace = true }
 alloy-sol-types         = { workspace = true }
 arc-consensus-types = { workspace = true }
 arc-execution-config = { workspace = true }
+arc-shared = { workspace = true }
 
 async-trait = { workspace = true }
 backon = { workspace = true }

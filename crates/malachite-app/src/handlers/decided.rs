@@ -17,6 +17,7 @@
 use eyre::{eyre, Context};
 use tracing::{debug, error, info, warn};
 
+use malachitebft_app_channel::Reply;
 use malachitebft_core_types::CommitCertificate;
 
 use arc_consensus_types::{ArcContext, Height};
@@ -40,6 +41,10 @@ use crate::utils::sync_state::{sync_state, SyncState};
 ///
 /// The `Finalized` message that will follow this message sends the appropriate `Next` message to
 /// consensus to start the next height, or in case of failure, restart the current height.
+///
+/// The `commit_ack` channel is consumed once the certificate is durably stored, so the sync actor
+/// can advertise the new tip height. If the commit fails before the store completes (block lookup
+/// or storage error), the channel is dropped and no acknowledgement is sent.
 #[tracing::instrument(
     name = "decided",
     skip_all,
@@ -52,6 +57,7 @@ pub async fn handle(
     state: &mut State,
     engine: &Engine,
     certificate: CommitCertificate<ArcContext>,
+    commit_ack: Reply<()>,
 ) -> eyre::Result<()> {
     let decided_height = certificate.height;
     let decided_value_id = certificate.value_id;
@@ -71,6 +77,7 @@ pub async fn handle(
         certificate,
         stats,
         metrics,
+        commit_ack,
     )
     .await;
 
@@ -127,6 +134,11 @@ async fn store_proposal_monitor_on_decision(
 
 /// Commits a value with the given certificate, finalizes the block,
 /// updates internal state and moves to the next height.
+///
+/// The `commit_ack` channel is consumed inside `commit` once the certificate has been durably
+/// stored. If we error out before reaching the store (block lookup), the channel is dropped here
+/// without firing.
+#[allow(clippy::too_many_arguments)]
 async fn decide(
     block_finalizer: impl BlockFinalizer,
     undecided_blocks: impl UndecidedBlocksRepository,
@@ -135,6 +147,7 @@ async fn decide(
     certificate: CommitCertificate<ArcContext>,
     stats: &Stats,
     metrics: &AppMetrics,
+    commit_ack: Reply<()>,
 ) -> eyre::Result<ExecutionBlock> {
     let height = certificate.height;
     let round = certificate.round;
@@ -173,6 +186,7 @@ async fn decide(
         pruning_service,
         certificate,
         &block,
+        commit_ack,
     )
     .await
     .wrap_err_with(|| {
@@ -191,13 +205,18 @@ async fn decide(
     Ok(new_latest_block)
 }
 
-/// Commits a value with the given certificate, cleanup stale consensus data and prune historical data
+/// Commits a value with the given certificate, cleanup stale consensus data and prune historical data.
+///
+/// The `commit_ack` channel is consumed immediately after the certificate is durably stored —
+/// before any post-store work (cleanup, finalize, pruning) — so the sync actor learns the new tip
+/// even if a later step fails. If the store itself fails, the channel is dropped without firing.
 async fn commit(
     block_finalizer: impl BlockFinalizer,
     decided_blocks: impl DecidedBlocksRepository,
     pruning_service: impl PruningService,
     certificate: CommitCertificate<ArcContext>,
     block: &ConsensusBlock,
+    commit_ack: Reply<()>,
 ) -> eyre::Result<ExecutionBlock> {
     let certificate_height = certificate.height;
     let certificate_round = certificate.round;
@@ -209,6 +228,13 @@ async fn commit(
         .wrap_err_with(|| {
             format!("Failed to store decided block at height={certificate_height}, round={certificate_round}, value_id={value_id}")
         })?;
+
+    if commit_ack.send(()).is_err() {
+        error!(
+            %certificate_height,
+            "Decided: Failed to send commit acknowledgement (sync actor may not be notified)"
+        );
+    }
 
     // Clean up stale consensus data (undecided blocks and pending proposals up to the certificate height)
     if let Err(e) = pruning_service
@@ -401,6 +427,14 @@ mod tests {
         Stats::default()
     }
 
+    /// A dummy commit-ack channel for tests that don't assert ack delivery.
+    /// The receiver is dropped, so a successful `commit_ack.send(())` will
+    /// return `Err`, which `commit` logs and ignores.
+    fn dummy_commit_ack() -> Reply<()> {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        tx
+    }
+
     // Tests for decide() function
 
     // Successful decision with valid block found
@@ -461,6 +495,7 @@ mod tests {
             certificate,
             &stats,
             &metrics,
+            dummy_commit_ack(),
         )
         .await;
 
@@ -497,6 +532,7 @@ mod tests {
             certificate,
             &stats,
             &metrics,
+            dummy_commit_ack(),
         )
         .await;
 
@@ -532,6 +568,7 @@ mod tests {
             certificate,
             &stats,
             &metrics,
+            dummy_commit_ack(),
         )
         .await;
 
@@ -573,6 +610,7 @@ mod tests {
             certificate,
             &stats,
             &metrics,
+            dummy_commit_ack(),
         )
         .await;
 
@@ -631,6 +669,7 @@ mod tests {
             pruning_service,
             certificate,
             &consensus_block,
+            dummy_commit_ack(),
         )
         .await;
 
@@ -663,6 +702,7 @@ mod tests {
             pruning_service,
             certificate,
             &consensus_block,
+            dummy_commit_ack(),
         )
         .await;
 
@@ -699,6 +739,7 @@ mod tests {
             pruning_service,
             certificate,
             &consensus_block,
+            dummy_commit_ack(),
         )
         .await;
 
@@ -748,11 +789,95 @@ mod tests {
             pruning_service,
             certificate,
             &consensus_block,
+            dummy_commit_ack(),
         )
         .await;
 
         // Despite pruning errors, the commit should succeed
         let block = result.unwrap();
         assert_eq!(block.block_number, height);
+    }
+
+    /// commit_ack must fire after the certificate is durably stored, even if a later
+    /// post-store step (finalize) fails — sync should still learn the new tip.
+    #[tokio::test]
+    async fn test_commit_acks_when_store_succeeds_but_finalize_fails() {
+        let height = 5u64;
+        let round = 2u32;
+        let timestamp = 1000u64;
+        let block_hash = B256::repeat_byte((height % 256) as u8);
+        let certificate = test_commit_certificate(height, round, block_hash);
+        let consensus_block = test_consensus_block(height, round, timestamp);
+
+        let mut decided_blocks = MockDecidedBlocksRepository::new();
+        decided_blocks.expect_store().return_once(|_, _, _| Ok(()));
+
+        let mut block_finalizer = MockBlockFinalizer::new();
+        block_finalizer
+            .expect_finalize_decided_block()
+            .return_once(|_, _| Err(eyre!("Finalization failed")));
+
+        let mut pruning_service = MockPruningService::new();
+        pruning_service
+            .expect_clean_stale_consensus_data()
+            .return_once(|_| Ok(()));
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+        let result = commit(
+            block_finalizer,
+            decided_blocks,
+            pruning_service,
+            certificate,
+            &consensus_block,
+            ack_tx,
+        )
+        .await;
+
+        assert!(result.is_err(), "expected finalize failure");
+        assert_eq!(
+            ack_rx.await,
+            Ok(()),
+            "ack must be sent when store succeeds, even if finalize later fails"
+        );
+    }
+
+    /// commit_ack must NOT fire if the durable store fails — otherwise sync
+    /// would advertise a height we cannot serve.
+    #[tokio::test]
+    async fn test_commit_does_not_ack_when_store_fails() {
+        let height = 5u64;
+        let round = 2u32;
+        let timestamp = 1000u64;
+        let block_hash = B256::repeat_byte((height % 256) as u8);
+        let certificate = test_commit_certificate(height, round, block_hash);
+        let consensus_block = test_consensus_block(height, round, timestamp);
+
+        let mut decided_blocks = MockDecidedBlocksRepository::new();
+        decided_blocks
+            .expect_store()
+            .return_once(|_, _, _| Err(std::io::Error::other("Store failed")));
+
+        let block_finalizer = MockBlockFinalizer::new();
+        let pruning_service = MockPruningService::new();
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+        let result = commit(
+            block_finalizer,
+            decided_blocks,
+            pruning_service,
+            certificate,
+            &consensus_block,
+            ack_tx,
+        )
+        .await;
+
+        assert!(result.is_err(), "expected store failure");
+        // Sender dropped without sending → recv resolves to Err(RecvError)
+        assert!(
+            ack_rx.await.is_err(),
+            "ack channel must be dropped (not sent) when store fails"
+        );
     }
 }

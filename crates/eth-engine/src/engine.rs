@@ -224,21 +224,15 @@ impl Engine {
     ///
     /// This is the fallback when `--genesis` is not provided.
     pub fn set_osaka_from_chain_id(&self, chain_id: u64) {
-        use arc_execution_config::chain_ids::*;
-        use arc_execution_config::chainspec::{DEVNET, LOCAL_DEV, TESTNET};
+        use arc_execution_config::chainspec::bundled_chainspec_for_chain_id;
         use reth_chainspec::EthereumHardforks;
 
-        let chainspec = match chain_id {
-            LOCALDEV_CHAIN_ID => LOCAL_DEV.clone(),
-            DEVNET_CHAIN_ID => DEVNET.clone(),
-            TESTNET_CHAIN_ID => TESTNET.clone(),
-            _ => {
-                tracing::warn!(
-                    chain_id,
-                    "Unknown chain ID for Osaka activation; defaulting to V4 (Osaka disabled)"
-                );
-                return;
-            }
+        let Some(chainspec) = bundled_chainspec_for_chain_id(chain_id) else {
+            tracing::warn!(
+                chain_id,
+                "Unknown chain ID for Osaka activation; defaulting to V4 (Osaka disabled)"
+            );
+            return;
         };
 
         tracing::info!(
@@ -758,6 +752,39 @@ mod tests {
             osaka_at_zero,
             "use_v5(0) for chain_id {chain_id}"
         );
+    }
+
+    #[test]
+    fn test_set_osaka_from_chain_id_mainnet() {
+        use arc_execution_config::chainspec::bundled_chainspec_for_chain_id;
+
+        let engine = mock_engine();
+        engine.set_osaka_from_chain_id(MAINNET_CHAIN_ID);
+
+        let expected = bundled_chainspec_for_chain_id(MAINNET_CHAIN_ID).is_some();
+        assert_eq!(
+            engine.use_v5(0),
+            expected,
+            "mainnet use_v5(0) must agree with bundle status"
+        );
+    }
+
+    /// Second call to `set_is_osaka_active` are silently ignored.
+    #[test]
+    fn test_set_is_osaka_active_subsequent_calls_are_ignored() {
+        let engine = mock_engine();
+        engine.set_is_osaka_active(Arc::new(|_| true));
+        engine.set_is_osaka_active(Arc::new(|_| false));
+        assert!(
+            engine.use_v5(0),
+            "subsequent calls to set_is_osaka_active must be ignored"
+        );
+    }
+
+    #[test]
+    fn test_subscription_endpoint_none_for_mock() {
+        let engine = mock_engine();
+        assert!(engine.subscription_endpoint().is_none());
     }
 
     #[tokio::test]

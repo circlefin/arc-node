@@ -297,6 +297,7 @@ mod tests {
     use super::*;
 
     use arc_consensus_types::proposer::RoundRobin;
+    use arc_consensus_types::signing::SigningProvider;
     use arc_consensus_types::{Address, ProposalFin, ProposalInit, ValidatorSet};
     use arc_signer::local::{LocalSigningProvider, PrivateKey, PublicKey};
 

@@ -30,6 +30,7 @@ use arc_execution_e2e::{
     ArcSetup, ArcTestBuilder,
 };
 use eyre::Result;
+use reth_chainspec::ForkCondition;
 
 /// EIP-2935 History Storage Contract address.
 const HISTORY_STORAGE_ADDRESS: Address = address!("0000F90827F1C53a10cb7A02335B175320002935");
@@ -104,10 +105,10 @@ async fn test_block_hash_history_starts_at_zero5_activation() -> Result<()> {
     reth_tracing::init_test_tracing();
 
     let chain_spec = localdev_with_hardforks(&[
-        (ArcHardfork::Zero3, 0),
-        (ArcHardfork::Zero4, 0),
-        (ArcHardfork::Zero5, 3),
-        (ArcHardfork::Zero6, 3),
+        (ArcHardfork::Zero3, ForkCondition::Block(0)),
+        (ArcHardfork::Zero4, ForkCondition::Block(0)),
+        (ArcHardfork::Zero5, ForkCondition::Block(3)),
+        (ArcHardfork::Zero6, ForkCondition::Block(3)),
     ]);
 
     ArcTestBuilder::new()

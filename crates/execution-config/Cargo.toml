@@ -38,6 +38,7 @@ reth-ethereum-forks.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-evm.workspace = true
 reth-network-peers.workspace = true
+reth-node-core.workspace = true
 reth-primitives-traits.workspace = true
 
 # revm
@@ -48,6 +49,7 @@ serde_json = { workspace = true, default-features = false, features = ["alloc"] 
 thiserror.workspace = true
 
 [dev-dependencies]
+clap = { workspace = true, features = ["derive"] }
 reth-ethereum = { workspace = true, features = ["evm"] }
 
 [lints]

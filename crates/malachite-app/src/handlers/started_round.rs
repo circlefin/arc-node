@@ -18,6 +18,7 @@ use eyre::Context;
 use tracing::{error, info, warn};
 
 use malachitebft_app_channel::app::consensus::Role;
+use malachitebft_app_channel::app::types::core::Validity;
 use malachitebft_app_channel::app::types::ProposedValue;
 use malachitebft_app_channel::Reply;
 
@@ -27,7 +28,7 @@ use arc_eth_engine::engine::Engine;
 use arc_signer::ArcSigningProvider;
 
 use crate::block::ConsensusBlock;
-use crate::metrics::AppMetrics;
+use crate::metrics::{AppMetrics, InvalidPayloadSource};
 use crate::payload::{validate_consensus_block, EnginePayloadValidator, PayloadValidator};
 use crate::proposal_parts::{
     assemble_block_from_parts, resolve_expected_proposer, validate_proposal_parts,
@@ -140,6 +141,7 @@ async fn fetch_and_process_pending_proposals(
         validator_set,
         proposer_selector,
         signing_provider,
+        metrics,
     )
     .await
     .wrap_err("Failed to validate pending proposal parts")?;
@@ -150,6 +152,7 @@ async fn fetch_and_process_pending_proposals(
         store,
         &EnginePayloadValidator::new(engine, metrics),
         store,
+        metrics,
     )
     .await
     .wrap_err("failed to validate undecided blocks")?;
@@ -171,6 +174,7 @@ async fn process_pending_proposal_parts(
     validator_set: &ValidatorSet,
     proposer_selector: &dyn ProposerSelector,
     signing_provider: &ArcSigningProvider,
+    metrics: &AppMetrics,
 ) -> eyre::Result<()> {
     for parts in pending_parts {
         let (height, round, proposer) = (parts.height(), parts.round(), parts.proposer());
@@ -202,13 +206,14 @@ async fn process_pending_proposal_parts(
                 remove_pending_parts_and_store_undecided_block(store, parts, block).await?;
             }
             Err(e) => {
+                warn!(%height, %round, %proposer, "Failed to assemble block from pending parts: {e}");
+                metrics.inc_invalid_payloads_count(InvalidPayloadSource::AssemblyFailure);
                 let invalid_payload = InvalidPayload::new_from_parts(&parts, &e.to_string());
                 store.append_invalid_payload(invalid_payload).await.wrap_err_with(|| {
                     format!(
                         "Failed to store invalid payload after assembling block from pending parts (height={height}, round={round}, proposer={proposer})",
                     )
                 })?;
-                warn!(%height, %round, %proposer, "Failed to assemble block from pending parts: {e}");
             }
         }
     }
@@ -235,6 +240,7 @@ async fn validate_undecided_blocks(
     undecided_blocks: &impl UndecidedBlocksRepository,
     payload_validator: &impl PayloadValidator,
     invalid_payloads: &impl InvalidPayloadsRepository,
+    metrics: &AppMetrics,
 ) -> eyre::Result<Vec<ConsensusBlock>> {
     let blocks = undecided_blocks
         .get_by_round(height, round)
@@ -254,14 +260,20 @@ async fn validate_undecided_blocks(
 
         info!(%height, %round, %block_hash, "Validating undecided block");
 
-        let validity =
-            match validate_consensus_block(payload_validator, &block, invalid_payloads).await {
-                Ok(validity) => validity,
-                Err(e) => {
-                    error!(%height, %round, %block_hash, "Failed to validate undecided block: {e}");
-                    continue;
-                }
-            };
+        let validity = match validate_consensus_block(
+            payload_validator,
+            &block,
+            invalid_payloads,
+            metrics,
+        )
+        .await
+        {
+            Ok(validity) => validity,
+            Err(e) => {
+                error!(%height, %round, %block_hash, "Failed to validate undecided block, marking Invalid: {e}");
+                Validity::Invalid
+            }
+        };
 
         block.validity = validity;
 
@@ -323,7 +335,15 @@ mod tests {
 
     use alloy_rpc_types_engine::ExecutionPayloadV3;
     use arbitrary::{Arbitrary, Unstructured};
+    use arc_consensus_db::{DbMetrics, DbUpgrade};
+    use arc_consensus_types::proposer::RoundRobin;
+    use arc_consensus_types::Validator;
+    use arc_signer::local::{LocalSigningProvider, PrivateKey};
+    use bytesize::ByteSize;
     use malachitebft_core_types::Validity;
+    use tempfile::tempdir;
+
+    use crate::handlers::test_utils::signed_parts_without_data;
 
     fn create_dummy_block(height: Height, round: Round, seed: u8) -> ConsensusBlock {
         let bytes = [seed; 1024];
@@ -338,6 +358,19 @@ mod tests {
             execution_payload: ExecutionPayloadV3::arbitrary(&mut u).unwrap(),
             signature: None,
         }
+    }
+
+    async fn test_store() -> (Store, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let store = Store::open(
+            dir.path().join("db"),
+            DbMetrics::default(),
+            DbUpgrade::Skip,
+            ByteSize::mib(64),
+        )
+        .await
+        .unwrap();
+        (store, dir)
     }
 
     #[tokio::test]
@@ -368,12 +401,15 @@ mod tests {
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid.expect_append().times(0);
 
-        let result = validate_undecided_blocks(height, round, &undecided, &validator, &invalid)
-            .await
-            .expect("should succeed");
+        let metrics = AppMetrics::default();
+        let result =
+            validate_undecided_blocks(height, round, &undecided, &validator, &invalid, &metrics)
+                .await
+                .expect("should succeed");
 
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|b| b.validity == Validity::Valid));
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
     }
 
     #[tokio::test]
@@ -420,9 +456,11 @@ mod tests {
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid.expect_append().times(1).returning(|_| Ok(()));
 
-        let result = validate_undecided_blocks(height, round, &undecided, &validator, &invalid)
-            .await
-            .expect("should succeed");
+        let metrics = AppMetrics::default();
+        let result =
+            validate_undecided_blocks(height, round, &undecided, &validator, &invalid, &metrics)
+                .await
+                .expect("should succeed");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].validity, Validity::Valid);
@@ -432,6 +470,7 @@ mod tests {
             vec![Validity::Valid, Validity::Invalid],
             "persisted validity should match engine verdict, not the placeholder"
         );
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
     }
 
     #[tokio::test]
@@ -445,11 +484,14 @@ mod tests {
         let validator = MockPayloadValidator::new();
         let invalid = MockInvalidPayloadsRepository::new();
 
-        let result = validate_undecided_blocks(height, round, &undecided, &validator, &invalid)
-            .await
-            .expect("should succeed");
+        let metrics = AppMetrics::default();
+        let result =
+            validate_undecided_blocks(height, round, &undecided, &validator, &invalid, &metrics)
+                .await
+                .expect("should succeed");
 
         assert!(result.is_empty());
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
     }
 
     #[tokio::test]
@@ -465,18 +507,26 @@ mod tests {
         let validator = MockPayloadValidator::new();
         let invalid = MockInvalidPayloadsRepository::new();
 
-        let err = validate_undecided_blocks(height, round, &undecided, &validator, &invalid)
-            .await
-            .expect_err("should propagate repository error");
+        let metrics = AppMetrics::default();
+        let err =
+            validate_undecided_blocks(height, round, &undecided, &validator, &invalid, &metrics)
+                .await
+                .expect_err("should propagate repository error");
 
         assert!(
             err.to_string().contains("Failed to fetch undecided blocks"),
             "error should describe the failure, got: {err}",
         );
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
     }
 
     #[tokio::test]
-    async fn validate_undecided_blocks_validation_error_skips_block() {
+    async fn validate_undecided_blocks_validation_error_marks_invalid() {
+        // When the engine call fails (transport error, SYNCING/ACCEPTED, etc.)
+        // we treat the block as `Invalid` for the current round so the placeholder
+        // `Valid` written by `process_pending_proposal_parts` does not leak.
+        // Malachite's `FullProposalKeeper::handle_validity_change` rejects any
+        // subsequent `Valid -> Invalid` flip on the same WAL entry.
         let height = Height::new(1);
         let round = Round::new(0);
 
@@ -488,13 +538,18 @@ mod tests {
         undecided
             .expect_get_by_round()
             .returning(move |_, _| Ok(blocks.clone()));
-        // Only the block that successfully validated should be persisted, the
-        // errored block must be skipped entirely.
+
+        // Both blocks must be persisted: the errored block with `Invalid`,
+        // the successful one with `Valid`. Order matches the input order.
+        let persisted = Arc::new(Mutex::new(Vec::<Validity>::new()));
+        let persisted_clone = Arc::clone(&persisted);
         undecided
             .expect_store_undecided_block()
-            .times(1)
-            .withf(|b| b.validity == Validity::Valid)
-            .returning(|_| Ok(()));
+            .times(2)
+            .returning(move |b| {
+                persisted_clone.lock().unwrap().push(b.validity);
+                Ok(())
+            });
 
         let mut call_count = 0usize;
         let mut validator = MockPayloadValidator::new();
@@ -510,16 +565,59 @@ mod tests {
                 }
             });
 
+        // Engine `Err` is not a verdict, so no forensic record is written.
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid.expect_append().times(0);
 
-        let result = validate_undecided_blocks(height, round, &undecided, &validator, &invalid)
-            .await
-            .expect("should succeed despite one block erroring");
+        let metrics = AppMetrics::default();
+        let result =
+            validate_undecided_blocks(height, round, &undecided, &validator, &invalid, &metrics)
+                .await
+                .expect("should succeed despite one block erroring");
 
-        // First block errored and was skipped, only second block returned
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].validity, Validity::Valid);
+        assert_eq!(result.len(), 2, "both blocks should be returned");
+        assert_eq!(result[0].validity, Validity::Invalid);
+        assert_eq!(result[1].validity, Validity::Valid);
+        assert_eq!(
+            *persisted.lock().unwrap(),
+            vec![Validity::Invalid, Validity::Valid],
+            "errored block must be persisted as Invalid, not left with placeholder Valid",
+        );
+        // Engine failure is not counted as an engine rejection; the metric
+        // tracks `EngineReject` and `AssemblyFailure`, not transport errors.
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn process_pending_proposal_parts_increments_on_assembly_failure() {
+        let (store, _dir) = test_store().await;
+
+        let signing_key = PrivateKey::generate(rand::rngs::OsRng);
+        let validator = Validator::new(signing_key.public_key(), 1);
+        let validator_set = ValidatorSet::new(vec![validator]);
+
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let parts = signed_parts_without_data(height, round, &signing_key).await;
+
+        let selector = RoundRobin;
+        let provider = ArcSigningProvider::Local(LocalSigningProvider::new(signing_key));
+        let metrics = AppMetrics::default();
+
+        process_pending_proposal_parts(
+            &store,
+            vec![parts],
+            height,
+            round,
+            &validator_set,
+            &selector,
+            &provider,
+            &metrics,
+        )
+        .await
+        .expect("should handle assembly failure gracefully");
+
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
     }
 
     #[tokio::test]
@@ -547,14 +645,17 @@ mod tests {
 
         let invalid = MockInvalidPayloadsRepository::new();
 
-        let err = validate_undecided_blocks(height, round, &undecided, &validator, &invalid)
-            .await
-            .expect_err("persist error should propagate");
+        let metrics = AppMetrics::default();
+        let err =
+            validate_undecided_blocks(height, round, &undecided, &validator, &invalid, &metrics)
+                .await
+                .expect_err("persist error should propagate");
 
         assert!(
             err.to_string()
                 .contains("Failed to persist validated undecided block"),
             "error should describe the persist failure, got: {err}",
         );
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
     }
 }

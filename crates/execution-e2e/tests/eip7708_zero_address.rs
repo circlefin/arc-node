@@ -29,6 +29,7 @@ use arc_execution_e2e::{
     chainspec::localdev_with_hardforks,
     ArcSetup, ArcTestBuilder,
 };
+use reth_chainspec::ForkCondition;
 
 /// Test #24: Send value to Address::ZERO under Zero5 — tx reverts.
 #[tokio::test]
@@ -82,10 +83,10 @@ async fn test_pre_zero5_zero_address_allowed() {
     reth_tracing::init_test_tracing();
 
     let chain_spec = localdev_with_hardforks(&[
-        (ArcHardfork::Zero3, 0),
-        (ArcHardfork::Zero4, 0),
-        (ArcHardfork::Zero5, 100),
-        (ArcHardfork::Zero6, 100),
+        (ArcHardfork::Zero3, ForkCondition::Block(0)),
+        (ArcHardfork::Zero4, ForkCondition::Block(0)),
+        (ArcHardfork::Zero5, ForkCondition::Block(100)),
+        (ArcHardfork::Zero6, ForkCondition::Block(100)),
     ]);
 
     let value = U256::from(1_000_000);

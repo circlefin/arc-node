@@ -1,7 +1,12 @@
 [workspace]
 resolver = "2"
 
-members = ["crates/*", "crates/test/checks", "crates/test/framework"]
+members = [
+    "crates/*",
+    "crates/test/checks",
+    "crates/test/framework",
+    "crates/test/integration",
+]
 exclude = ["crates/test"]
 
 [workspace.package]
@@ -34,7 +39,7 @@ alloy-genesis = { version = "1.6.3", default-features = false }
 alloy-network = { version = "1.6.3", default-features = false }
 
 # op
-alloy-primitives = { version = "1.5.6", default-features = false, features = ["map-foldhash"] }
+alloy-primitives = { version = "1.5.6", default-features = false, features = ["map-foldhash", "keccak-cache-global", "asm-keccak"] }
 alloy-provider = { version = "1.6.3", features = ["reqwest"], default-features = false }
 alloy-rlp = { version = "0.3.13", default-features = false, features = ["core-net"] }
 alloy-rpc-types = { version = "1.6.3", features = ["eth"], default-features = false }
@@ -74,6 +79,7 @@ arc-shared = { version = "0.0.1", path = "crates/shared" }
 arc-signer = { version = "0.0.1", path = "crates/signer" }
 arc-snapshots = { version = "0.0.1", path = "crates/snapshots" }
 arc-test-framework = { version = "0.0.1", path = "crates/test/framework" }
+arc-test-integration = { version = "0.0.1", path = "crates/test/integration" }
 arc-version = { version = "0.0.1", path = "crates/version" }
 
 # async
@@ -88,7 +94,7 @@ bip39 = { version = "2.2.0", default-features = false, features = ["std"] }
 # arc
 bon = "2.3.0"
 bytes = { version = "1.5", default-features = false }
-bytesize           = "1.3"
+bytesize           = "2.3"
 
 # for eip-4844
 cc = "=1.2.15"
@@ -229,6 +235,7 @@ sha3 = "0.10.5"
 signature          = "2.2.0"
 # Security fix for RUSTSEC-2025-0047
 slab = "0.4.11"
+slh-dsa = "0.2.0-rc.5"
 
 # spammer
 spammer = { version = "0.0.1", path = "crates/spammer" }
@@ -262,67 +269,72 @@ wiremock = "0.6"
 [workspace.dependencies.malachitebft-app]
 package = "arc-malachitebft-app"
 git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "0422137f"
 
 [workspace.dependencies.malachitebft-app-channel]
 package = "arc-malachitebft-app-channel"
 git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "0422137f"
 
 [workspace.dependencies.malachitebft-codec]
 package = "arc-malachitebft-codec"
 git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "0422137f"
 
 [workspace.dependencies.malachitebft-config]
 package = "arc-malachitebft-config"
 git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "0422137f"
 
 [workspace.dependencies.malachitebft-core-consensus]
 package = "arc-malachitebft-core-consensus"
 git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "0422137f"
 
 [workspace.dependencies.malachitebft-core-state-machine]
 package = "arc-malachitebft-core-state-machine"
 git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "0422137f"
 
 [workspace.dependencies.malachitebft-core-types]
 package = "arc-malachitebft-core-types"
+git = "https://github.com/circlefin/malachite.git"
+rev = "0422137f"
+
+[workspace.dependencies.malachitebft-engine]
+package = "arc-malachitebft-engine"
 git = "https://github.com/circlefin/malachite.git"
 rev = "6d95e673"
 
 [workspace.dependencies.malachitebft-network]
 package = "arc-malachitebft-network"
 git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "0422137f"
 
 [workspace.dependencies.malachitebft-peer]
 package = "arc-malachitebft-peer"
 git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "0422137f"
 
 [workspace.dependencies.malachitebft-proto]
 package = "arc-malachitebft-proto"
 git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "0422137f"
 
 [workspace.dependencies.malachitebft-signing]
 package = "arc-malachitebft-signing"
 git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "0422137f"
 
 [workspace.dependencies.malachitebft-signing-ed25519]
 package = "arc-malachitebft-signing-ed25519"
 git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "0422137f"
 
 [workspace.dependencies.malachitebft-sync]
 package = "arc-malachitebft-sync"
 git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "0422137f"
 
 [profile.dev]
 # enable basic optimizations (otherwise reth can't process txs)

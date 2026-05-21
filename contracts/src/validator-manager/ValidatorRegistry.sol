@@ -34,6 +34,9 @@ contract ValidatorRegistry is IValidatorRegistry, Ownable2StepUpgradeable {
     /// @notice Thrown when a referenced registrationId is invalid
     error InvalidRegistrationId(uint256 registrationId);
 
+    /// @notice Thrown when a validator is not in the expected status for an operation
+    error InvalidValidatorStatus(uint256 registrationId, ValidatorStatus status);
+
     /// @notice Thrown for invalid public key formats
     error InvalidPublicKeyFormat();
 
@@ -74,7 +77,8 @@ contract ValidatorRegistry is IValidatorRegistry, Ownable2StepUpgradeable {
         // Verify storage slot calculation is correct
         assert(
             VALIDATOR_REGISTRY_STORAGE_LOCATION
-                == keccak256(abi.encode(uint256(keccak256("arc.storage.ValidatorRegistry")) - 1)) & ~bytes32(uint256(0xff))
+                == keccak256(abi.encode(uint256(keccak256("arc.storage.ValidatorRegistry")) - 1))
+                    & ~bytes32(uint256(0xff))
         );
 
         // Disable initializers on implementation contract
@@ -87,7 +91,7 @@ contract ValidatorRegistry is IValidatorRegistry, Ownable2StepUpgradeable {
      * @inheritdoc IValidatorRegistry
      */
     function registerValidator(bytes memory publicKey, uint64 votingPower)
-        public
+        external
         onlyOwner
         returns (uint256 registrationId)
     {
@@ -119,7 +123,11 @@ contract ValidatorRegistry is IValidatorRegistry, Ownable2StepUpgradeable {
     function activateValidator(uint256 registrationId) external onlyOwner {
         ValidatorRegistryStorage storage $ = _getValidatorRegistryStorage();
         Validator storage validatorInfo = $._validatorsByRegistrationId[registrationId];
-        require(validatorInfo.status == ValidatorStatus.Registered, InvalidRegistrationId(registrationId));
+        require(validatorInfo.status != ValidatorStatus.Unknown, InvalidRegistrationId(registrationId));
+        require(
+            validatorInfo.status == ValidatorStatus.Registered,
+            InvalidValidatorStatus(registrationId, validatorInfo.status)
+        );
 
         validatorInfo.status = ValidatorStatus.Active;
         $._activeValidatorRegistrations.add(registrationId);

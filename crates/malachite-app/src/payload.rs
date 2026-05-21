@@ -29,7 +29,7 @@ use arc_eth_engine::json_structures::ExecutionBlock;
 use arc_eth_engine::rpc::EngineApiRpcError;
 
 use crate::block::ConsensusBlock;
-use crate::metrics::app::AppMetrics;
+use crate::metrics::app::{AppMetrics, InvalidPayloadSource};
 use crate::store::repositories::InvalidPayloadsRepository;
 use arc_consensus_db::invalid_payloads::InvalidPayload;
 
@@ -293,10 +293,23 @@ async fn validate_payload(
 /// to [`PayloadValidator::validate_payload`] for the actual engine call
 /// and then persists an [`InvalidPayload`] record when the verdict is
 /// `Invalid`.
+///
+/// # Return contract
+///
+/// - `Ok(Validity::Valid)`: the engine accepted the payload.
+/// - `Ok(Validity::Invalid)`: the engine rejected the payload. Persisting
+///   the forensic [`InvalidPayload`] record is **best-effort**: a failure
+///   to append is logged at `error` but does not change the verdict
+///   returned to the caller. The engine's verdict is authoritative and
+///   must reach the consensus layer so the corresponding undecided block
+///   is marked `Invalid` rather than left with a placeholder `Valid`.
+/// - `Err(_)`: no verdict was obtained (engine transport error,
+///   `SYNCING`/`ACCEPTED` status, etc.).
 pub async fn validate_consensus_block(
     payload_validator: &impl PayloadValidator,
     block: &ConsensusBlock,
     store: &impl InvalidPayloadsRepository,
+    metrics: &AppMetrics,
 ) -> eyre::Result<Validity> {
     let result = payload_validator
         .validate_payload(&block.execution_payload)
@@ -305,8 +318,25 @@ pub async fn validate_consensus_block(
     match result {
         PayloadValidationResult::Valid => Ok(Validity::Valid),
         PayloadValidationResult::Invalid { reason } => {
+            warn!(
+                height = %block.height,
+                round = %block.round,
+                block_hash = %block.block_hash(),
+                proposer = %block.proposer,
+                reason = %reason,
+                "Engine rejected payload, storing for forensics",
+            );
+            metrics.inc_invalid_payloads_count(InvalidPayloadSource::EngineReject);
             let invalid = InvalidPayload::new_from_block(block, &reason);
-            store.append(invalid).await?;
+            if let Err(e) = store.append(invalid).await {
+                error!(
+                    height = %block.height,
+                    round = %block.round,
+                    block_hash = %block.block_hash(),
+                    proposer = %block.proposer,
+                    "Failed to persist invalid-payload forensic record: {e}",
+                );
+            }
             Ok(Validity::Invalid)
         }
     }
@@ -519,12 +549,14 @@ mod tests {
         let mut store = MockInvalidPayloadsRepository::new();
         store.expect_append().times(0);
 
+        let metrics = AppMetrics::default();
         let block = test_block();
-        let result = validate_consensus_block(&validator, &block, &store)
+        let result = validate_consensus_block(&validator, &block, &store, &metrics)
             .await
             .expect("should succeed");
 
         assert_eq!(result, Validity::Valid);
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
     }
 
     #[tokio::test]
@@ -549,12 +581,14 @@ mod tests {
             })
             .returning(|_| Ok(()));
 
+        let metrics = AppMetrics::default();
         let block = test_block();
-        let result = validate_consensus_block(&validator, &block, &store)
+        let result = validate_consensus_block(&validator, &block, &store, &metrics)
             .await
             .expect("should succeed");
 
         assert_eq!(result, Validity::Invalid);
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
     }
 
     #[tokio::test]
@@ -567,8 +601,9 @@ mod tests {
         let mut store = MockInvalidPayloadsRepository::new();
         store.expect_append().times(0);
 
+        let metrics = AppMetrics::default();
         let block = test_block();
-        let err = validate_consensus_block(&validator, &block, &store)
+        let err = validate_consensus_block(&validator, &block, &store, &metrics)
             .await
             .expect_err("should propagate error");
 
@@ -577,10 +612,17 @@ mod tests {
             "error should contain the original message, \
              got: {err}",
         );
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
     }
 
     #[tokio::test]
-    async fn validate_consensus_block_propagates_store_error() {
+    async fn validate_consensus_block_returns_invalid_when_forensics_persist_fails() {
+        // When the engine returns Invalid but persisting the forensic record
+        // fails (e.g. transient DB issue), the engine's verdict is still the
+        // authoritative answer and must be returned. Otherwise the caller
+        // (validate_undecided_blocks) treats it as "no verdict obtained" and
+        // leaves the placeholder `Valid` in undecided_blocks, masking a
+        // rejected block.
         let mut validator = MockPayloadValidator::new();
         validator.expect_validate_payload().returning(|_| {
             Ok(PayloadValidationResult::Invalid {
@@ -594,16 +636,14 @@ mod tests {
             .times(1)
             .returning(|_| Err(std::io::Error::other("disk full")));
 
+        let metrics = AppMetrics::default();
         let block = test_block();
-        let err = validate_consensus_block(&validator, &block, &store)
+        let validity = validate_consensus_block(&validator, &block, &store, &metrics)
             .await
-            .expect_err("should propagate store error");
+            .expect("verdict should be returned even when forensics persist fails");
 
-        assert!(
-            err.to_string().contains("disk full"),
-            "error should contain the store error message, \
-             got: {err}",
-        );
+        assert_eq!(validity, Validity::Invalid);
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
     }
 
     #[derive(Clone, Debug)]

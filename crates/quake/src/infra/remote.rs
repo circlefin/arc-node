@@ -507,28 +507,6 @@ impl RemoteInfra {
         }
     }
 
-    /// Start monitoring services on the CC server.
-    pub fn start_monitoring(&self) -> Result<String> {
-        self.ssh_cc_with_output("docker compose -f ~/monitoring/compose.yaml up -d")
-            .wrap_err("Failed to start monitoring services on CC")
-    }
-
-    /// Stop monitoring services on the CC server.
-    pub fn stop_monitoring(&self) -> Result<String> {
-        self.ssh_cc_with_output(
-            "docker compose -f ~/monitoring/compose.yaml down --volumes --timeout 5",
-        )
-        .wrap_err("Failed to stop monitoring services on CC")
-    }
-
-    /// Remove monitoring data directories on the CC server.
-    pub fn clean_monitoring_data(&self) -> Result<String> {
-        self.ssh_cc_with_output(
-            "sudo rm -rf ~/monitoring/data-prometheus ~/monitoring/data-grafana ~/monitoring/blockscout/db ~/monitoring/blockscout/logs ~/monitoring/blockscout/dets",
-        )
-        .wrap_err("Failed to remove monitoring data on CC")
-    }
-
     fn abs_local_path(&self, path: &Path) -> PathBuf {
         if path.is_absolute() {
             path.to_path_buf()
@@ -779,5 +757,29 @@ impl InfraProvider for RemoteInfra {
 
     fn restart(&self, containers: &[ContainerName]) -> Result<()> {
         self.exec_on_containers("docker compose restart", containers)
+    }
+
+    /// Start monitoring services on the CC server.
+    fn start_monitoring(&self) -> Result<()> {
+        self.ssh_cc("docker compose -f ~/monitoring/compose.yaml up -d", false)
+            .wrap_err("Failed to start monitoring services on CC")
+    }
+
+    /// Stop monitoring services on the CC server.
+    fn stop_monitoring(&self) -> Result<()> {
+        self.ssh_cc(
+            "docker compose -f ~/monitoring/compose.yaml down --volumes --timeout 5",
+            false,
+        )
+        .wrap_err("Failed to stop monitoring services on CC")
+    }
+
+    /// Remove monitoring data directories on the CC server.
+    fn clean_monitoring_data(&self) -> Result<()> {
+        self.ssh_cc(
+                "sudo rm -rf ~/monitoring/data-prometheus ~/monitoring/data-grafana ~/monitoring/blockscout/db ~/monitoring/blockscout/logs ~/monitoring/blockscout/dets",
+                false,
+            )
+            .wrap_err("Failed to remove monitoring data on CC")
     }
 }

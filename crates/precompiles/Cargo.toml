@@ -36,7 +36,7 @@ revm-interpreter.workspace = true
 revm-primitives.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, default-features = false, features = ["alloc"] }
-slh-dsa = "0.2.0-rc.4"
+slh-dsa.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

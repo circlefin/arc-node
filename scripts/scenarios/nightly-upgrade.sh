@@ -32,16 +32,26 @@ SCENARIO="${1:-crates/quake/scenarios/nightly-upgrade.toml}"
 LOAD_DURATION="${2:-90}"
 LOAD_RATE="${3:-100}"
 NEXT_HARDFORK_NAME="${4:-zero6}"
-UPGRADE_TO_HARDFORK_BLOCKS=60
-UPGRADE_TO_HARDFORK_TIMESTAMP=300
-HARDFORK_TIMESTAMP=0
+UPGRADE_TO_HARDFORK_BLOCKS=60      # block-based hardfork: activate this many blocks ahead
+UPGRADE_TO_HARDFORK_SECONDS=60     # timestamp-based hardfork: activate this many seconds ahead
+UPGRADE_TO_OSAKA_SECONDS=300       # osakaTime is always timestamp-patched; activate this many seconds ahead
 GENESIS_FILE=.quake/nightly-upgrade/assets/genesis.json
+
+# Determine activation kind for the next hardfork. Zero3-Zero6 are historical block-based
+# forks; Zero7 onward activates by timestamp per Arc's EIP-2124 invariant — see
+# crates/execution-config/src/hardforks.rs `test_no_future_block_forks_per_network`.
+case "$NEXT_HARDFORK_NAME" in
+  ""|zero3|zero4|zero5|zero6) HARDFORK_KIND=block ;;
+  *) HARDFORK_KIND=time ;;
+esac
+HARDFORK_TARGET=0  # the block number (kind=block) or unix timestamp (kind=time) we patch in Step 8
 
 echo "Configuration:"
 echo "  Scenario: $SCENARIO"
 echo "  Load duration: ${LOAD_DURATION}s"
 echo "  Load rate: ${LOAD_RATE} tx/s"
 echo "  Next hardfork name: ${NEXT_HARDFORK_NAME:-none}"
+echo "  Next hardfork kind: ${HARDFORK_KIND}"
 
 # Step 1: Build
 echo "[1/9] Building (genesis, Docker images, quake)..."
@@ -148,22 +158,34 @@ done
 wait $UPGRADE_PID
 UPGRADE_EXIT=$?
 
-# Step 8: Set the next hardfork height to a future height and restart EL
-echo "[8/9] Setting hardfork height and restarting execution nodes..."
+# Step 8: Schedule the next hardfork at a future point and restart EL nodes so they
+# pick up the patched genesis. The patch key (`zeroNBlock` vs `zeroNTime`) and the
+# activation value are both chosen by HARDFORK_KIND set above.
+echo "[8/9] Setting hardfork activation and restarting execution nodes..."
 get_block_height() {
   cast block-number --rpc-url http://localhost:8545
 }
+get_block_timestamp() {
+  # `cast block --field timestamp` returns the raw value (typically hex 0x...).
+  # `cast --to-dec` normalises it to decimal so downstream arithmetic works.
+  cast --to-dec "$(cast block latest --rpc-url http://localhost:8545 --field timestamp)"
+}
 
 if [ -n "$NEXT_HARDFORK_NAME" ]; then
-  HARDFORK_HEIGHT=$(( $(get_block_height) + $UPGRADE_TO_HARDFORK_BLOCKS ))
-  HARDFORK_TIMESTAMP=$(( $(date +%s) + $UPGRADE_TO_HARDFORK_TIMESTAMP ))
-  echo "Patch $GENESIS_FILE: ${NEXT_HARDFORK_NAME}Block=$HARDFORK_HEIGHT, osakaTime=$HARDFORK_TIMESTAMP"
+  OSAKA_TIMESTAMP=$(( $(date +%s) + $UPGRADE_TO_OSAKA_SECONDS ))
+  if [ "$HARDFORK_KIND" = "block" ]; then
+    HARDFORK_TARGET=$(( $(get_block_height) + $UPGRADE_TO_HARDFORK_BLOCKS ))
+    PATCH_KEY="${NEXT_HARDFORK_NAME}Block"
+  else
+    HARDFORK_TARGET=$(( $(date +%s) + $UPGRADE_TO_HARDFORK_SECONDS ))
+    PATCH_KEY="${NEXT_HARDFORK_NAME}Time"
+  fi
+  echo "Patch $GENESIS_FILE: ${PATCH_KEY}=$HARDFORK_TARGET, osakaTime=$OSAKA_TIMESTAMP"
   cp "$GENESIS_FILE" "$GENESIS_FILE.bak"
-  jq ".config.${NEXT_HARDFORK_NAME}Block=$HARDFORK_HEIGHT | .config.osakaTime=$HARDFORK_TIMESTAMP" \
+  jq ".config.${PATCH_KEY}=$HARDFORK_TARGET | .config.osakaTime=$OSAKA_TIMESTAMP" \
     "$GENESIS_FILE.bak" > "$GENESIS_FILE"
 else
   echo "No next hardfork name provided, skipping hardfork application"
-  HARDFORK_HEIGHT=0
 fi
 
 # Stop ALL CL nodes first, then restart all EL nodes, then start all CL nodes.
@@ -251,25 +273,42 @@ LOAD_EXIT=$?
 wait $RESTART_PID
 RESTART_EXIT=$?
 
-# Make sure the hardfork is applied
+# Make sure the hardfork is applied — poll the chain for progress past the activation
+# point. For block-based hardforks we watch block height; for timestamp-based we watch
+# the latest block's timestamp.
 HARDFORK_APPLIED=1
 if [ -n "$NEXT_HARDFORK_NAME" ]; then
-  TARGET_BLOCK_HEIGHT=$(( $HARDFORK_HEIGHT + 10 ))
-  CURR_BLOCK_HEIGHT=$(get_block_height)
-  START_BLOCK_HEIGHT=$CURR_BLOCK_HEIGHT
-  for i in `seq $(( ($START_BLOCK_HEIGHT + $TARGET_BLOCK_HEIGHT) / 2 + 1 ))`; do
-    if [ $CURR_BLOCK_HEIGHT -gt $TARGET_BLOCK_HEIGHT ]; then
+  if [ "$HARDFORK_KIND" = "block" ]; then
+    TARGET=$(( $HARDFORK_TARGET + 10 ))
+    CURR=$(get_block_height)
+    START=$CURR
+    # Preserve the original heuristic bound for block-based polling.
+    LOOP_BOUND=$(( ($START + $TARGET) / 2 + 1 ))
+  else
+    TARGET=$(( $HARDFORK_TARGET + 10 ))
+    CURR=$(get_block_timestamp)
+    START=$CURR
+    # Timestamp polling: cap wall-clock wait at ~3 min — the heuristic above would
+    # explode for unix-timestamp magnitudes.
+    LOOP_BOUND=180
+  fi
+  for i in `seq $LOOP_BOUND`; do
+    if [ $CURR -gt $TARGET ]; then
       HARDFORK_APPLIED=0 # success
       break
     fi
-    if [ $i -gt 10 ] && [ $CURR_BLOCK_HEIGHT -eq $START_BLOCK_HEIGHT ]; then
-      echo "Block height stuck for 10 seconds"
+    if [ $i -gt 10 ] && [ $CURR -eq $START ]; then
+      echo "Chain ${HARDFORK_KIND} value stuck for 10 seconds"
       HARDFORK_APPLIED=1 # failed
       break
     fi
-    echo "Waiting for hardfork applied... current: $CURR_BLOCK_HEIGHT, hardfork: $HARDFORK_HEIGHT, target: $TARGET_BLOCK_HEIGHT"
+    echo "Waiting for hardfork applied (kind=$HARDFORK_KIND)... current: $CURR, hardfork: $HARDFORK_TARGET, target: $TARGET"
     sleep 1
-    CURR_BLOCK_HEIGHT=$(get_block_height)
+    if [ "$HARDFORK_KIND" = "block" ]; then
+      CURR=$(get_block_height)
+    else
+      CURR=$(get_block_timestamp)
+    fi
   done
 fi
 

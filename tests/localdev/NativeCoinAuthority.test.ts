@@ -26,6 +26,13 @@ import { CallHelper } from '../helpers/CallHelper'
 import { encodeFunctionData, EstimateGasExecutionError, parseEther } from 'viem'
 import { FIAT_TOKEN_ADDRESS } from '../../scripts/genesis/NativeFiatToken'
 import { USDC } from '../helpers/FiatToken'
+import { NativeCoinControl } from '../helpers/NativeCoinControl'
+
+// The NativeFiatToken contract is blocklisted in NativeCoinControl at genesis
+// (mirrors FiatTokenV2_2.initialize()), so simulating it as the tx caller trips
+// the EVM handler's pre-execution sender check. Override the slot to unblock
+// for the duration of the simulation.
+const unblockFiatToken = [NativeCoinControl.unblockStateOverride(FIAT_TOKEN_ADDRESS)]
 
 describe('NativeCoinAuthority', () => {
   const errNotMinter = CallHelper.encodeRevertMessage('Not enabled native coin minter')
@@ -42,6 +49,7 @@ describe('NativeCoinAuthority', () => {
 
     const res = await client.simulateCalls({
       account: FIAT_TOKEN_ADDRESS,
+      stateOverrides: unblockFiatToken,
       calls: [
         {
           to: NativeCoinAuthority.address,
@@ -69,6 +77,7 @@ describe('NativeCoinAuthority', () => {
 
     const res = await client.simulateCalls({
       account: FIAT_TOKEN_ADDRESS,
+      stateOverrides: unblockFiatToken,
       calls: [
         {
           to: NativeCoinAuthority.address,
@@ -96,6 +105,7 @@ describe('NativeCoinAuthority', () => {
 
     const res = await client.simulateCalls({
       account: FIAT_TOKEN_ADDRESS,
+      stateOverrides: unblockFiatToken,
       calls: [
         {
           to: NativeCoinAuthority.address,
@@ -124,6 +134,7 @@ describe('NativeCoinAuthority', () => {
 
     const res = await client.simulateCalls({
       account: FIAT_TOKEN_ADDRESS,
+      stateOverrides: unblockFiatToken,
       calls: [
         {
           to: NativeCoinAuthority.address,
@@ -136,9 +147,7 @@ describe('NativeCoinAuthority', () => {
       ],
     })
     expect(res.results[0].status).to.be.eq('success')
-    // transfer(0): min=21000+200=21200 (warm), max=21000+4200=25200 (cold), +overhead
-    expect(res.results[0].gasUsed).to.be.greaterThanOrEqual(21000n + 200n)
-    expectGasUSedApproximately(res.results[0].gasUsed, 28228n)
+    expectGasUSedApproximately(res.results[0].gasUsed, 26128n)
     expect(res.results[0].logs).to.have.lengthOf(0)
   })
 
@@ -166,11 +175,11 @@ describe('NativeCoinAuthority', () => {
     expect(res.results[0].status).to.be.eq('failure')
     expect(res.results[0].data).to.be.eq(errNotMinter)
     // invalid minter direct call: immediate revert, ~21000 base + overhead
-    expectGasUSedApproximately(res.results[0].gasUsed, 24530n)
+    expectGasUSedApproximately(res.results[0].gasUsed, 22430n)
 
     expect(res.results[1].status).to.be.eq('success')
     // invalid minter via helper: helper call overhead + inner revert
-    expectGasUSedApproximately(res.results[1].gasUsed, 31112n)
+    expectGasUSedApproximately(res.results[1].gasUsed, 29008n)
 
     EventsVerifier.fromSimulationLogs(res.results[1].logs).expectExecutionResult({
       helper,
@@ -192,7 +201,7 @@ describe('NativeCoinAuthority', () => {
       data: CallHelper.encodeNested({ fn: 'execute', target: NativeCoinAuthority.address, data: mintData }),
     })
     // estimateGas includes buffer for gas estimation
-    expectGasUSedApproximately(est, 31464n)
+    expectGasUSedApproximately(est, 29356n)
 
     const receipt = await sender
       .sendTransaction({
@@ -201,7 +210,7 @@ describe('NativeCoinAuthority', () => {
       })
       .then(ReceiptVerifier.waitSuccess)
     // invalid minter via helper: helper call overhead + inner revert
-    receipt.verifyGasUsedApproximately(31112n)
+    receipt.verifyGasUsedApproximately(29008n)
   })
 
   it('invalid selector', async () => {
@@ -329,6 +338,7 @@ describe('NativeCoinAuthority', () => {
 
     const res = await client.simulateCalls({
       account: USDC.address,
+      stateOverrides: unblockFiatToken,
       calls: [
         {
           to: helper.address,

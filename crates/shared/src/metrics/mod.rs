@@ -17,3 +17,4 @@
 //! Prometheus metrics shared across Arc node crates.
 
 pub mod denylist;
+pub mod validator_set;

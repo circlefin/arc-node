@@ -88,19 +88,41 @@ pub(crate) fn generate_system_contracts(repo_root_dir: &Path, force: bool) -> Re
     Ok(())
 }
 
+/// Inputs to [`generate_genesis_file`].
+///
+/// Grouped into a struct because the underlying hardhat invocation has
+/// accumulated enough knobs (paths, validator config, optional genesis
+/// overrides) that a positional signature was getting hard to read at call
+/// sites and easy to mis-order. All fields are inputs only — there is no
+/// hidden state.
+pub(crate) struct GenesisParams<'a> {
+    pub repo_root_dir: &'a Path,
+    pub genesis_file: &'a Path,
+    pub num_extra_accounts: usize,
+    pub public_keys_overrides: &'a IndexMap<usize, String>,
+    pub validator_names: &'a [String],
+    pub validator_voting_powers: Option<&'a [u64]>,
+    pub force: bool,
+    pub el_init_hardfork: Option<&'a str>,
+    pub extra_account_balance_usdc: Option<u64>,
+    pub block_gas_limit: Option<u64>,
+}
+
 /// Generate genesis file
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_genesis_file(
-    repo_root_dir: impl AsRef<Path>,
-    genesis_file: impl AsRef<Path>,
-    num_extra_accounts: usize,
-    public_keys_overrides: &IndexMap<usize, String>,
-    validator_names: &[String],
-    validator_voting_powers: Option<&[u64]>,
-    force: bool,
-    el_init_hardfork: Option<&str>,
-) -> Result<()> {
-    let genesis_file = genesis_file.as_ref();
+pub(crate) fn generate_genesis_file(params: GenesisParams<'_>) -> Result<()> {
+    let GenesisParams {
+        repo_root_dir,
+        genesis_file,
+        num_extra_accounts,
+        public_keys_overrides,
+        validator_names,
+        validator_voting_powers,
+        force,
+        el_init_hardfork,
+        extra_account_balance_usdc,
+        block_gas_limit,
+    } = params;
+
     if !force && genesis_file.exists() {
         debug!("⏭️ Skipping generating and copying genesis file");
         return Ok(());
@@ -116,6 +138,12 @@ pub(crate) fn generate_genesis_file(
     // Metadata to identify the genesis file for the given parameters
     let mut metadata =
         format!("val_{num_validators}-extra_{num_extra_accounts}-over_{num_overrides}");
+    if let Some(bal) = extra_account_balance_usdc {
+        metadata.push_str(&format!("-bal_{bal}"));
+    }
+    if let Some(gl) = block_gas_limit {
+        metadata.push_str(&format!("-gas_{gl}"));
+    }
     if let Some(el_init_hardfork) = el_init_hardfork {
         metadata.push_str(&format!("-hardfork_{el_init_hardfork}"));
     };
@@ -145,7 +173,6 @@ pub(crate) fn generate_genesis_file(
 
     // Generate genesis file if --force was given or if the genesis file doesn't
     // exist in the testnet directory
-    let repo_root_dir = repo_root_dir.as_ref();
     let filename = format!("genesis-{metadata}.json");
     let quake_cache_dir = repo_root_dir.join(QUAKE_DIR).join(".cache");
     let cached_genesis_file = quake_cache_dir.join(&filename);
@@ -180,6 +207,12 @@ pub(crate) fn generate_genesis_file(
         }
         if let Some(el_init_hardfork) = el_init_hardfork {
             cmd.push_str(&format!(" --hardfork {el_init_hardfork}"));
+        }
+        if let Some(bal) = extra_account_balance_usdc {
+            cmd.push_str(&format!(" --extra-account-balance {bal}"));
+        }
+        if let Some(gl) = block_gas_limit {
+            cmd.push_str(&format!(" --block-gas-limit {gl}"));
         }
         shell::exec("bash", vec!["-c", cmd.as_str()], repo_root_dir, None, false)?;
         debug!(
@@ -255,6 +288,14 @@ pub(crate) struct ComposeTemplateDataLocal {
     pub monitoring_bind_host: Option<String>,
     /// For each node, a comma-separated list of enodes to add as trusted peers
     pub trusted_peers: IndexMap<NodeName, Option<String>>,
+    /// CPU limit for the EL container (Docker `cpus`); when None, no limit is applied.
+    pub el_cpu_limit: Option<f64>,
+    /// Memory limit for the EL container in GiB; when None, no limit is applied.
+    pub el_memory_limit_gb: Option<f64>,
+    /// CPU limit for the CL container (Docker `cpus`); when None, no limit is applied.
+    pub cl_cpu_limit: Option<f64>,
+    /// Memory limit for the CL container in GiB; when None, no limit is applied.
+    pub cl_memory_limit_gb: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -284,6 +325,12 @@ pub(crate) struct ComposeTemplateDataRemote {
     pub cl_container_name: String,
     /// Execution layer container name
     pub el_container_name: String,
+    /// Manifest node name — used to locate the per-node latency_setup.sh on NFS.
+    pub node_name: String,
+    /// Whether latency emulation is enabled for the testnet. When true, the
+    /// per-node `latency_setup.sh` is bind-mounted into both EL and CL containers
+    /// at the path the entrypoint expects (`/usr/local/bin/latency_setup.sh`).
+    pub latency_emulation: bool,
     /// Whether to enable RPC or use the default IPC connection between Reth and Malachite
     pub rpc: bool,
     /// Remote home directory
@@ -298,6 +345,14 @@ pub(crate) struct ComposeTemplateDataRemote {
     pub el_cli_flags: Vec<String>,
     /// Comma-separated list of trusted peer enodes for this node
     pub trusted_peers: Option<String>,
+    /// CPU limit for the EL container (Docker `cpus`); when None, no limit is applied.
+    pub el_cpu_limit: Option<f64>,
+    /// Memory limit for the EL container in GiB; when None, the legacy default applies.
+    pub el_memory_limit_gb: Option<f64>,
+    /// CPU limit for the CL container (Docker `cpus`); when None, no limit is applied.
+    pub cl_cpu_limit: Option<f64>,
+    /// Memory limit for the CL container in GiB; when None, the legacy default applies.
+    pub cl_memory_limit_gb: Option<f64>,
 }
 
 /// Generate docker compose content from the given template and data and write to the given path
@@ -491,28 +546,9 @@ pub(crate) fn generate_app_config_files(
         debug!(node=%name, dir=%node_home_dir.display(), "Generating node configuration...");
 
         let peers_ips: Vec<String> = if let Some(peers) = &node.cl_persistent_peers {
-            // Use consensus-layer IP addresses of the given peers
-            NodesMetadata::peer_consensus_ips(
-                name,
-                peers,
-                &nodes_metadata.consensus_ip_addresses_map(),
-            )?
+            nodes_metadata.resolve_cl_persistent_peers_list_ips(name, peers)?
         } else {
-            // IP addresses of peers in the same subnet(s), to ensure network isolation
-            manifest
-                .filter_nodes_with_shared_subnets(name)
-                .flat_map(|(peer_name, _)| {
-                    let shared_subnets = manifest.subnets.shared_subnets(name, peer_name);
-                    nodes_metadata
-                        .get(peer_name)
-                        .map(|peer_data| {
-                            peer_data
-                                .consensus
-                                .private_ip_addresses_for(&shared_subnets)
-                        })
-                        .unwrap_or_default()
-                })
-                .collect()
+            nodes_metadata.default_cl_persistent_peers_list_ips(name)
         };
 
         // Generate an initial config and merge it with the config customisations from the manifest by ser/deserializing to TOML values
@@ -1179,6 +1215,14 @@ mod tests {
         (nodekeys, nodes_metadata)
     }
 
+    fn legacy_node(peers: Option<Vec<NodeName>>) -> manifest::Node {
+        manifest::Node {
+            cl_config: manifest::NodeClConfig::Legacy(Config::default()),
+            cl_persistent_peers: peers,
+            ..Default::default()
+        }
+    }
+
     fn assert_peer_count(
         trusted_peers: &IndexMap<NodeName, Option<String>>,
         node: &str,
@@ -1339,6 +1383,92 @@ mod tests {
             read_key(dir.path(), "sentry-1"),
             read_key(ref_dir.path(), "ref-3"),
             "sentry-1 should get key[3]"
+        );
+    }
+
+    #[test]
+    fn generate_legacy_consensus_config_uses_shared_subnet_peer_ips() {
+        let source = "source".to_string();
+        let peer = "peer".to_string();
+        let subnet_a = "subnet-a".to_string();
+        let subnet_b = "subnet-b".to_string();
+
+        let mut manifest_nodes = IndexMap::new();
+        manifest_nodes.insert(source.clone(), legacy_node(Some(vec![peer.clone()])));
+        manifest_nodes.insert(peer.clone(), legacy_node(None));
+
+        let node_subnets = IndexMap::from([
+            (source.clone(), vec![subnet_a.clone()]),
+            (peer.clone(), vec![subnet_a.clone(), subnet_b.clone()]),
+        ]);
+        let infra_data = InfraData::new_local("testnet".to_string(), &manifest_nodes);
+        let manifest = Manifest::new(Some("testnet".to_string()), &manifest_nodes, &node_subnets);
+        let nodes_metadata = NodesMetadata::new(infra_data, &manifest, &BTreeSet::new()).unwrap();
+        let peer_metadata = nodes_metadata.get(&peer).unwrap();
+        let shared_ip = peer_metadata
+            .consensus
+            .private_ip_address_for(&subnet_a)
+            .unwrap();
+        let unshared_ip = peer_metadata
+            .consensus
+            .private_ip_address_for(&subnet_b)
+            .unwrap();
+
+        let peers_ips = nodes_metadata
+            .resolve_cl_persistent_peers_list_ips(&source, &[peer])
+            .unwrap();
+        let config = generate_legacy_consensus_config(
+            &source,
+            manifest_nodes.get(&source).unwrap(),
+            &Config::default(),
+            &peers_ips,
+        )
+        .unwrap();
+        let shared_peer = format!("/ip4/{shared_ip}/tcp/{APP_CONSENSUS_DEFAULT_PORT}");
+        let persistent_peers = config
+            .consensus
+            .p2p
+            .persistent_peers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(
+            persistent_peers.contains(&shared_peer),
+            "expected shared peer address in config: {persistent_peers:?}"
+        );
+        assert!(
+            persistent_peers
+                .iter()
+                .all(|peer| !peer.contains(&unshared_ip)),
+            "unshared peer address should not be in config: {persistent_peers:?}"
+        );
+    }
+
+    #[test]
+    fn generate_app_config_files_errors_for_unreachable_legacy_peer() {
+        let dir = tempdir().unwrap();
+        let source = "source".to_string();
+        let peer = "peer".to_string();
+
+        let mut manifest_nodes = IndexMap::new();
+        manifest_nodes.insert(source.clone(), legacy_node(Some(vec![peer.clone()])));
+        manifest_nodes.insert(peer.clone(), legacy_node(None));
+
+        let node_subnets = IndexMap::from([
+            (source.clone(), vec!["subnet-a".to_string()]),
+            (peer, vec!["subnet-b".to_string()]),
+        ]);
+        let infra_data = InfraData::new_local("testnet".to_string(), &manifest_nodes);
+        let manifest = Manifest::new(Some("testnet".to_string()), &manifest_nodes, &node_subnets);
+        let nodes_metadata = NodesMetadata::new(infra_data, &manifest, &BTreeSet::new()).unwrap();
+
+        let err =
+            generate_app_config_files(dir.path(), &nodes_metadata, &manifest, false).unwrap_err();
+
+        assert!(
+            err.to_string().contains("shares no subnet"),
+            "unexpected error: {err:?}"
         );
     }
 

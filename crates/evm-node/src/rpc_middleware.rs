@@ -15,11 +15,9 @@
 // limitations under the License.
 
 use jsonrpsee::{
-    core::middleware::{
-        layer::Either, Batch, BatchEntry, BatchEntryErr, Notification, RpcServiceT,
-    },
+    core::middleware::{layer::Either, Batch, BatchEntry, Notification, RpcServiceT},
     types::{ErrorObject, ErrorObjectOwned, Request, ResponsePayload},
-    MethodResponse,
+    BatchResponseBuilder, MethodResponse,
 };
 use std::future::Future;
 use tower::Layer;
@@ -29,16 +27,20 @@ const PENDING_TX_SUBSCRIPTION_TYPE: &str = "newPendingTransactions";
 const ETH_NEW_PENDING_TX_FILTER_METHOD: &str = "eth_newPendingTransactionFilter";
 const ETH_GET_BLOCK_BY_NUMBER_METHOD: &str = "eth_getBlockByNumber";
 const PENDING_BLOCK_TAG: &str = "pending";
+const ETH_GET_TX_BY_SENDER_AND_NONCE_METHOD: &str = "eth_getTransactionBySenderAndNonce";
 const PENDING_TX_SUBSCRIPTION_ERROR_CODE: i32 = -32001;
 
 /// Adds Arc-specific RPC middlewares
 #[derive(Clone, Debug)]
 pub struct ArcRpcLayer {
     /// When true (default), `eth_subscribe("newPendingTransactions")`,
-    /// `eth_newPendingTransactionFilter`, and `eth_getBlockByNumber("pending")`
-    /// are blocked. When false, the filter is bypassed and these are allowed.
+    /// `eth_newPendingTransactionFilter`, `eth_getBlockByNumber("pending")`,
+    /// and `eth_getTransactionBySenderAndNonce` are blocked.
+    /// When false, the filter is bypassed and these are allowed.
     /// CLI users opt out of the default via `--arc.expose-pending-txs`.
     pub filter_pending_txs: bool,
+    /// Mirrors `--rpc.max-response-size` from the server config (in bytes).
+    pub max_response_body_size: usize,
 }
 
 impl Default for ArcRpcLayer {
@@ -47,14 +49,18 @@ impl Default for ArcRpcLayer {
     fn default() -> Self {
         Self {
             filter_pending_txs: true,
+            max_response_body_size: usize::MAX,
         }
     }
 }
 
 impl ArcRpcLayer {
-    /// Creates a new `ArcRpcLayer` with the given filter setting.
-    pub fn new(filter_pending_txs: bool) -> Self {
-        Self { filter_pending_txs }
+    /// Creates a new `ArcRpcLayer` with the given filter and response size settings.
+    pub fn new(filter_pending_txs: bool, max_response_body_size: usize) -> Self {
+        Self {
+            filter_pending_txs,
+            max_response_body_size,
+        }
     }
 }
 
@@ -68,7 +74,10 @@ where
 
     fn layer(&self, inner: S) -> Self::Service {
         if self.filter_pending_txs {
-            Either::Left(NoPendingTransactionsRpcMiddleware { service: inner })
+            Either::Left(NoPendingTransactionsRpcMiddleware {
+                service: inner,
+                max_response_body_size: self.max_response_body_size,
+            })
         } else {
             Either::Right(inner)
         }
@@ -79,19 +88,26 @@ where
 #[derive(Clone, Debug)]
 pub struct NoPendingTransactionsRpcMiddleware<S> {
     service: S,
+    max_response_body_size: usize,
 }
 
 impl<S> NoPendingTransactionsRpcMiddleware<S> {
     /// Creates a new instance of the middleware.
     pub fn new(service: S) -> Self {
-        Self { service }
+        Self {
+            service,
+            max_response_body_size: usize::MAX,
+        }
     }
 }
 
 impl<S> RpcServiceT for NoPendingTransactionsRpcMiddleware<S>
 where
-    S: RpcServiceT<MethodResponse = MethodResponse, BatchResponse = MethodResponse>
-        + Send
+    S: RpcServiceT<
+            MethodResponse = MethodResponse,
+            NotificationResponse = MethodResponse,
+            BatchResponse = MethodResponse,
+        > + Send
         + Sync
         + Clone
         + 'static,
@@ -102,41 +118,40 @@ where
 
     fn call<'a>(&self, req: Request<'a>) -> impl Future<Output = Self::MethodResponse> + Send + 'a {
         let service = self.service.clone();
-
-        async move {
-            // Error if the request is a pending transactions subscription or filter
-            if let Err(err) = error_if_pending_tx_rpc(&req) {
-                return MethodResponse::error(req.id(), err);
-            }
-
-            if is_pending_block_query(&req) {
-                return null_response(&req);
-            }
-
-            service.call(req).await
-        }
+        async move { intercept_or_forward(&service, req).await }
     }
 
     fn batch<'a>(&self, req: Batch<'a>) -> impl Future<Output = Self::BatchResponse> + Send + 'a {
-        // Pending-block filtering is intentionally skipped for batch requests.
-        // --rpc.pending-block=none (binary default) + network topology make this unexploitable.
-        let batch = req
-            .into_iter()
-            .map(
-                |request: Result<BatchEntry<'_>, BatchEntryErr<'_>>| match request {
+        let service = self.service.clone();
+        let max_response_body_size = self.max_response_body_size;
+        async move {
+            let mut builder = BatchResponseBuilder::new_with_limit(max_response_body_size);
+            let mut got_notif = false;
+            for entry in req {
+                match entry {
                     Ok(BatchEntry::Call(request)) => {
-                        // Error if the batch contains a pending transactions subscription or filter
-                        error_if_pending_tx_rpc(&request)
-                            .map_err(|err| BatchEntryErr::new(request.id(), err))?;
-                        Ok(BatchEntry::Call(request))
+                        let response = intercept_or_forward(&service, request).await;
+                        if let Err(too_large) = builder.append(response) {
+                            return too_large;
+                        }
                     }
-                    _ => request,
-                },
-            )
-            .collect::<Vec<_>>();
-
-        // Forward the batch to the underlying service
-        self.service.batch(Batch::from(batch))
+                    Ok(BatchEntry::Notification(notification)) => {
+                        got_notif = true;
+                        service.notification(notification).await;
+                    }
+                    Err(err) => {
+                        let (error, id) = err.into_parts();
+                        if let Err(too_large) = builder.append(MethodResponse::error(id, error)) {
+                            return too_large;
+                        }
+                    }
+                }
+            }
+            if builder.is_empty() && got_notif {
+                return MethodResponse::notification();
+            }
+            MethodResponse::from_batch(builder.finish())
+        }
     }
 
     fn notification<'a>(
@@ -145,6 +160,20 @@ where
     ) -> impl Future<Output = Self::NotificationResponse> + Send + 'a {
         self.service.notification(n)
     }
+}
+
+/// Intercepts pending-tx RPCs (error or null) or forwards to the inner service.
+async fn intercept_or_forward<'a, S>(service: &S, req: Request<'a>) -> MethodResponse
+where
+    S: RpcServiceT<MethodResponse = MethodResponse> + Send + Sync,
+{
+    if let Err(err) = error_if_pending_tx_rpc(&req) {
+        return MethodResponse::error(req.id(), err);
+    }
+    if is_pool_pending_tx_lookup(&req) || is_pending_block_query(&req) {
+        return null_response(&req);
+    }
+    service.call(req).await
 }
 
 /// Returns an error if the request is a pending-tx RPC (subscription or filter) that would leak pending transaction data.
@@ -172,6 +201,11 @@ fn error_if_pending_tx_rpc<'a>(req: &Request<'a>) -> Result<(), ErrorObject<'a>>
         }
     }
     Ok(())
+}
+
+/// Returns true if the request queries the transaction pool directly for pending tx data.
+fn is_pool_pending_tx_lookup(req: &Request<'_>) -> bool {
+    req.method_name() == ETH_GET_TX_BY_SENDER_AND_NONCE_METHOD
 }
 
 /// Returns true if the request is `eth_getBlockByNumber("pending", ...)`.
@@ -457,11 +491,54 @@ mod tests {
         );
     }
 
+    // -- pool pending tx lookup: intercepted --
+    //
+    // eth_getTransactionBySenderAndNonce returns null (success, not error)
+    // because it directly queries the pool for pending tx contents.
+
+    #[tokio::test]
+    async fn test_enabled_pool_lookup_returns_null() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let params = RawValue::from_string("[]".to_string()).unwrap();
+        let request = create_request_with_params(ETH_GET_TX_BY_SENDER_AND_NONCE_METHOD, params, 1);
+        let response = middleware.call(request).await;
+
+        assert!(
+            response.as_error_code().is_none(),
+            "should return success, not error"
+        );
+        let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+        assert!(
+            json["result"].is_null(),
+            "should return null for pool lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enabled_pool_lookup_with_params_returns_null() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let params = RawValue::from_string(
+            r#"["0x1234567890abcdef1234567890abcdef12345678", "0x0"]"#.to_string(),
+        )
+        .unwrap();
+        let request = create_request_with_params(ETH_GET_TX_BY_SENDER_AND_NONCE_METHOD, params, 2);
+        let response = middleware.call(request).await;
+
+        assert!(
+            response.as_error_code().is_none(),
+            "should return success, not error"
+        );
+        let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+        assert!(
+            json["result"].is_null(),
+            "should return null for pool lookup with params"
+        );
+    }
+
     // -- batch requests --
     //
-    // Pending-tx subscription/filter are blocked in batch.
-    // Pending block interception is intentionally NOT applied in batch; falls back to
-    // --rpc.pending-block=none.
+    // Batch entries are intercepted per-entry, consistent with the single-request path:
+    // subscriptions/filters → error, pool lookups/pending block → null.
 
     #[tokio::test]
     async fn test_enabled_batch_blocks_pending_tx_subscription() {
@@ -515,7 +592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enabled_batch_pending_block_passes_through() {
+    async fn test_enabled_batch_pending_block_returns_null() {
         let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
         let batch = Batch::from(vec![
             Ok(BatchEntry::Call(create_request_with_params(
@@ -535,6 +612,126 @@ mod tests {
 
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["result"], "success");
+        assert!(
+            responses[1]["result"].is_null(),
+            "batch pending block should return null"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enabled_batch_pool_lookup_returns_null() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let batch = Batch::from(vec![
+            Ok(BatchEntry::Call(create_request_with_params(
+                "eth_blockNumber",
+                RawValue::from_string("[]".to_string()).unwrap(),
+                1,
+            ))),
+            Ok(BatchEntry::Call(create_request_with_params(
+                ETH_GET_TX_BY_SENDER_AND_NONCE_METHOD,
+                RawValue::from_string(
+                    r#"["0x1234567890abcdef1234567890abcdef12345678", "0x0"]"#.to_string(),
+                )
+                .unwrap(),
+                2,
+            ))),
+        ]);
+        let response = middleware.batch(batch).await;
+        let json = response.into_json();
+        let responses: Vec<serde_json::Value> = serde_json::from_str(json.get()).unwrap();
+
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["result"], "success");
+        assert!(
+            responses[1]["result"].is_null(),
+            "batch pool lookup should return null"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enabled_batch_mixed_interceptions() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let batch = Batch::from(vec![
+            // 0: normal method → success
+            Ok(BatchEntry::Call(create_request_with_params(
+                "eth_blockNumber",
+                RawValue::from_string("[]".to_string()).unwrap(),
+                1,
+            ))),
+            // 1: pool lookup → null
+            Ok(BatchEntry::Call(create_request_with_params(
+                ETH_GET_TX_BY_SENDER_AND_NONCE_METHOD,
+                RawValue::from_string("[]".to_string()).unwrap(),
+                2,
+            ))),
+            // 2: pending block → null
+            Ok(BatchEntry::Call(create_request_with_params(
+                ETH_GET_BLOCK_BY_NUMBER_METHOD,
+                RawValue::from_string(r#"["pending", false]"#.to_string()).unwrap(),
+                3,
+            ))),
+            // 3: pending tx subscription → error
+            Ok(BatchEntry::Call(create_request_with_params(
+                ETH_SUBSCRIBE_METHOD,
+                RawValue::from_string(r#"["newPendingTransactions"]"#.to_string()).unwrap(),
+                4,
+            ))),
+        ]);
+        let response = middleware.batch(batch).await;
+        let json = response.into_json();
+        let responses: Vec<serde_json::Value> = serde_json::from_str(json.get()).unwrap();
+
+        assert_eq!(responses.len(), 4);
+        assert_eq!(
+            responses[0]["result"], "success",
+            "normal method should succeed"
+        );
+        assert!(
+            responses[1]["result"].is_null(),
+            "pool lookup should return null"
+        );
+        assert!(
+            responses[2]["result"].is_null(),
+            "pending block should return null"
+        );
+        assert!(
+            responses[3].get("error").is_some(),
+            "pending tx subscription should error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enabled_batch_notification_excluded_from_response() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let batch = Batch::from(vec![
+            Ok(BatchEntry::Call(create_request_with_params(
+                "eth_blockNumber",
+                RawValue::from_string("[]".to_string()).unwrap(),
+                1,
+            ))),
+            Ok(BatchEntry::Notification(Notification::new(
+                Cow::Borrowed("eth_subscription"),
+                Some(Cow::Owned(
+                    RawValue::from_string(r#"{"subscription":"0x1","result":"0x123"}"#.to_string())
+                        .unwrap(),
+                )),
+            ))),
+            Ok(BatchEntry::Call(create_request_with_params(
+                "eth_chainId",
+                RawValue::from_string("[]".to_string()).unwrap(),
+                2,
+            ))),
+        ]);
+        let response = middleware.batch(batch).await;
+        let json = response.into_json();
+        let responses: Vec<serde_json::Value> = serde_json::from_str(json.get()).unwrap();
+
+        assert_eq!(
+            responses.len(),
+            2,
+            "notification must not produce a response entry"
+        );
+        assert_eq!(responses[0]["result"], "success");
         assert_eq!(responses[1]["result"], "success");
     }
 
@@ -546,6 +743,7 @@ mod tests {
     async fn test_disabled_allows_pending_tx_subscription() {
         let layer = ArcRpcLayer {
             filter_pending_txs: false,
+            ..Default::default()
         };
         let middleware = layer.layer(MockRpcService);
         let params = RawValue::from_string(r#"["newPendingTransactions"]"#.to_string()).unwrap();
@@ -556,12 +754,18 @@ mod tests {
             response.as_error_code().is_none(),
             "filter_pending_txs=false should allow newPendingTransactions"
         );
+        let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+        assert_eq!(
+            json["result"], "success",
+            "filter_pending_txs=false should forward to inner service"
+        );
     }
 
     #[tokio::test]
     async fn test_disabled_allows_pending_tx_filter() {
         let layer = ArcRpcLayer {
             filter_pending_txs: false,
+            ..Default::default()
         };
         let middleware = layer.layer(MockRpcService);
         let params = RawValue::from_string(r#"[]"#.to_string()).unwrap();
@@ -571,12 +775,43 @@ mod tests {
             response.as_error_code().is_none(),
             "filter_pending_txs=false should allow newPendingTransactionFilter"
         );
+        let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+        assert_eq!(
+            json["result"], "success",
+            "filter_pending_txs=false should forward to inner service"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disabled_allows_pool_lookup() {
+        let layer = ArcRpcLayer {
+            filter_pending_txs: false,
+            ..Default::default()
+        };
+        let middleware = layer.layer(MockRpcService);
+        let params = RawValue::from_string(
+            r#"["0x1234567890abcdef1234567890abcdef12345678", "0x0"]"#.to_string(),
+        )
+        .unwrap();
+        let request =
+            create_request_with_params(ETH_GET_TX_BY_SENDER_AND_NONCE_METHOD, params, 102);
+        let response = middleware.call(request).await;
+        assert!(
+            response.as_error_code().is_none(),
+            "filter_pending_txs=false should allow eth_getTransactionBySenderAndNonce"
+        );
+        let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+        assert_eq!(
+            json["result"], "success",
+            "filter_pending_txs=false should forward to inner service"
+        );
     }
 
     #[tokio::test]
     async fn test_disabled_allows_pending_block() {
         let layer = ArcRpcLayer {
             filter_pending_txs: false,
+            ..Default::default()
         };
         let middleware = layer.layer(MockRpcService);
         let params = RawValue::from_string(r#"["pending", false]"#.to_string()).unwrap();
@@ -586,6 +821,11 @@ mod tests {
         assert!(
             response.as_error_code().is_none(),
             "filter_pending_txs=false should allow getBlockByNumber(\"pending\")"
+        );
+        let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+        assert_eq!(
+            json["result"], "success",
+            "filter_pending_txs=false should forward to inner service"
         );
     }
 

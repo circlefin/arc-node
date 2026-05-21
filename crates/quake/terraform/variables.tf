@@ -25,8 +25,15 @@ variable "network_topology" {
   default     = {}
 }
 
-variable "github_user" {}
-variable "github_token" {}
+variable "github_user" {
+  description = "GitHub user that owns the PAT used to pull container images from GHCR"
+  type        = string
+}
+variable "github_token" {
+  description = "GitHub PAT used to pull container images from GHCR"
+  type        = string
+  sensitive   = true
+}
 
 variable "image_cl" {
   type = string
@@ -72,6 +79,23 @@ variable "cc_volume_size" {
   nullable = true
 }
 
+# Root EBS volume type for nodes (e.g. "gp3", "io2"). Override via `quake remote create --node-volume-type`.
+# When null (default), gp3 is used whenever a custom volume_size or iops is set; otherwise the
+# AMI default volume type is used.
+variable "node_volume_type" {
+  type     = string
+  default  = null
+  nullable = true
+}
+
+# Provisioned IOPS for the node root EBS volume. Override via `quake remote create --node-volume-iops`.
+# Only meaningful for gp3, io1, and io2. When null (default), AWS uses the volume-type default IOPS.
+variable "node_volume_iops" {
+  type     = number
+  default  = null
+  nullable = true
+}
+
 variable "tags" {
   type    = list(string)
   default = ["arc-quake-testnet"]
@@ -83,11 +107,15 @@ variable "blockscout_ssm_port" {
 }
 
 variable "circle_base_image" {
-  type = string
+  description = "ECR image used as the base layer for spammer/proxy containers"
+  type        = string
+  sensitive   = true
 }
 
 variable "ami_owner" {
-  type = string
+  description = "AWS account ID owning the EKS AMI used for node instances"
+  type        = string
+  sensitive   = true
 }
 
 variable "ami_name_filter" {
@@ -95,5 +123,7 @@ variable "ami_name_filter" {
 }
 
 variable "ec2_profile_name" {
-  type = string
+  description = "IAM instance profile attached to the EC2 nodes"
+  type        = string
+  sensitive   = true
 }

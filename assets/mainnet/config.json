@@ -1,0 +1,230 @@
+{
+  "timestamp": "1778544000",
+  "coinbase": "0x3141592653589793238462643383279502884197",
+  "NativeFiatToken": {
+    "proxy": {
+      "admin": "0x9005E53E3ee2f27999F15e7a52C58f804Fc716e0"
+    },
+    "owner": "0xf5a5658b55983E2Aa037cAC7A8431B510E8A97F4",
+    "pauser": "0x0000000000000000000000000000000000000000",
+    "masterMinter": "0x0000000000000000000000000000000000000000",
+    "blacklister": "0x0000000000000000000000000000000000000000",
+    "rescuer": "0x0000000000000000000000000000000000000000",
+    "minters": []
+  },
+  "ProtocolConfig": {
+    "proxy": {
+      "admin": "0xBD3738ab866eff9B0908Ef8985d00eECA22DA4eF"
+    },
+    "owner": "0xA5FeD552f38E11291Dd2Fc9cb91e2a5F6Ae86eD4",
+    "controller": "0x41fE044f1f71ff69F46F35f41EC93369a0E94733",
+    "pauser": "0x85c8825829fC649694D569bcCc374E8382Df2D12",
+    "feeParams": {
+      "alpha": "20",
+      "kRate": "200",
+      "inverseElasticityMultiplier": "5000",
+      "minBaseFee": "20000000000",
+      "maxBaseFee": "20000000000000",
+      "blockGasLimit": "30000000"
+    },
+    "consensusParams": {
+      "timeoutProposeMs": "3000",
+      "timeoutProposeDeltaMs": "500",
+      "timeoutPrevoteMs": "1000",
+      "timeoutPrevoteDeltaMs": "500",
+      "timeoutPrecommitMs": "1000",
+      "timeoutPrecommitDeltaMs": "500",
+      "timeoutRebroadcastMs": "5000",
+      "targetBlockTimeMs": "500"
+    }
+  },
+  "ValidatorManager": {
+    "proxy": {
+      "admin": "0x20Db45729BC366833107524804d16cEb44e946c6"
+    },
+    "PermissionedValidatorManager": {
+      "proxy": {
+        "admin": "0x131E6B8E466aC8046c38c3ae7de77595CfEAf0D1"
+      },
+      "owner": "0x20E61a9CC8d010928Aa9997e4e773e84dE1B8306",
+      "pauser": "0x5bC1d44F8e844863cbC45D2f425F4c3758faf7b8",
+      "validatorRegisterers": [
+        "0xF65A7d2E6C16d263B7B263369deD8C78f3aa4813",
+        "0x38c57d852eddE831CE368D127CDabf5AdB86Ce96"
+      ]
+    },
+    "validators": [
+      {
+        "publicKey": "0x12a68aa84643efd6fb79b4097ef9b5ae1bef849c9c75e8eba2b977e09d227c35",
+        "votingPower": "2000",
+        "controllers": [
+          {
+            "address": "0x5f86a4dCBD49c86Becc4FB89680f66FeC8eF358a",
+            "votingPowerLimit": "2000"
+          },
+          {
+            "address": "0x6F80738F31019B70B616Ac9Fac1C853dFC35Cc37",
+            "votingPowerLimit": "0"
+          }
+        ]
+      },
+      {
+        "publicKey": "0xae89fa207bb808e8a34e05b5892a16625e8b66b92e597f8866aa586b487dfbfe",
+        "votingPower": "2000",
+        "controllers": [
+          {
+            "address": "0xb0100454798fD2a11d7e7Bde0804a29171d2F492",
+            "votingPowerLimit": "2000"
+          },
+          {
+            "address": "0xA53dd220650550BC68dFC63faAF954b85eAfED7c",
+            "votingPowerLimit": "0"
+          }
+        ]
+      },
+      {
+        "publicKey": "0xd5c96c5d0daf70f25fb5bfc20c0747b2ce0408cc6e54b8494f3a62b61ffca7cd",
+        "votingPower": "2000",
+        "controllers": [
+          {
+            "address": "0x64637C1f9899684722da4657d94396ec4Fd85E09",
+            "votingPowerLimit": "2000"
+          },
+          {
+            "address": "0x882b0d0E0952170a7d3D62946327fF3F6d7AD329",
+            "votingPowerLimit": "0"
+          }
+        ]
+      },
+      {
+        "publicKey": "0xed259c1abb397823afb31cb36089547367221242de3057df803a0b091e9a1c8d",
+        "votingPower": "2000",
+        "controllers": [
+          {
+            "address": "0x5c2220b253c4E02Eec51A3959b9f67E599E8ECF9",
+            "votingPowerLimit": "2000"
+          },
+          {
+            "address": "0x386976F806739bDA4126a18eEF4157F92Fb53Cce",
+            "votingPowerLimit": "0"
+          }
+        ]
+      },
+      {
+        "publicKey": "0xf43562191fe65ba250ac32d4602efb664586bf4e8150e4c80cf2dbf64650d2a9",
+        "votingPower": "2000",
+        "controllers": [
+          {
+            "address": "0xB0556E9AE15cA9e02fFD66C1651134bf343ad2B2",
+            "votingPowerLimit": "2000"
+          },
+          {
+            "address": "0x5e887aFa6E659995A546e72B9959594D8DAEDD71",
+            "votingPowerLimit": "0"
+          }
+        ]
+      },
+      {
+        "publicKey": "0xf927d6659307a219c3a59b51a31c29412b6d2b1c1717697a0ae0d5c9999ba740",
+        "votingPower": "2000",
+        "controllers": [
+          {
+            "address": "0x5802620312d16b94E70147AAf730c662Ceee821C",
+            "votingPowerLimit": "2000"
+          },
+          {
+            "address": "0xBFB35262B8dF18829D33Da3A220DdE13505Cf485",
+            "votingPowerLimit": "0"
+          }
+        ]
+      },
+      {
+        "publicKey": "0xda4f31b2d26acac4143d67f6b0ebc5a7b9fa829e4b63970f28130bff361316c9",
+        "votingPower": "2000",
+        "controllers": [
+          {
+            "address": "0x9c4a7E4964d0b14c3B436b522F0BFA33DD517350",
+            "votingPowerLimit": "2000"
+          },
+          {
+            "address": "0xF75431B62AECD7da6AF24b6c0dFEd419579760c8",
+            "votingPowerLimit": "0"
+          }
+        ]
+      },
+      {
+        "publicKey": "0x7bd0ca04c9423d39c25ee7747d2a5977acf19ff9d7f835f8dc1a746c83e71070",
+        "votingPower": "2000",
+        "controllers": [
+          {
+            "address": "0x22C1Ba671ad7c01d00Afb8E159424A8568B6b3a7",
+            "votingPowerLimit": "2000"
+          },
+          {
+            "address": "0x4e5bF0aBC4EFA3c94Bc1ed23b1dB4b40De43AafA",
+            "votingPowerLimit": "0"
+          }
+        ]
+      },
+      {
+        "publicKey": "0xc3fbb251a140db946283233a3fe5762a05a8305e2a8eaefc41d5df2820e071fc",
+        "votingPower": "2000",
+        "controllers": [
+          {
+            "address": "0xD28Ae083CFEefd89cb2b0f6466351d4C5630Ac5F",
+            "votingPowerLimit": "2000"
+          },
+          {
+            "address": "0x034BB1f6239a70f956d2b18054CF7Bf7Bbe77Cc4",
+            "votingPowerLimit": "0"
+          }
+        ]
+      },
+      {
+        "publicKey": "0xdeb9620fb017834b90e4b0cf66fdc7fd06b3edb68f0147938e59a9fa7db83380",
+        "votingPower": "2000",
+        "controllers": [
+          {
+            "address": "0x5dD30B6C339ec59eB7fBeD6026C43978e5663FbE",
+            "votingPowerLimit": "2000"
+          },
+          {
+            "address": "0x7dCCcD3f36dDc820265F6e5758044EA3d4739C80",
+            "votingPowerLimit": "0"
+          }
+        ]
+      },
+      {
+        "publicKey": "0x254192a339b277911fae7dac3a52ed4b0196bb90670fb3b893f521849086fc8d",
+        "votingPower": "2000",
+        "controllers": [
+          {
+            "address": "0x4e8FC724848B3F119E031C1e17c5e68Af75D29C2",
+            "votingPowerLimit": "2000"
+          },
+          {
+            "address": "0x5519855988085f55Ac7aCcD7aED1C53988D9aF18",
+            "votingPowerLimit": "0"
+          }
+        ]
+      }
+    ]
+  },
+  "Denylist": {
+    "proxy": {
+      "address": "0x3600000000000000000000000000000000000004",
+      "admin": "0xAfb5b6a4725459959ef931a3e5df758a72A8cA7f"
+    },
+    "owner": "0x49ec36db19623e4DaDc1Aa821CbA2D1476F8E859",
+    "denylisters": []
+  },
+  "prefund": [
+    {
+      "address": "0x50A2b0B577eC24d7ce1aeD372A8a6fd14CE1bE57",
+      "balance": "10000000000000000000000"
+    }
+  ],
+  "hardforks": {
+    "osakaTime": 0
+  }
+}

@@ -18,11 +18,13 @@
 
 use std::time::Duration;
 
-use arc_consensus_types::{ConsensusConfig, RemoteSigningConfig, RetryConfig, ValueSyncConfig};
+use arc_consensus_types::{
+    ChainId, ConsensusConfig, RemoteSigningConfig, RetryConfig, ValueSyncConfig,
+};
 use arc_node_consensus_cli::config::ScoringStrategy;
 use malachitebft_app_channel::app::config::{
-    BootstrapProtocol, DiscoveryConfig, GossipSubConfig, P2pConfig, PubSubProtocol, Selector,
-    ValuePayload,
+    BootstrapProtocol, DiscoveryConfig, GossipSubConfig, P2pConfig, ProtocolNames, PubSubProtocol,
+    Selector, ValuePayload,
 };
 use malachitebft_app_channel::app::net::Multiaddr;
 
@@ -39,6 +41,55 @@ pub mod consensus {
     ///
     /// Default: `10`
     pub const QUEUE_CAPACITY: usize = 16;
+
+    /// Maximum number of buffered inputs per height in the gossip input queue.
+    ///
+    /// Default: `500`
+    pub const QUEUE_PER_HEIGHT_CAPACITY: usize = 500;
+
+    /// Duration to wait before replaying the WAL on recovery.
+    ///
+    /// Default: `5s`
+    pub const WAL_REPLAY_DELAY: Duration = Duration::from_secs(5);
+
+    /// Chain-specific libp2p protocol names.
+    pub mod p2p {
+        use super::*;
+
+        pub(crate) fn protocol_names_malachite_defaults() -> ProtocolNames {
+            ProtocolNames {
+                consensus: "/malachitebft-core-consensus/v1beta1".to_string(),
+                discovery_kad: "/malachitebft-discovery/kad/v1beta1".to_string(),
+                discovery_regres: "/malachitebft-discovery/reqres/v1beta1".to_string(),
+                sync: "/malachitebft-sync/v1beta1".to_string(),
+                validator_proof: "/malachitebft-validator-proof/v1".to_string(),
+            }
+        }
+
+        fn protocol_names_arc_v1() -> ProtocolNames {
+            ProtocolNames {
+                consensus: "/arc/consensus/v1".to_string(),
+                discovery_kad: "/arc/discovery/kad/v1".to_string(),
+                discovery_regres: "/arc/discovery/req-res/v1".to_string(),
+                sync: "/arc/sync/v1".to_string(),
+                validator_proof: "/arc/validator-proof/v1".to_string(),
+            }
+        }
+
+        /// Chain-specific libp2p protocol names.
+        ///
+        /// Mainnet uses Arc-branded names; Testnet, Devnet, and Localdev
+        /// keep the Malachite defaults to avoid breaking the wire protocol
+        /// on already-running networks (including CI upgrade scenarios).
+        pub fn protocol_names(chain_id: ChainId) -> ProtocolNames {
+            match chain_id {
+                ChainId::Mainnet => protocol_names_arc_v1(),
+                ChainId::Localdev => protocol_names_malachite_defaults(),
+                ChainId::Testnet => protocol_names_malachite_defaults(),
+                ChainId::Devnet => protocol_names_malachite_defaults(),
+            }
+        }
+    }
 }
 
 /// Hardcoded discovery parameters.
@@ -84,7 +135,7 @@ pub mod value_sync {
 
     /// Timeout duration for sync requests
     /// Default: `Duration::from_secs(10)`
-    pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+    pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
     /// Maximum size of a request
     /// Default: `1 MiB`
@@ -187,6 +238,8 @@ pub fn build_consensus_config(
         enabled: consensus_enabled,
         value_payload: consensus::VALUE_PAYLOAD,
         queue_capacity: consensus::QUEUE_CAPACITY,
+        queue_per_height_capacity: consensus::QUEUE_PER_HEIGHT_CAPACITY,
+        wal_replay_delay: consensus::WAL_REPLAY_DELAY,
         p2p: P2pConfig {
             listen_addr,
             persistent_peers,
@@ -252,7 +305,6 @@ pub fn build_remote_signing_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use malachitebft_app_channel::app::config::PubSubProtocol;
 
     #[test]
     fn generate_gossipsub_config_uses_defaults() {
@@ -289,6 +341,11 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.value_payload, consensus::VALUE_PAYLOAD);
         assert_eq!(config.queue_capacity, consensus::QUEUE_CAPACITY);
+        assert_eq!(
+            config.queue_per_height_capacity,
+            consensus::QUEUE_PER_HEIGHT_CAPACITY
+        );
+        assert_eq!(config.wal_replay_delay, consensus::WAL_REPLAY_DELAY);
         assert_eq!(config.p2p.listen_addr, listen_addr);
         assert_eq!(config.p2p.persistent_peers, persistent_peers);
     }
@@ -495,6 +552,8 @@ mod tests {
         // Verify consensus constants
         assert_eq!(consensus::VALUE_PAYLOAD, ValuePayload::ProposalAndParts);
         assert_eq!(consensus::QUEUE_CAPACITY, 16);
+        assert_eq!(consensus::QUEUE_PER_HEIGHT_CAPACITY, 500);
+        assert_eq!(consensus::WAL_REPLAY_DELAY, Duration::from_secs(5));
 
         // Verify discovery constants
         assert_eq!(discovery::BOOTSTRAP_PROTOCOL, BootstrapProtocol::Full);
@@ -506,5 +565,45 @@ mod tests {
 
         // Verify remote signing constants
         assert_eq!(remote_signing::TIMEOUT, Duration::from_secs(30));
+    }
+
+    fn expected_arc_v1_names() -> ProtocolNames {
+        ProtocolNames {
+            consensus: "/arc/consensus/v1".to_string(),
+            discovery_kad: "/arc/discovery/kad/v1".to_string(),
+            discovery_regres: "/arc/discovery/req-res/v1".to_string(),
+            sync: "/arc/sync/v1".to_string(),
+            validator_proof: "/arc/validator-proof/v1".to_string(),
+        }
+    }
+
+    #[test]
+    fn protocol_names_mainnet_uses_arc_brand() {
+        assert_eq!(
+            consensus::p2p::protocol_names(ChainId::Mainnet),
+            expected_arc_v1_names(),
+        );
+    }
+
+    #[test]
+    fn protocol_names_non_mainnet_uses_malachite_defaults() {
+        for chain_id in [ChainId::Testnet, ChainId::Devnet, ChainId::Localdev] {
+            assert_eq!(
+                consensus::p2p::protocol_names(chain_id),
+                ProtocolNames::default(),
+                "expected Malachite defaults for {chain_id:?}",
+            );
+        }
+    }
+
+    // Tripwire: our inlined Malachite defaults must match upstream. If Malachite
+    // bumps its defaults, this fails and forces a conscious decision about whether
+    // non-mainnet chains follow the bump or stay pinned to the inlined strings.
+    #[test]
+    fn inlined_malachite_defaults_match_upstream() {
+        assert_eq!(
+            consensus::p2p::protocol_names_malachite_defaults(),
+            ProtocolNames::default(),
+        );
     }
 }

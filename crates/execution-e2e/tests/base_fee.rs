@@ -28,6 +28,7 @@ use arc_execution_e2e::{
     Action, ArcEnvironment, ArcSetup,
 };
 use eyre::Result;
+use reth_chainspec::ForkCondition;
 
 // ADR-0004 encodes the next block's required base fee in parent's `extra_data` (8 bytes).
 // Two independent checks enforce this on every new block:
@@ -144,9 +145,9 @@ async fn test_base_fee_absolute_bounds_enforced_only_after_zero5() -> Result<()>
 
     // Zero5 not yet active: the bounds check is skipped — "block base fee mismatch" must not appear.
     let pre_zero5_spec = localdev_with_hardforks(&[
-        (ArcHardfork::Zero3, 0),
-        (ArcHardfork::Zero4, 0),
-        (ArcHardfork::Zero5, 10),
+        (ArcHardfork::Zero3, ForkCondition::Block(0)),
+        (ArcHardfork::Zero4, ForkCondition::Block(0)),
+        (ArcHardfork::Zero5, ForkCondition::Block(10)),
     ]);
     let status =
         submit_with_base_fee(ArcSetup::new().with_chain_spec(pre_zero5_spec), U256::ZERO).await?;

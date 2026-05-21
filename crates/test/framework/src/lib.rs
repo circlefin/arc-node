@@ -69,6 +69,11 @@ impl NodeId {
     pub const fn new(id: usize) -> Self {
         Self(id)
     }
+
+    /// Convert the node identifier to a usize.
+    pub const fn as_usize(self) -> usize {
+        self.0
+    }
 }
 
 impl fmt::Display for NodeId {

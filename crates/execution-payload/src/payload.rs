@@ -21,7 +21,6 @@
 //! Panics during individual transaction execution are caught inline in
 //! `arc_ethereum_payload` and converted to `UnprocessableTransactionError`.
 
-use alloy_consensus::Transaction;
 use alloy_primitives::U256;
 use alloy_primitives::{hex, TxHash};
 use alloy_rlp::Encodable;
@@ -475,6 +474,21 @@ where
     }
 }
 
+/// Proposer revenue contributed by a single transaction on Arc.
+///
+/// On Arc, Proposer revenue equals `effective_gas_price * gas_used`, not
+/// `effective_tip_per_gas * gas_used` (the upstream-reth formula, which
+/// assumes base fees are burned).
+fn proposer_revenue<T: alloy_consensus::Transaction>(tx: &T, gas_used: u64, base_fee: u64) -> U256 {
+    let effective_gas_price = tx.effective_gas_price(Some(base_fee));
+    // u128 * u64 fits in U256 (max 192 bits);
+    // bounded by block_gas_limit * max_fee_per_gas.
+    #[allow(clippy::arithmetic_side_effects)]
+    {
+        U256::from(effective_gas_price) * U256::from(gas_used)
+    }
+}
+
 /// Constructs an transaction payload using the best transactions from the pool.
 /// It follows the upstream Ethereum payload building logic with a Arc-specific deadline for the main loop.
 ///
@@ -657,14 +671,9 @@ where
 
         block_transactions_rlp_length = block_transactions_rlp_length.saturating_add(tx_rlp_len);
 
-        // update and add to total fees
-        let miner_fee = tx
-            .effective_tip_per_gas(base_fee)
-            .expect("fee is always valid; execution succeeded");
-        // u128 * u64 fits in U256 (max 192 bits); total_fees is bounded by block gas limit * max fee.
         #[allow(clippy::arithmetic_side_effects)]
         {
-            total_fees += U256::from(miner_fee) * U256::from(gas_used);
+            total_fees += proposer_revenue(tx.inner(), gas_used, base_fee);
         }
         cumulative_gas_used = cumulative_gas_used
             .checked_add(gas_used)
@@ -1117,5 +1126,106 @@ mod tests {
             Some(InvalidTxList::new(16)),
         );
         let _ = builder.build_empty_payload(empty_payload_config());
+    }
+
+    // --- Regression tests for `proposer_revenue` ---
+    //
+    // Arc redirects base fees to the beneficiary instead of burning them (see
+    // `ArcEvmHandler::reward_beneficiary`), so proposer revenue must be
+    // computed from `effective_gas_price`, not `effective_tip_per_gas`. These
+    // tests pin that formula against a reth bump accidentally reintroducing
+    // the upstream tip-only pattern.
+    #[test]
+    fn proposer_revenue_dynamic_fee_tx_includes_base_fee_plus_tip() {
+        use alloy_consensus::TxEip1559;
+        use alloy_primitives::{Address, TxKind};
+
+        let base_fee: u64 = 100;
+        let priority_fee: u128 = 50;
+        let max_fee: u128 = 200;
+        let gas_used: u64 = 21_000;
+
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: priority_fee,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Default::default(),
+        };
+
+        // effective_gas_price = min(max_fee, base_fee + priority_fee) = 150
+        let expected = U256::from(150u128) * U256::from(gas_used);
+        assert_eq!(proposer_revenue(&tx, gas_used, base_fee), expected);
+
+        // Regression guard: full fee is strictly more than tip-only. If a reth
+        // bump reintroduces `effective_tip_per_gas`, this assert fails.
+        let tip_only = U256::from(priority_fee) * U256::from(gas_used);
+        assert!(proposer_revenue(&tx, gas_used, base_fee) > tip_only);
+
+        // Zero-tip trip-wire: proposer revenue is `base_fee * gas_used`, not 0.
+        // `effective_tip_per_gas` would return 0 here.
+        let zero_tip_tx = TxEip1559 {
+            max_priority_fee_per_gas: 0,
+            ..tx
+        };
+        assert_eq!(
+            proposer_revenue(&zero_tip_tx, gas_used, base_fee),
+            U256::from(base_fee) * U256::from(gas_used),
+        );
+    }
+
+    #[test]
+    fn proposer_revenue_dynamic_fee_tx_capped_at_max_fee() {
+        use alloy_consensus::TxEip1559;
+        use alloy_primitives::{Address, TxKind};
+
+        let base_fee: u64 = 100;
+        let priority_fee: u128 = 200; // base + tip would exceed max
+        let max_fee: u128 = 250;
+        let gas_used: u64 = 21_000;
+
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: priority_fee,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Default::default(),
+        };
+
+        // effective_gas_price = min(250, 100 + 200) = 250
+        let expected = U256::from(max_fee) * U256::from(gas_used);
+        assert_eq!(proposer_revenue(&tx, gas_used, base_fee), expected);
+    }
+
+    #[test]
+    fn proposer_revenue_legacy_equals_gas_price_times_gas() {
+        use alloy_consensus::TxLegacy;
+        use alloy_primitives::{Address, TxKind};
+
+        let gas_price: u128 = 75;
+        let gas_used: u64 = 21_000;
+        // Base fee is irrelevant for legacy txs.
+        let base_fee: u64 = 100;
+
+        let tx = TxLegacy {
+            chain_id: Some(1),
+            nonce: 0,
+            gas_price,
+            gas_limit: 100_000,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: Default::default(),
+        };
+
+        let expected = U256::from(gas_price) * U256::from(gas_used);
+        assert_eq!(proposer_revenue(&tx, gas_used, base_fee), expected);
     }
 }

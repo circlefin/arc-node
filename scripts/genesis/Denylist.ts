@@ -19,6 +19,7 @@ import {
   addressToBytes32,
   buildImplContractAlloc,
   buildSystemContractAlloc,
+  enforceOperatorsNotProxyAdmin,
   schemaAddress,
   slotForAddressMap,
   slotIndex,
@@ -27,10 +28,10 @@ import {
 } from './types'
 import { BuilderContext } from './context'
 import { AdminUpgradeableProxy, schemaAdminProxy, schemaAdminProxyImpl, setInitializers } from './AdminUpgradeableProxy'
-import { denylistAddress } from './addresses'
+import { denylistAddressByNetwork } from './addresses'
 import { DENYLIST_VERSION } from './versions'
 
-const DEFAULT_PROXY_ADDRESS = denylistAddress
+const DEFAULT_PROXY_ADDRESS = denylistAddressByNetwork.localdev
 const DEFAULT_IMPL_CONTRACT = 'Denylist'
 
 // ERC-7201 Storage: arc.storage.Denylist.v1
@@ -55,6 +56,12 @@ export const schemaDenylist = z
     denylisters: z.array(schemaAddress).optional(),
   })
   .strict()
+  .superRefine((data, ctx) => {
+    enforceOperatorsNotProxyAdmin(ctx, 'Denylist', data.proxy.admin, [
+      { key: 'owner', value: data.owner },
+      ...(data.denylisters ?? []).map((d, i) => ({ key: `denylisters[${i}]`, value: d })),
+    ])
+  })
 
 export type DenylistConfig = z.infer<typeof schemaDenylist>
 

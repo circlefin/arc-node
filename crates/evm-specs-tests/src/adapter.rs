@@ -132,10 +132,9 @@ pub fn build_evm_env(
     chain_id: u64,
 ) -> Result<EvmEnv, EvmSpecsTestError> {
     let spec_id = spec_name.to_spec_id();
-    let mut cfg = CfgEnv::default();
+    let mut cfg = CfgEnv::new().with_spec_and_mainnet_gas_params(spec_id);
 
     cfg.chain_id = chain_id;
-    cfg.spec = spec_id;
 
     let block = unit.block_env(&mut cfg);
 
@@ -293,6 +292,31 @@ mod tests {
         assert_eq!(env.cfg_env.chain_id, 5042);
         assert_eq!(env.cfg_env.spec, SpecId::PRAGUE);
         assert_eq!(env.block_env.number.to::<u64>(), 1);
+    }
+
+    #[test]
+    fn build_evm_env_gas_params_track_spec_across_forks() {
+        let unit = unit_with_chain_id(Some(U256::from(1)));
+
+        let frontier = build_evm_env(&unit, &SpecName::Frontier, 1).expect("frontier env builds");
+        let istanbul = build_evm_env(&unit, &SpecName::Istanbul, 1).expect("istanbul env builds");
+        let prague = build_evm_env(&unit, &SpecName::Prague, 1).expect("prague env builds");
+
+        assert_eq!(frontier.cfg_env.spec, SpecId::FRONTIER);
+        assert_eq!(istanbul.cfg_env.spec, SpecId::ISTANBUL);
+        assert_eq!(prague.cfg_env.spec, SpecId::PRAGUE);
+
+        // Pre-fix bug: gas_params were stuck on the default (PRAGUE) regardless of
+        // requested spec, causing pre-Prague fixtures to bill modern SSTORE/SLOAD
+        // gas. The fix routes through with_spec_and_mainnet_gas_params so the table
+        // matches the spec.
+        assert_ne!(frontier.cfg_env.gas_params, prague.cfg_env.gas_params);
+        assert_ne!(istanbul.cfg_env.gas_params, prague.cfg_env.gas_params);
+
+        let reference_frontier = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::FRONTIER);
+        let reference_istanbul = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::ISTANBUL);
+        assert_eq!(frontier.cfg_env.gas_params, reference_frontier.gas_params);
+        assert_eq!(istanbul.cfg_env.gas_params, reference_istanbul.gas_params);
     }
 
     #[test]

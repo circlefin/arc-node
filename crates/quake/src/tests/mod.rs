@@ -75,12 +75,14 @@
 //! Tests are executed via the `quake test` command with glob pattern support:
 //!
 //! ## Basic Usage
-//! - `quake test` - Run all tests except excluded groups (`validation`, `health`)
+//! - `quake test` - Run all tests except excluded groups (`validation`, `health`, `validator_set`, `perf`)
 //! - `quake test probe` - Run all tests in the probe group
 //! - `quake test probe:connectivity` - Run a single test
 //! - `quake test probe:connectivity,sync` - Run multiple specific tests
 //! - `quake test validation:basic` - Run excluded groups explicitly
 //! - `quake test health:stability` - Run excluded groups explicitly
+//! - `quake test validator_set:malformed_key_skipped` - Run excluded groups explicitly
+//! - `quake test perf:block_time` - Run excluded groups explicitly
 //! - `quake test --dry-run` - List all available test groups and tests
 //! - `quake test probe --dry-run` - List tests in a specific group
 //!
@@ -123,6 +125,7 @@ pub(crate) mod snapshot;
 // Test modules - must come after type definitions so they can use them
 pub(crate) mod arc_node;
 mod health;
+mod malformed_validator;
 mod mempool;
 pub(crate) mod mesh;
 mod mev;
@@ -241,14 +244,19 @@ pub(crate) async fn run_tests(
     // Match test specifications using glob patterns
     let mut matched_tests = match_test_specs(&registry, &group_pattern, test_patterns)?;
 
-    // Exclude flaky / strict groups from the default (empty spec) run.
+    // Exclude flaky / strict / state-mutating groups from the default (empty spec) run.
     // - `validation`: generates load that leaves pending txs, elevated metrics
     // - `health`: assertions (e.g. sync_fell_behind == 0) are too strict for CI
-    // Run explicitly: `quake test validation:basic`, `quake test health:stability`
+    // - `validator_set`: mutates persistent on-chain state (registers extra validators)
+    // - `perf`: thresholds are too tight for shared CI runners; run via nightly-perf workflow
+    // Run explicitly: `quake test validation:basic`, `quake test health:stability`,
+    // `quake test validator_set:malformed_key_skipped`, `quake test perf:block_time`
     // NOTE: update module-level doc comments (Basic Usage / Glob Pattern) if changing exclusions.
     if spec.is_empty() {
         matched_tests.remove("validation");
         matched_tests.remove("health");
+        matched_tests.remove("validator_set");
+        matched_tests.remove("perf");
     }
 
     // If dry-run, just list the tests
