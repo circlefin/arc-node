@@ -88,7 +88,7 @@ jobs:
           tool: nextest
 
       - name: Run unit tests
-        run: cargo nextest run --locked --workspace
+        run: cargo nextest run --locked --workspace --exclude arc-test-integration
 
   rust-integration-test:
     name: Rust Integration Tests
@@ -129,11 +129,14 @@ jobs:
         with:
           tool: nextest
 
+      - name: Run node integration tests
+        run: cargo nextest run --locked -p arc-test-integration --test-threads 1
+
       - name: Start integration services
         run: make up
 
       - name: Run integration tests
-        run: cargo nextest run --locked --workspace --features integration
+        run: cargo nextest run --locked --workspace --exclude arc-test-integration --features integration
 
   # ---------------------------------------------------------------------------
   # Protocol Buffers (standalone, no deps)
