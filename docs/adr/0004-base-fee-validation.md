@@ -17,7 +17,7 @@ The value of 1) is that it is familiar and well-understood. The value of 2) is t
 
 The combination of these makes it challenging for integrators to precisely understand the next block base fee as the calculation is more involved. To address this, Arc includes the next block base fee in the header, computed at the end of the parent's block execution, since it is fully known at that point. 
 
-Currently, the implementation has several gaps in validation. This ADR, similar to ADR-003, seeks to document solutions to these gaps.
+Currently, the implementation has several gaps in validation. This ADR, similar to ADR-0003, seeks to document solutions to these gaps.
 
 ### Gap 1: No validation of the base fee computation
 
