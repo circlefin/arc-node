@@ -1,6 +1,6 @@
 # CCTP V2 Integration Guide for Arc
 
-  This guide documents Arc-specific behaviors when integrating [Circle's Cross-Chain Transfer Protocol V2 (CCTP V2)](https://developers.circle.com/stablecoins/cctp-getting-started). These findings come from building and testing against the live Arc testnet and are not fully covered in Circle's general CCTP documentation.
+  This guide documents Arc-specific behaviors when integrating [Circle's Cross-Chain Transfer Protocol V2 (CCTP V2)](https://developers.circle.com/stablecoins/cctp-getting-started). These findings come from building and testing a production bridge dapp against the live Arc testnet and are not fully covered in Circle's general CCTP documentation.
 
   ---
 
@@ -16,12 +16,13 @@
   | `minFinalityThreshold` | `2000` (finalized) |
   | Message length | 376 bytes |
   | Attestation time | ~1–3 minutes |
+  | Recommended gas limit | 600,000 (see §Gas Estimation Bug) |
 
   ---
 
   ## Critical: Always Use the V2 `depositForBurn` Selector
 
-  Arc's TokenMessenger **only** supports the 7-parameter CCTP V2 variant of `depositForBurn`. The V1 4-parameter variant will revert.
+  Arc's TokenMessenger **only** supports the 7-parameter CCTP V2 variant of `depositForBurn`. The V1 4-parameter variant will revert silently.
 
   ### V2 (correct) — selector `0x8e0250ee`
 
@@ -96,9 +97,97 @@
 
   ---
 
-  ## minFinalityThreshold
+  ## ⚠️ Known Bug: eth_estimateGas Unreliable on Arc Testnet
 
-  The `minFinalityThreshold` parameter controls when Circle will issue an attestation after a burn.
+  **`eth_estimateGas` consistently fails or returns incorrect values for all USDC write transactions on Arc Testnet.** This affects ERC-20 `approve`, ERC-20 `transfer`, `depositForBurn`, and `receiveMessage`.
+
+  ### Observed errors (without explicit gas limit)
+
+  ```
+  Error: missing revert data
+  Error: could not estimate gas; transaction may fail or may require manual gas limit
+  Error: execution reverted (no reason string)
+  ```
+
+  ### Root cause hypothesis
+
+  Arc's USDC-as-gas model may cause the EVM's gas simulation to incorrectly predict reverts when it cannot account for the ERC-20 gas token balance check. The transactions themselves succeed on-chain when submitted with a fixed gas limit.
+
+  ### Workaround — always provide an explicit gasLimit
+
+  ```typescript
+  const tx = await contract.someMethod(args, { gasLimit: 600_000n });
+  ```
+
+  600,000 is comfortably above actual gas usage (typically 50,000–150,000 for CCTP ops) and is safe to hard-code until gas estimation is fixed. This issue has been reported in [arc-node#80](https://github.com/circlefin/arc-node/issues/80).
+
+  ---
+
+  ## ⚠️ Known Issue: RPC Endpoint Reliability
+
+  Two public testnet RPC endpoints are available, with significantly different reliability for transaction submission:
+
+  | Endpoint | Read calls | `eth_sendRawTransaction` |
+  |---|---|---|
+  | `https://rpc.drpc.testnet.arc.network` | ✅ Reliable | ✅ Reliable |
+  | `https://rpc.testnet.arc.network` | ✅ Reliable | ⚠️ Intermittently fails with `"error sending request"` |
+
+  **Use `rpc.drpc.testnet.arc.network` as your primary endpoint**, with `rpc.testnet.arc.network` as a fallback. The unreliable forwarding behaviour of the second endpoint is related to [arc-node#59](https://github.com/circlefin/arc-node/issues/59).
+
+  ```typescript
+  // Recommended RPC config for Arc Testnet
+  const RPC_PRIMARY  = "https://rpc.drpc.testnet.arc.network";
+  const RPC_FALLBACK = "https://rpc.testnet.arc.network";
+  ```
+
+  ---
+
+  ## ⚠️ Known Issue: ethers.js BrowserProvider + Chain Switch
+
+  When building a cross-chain dapp that switches the user's wallet between Arc and another chain (e.g. Arc → Sepolia for the mint step), **ethers v6 `BrowserProvider` can throw `"underlying network changed"` during `tx.wait()`** — even when the transaction was already confirmed on-chain.
+
+  ### Why this happens
+
+  After MetaMask switches chains, ethers v6 detects the network change and aborts any in-flight receipt polling with a "network changed" error. This is a false negative — the transaction succeeded, but the dapp sees an error.
+
+  ### Workaround — retry with a static provider
+
+  After catching a network-flavoured error from `tx.wait()`, retry by fetching the receipt via a `JsonRpcProvider` (static, independent of MetaMask):
+
+  ```typescript
+  async function waitWithRetry(
+    tx: ethers.TransactionResponse,
+    rpcUrls: string[],
+    retries = 4
+  ): Promise<ethers.TransactionReceipt> {
+    const isNetworkErr = (e: unknown) =>
+      /(network|could not detect|connection|timeout)/i.test(
+        e instanceof Error ? e.message : String(e)
+      );
+
+    for (let i = 0; i <= retries; i++) {
+      try {
+        const receipt = await tx.wait();
+        if (receipt) return receipt;
+      } catch (err) {
+        if (!isNetworkErr(err) || i === retries) throw err;
+      }
+      await new Promise(r => setTimeout(r, 4000));
+      for (const url of rpcUrls) {
+        try {
+          const receipt = await new ethers.JsonRpcProvider(url)
+            .getTransactionReceipt(tx.hash);
+          if (receipt) return receipt;
+        } catch { /* try next */ }
+      }
+    }
+    throw new Error("Transaction not confirmed after retries");
+  }
+  ```
+
+  ---
+
+  ## minFinalityThreshold
 
   | Chain | Recommended value | Meaning |
   |---|---|---|
@@ -107,25 +196,40 @@
   | Base Sepolia | `1000` | Safe finality |
   | Avalanche Fuji | `1000` | Safe finality |
 
-  Using `1000` on Arc works but may result in longer attestation waits. Using `2000` is recommended for Arc-originated burns.
+  Using `1000` on Arc works but may result in longer attestation waits. `2000` (finalized) is recommended for Arc-originated burns.
 
   ---
 
   ## USDC Decimals
 
-  Arc's native USDC at `0x3600000000000000000000000000000000000000` is a system address with a special dual-decimal representation:
+  Arc's native USDC at `0x3600000000000000000000000000000000000000` has a dual-decimal representation:
 
   - **18 decimals** — used internally for gas accounting
   - **6 decimals** — exposed via the standard ERC-20 interface (`decimals()` returns 6)
 
-  **Always use the ERC-20 interface with 6 decimals** for all token operations (approve, transfer, balance queries). Using 18 decimals will result in 10^12x over/underestimates.
+  **Always use the ERC-20 interface with 6 decimals** for all token operations.
 
   ```typescript
-  // ✅ Correct — use 6 decimals via ERC-20 interface
+  // ✅ Correct
   const amount = ethers.parseUnits("10.00", 6); // 10 USDC = 10_000_000n
 
-  // ❌ Wrong — do not use 18 decimals
+  // ❌ Wrong
   const amount = ethers.parseUnits("10.00", 18);
+  ```
+
+  ---
+
+  ## Block Explorer
+
+  The canonical Arc Testnet block explorer is **[testnet.arcscan.app](https://testnet.arcscan.app)**.
+
+  Transaction URL format: `https://testnet.arcscan.app/tx/{txHash}`
+
+  > ⚠️ `explorer.testnet.arc.network` and `explorer.arc.io` are both dead. See [arc-node#81](https://github.com/circlefin/arc-node/issues/81).
+
+  When adding Arc Testnet to MetaMask via `wallet_addEthereumChain`, use:
+  ```typescript
+  blockExplorerUrls: ["https://testnet.arcscan.app"]
   ```
 
   ---
@@ -138,35 +242,13 @@
   GET https://iris-api-sandbox.circle.com/v1/attestations/{messageHash}
   ```
 
-  Where `messageHash` is `keccak256(messageBytes)` from the `MessageSent` event.
-
-  Expected response when ready:
-
-  ```json
-  {
-    "attestation": "0x...",
-    "status": "complete"
-  }
-  ```
+  Where `messageHash = keccak256(messageBytes)` from the `MessageSent` event.
 
   **Timing:**
-  - Arc → other chains: ~1–3 minutes
-  - Other chains → Arc: ~2–5 minutes
+  - Arc → other chains: ~1–3 minutes (finalized finality)
+  - Other chains → Arc: ~2–5 minutes (safe finality)
 
-  Poll every 5 seconds. If the attestation is not ready within 20 minutes, the burn may not have been indexed — verify the transaction was confirmed on-chain first.
-
-  ---
-
-  ## Gas on Arc
-
-  Arc uses USDC as its native gas token. When estimating gas for `depositForBurn` or `receiveMessage` calls on Arc, use a higher gas limit than you might expect:
-
-  ```typescript
-  // Recommended gas limit for Arc write transactions
-  const gasLimit = 600_000n;
-  ```
-
-  Standard EVM gas estimation (`eth_estimateGas`) may underestimate on Arc due to the USDC-as-gas mechanics. Setting an explicit override prevents out-of-gas reverts.
+  Poll every 5 seconds for up to 20 minutes. If the attestation is not ready, verify the burn transaction was confirmed on-chain first.
 
   ---
 
@@ -176,34 +258,31 @@
   import { ethers } from "ethers";
 
   const TOKEN_MESSENGER = "0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA";
-  const ARC_DOMAIN = 26;
-  const ARC_USDC   = "0x3600000000000000000000000000000000000000";
+  const ARC_USDC        = "0x3600000000000000000000000000000000000000";
 
   async function burnOnArc(
     signer: ethers.Signer,
-    amount: bigint,          // in 6-decimal units
+    amount: bigint,           // 6-decimal units
     destinationDomain: number,
-    mintRecipient: string    // EVM address of recipient
+    mintRecipient: string     // EVM address
   ) {
     const messenger = new ethers.Contract(TOKEN_MESSENGER, [
       "function depositForBurn(uint256,uint32,bytes32,address,bytes32,uint256,uint32) returns (uint64)"
     ], signer);
 
-    const recipientBytes32 = ethers.zeroPadValue(mintRecipient, 32);
-
+    // Note: always provide explicit gasLimit — eth_estimateGas is unreliable on Arc
     const tx = await messenger.depositForBurn(
       amount,
       destinationDomain,
-      recipientBytes32,
+      ethers.zeroPadValue(mintRecipient, 32),
       ARC_USDC,
-      ethers.ZeroHash,  // destinationCaller = bytes32(0) = permissionless
-      0n,               // maxFee = 0
-      2000,             // minFinalityThreshold (Arc-originated burns)
+      ethers.ZeroHash, // destinationCaller = anyone may relay
+      0n,              // maxFee
+      2000,            // minFinalityThreshold (Arc: finalized)
       { gasLimit: 600_000n }
     );
 
-    const receipt = await tx.wait();
-    return receipt;
+    return tx.wait();
   }
   ```
 
@@ -216,4 +295,6 @@
   - [Arc Testnet Explorer](https://testnet.arcscan.app)
   - [Circle Iris API (sandbox)](https://iris-api-sandbox.circle.com)
   - [Circle Faucet](https://faucet.circle.com)
+  - [arc-node#80](https://github.com/circlefin/arc-node/issues/80) — eth_estimateGas bug report
+  - [arc-node#81](https://github.com/circlefin/arc-node/issues/81) — Dead explorer URLs report
   
