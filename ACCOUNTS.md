@@ -84,6 +84,19 @@ These accounts are compatible with:
 - ✅ MetaMask
 - ✅ Most Ethereum development tools
 
+## 🔗 Arc Network Chain IDs
+
+When connecting to Arc networks, use the following chain IDs:
+
+| Network | Chain ID | Purpose |
+|---------|----------|---------|
+| Local Dev (`arc-localdev`) | `1337` | Local development and testing |
+| Devnet (`arc-devnet`) | `5042001` | Arc development network |
+| Testnet (`arc-testnet`) | `5042002` | Public Arc testnet |
+| Mainnet (`arc-mainnet`) | `5042` | Arc production mainnet |
+
+These chain IDs are defined in the genesis configuration files under `assets/{network}/genesis.config.ts`.
+
 ## 📚 References
 
 - [Hardhat Network Configuration](https://hardhat.org/hardhat-network/docs/overview)
