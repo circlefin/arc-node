@@ -25,8 +25,9 @@ mod helpers;
 use alloy_primitives::{address, U256};
 use arc_execution_e2e::{
     actions::{
-        AssertBalance, AssertNamedBalance, AssertTransferEvent, AssertTxIncluded, AssertTxLogs,
-        AssertTxTrace, ProduceBlocks, SendTransaction, StoreDeployedAddress, TxStatus,
+        AssertBalance, AssertLastOpcodeGasCost, AssertNamedBalance, AssertTransferEvent,
+        AssertTxIncluded, AssertTxLogs, AssertTxTrace, ProduceBlocks, SendTransaction,
+        StoreDeployedAddress, TxStatus,
     },
     ArcSetup, ArcTestBuilder,
 };
@@ -397,6 +398,97 @@ async fn test_create_revert_with_endowment_no_log() {
         .run()
         .await
         .expect("test_create_revert_with_endowment_no_log failed");
+}
+
+/// Test: successful CREATE2 with value leaves the created address warm.
+///
+/// The probe contract funds a CREATE2 child with 1 wei and immediately executes
+/// BALANCE on the precomputed created address passed in calldata. A successful
+/// CREATE2 warms the child through revm's create handler, so that BALANCE costs
+/// 100 gas.
+#[tokio::test]
+async fn test_create2_with_value_balance_probe_is_warm_after_successful_create() {
+    reth_tracing::init_test_tracing();
+
+    let deploy_code = helpers::contracts::create2_with_balance_probe();
+    let endowment = U256::from(1);
+
+    ArcTestBuilder::new()
+        .with_setup(ArcSetup::new())
+        .with_action(
+            SendTransaction::new("deploy_probe")
+                .with_create()
+                .with_data(deploy_code)
+                .with_value(endowment)
+                .with_gas_limit(200_000),
+        )
+        .with_action(ProduceBlocks::new(1))
+        .with_action(AssertTxIncluded::new("deploy_probe").expect(TxStatus::Success))
+        .with_action(StoreDeployedAddress::new("deploy_probe"))
+        .with_action(
+            SendTransaction::new("run_probe")
+                .with_to_named("deploy_probe_address")
+                .with_value(U256::ZERO)
+                .with_data_fn(|env| {
+                    let probe = *env.get_address("deploy_probe_address").ok_or_else(|| {
+                        eyre::eyre!("Named address 'deploy_probe_address' not found")
+                    })?;
+                    Ok(helpers::contracts::create2_balance_probe_calldata(probe))
+                })
+                .with_gas_limit(200_000),
+        )
+        .with_action(ProduceBlocks::new(1))
+        .with_action(AssertTxIncluded::new("run_probe").expect(TxStatus::Success))
+        .with_action(AssertLastOpcodeGasCost::new("run_probe", "BALANCE", 100))
+        .run()
+        .await
+        .expect("test_create2_with_value_balance_probe_is_warm_after_successful_create failed");
+}
+
+/// Test: out-of-funds CREATE2 with value does not warm the would-be created
+/// address via Arc's selfdestruct-target probe.
+///
+/// The probe has zero balance, so its CREATE2(value=1) fails before revm's
+/// create handler warms the derived child address. The probe then checks BALANCE
+/// for that precomputed address in the same frame. Under Zero7, Arc's
+/// selfdestruct-target check is checkpointed, so BALANCE remains cold and costs
+/// 2600 gas.
+#[tokio::test]
+async fn test_create2_out_of_funds_keeps_balance_probe_cold() {
+    reth_tracing::init_test_tracing();
+
+    let deploy_code = helpers::contracts::create2_with_balance_probe();
+
+    ArcTestBuilder::new()
+        .with_setup(ArcSetup::new())
+        .with_action(
+            SendTransaction::new("deploy_probe")
+                .with_create()
+                .with_data(deploy_code)
+                .with_value(U256::ZERO)
+                .with_gas_limit(200_000),
+        )
+        .with_action(ProduceBlocks::new(1))
+        .with_action(AssertTxIncluded::new("deploy_probe").expect(TxStatus::Success))
+        .with_action(StoreDeployedAddress::new("deploy_probe"))
+        .with_action(
+            SendTransaction::new("run_probe")
+                .with_to_named("deploy_probe_address")
+                .with_value(U256::ZERO)
+                .with_data_fn(|env| {
+                    let probe = *env.get_address("deploy_probe_address").ok_or_else(|| {
+                        eyre::eyre!("Named address 'deploy_probe_address' not found")
+                    })?;
+                    Ok(helpers::contracts::create2_balance_probe_calldata(probe))
+                })
+                .with_gas_limit(200_000),
+        )
+        .with_action(ProduceBlocks::new(1))
+        .with_action(AssertTxIncluded::new("run_probe").expect(TxStatus::Success))
+        .with_action(AssertLastOpcodeGasCost::new("run_probe", "BALANCE", 2600))
+        .run()
+        .await
+        .expect("test_create2_out_of_funds_keeps_balance_probe_cold failed");
 }
 
 // ===== SELFDESTRUCT (#11-18) =====

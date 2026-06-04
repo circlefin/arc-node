@@ -68,7 +68,7 @@ pub async fn handle(
 
     let address = state.address();
     let fee_recipient = state.fee_recipient();
-    let stream_id = state.next_stream_id();
+    let stream_id = state.next_stream_id(height, round);
     let previous_block = state.previous_block.as_ref();
     let signing_provider = state.signing_provider();
 

@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Validator proof creation and verification (ADR-006).
+//! Validator proof creation and verification.
 //!
 //! A validator proof binds a consensus public key to a libp2p peer ID,
 //! proving that the validator controls both keys. This prevents identity

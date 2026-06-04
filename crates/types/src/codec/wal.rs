@@ -17,9 +17,12 @@
 //! WAL codec
 
 use malachitebft_core_consensus::{ProposedValue, SignedConsensusMsg};
+use malachitebft_core_types::PolkaCertificate;
 
 use crate::codec::impl_versioned_codec;
-use crate::codec::versions::{ProposedValueVersion, SignedConsensusMsgVersion};
+use crate::codec::versions::{
+    PolkaCertificateVersion, ProposedValueVersion, SignedConsensusMsgVersion,
+};
 use crate::ArcContext;
 
 #[derive(Copy, Clone, Debug)]
@@ -37,6 +40,12 @@ impl_versioned_codec!(
     ProposedValueVersion,
     ProposedValueVersion::V1
 );
+impl_versioned_codec!(
+    WalCodec,
+    PolkaCertificate<ArcContext>,
+    PolkaCertificateVersion,
+    PolkaCertificateVersion::V1
+);
 
 #[cfg(test)]
 mod tests {
@@ -45,12 +54,13 @@ mod tests {
     use malachitebft_codec::Codec;
     use malachitebft_core_consensus::SignedConsensusMsg;
     use malachitebft_core_types::{
-        NilOrVal, Proposal as _, Round, SignedVote, Validity, Vote as _,
+        NilOrVal, PolkaCertificate, PolkaSignature, Proposal as _, Round, SignedVote, Validity,
+        Vote as _,
     };
 
     use crate::codec::error::CodecError;
     use crate::codec::proto::ProtobufCodec;
-    use crate::{signing::Signature, Address, BlockHash, Height, Value, Vote};
+    use crate::{signing::Signature, Address, BlockHash, Height, Value, ValueId, Vote};
 
     use alloy_primitives::Address as AlloyAddress;
 
@@ -90,6 +100,25 @@ mod tests {
             proposer: Address::from(AlloyAddress::from([5u8; 20])),
             value: Value::new(BlockHash::from([0xb; 32])),
             validity: Validity::Valid,
+        }
+    }
+
+    // Helper function to create a test PolkaCertificate
+    fn create_test_polka_certificate() -> PolkaCertificate<ArcContext> {
+        PolkaCertificate {
+            height: Height::new(7),
+            round: Round::new(3),
+            value_id: ValueId::from(BlockHash::from([0xc; 32])),
+            polka_signatures: vec![
+                PolkaSignature::new(
+                    Address::from(AlloyAddress::from([6u8; 20])),
+                    Signature::from_bytes([44u8; 64]),
+                ),
+                PolkaSignature::new(
+                    Address::from(AlloyAddress::from([7u8; 20])),
+                    Signature::from_bytes([45u8; 64]),
+                ),
+            ],
         }
     }
 
@@ -154,6 +183,21 @@ mod tests {
         assert_eq!(value.proposer, decoded.proposer);
         assert_eq!(value.value, decoded.value);
         assert_eq!(value.validity, decoded.validity);
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip_polka_certificate() {
+        let cert = create_test_polka_certificate();
+        let codec = WalCodec;
+
+        let encoded = codec.encode(&cert).expect("Failed to encode");
+        let decoded: PolkaCertificate<ArcContext> =
+            codec.decode(encoded).expect("Failed to decode");
+
+        assert_eq!(cert.height, decoded.height);
+        assert_eq!(cert.round, decoded.round);
+        assert_eq!(cert.value_id, decoded.value_id);
+        assert_eq!(cert.polka_signatures, decoded.polka_signatures);
     }
 
     #[test]
@@ -259,6 +303,11 @@ mod tests {
         assert_eq!(msg, decoded);
 
         let msg = create_test_proposed_value();
+        let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
+        let decoded = codec.decode(encoded).expect("Failed to decode");
+        assert_eq!(msg, decoded);
+
+        let msg = create_test_polka_certificate();
         let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
         let decoded = codec.decode(encoded).expect("Failed to decode");
         assert_eq!(msg, decoded);

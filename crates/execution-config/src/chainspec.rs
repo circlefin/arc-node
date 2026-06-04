@@ -1066,7 +1066,7 @@ Post-merge hard forks (timestamp based):
         assert!(spec.is_osaka_active_at_timestamp(0));
         assert_eq!(spec.forks_iter().count(), 22);
 
-        // Mainnet launches at Zero6: Zero3..Zero6 active at block 0, Zero7 not.
+        // Mainnet launches at Zero6: Zero3..Zero6 active at block 0; Zero7 is not scheduled on mainnet.
         let flags = spec.get_hardfork_flags(0, 0);
         assert!(flags.is_active(ArcHardfork::Zero3));
         assert!(flags.is_active(ArcHardfork::Zero4));
@@ -1200,7 +1200,7 @@ Post-merge hard forks (timestamp based):
             "0x41c417868fee948f58602b01a84ce0ddb5ffe2184f7e9ab43b9c8d7e5eb47067",
             "the genesis hash of assets/devnet/genesis.json changed unexpectedly"
         );
-        assert_eq!(spec.forks_iter().count(), 22);
+        assert_eq!(spec.forks_iter().count(), 23);
         assert_arc_chainspec_evm_hardforks(&spec);
         assert!(!spec.is_osaka_active_at_timestamp(0));
         assert!(spec.is_osaka_active_at_timestamp(ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET));
@@ -1275,7 +1275,8 @@ Post-merge hard forks (timestamp based):
 - Shanghai                         @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Cancun                           @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Prague                           @0          blob: (target: 6, max: 9, fraction: 5007716)
-- Osaka                            @1775483400          blob: (target: 6, max: 9, fraction: 5007716)"#
+- Osaka                            @1775483400          blob: (target: 6, max: 9, fraction: 5007716)
+- Zero7                            @1780495200          blob: (target: 6, max: 9, fraction: 5007716)"#
         );
         assert_eq!(
             spec.fork(ArcHardfork::Zero3),
@@ -1309,7 +1310,7 @@ Post-merge hard forks (timestamp based):
         assert_arc_chainspec_evm_hardforks(&spec);
         assert!(!spec.is_osaka_active_at_timestamp(0));
         assert!(spec.is_osaka_active_at_timestamp(ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET));
-        assert_eq!(spec.forks_iter().count(), 22);
+        assert_eq!(spec.forks_iter().count(), 23);
 
         // Zero3
         let flags_before_zero3 =
@@ -1409,7 +1410,8 @@ Post-merge hard forks (timestamp based):
 - Prague                           @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Osaka                            @1779890400          blob: (target: 6, max: 9, fraction: 5007716)
 - Zero5                            @1779894517          blob: (target: 6, max: 9, fraction: 5007716)
-- Zero6                            @1779894517          blob: (target: 6, max: 9, fraction: 5007716)"#
+- Zero6                            @1779894517          blob: (target: 6, max: 9, fraction: 5007716)
+- Zero7                            @1781791200          blob: (target: 6, max: 9, fraction: 5007716)"#
         );
     }
 

@@ -73,6 +73,7 @@ use tracing::{error, info};
 
 use arc_consensus_types::{ArcContext, Config as ConsensusConfig};
 use arc_evm_node::node::{ArcNode, ArcRpcConfig};
+use arc_evm_node::ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT;
 use arc_execution_config::addresses_denylist::AddressesDenylistConfig;
 use arc_execution_config::chainspec::{localdev_with_block_gas_limit, ArcChainSpec, LOCAL_DEV};
 use arc_execution_txpool::InvalidTxListConfig;
@@ -715,7 +716,9 @@ async fn spawn_execution_layer(
         None,
         true,
         false,
+        false,
         160 * 1024 * 1024,
+        ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
         std::time::Duration::from_secs(0),
     );
 

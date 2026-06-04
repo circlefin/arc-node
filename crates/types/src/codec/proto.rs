@@ -365,6 +365,20 @@ impl Codec<ProposedValue<ArcContext>> for ProtobufCodec {
     }
 }
 
+impl Codec<PolkaCertificate<ArcContext>> for ProtobufCodec {
+    type Error = ProtoError;
+
+    fn decode(&self, bytes: Bytes) -> Result<PolkaCertificate<ArcContext>, Self::Error> {
+        let proto = proto::PolkaCertificate::decode(bytes.as_ref())?;
+        decode_polka_certificate(proto)
+    }
+
+    fn encode(&self, msg: &PolkaCertificate<ArcContext>) -> Result<Bytes, Self::Error> {
+        let proto = encode_polka_certificate(msg)?;
+        Ok(Bytes::from(proto.encode_to_vec()))
+    }
+}
+
 impl Codec<sync::Status<ArcContext>> for ProtobufCodec {
     type Error = ProtoError;
 
@@ -523,8 +537,6 @@ pub fn decode_synced_value(
     })
 }
 
-// NOTE: Will be used again in #997
-#[allow(dead_code)]
 pub(crate) fn encode_polka_certificate(
     polka_certificate: &PolkaCertificate<ArcContext>,
 ) -> Result<proto::PolkaCertificate, ProtoError> {
@@ -550,8 +562,6 @@ pub(crate) fn encode_polka_certificate(
     })
 }
 
-// NOTE: Will be used again in #997
-#[allow(dead_code)]
 pub(crate) fn decode_polka_certificate(
     certificate: proto::PolkaCertificate,
 ) -> Result<PolkaCertificate<ArcContext>, ProtoError> {

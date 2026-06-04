@@ -107,7 +107,6 @@ const localdevManager = new ProcessManager({
       `--http.port=${options.port ?? 8545}`,
       '--metrics=8080',
       '--rpc.txfeecap=1000',
-      '--invalid-tx-list-enable',
       '--arc.denylist.enabled',
     ]
     if (options.bin) {

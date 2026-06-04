@@ -155,7 +155,7 @@ pub struct StartCmd {
     /// Run as a validator node.
     ///
     /// When set, the node loads its consensus signing key,
-    /// signs a validator proof (ADR-006), and advertises a
+    /// signs a validator proof, and advertises a
     /// validator identity on the P2P network. Requires
     /// `--suggested-fee-recipient` so tips and rewards go to
     /// an explicit address rather than being silently burned.

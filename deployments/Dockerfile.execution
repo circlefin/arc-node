@@ -22,7 +22,7 @@ WORKDIR /src
 COPY . .
 
 # Prepare the recipe for cargo-chef, essentially the dependency graph
-RUN cargo chef prepare --bin arc-node-execution --recipe-path arc-node-execution-recipe.json
+RUN cargo chef prepare --recipe-path arc-node-execution-recipe.json
 
 ###############
 # builder image
@@ -54,7 +54,7 @@ RUN --mount=type=cache,id=reth-cargo-registry,sharing=locked,target=/usr/local/c
     --mount=type=cache,id=reth-cargo-git,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=reth-cargo-target,sharing=locked,target=/app/target \
     # Cook the recipe produced by the planner, namely compile dependencies
-    cargo chef cook --bin arc-node-execution --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path arc-node-execution-recipe.json
+    cargo chef cook --bin arc-node-execution --bin arc-snapshots --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path arc-node-execution-recipe.json
 
 # Per-commit git version args come after dep-cook — moving them here prevents the
 # new commit hash from busting the cook layer's S3 cache key on every push.

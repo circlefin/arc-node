@@ -18,6 +18,7 @@ pragma solidity ^0.8.29;
 
 import {Script, console, console2} from "forge-std/Script.sol";
 import {ValidatorRegistry, Validator, ValidatorStatus} from "../src/validator-manager/ValidatorRegistry.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import {PermissionedValidatorManager} from "../src/validator-manager/PermissionedValidatorManager.sol";
 import {Addresses} from "./Addresses.sol";
 
@@ -280,5 +281,42 @@ contract ValidatorManagement is Script {
         if (status == ValidatorStatus.Registered) return "Registered";
         if (status == ValidatorStatus.Active) return "Active";
         return "Invalid";
+    }
+}
+
+/// @title ValidatorRegistryState
+/// @notice Preserved-state hash helper used by upgrade/rollback scripts under
+///         `contracts/deployments/<date>-validator-registry-*/scripts/`.
+///
+///         Aggregates every field an implementation-only upgrade must preserve and returns a
+///         single hash. Pre-boundary and post-boundary calls should produce equal hashes; any
+///         divergence indicates a storage-slot collision, accidental overwrite, or layout drift
+///         between old and new implementations.
+///
+///         Validity condition: valid only when the `Validator` struct layout returned by
+///         `getValidator` and `getActiveValidatorSet` is unchanged between old and new impl.
+///         A struct layout change would make `abi.encode` produce different bytes for the same
+///         logical state — when that happens, replace this helper with field-by-field comparison
+///         on the surviving fields.
+library ValidatorRegistryState {
+    function hash(address proxy) internal view returns (bytes32) {
+        ValidatorRegistry vr = ValidatorRegistry(proxy);
+        uint256 nextId = vr.getNextRegistrationId();
+
+        bytes32[] memory perValidator = new bytes32[](nextId);
+        for (uint256 i = 0; i < nextId; ++i) {
+            Validator memory v = vr.getValidator(i);
+            perValidator[i] = keccak256(abi.encode(v.status, v.publicKey, v.votingPower));
+        }
+
+        return keccak256(
+            abi.encode(
+                Ownable2StepUpgradeable(proxy).owner(),
+                Ownable2StepUpgradeable(proxy).pendingOwner(),
+                nextId,
+                vr.getActiveValidatorSet(),
+                perValidator
+            )
+        );
     }
 }

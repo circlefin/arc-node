@@ -97,21 +97,6 @@ GPG signature verification is disabled until the Arc release signing key is
 published. If an archive for your operating system or CPU architecture is not
 available in the selected release, `arcup` prints the expected asset name and
 the available release assets.
-For private repository testing, set `ARC_GITHUB_TOKEN`, `GH_TOKEN`, or
-`GITHUB_TOKEN` to a token with release access. `arcup` uses that token with the
-GitHub release asset API before trying other download methods. If no token is
-set but the GitHub CLI (`gh`) is installed and logged in, `arcup` tries
-`gh release download`. Public releases continue to work through direct `curl`
-downloads without extra setup.
-
-Private repository testing also needs `ARC_REPO` if the target release is not
-in the default repository:
-
-```sh
-ARC_REPO=owner/repo \
-ARC_GITHUB_TOKEN="<token-with-release-access>" \
-arcup --install v0.0.0-test.abcdef12
-```
 
 Troubleshooting:
 

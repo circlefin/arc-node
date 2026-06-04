@@ -29,6 +29,11 @@ pub(crate) const ARC_DEFAULT_NODE_FLAGS: &[&str] = &[
     "--engine.persistence-threshold=0",
     "--rpc.pending-block=none",
     "--rpc.txfeecap=1000",
+    // Caps the per-request gas budget on `eth_call`, `eth_estimateGas`, and
+    // the trace/debug call variants. 30M matches genesis `blockGasLimit` and
+    // stays well below every chainspec ceiling. Operators raise it via
+    // `--rpc.gascap N`.
+    "--rpc.gascap=30000000",
 ];
 
 // Subcommand name for the `node` subcommand.
@@ -73,6 +78,7 @@ mod tests {
         expected.insert("engine.persistence-threshold", "0");
         expected.insert("rpc.pending-block", "none");
         expected.insert("rpc.txfeecap", "1000");
+        expected.insert("rpc.gascap", "30000000");
 
         assert_eq!(
             overrides, expected,
@@ -97,6 +103,49 @@ mod tests {
             node_matches.get_one::<String>("rpc.txfeecap").cloned(),
             Some("1000".to_string()),
             "Arc default overrides Reth default"
+        );
+    }
+
+    /// `--rpc.gascap` default flips from Reth's 50M to Arc's 30M when the
+    /// operator does not pass the flag.
+    #[test]
+    fn test_rpc_gascap_default_is_thirty_million() {
+        let cmd = Command::new("bin").subcommand(
+            Command::new(NODE_SUBCOMMAND).arg(
+                Arg::new("rpc.gascap")
+                    .long("rpc.gascap")
+                    .default_value("50000000"),
+            ),
+        );
+        let patched = patch_node_command_defaults(cmd);
+        let args_matches = patched.get_matches_from(["bin", "node"]);
+        let node_matches = args_matches.subcommand_matches(NODE_SUBCOMMAND).unwrap();
+
+        assert_eq!(
+            node_matches.get_one::<String>("rpc.gascap").cloned(),
+            Some("30000000".to_string()),
+            "Arc default (30M) overrides Reth's stock 50M"
+        );
+    }
+
+    /// Explicit `--rpc.gascap` from the operator wins over Arc's default.
+    #[test]
+    fn test_explicit_rpc_gascap_overrides_arc_default() {
+        let cmd = Command::new("bin").subcommand(
+            Command::new(NODE_SUBCOMMAND).arg(
+                Arg::new("rpc.gascap")
+                    .long("rpc.gascap")
+                    .default_value("50000000"),
+            ),
+        );
+        let patched = patch_node_command_defaults(cmd);
+        let args_matches = patched.get_matches_from(["bin", "node", "--rpc.gascap=12345"]);
+        let node_matches = args_matches.subcommand_matches(NODE_SUBCOMMAND).unwrap();
+
+        assert_eq!(
+            node_matches.get_one::<String>("rpc.gascap").cloned(),
+            Some("12345".to_string()),
+            "Explicit operator value beats the Arc default"
         );
     }
 }

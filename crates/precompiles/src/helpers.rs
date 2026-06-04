@@ -22,6 +22,7 @@ use reth_evm::precompiles::PrecompileInput;
 use revm::context_interface::journaled_state::TransferError;
 use revm::state::AccountInfo;
 use revm_context_interface::cfg::gas::CALL_STIPEND;
+use revm_context_interface::journaled_state::account::JournaledAccountTr;
 use revm_interpreter::Gas;
 use revm_primitives::address;
 use revm_primitives::constants::KECCAK_EMPTY;
@@ -124,6 +125,12 @@ fn account_load_cost(is_cold: bool, hardfork_flags: ArcHardforkFlags) -> u64 {
     } else {
         PRECOMPILE_SLOAD_GAS_COST
     }
+}
+
+fn storage_io_error(op: &str, e: impl core::fmt::Debug) -> PrecompileErrorOrRevert {
+    PrecompileErrorOrRevert::Error(PrecompileError::Other(
+        format!("Storage {op} failed: {e:?}").into(),
+    ))
 }
 
 fn record_zero6_empty_account_creation_cost(
@@ -235,26 +242,55 @@ pub(crate) fn read(
     gas_counter: &mut Gas,
     hardfork_flags: ArcHardforkFlags,
 ) -> Result<Bytes, PrecompileErrorOrRevert> {
-    // Read from storage using the journal to get value and is_cold flag
-    let state_load = internals.sload(address, storage_key.into()).map_err(|e| {
-        PrecompileErrorOrRevert::Error(PrecompileError::Other(
-            format!("Storage read failed: {e:?}").into(),
-        ))
-    })?;
+    if hardfork_flags.is_active(ArcHardfork::Zero5) {
+        let mut account = internals
+            .load_account_mut(address)
+            .map_err(|e| storage_io_error("read", e))?
+            .data;
 
-    // Calculate gas based on hardfork - Zero5+ uses EIP-2929 warm/cold pricing
-    let gas_cost = if hardfork_flags.is_active(ArcHardfork::Zero5) {
-        if state_load.is_cold {
-            revm_interpreter::gas::COLD_SLOAD_COST
-        } else {
-            revm_interpreter::gas::WARM_STORAGE_READ_COST
+        // Probe slot warmth without DB I/O (skip_cold_load=true).
+        // Warm → Ok with cached value. Cold → ColdLoadSkipped error, retry after charging.
+        match account.sload(storage_key.into(), true) {
+            Ok(slot_load) => {
+                record_cost_or_out_of_gas(
+                    gas_counter,
+                    revm_interpreter::gas::WARM_STORAGE_READ_COST,
+                )?;
+                Ok(slot_load.data.present_value().to_be_bytes_vec().into())
+            }
+            Err(e) if e.is_cold_load_skipped() => {
+                record_cost_or_out_of_gas(gas_counter, revm_interpreter::gas::COLD_SLOAD_COST)?;
+                let slot_load = account
+                    .sload(storage_key.into(), false)
+                    .map_err(|e| storage_io_error("read", e))?;
+                Ok(slot_load.data.present_value().to_be_bytes_vec().into())
+            }
+            Err(e) => Err(storage_io_error("read", e)),
         }
     } else {
-        PRECOMPILE_SLOAD_GAS_COST
-    };
+        record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SLOAD_GAS_COST)?;
+        let state_load = internals
+            .sload(address, storage_key.into())
+            .map_err(|e| storage_io_error("read", e))?;
+        Ok(state_load.data.to_be_bytes_vec().into())
+    }
+}
 
-    record_cost_or_out_of_gas(gas_counter, gas_cost)?;
-    Ok(state_load.data.to_be_bytes_vec().into())
+/// Value-change component of SSTORE gas, excluding the cold-load penalty.
+///
+/// Mirrors revm v29 `istanbul_sstore_cost<WARM_STORAGE_READ_COST, WARM_SSTORE_RESET>`.
+fn sstore_base_cost(original: U256, present: U256, new: U256) -> u64 {
+    if new == present {
+        revm_interpreter::gas::WARM_STORAGE_READ_COST
+    } else if original == present {
+        if original.is_zero() {
+            revm_interpreter::gas::SSTORE_SET
+        } else {
+            revm_interpreter::gas::WARM_SSTORE_RESET
+        }
+    } else {
+        revm_interpreter::gas::WARM_STORAGE_READ_COST
+    }
 }
 
 /// Writes a value to storage for stateful precompiles.
@@ -306,56 +342,52 @@ pub(crate) fn write(
         return Err(PrecompileErrorOrRevert::Error(PrecompileError::OutOfGas));
     }
 
-    // Parse the input as a U256 value
     let value = U256::from_be_slice(input);
 
-    // Store the value in the precompile's storage and get result with is_cold flag
-    let sstore_result = internals
-        .sstore(address, storage_key.into(), value)
-        .map_err(|e| {
-            PrecompileErrorOrRevert::Error(PrecompileError::Other(
-                format!("Storage write failed: {e:?}").into(),
-            ))
-        })?;
+    if hardfork_flags.is_active(ArcHardfork::Zero5) {
+        let mut account = internals
+            .load_account_mut(address)
+            .map_err(|e| storage_io_error("write", e))?
+            .data;
 
-    // Calculate gas based on hardfork - Zero5+ uses EIP-2929/EIP-2200 pricing
-    let gas_cost = if hardfork_flags.is_active(ArcHardfork::Zero5) {
-        // Berlin-era sstore cost (EIP-2929 + EIP-2200)
-        // Mirrors revm v29 istanbul_sstore_cost<WARM_STORAGE_READ_COST, WARM_SSTORE_RESET>
-        let vals = &sstore_result.data;
-        let base_cost = if vals.is_new_eq_present() {
-            revm_interpreter::gas::WARM_STORAGE_READ_COST
-        } else if vals.is_original_eq_present() {
-            if vals.is_original_zero() {
-                20000 // SSTORE_SET
-            } else {
-                // WARM_SSTORE_RESET: 5000 - COLD_SLOAD_COST (2,100) = 2,900
-                #[allow(clippy::arithmetic_side_effects)]
-                {
-                    5000 - revm_interpreter::gas::COLD_SLOAD_COST
-                }
+        // Probe slot warmth via sload to get current values for gas calculation.
+        // This lets us charge all gas before the actual sstore mutation.
+        let slot = match account.sload(storage_key.into(), true) {
+            Ok(slot_load) => slot_load.data,
+            Err(e) if e.is_cold_load_skipped() => {
+                record_cost_or_out_of_gas(gas_counter, revm_interpreter::gas::COLD_SLOAD_COST)?;
+                account
+                    .sload(storage_key.into(), false)
+                    .map_err(|e| storage_io_error("write", e))?
+                    .data
             }
-        } else {
-            revm_interpreter::gas::WARM_STORAGE_READ_COST
+            Err(e) => return Err(storage_io_error("write", e)),
         };
-        if sstore_result.is_cold {
-            // base_cost <= 20,000; + COLD_SLOAD_COST (2,100) fits in u64
-            #[allow(clippy::arithmetic_side_effects)]
-            {
-                base_cost + revm_interpreter::gas::COLD_SLOAD_COST
-            }
-        } else {
-            base_cost
-        }
-    } else {
-        PRECOMPILE_SSTORE_GAS_COST
-    };
 
-    record_cost_or_out_of_gas(gas_counter, gas_cost)?;
-    Ok(())
+        record_cost_or_out_of_gas(
+            gas_counter,
+            sstore_base_cost(slot.original_value, slot.present_value, value),
+        )?;
+
+        // All gas charged — safe to mutate. Slot is warm from the sload.
+        account
+            .sstore(storage_key.into(), value, false)
+            .map_err(|e| storage_io_error("write", e))?;
+        Ok(())
+    } else {
+        record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
+        internals
+            .sstore(address, storage_key.into(), value)
+            .map_err(|e| storage_io_error("write", e))?;
+        Ok(())
+    }
 }
 
 /// Helper to transfer funds between two accounts using the Journal
+///
+/// Account gas is charged after the load because `load_account_mut_skip_cold_load`
+/// panics on cold accounts in revm ≤36. Storage slot helpers (`read`/`write`)
+/// use `skip_cold_load` to charge before I/O; accounts cannot until revm ≥37.
 pub(crate) fn transfer(
     internals: &mut EvmInternals,
     from: Address,
@@ -584,11 +616,163 @@ pub(crate) fn emit_event<Event: SolEvent>(
 }
 
 #[cfg(test)]
+pub(crate) mod test_utils {
+    use alloy_primitives::{Address, B256, U256};
+    use revm::database_interface::{DBErrorMarker, Database, DatabaseRef};
+    use revm::state::{AccountInfo, Bytecode};
+    use std::cell::Cell;
+
+    /// Database wrapper that counts `storage()` calls via a shared `Cell`
+    /// counter while returning empty state. Use to prove that an OOG path
+    /// does not hit the database.
+    #[derive(Debug, Clone)]
+    pub(crate) struct TrackingDB {
+        storage_reads: std::rc::Rc<Cell<u64>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct TrackingDBError;
+
+    impl core::fmt::Display for TrackingDBError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "TrackingDBError")
+        }
+    }
+
+    impl core::error::Error for TrackingDBError {}
+    impl DBErrorMarker for TrackingDBError {}
+
+    type TrackingContext = revm::Context<
+        revm::context::BlockEnv,
+        revm::context::TxEnv,
+        revm::context::CfgEnv,
+        TrackingDB,
+        revm::context::Journal<TrackingDB>,
+    >;
+
+    impl TrackingDB {
+        pub(crate) fn new() -> (Self, std::rc::Rc<Cell<u64>>) {
+            let counter = std::rc::Rc::new(Cell::new(0));
+            (
+                Self {
+                    storage_reads: counter.clone(),
+                },
+                counter,
+            )
+        }
+
+        pub(crate) fn context() -> (TrackingContext, std::rc::Rc<Cell<u64>>) {
+            let (db, counter) = Self::new();
+            (
+                revm::context::Context::new(db, revm_primitives::hardfork::SpecId::default()),
+                counter,
+            )
+        }
+    }
+
+    impl Database for TrackingDB {
+        type Error = TrackingDBError;
+
+        fn basic(&mut self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(None)
+        }
+
+        fn code_by_hash(&mut self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+
+        fn storage(&mut self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+            self.storage_reads
+                .set(self.storage_reads.get().saturating_add(1));
+            Ok(U256::ZERO)
+        }
+
+        fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+            Ok(alloy_primitives::keccak256(number.to_string().as_bytes()))
+        }
+    }
+
+    impl DatabaseRef for TrackingDB {
+        type Error = TrackingDBError;
+
+        fn basic_ref(&self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(None)
+        }
+
+        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+
+        fn storage_ref(&self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+            self.storage_reads
+                .set(self.storage_reads.get().saturating_add(1));
+            Ok(U256::ZERO)
+        }
+
+        fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+            Ok(alloy_primitives::keccak256(number.to_string().as_bytes()))
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::{address, U256};
     use alloy_sol_types::sol;
     use revm_primitives::B256;
+
+    /// Demonstrates that revm's `JournalTr::load_account_mut_skip_cold_load`
+    /// panics on cold accounts, making it unusable for the probe-then-charge
+    /// pattern we use for storage slots via `JournaledAccountTr::sload/sstore`.
+    ///
+    /// This is fixed in revm 37+ (bluealloy/revm#3477). When upgrading past
+    /// revm 36, this test should start failing (no longer panics). At that
+    /// point, switch `transfer`/`balance_incr`/`balance_decr` to the
+    /// skip-cold-then-retry pattern used by `read`/`write`, and remove this test.
+    #[test]
+    #[should_panic(expected = "Expected DBError")]
+    fn load_account_mut_skip_cold_load_panics_on_cold_account() {
+        use revm::context_interface::journaled_state::JournalTr;
+        use revm::{Journal, JournalEntry};
+
+        let db = revm::database_interface::EmptyDB::default();
+        let mut journal = Journal::<_, JournalEntry>::new_with_inner(db, Default::default());
+
+        let cold_address = address!("dead000000000000000000000000000000000001");
+        // Panics because the JournalTr impl maps ColdLoadSkipped through
+        // unwrap_db_error(), which expects a DBError variant.
+        let _ = journal.load_account_mut_skip_cold_load(cold_address, true);
+    }
+
+    /// Asserts all branches of [`sstore_base_cost`] with explicit values to
+    /// catch silent upstream changes.
+    #[test]
+    fn sstore_base_cost_covers_all_branches() {
+        // new == present → WARM_STORAGE_READ_COST (100)
+        assert_eq!(
+            sstore_base_cost(U256::from(1), U256::from(2), U256::from(2)),
+            100,
+        );
+
+        // original == present, original == 0 → SSTORE_SET (20000)
+        assert_eq!(
+            sstore_base_cost(U256::ZERO, U256::ZERO, U256::from(1)),
+            20000,
+        );
+
+        // original == present, original != 0 → WARM_SSTORE_RESET (2900)
+        assert_eq!(
+            sstore_base_cost(U256::from(1), U256::from(1), U256::from(2)),
+            2900,
+        );
+
+        // original != present, new != present → WARM_STORAGE_READ_COST (100)
+        assert_eq!(
+            sstore_base_cost(U256::from(1), U256::from(2), U256::from(3)),
+            100,
+        );
+    }
 
     sol! {
         interface IAbiDecodeTest {

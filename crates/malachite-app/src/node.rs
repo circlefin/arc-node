@@ -502,7 +502,7 @@ impl App {
     /// Create a NetworkIdentity with a signed validator proof.
     ///
     /// The validator proof binds the consensus public key to the libp2p peer ID,
-    /// proving that the validator controls both keys (ADR-006).
+    /// proving that the validator controls both keys.
     async fn create_network_identity_with_proof(
         &self,
         identity: &NodeIdentity,

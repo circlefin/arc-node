@@ -22,7 +22,7 @@ WORKDIR /src
 COPY . .
 
 # Prepare the recipe for cargo-chef, essentially the dependency graph
-RUN cargo chef prepare --bin arc-node-consensus --recipe-path arc-node-consensus-recipe.json
+RUN cargo chef prepare --recipe-path arc-node-consensus-recipe.json
 
 ###############
 # builder image
@@ -53,7 +53,7 @@ RUN --mount=type=cache,id=malachite-cargo-registry,sharing=locked,target=/usr/lo
     --mount=type=cache,id=malachite-cargo-git,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=malachite-cargo-target,sharing=locked,target=/app/target \
     # Cook the recipe produced by the planner, namely compile dependencies
-    cargo chef cook --bin arc-node-consensus --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path arc-node-consensus-recipe.json
+    cargo chef cook --bin arc-node-consensus --bin arc-snapshots --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path arc-node-consensus-recipe.json
 
 # Per-commit git version args come after dep-cook — moving them here prevents the
 # new commit hash from busting the cook layer's S3 cache key on every push.
