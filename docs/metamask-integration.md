@@ -10,14 +10,51 @@ Use `wallet_addEthereumChain` to add Arc Testnet:
 await window.ethereum.request({
   method: "wallet_addEthereumChain",
   params: [{
-    chainId: "0x4CF252",  // 5042002 in hex
+    chainId: "0x4CEF52",  // 5042002 in hex
     chainName: "Arc Testnet",
     nativeCurrency: {
-      name: "USDC",
-      symbol: "USDC",
-      decimals: 6,
+      name: "ETH",
+      symbol: "ETH",
+      decimals: 18,
     },
-    rpcUrls: ["https://rpc.arc.network"],
+    rpcUrls: ["https://rpc.drpc.testnet.arc.network"],
+    blockExplorerUrls: ["https://testnet.arcscan.app"],
+  }],
+});
+```
+
+### Why the native currency is "ETH" and not "USDC"
+
+Arc pays gas in USDC, but the `nativeCurrency` here still has to be `{ name: "ETH", symbol: "ETH", decimals: 18 }`. MetaMask only supports 18-decimal native currencies and validates that `decimals` equals 18, so a config with `decimals: 6` is rejected. If you pass `symbol: "USDC"` with `decimals: 18` the network is accepted but MetaMask shows the gas balance 10^12 times too high.
+
+The practical consequences:
+
+- MetaMask labels gas costs in "ETH" (for example "0.000000021 ETH") rather than USDC. Show the real USDC gas estimate in your own DApp UI if that matters to your users.
+- This only affects the native gas display. The USDC ERC-20 token you register below keeps `decimals: 6` and shows the correct balance.
+
+See issue [#95](https://github.com/circlefin/arc-node/issues/95) for the full background.
+
+## Switching to Arc Testnet
+
+Do not use `wallet_switchEthereumChain` to move the user to Arc Testnet. On Arc Testnet it fails silently or throws a `4902` (chain not found) even after the network has already been added (issue [#89](https://github.com/circlefin/arc-node/issues/89)).
+
+Call `wallet_addEthereumChain` instead. It both adds the network if it is missing and switches to it if it is already present, so it is reliable in both cases:
+
+```typescript
+// Unreliable on Arc Testnet, may resolve without switching or throw 4902
+// await window.ethereum.request({
+//   method: "wallet_switchEthereumChain",
+//   params: [{ chainId: "0x4CEF52" }],
+// });
+
+// Reliable, works whether the network is already added or not
+await window.ethereum.request({
+  method: "wallet_addEthereumChain",
+  params: [{
+    chainId: "0x4CEF52",
+    chainName: "Arc Testnet",
+    nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+    rpcUrls: ["https://rpc.drpc.testnet.arc.network"],
     blockExplorerUrls: ["https://testnet.arcscan.app"],
   }],
 });
@@ -42,7 +79,7 @@ await window.ethereum.request({
 });
 ```
 
-MetaMask will show a confirmation dialog. Once accepted, USDC will appear in the user's token list with the correct balance.
+MetaMask will show a confirmation dialog. Once accepted, USDC will appear in the user's token list with the correct balance. Note that USDC uses `decimals: 6` here, which is correct for the ERC-20 token and separate from the 18-decimal native currency above.
 
 ## Complete Onboarding Flow
 
@@ -56,18 +93,18 @@ async function connectWallet() {
       method: "eth_requestAccounts",
     });
 
-    // 2. Add Arc Testnet network
+    // 2. Add Arc Testnet network (also switches to it if already added)
     await window.ethereum.request({
       method: "wallet_addEthereumChain",
       params: [{
-        chainId: "0x4CF252",
+        chainId: "0x4CEF52",
         chainName: "Arc Testnet",
         nativeCurrency: {
-          name: "USDC",
-          symbol: "USDC",
-          decimals: 6,
+          name: "ETH",
+          symbol: "ETH",
+          decimals: 18,
         },
-        rpcUrls: ["https://rpc.arc.network"],
+        rpcUrls: ["https://rpc.drpc.testnet.arc.network"],
         blockExplorerUrls: ["https://testnet.arcscan.app"],
       }],
     });
@@ -108,9 +145,11 @@ Every DApp on Arc Testnet that involves USDC transfers should include this step 
 
 **Arc Testnet:**
 - USDC: `0x3600000000000000000000000000000000000000`
-- Chain ID: `5042002` (hex: `0x4CF252`)
-- RPC: `https://rpc.arc.network`
+- Chain ID: `5042002` (hex: `0x4CEF52`)
+- RPC: `https://rpc.drpc.testnet.arc.network`
 - Explorer: `https://testnet.arcscan.app`
+
+The public RPC `https://rpc.testnet.arc.network` works too, but `rpc.drpc.testnet.arc.network` returns `Access-Control-Allow-Origin: *`, which is the safest choice for browser DApps calling the endpoint directly (see issue [#90](https://github.com/circlefin/arc-node/issues/90)).
 
 ## References
 
