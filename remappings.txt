@@ -1,5 +1,0 @@
-forge-std/=contracts/lib/forge-std/src/
-@openzeppelin/contracts-upgradeable/=contracts/lib/openzeppelin-contracts-upgradeable/contracts/
-@openzeppelin/contracts/=contracts/lib/openzeppelin-contracts/contracts/
-@solidity-parser/=contracts/
-hardhat/=node_modules/hardhat/

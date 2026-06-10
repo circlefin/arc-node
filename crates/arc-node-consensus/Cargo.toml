@@ -1,0 +1,9 @@
+[package]
+name = "arc-node-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Placeholder package for the Arc consensus node."
+readme = "README.md"
+include = ["Cargo.toml", "README.md", "src/lib.rs"]
