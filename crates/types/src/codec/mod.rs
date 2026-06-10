@@ -56,7 +56,9 @@ macro_rules! impl_versioned_codec {
                 }
 
                 let version_byte = bytes.get_u8();
-                Err($crate::codec::error::CodecError::UnsupportedVersion(version_byte))
+                Err($crate::codec::error::CodecError::UnsupportedVersion(
+                    version_byte,
+                ))
             }
 
             fn encode(&self, msg: &$ty) -> Result<bytes::Bytes, Self::Error> {
