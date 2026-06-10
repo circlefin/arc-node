@@ -153,7 +153,7 @@ Every DApp on Arc Testnet that involves USDC transfers should include this step 
 
 The public RPC `https://rpc.testnet.arc.network` works too, but `rpc.drpc.testnet.arc.network` returns `Access-Control-Allow-Origin: *`, which is the safest choice for browser DApps calling the endpoint directly (see issue [#90](https://github.com/circlefin/arc-node/issues/90)).
 
-`https://testnet.arcscan.app` is the only block explorer that currently resolves. The older `explorer.testnet.arc.network` and `explorer.arc.io` hosts are dead, so use `testnet.arcscan.app` in the `blockExplorerUrls` field and in any transaction-link examples.
+`https://testnet.arcscan.app` is the only public block explorer that currently works, so use it in the `blockExplorerUrls` field and in any transaction-link examples. `explorer.testnet.arc.network` no longer resolves, and `explorer.arc.io` resolves but sits behind Circle's internal Cloudflare Access login rather than serving a public explorer.
 
 ## References
 
