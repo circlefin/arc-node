@@ -60,6 +60,42 @@ await window.ethereum.request({
 });
 ```
 
+## Wait for the RPC Transport Before Sending Transactions
+
+`wallet_addEthereumChain` resolving does not mean transactions route to Arc Testnet yet. For a short window (roughly 200 to 500 ms) MetaMask already reports the new chain from `eth_chainId` while its internal JSON-RPC router still points at the previous endpoint. A transaction sent in that window lands on the old chain (issue [#130](https://github.com/circlefin/arc-node/issues/130)). The reported case was a CCTP `receiveMessage` meant for Arc Testnet that landed on Base Sepolia instead and reverted with `"Invalid destination domain"`.
+
+Polling `eth_chainId` does not close the gap because it flips before the routing does. Verify through `provider.getNetwork()` instead. It goes through the same transport as `eth_sendTransaction`, so once it returns the Arc Testnet chain ID, transactions route there too:
+
+```typescript
+import { ethers } from "ethers";
+
+// After wallet_addEthereumChain resolves, wait for the provider
+// transport to catch up before sending any transaction.
+async function waitForProviderChain(
+  expectedChainId: number,
+  retries = 6,
+): Promise<void> {
+  for (let i = 0; i < retries; i++) {
+    if (i > 0) await new Promise((r) => setTimeout(r, 500 * i));
+    const provider = new ethers.BrowserProvider(window.ethereum);
+    const network = await provider.getNetwork();
+    if (Number(network.chainId) === expectedChainId) return;
+  }
+  throw new Error("Network did not stabilize. Switch manually and retry.");
+}
+
+await window.ethereum.request({
+  method: "wallet_addEthereumChain",
+  params: [arcTestnetConfig],
+});
+await waitForProviderChain(5042002);
+// Now safe to send transactions
+```
+
+Construct a fresh `BrowserProvider` on each attempt. ethers caches the network per provider instance, so reusing one instance can keep returning the stale chain.
+
+The wait is only needed when a transaction follows the network switch in the same flow. Reading balances or registering tokens is not affected.
+
 ## Register USDC Token
 
 **Important:** MetaMask does not automatically show USDC in the token list for custom chains. After adding the network, you must register USDC using `wallet_watchAsset`:
@@ -134,6 +170,8 @@ async function connectWallet() {
 }
 ```
 
+If the flow continues straight into a transaction, run `waitForProviderChain` from the section above between steps 2 and 3.
+
 ## Why This Matters
 
 Without the `wallet_watchAsset` call:
@@ -153,7 +191,7 @@ Every DApp on Arc Testnet that involves USDC transfers should include this step 
 
 The public RPC `https://rpc.testnet.arc.network` works too, but `rpc.drpc.testnet.arc.network` returns `Access-Control-Allow-Origin: *`, which is the safest choice for browser DApps calling the endpoint directly (see issue [#90](https://github.com/circlefin/arc-node/issues/90)).
 
-`https://testnet.arcscan.app` is the only public block explorer that currently works, so use it in the `blockExplorerUrls` field and in any transaction-link examples. `explorer.testnet.arc.network` no longer resolves, and `explorer.arc.io` resolves but sits behind Circle's internal Cloudflare Access login rather than serving a public explorer.
+`https://testnet.arcscan.app` is the only public block explorer that currently works, so use it in the `blockExplorerUrls` field and in any transaction-link examples. `explorer.testnet.arc.network` no longer resolves. `explorer.arc.io` resolves but sits behind Circle's internal Cloudflare Access login rather than serving a public explorer.
 
 ## References
 
