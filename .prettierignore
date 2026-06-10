@@ -1,8 +1,0 @@
-contracts/lib/**
-contracts/out/**
-contracts/cache/**
-.github/**
-assets/artifacts/**/*.json
-**/*.md
-**/*.yaml
-**/*.yml
