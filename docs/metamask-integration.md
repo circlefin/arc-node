@@ -81,6 +81,8 @@ await window.ethereum.request({
 
 MetaMask will show a confirmation dialog. Once accepted, USDC will appear in the user's token list with the correct balance. Note that USDC uses `decimals: 6` here, which is correct for the ERC-20 token and separate from the 18-decimal native currency above.
 
+**Order matters:** call `wallet_watchAsset` only after the `wallet_addEthereumChain` promise has resolved. If it fires while the user is still on a different network, MetaMask registers USDC against the wrong chain and the balance never shows up. The onboarding flow below awaits the chain add before registering the token for this reason.
+
 ## Complete Onboarding Flow
 
 Recommended sequence for DApp wallet connection:
@@ -150,6 +152,8 @@ Every DApp on Arc Testnet that involves USDC transfers should include this step 
 - Explorer: `https://testnet.arcscan.app`
 
 The public RPC `https://rpc.testnet.arc.network` works too, but `rpc.drpc.testnet.arc.network` returns `Access-Control-Allow-Origin: *`, which is the safest choice for browser DApps calling the endpoint directly (see issue [#90](https://github.com/circlefin/arc-node/issues/90)).
+
+`https://testnet.arcscan.app` is the only block explorer that currently resolves. The older `explorer.testnet.arc.network` and `explorer.arc.io` hosts are dead, so use `testnet.arcscan.app` in the `blockExplorerUrls` field and in any transaction-link examples.
 
 ## References
 
