@@ -311,10 +311,10 @@ fn record_self_proposal_in_monitor(state: &mut State, height: Height, value_id: 
         return;
     };
     debug_assert_eq!(monitor.height, height, "proposal monitor height mismatch");
-    if !monitor.record_proposal(value_id) {
+    if let Some(first_value) = monitor.record_proposal(value_id) {
         warn!(
             height = %monitor.height,
-            first_value = %monitor.value_id.unwrap(),
+            first_value = %first_value,
             new_value = %value_id,
             "Equivocating proposal at round 0"
         );
