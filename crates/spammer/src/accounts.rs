@@ -100,7 +100,13 @@ impl PartitionMode {
             (n + d / 2) / d
         }
 
-        if round_div(num_accounts, 1 << (num_generators - 1)) == 0 {
+        // The smallest bucket spans `num_accounts / 2^(num_generators - 1)`. Once the
+        // exponent reaches the word size, `2^(num_generators - 1)` already exceeds any
+        // possible `num_accounts`, so the smallest bucket is empty. Check that first:
+        // shifting by >= the word size is undefined and would otherwise panic (debug) or
+        // wrap the shift distance (release) before this guard could reject the input.
+        let shift = num_generators - 1;
+        if shift >= usize::BITS as usize || round_div(num_accounts, 1 << shift) == 0 {
             eyre::bail!("too many generators: it would result in a bucket with size 0");
         }
 
@@ -163,6 +169,24 @@ mod tests {
         for (num_accounts, num_generators, expected) in test_cases {
             let ranges = PartitionMode::Linear.partition_accounts(num_accounts, num_generators);
             assert_eq!(ranges.ok(), expected);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partition_accounts_exponential_rejects_too_many_generators() -> Result<()> {
+        // num_generators large enough that 2^(num_generators - 1) reaches the word
+        // size. These inputs pass the num_generators>0 and num_accounts>=num_generators
+        // checks, so they reach partition_exponential, where the smallest bucket would
+        // round to 0. Expect the same graceful "too many generators" error as smaller
+        // over-subscriptions (e.g. (100, 9)) rather than a shift-overflow panic.
+        for (num_accounts, num_generators) in [(130usize, 65usize), (200, 100)] {
+            let result =
+                PartitionMode::Exponential.partition_accounts(num_accounts, num_generators);
+            assert!(
+                result.is_err(),
+                "expected graceful error for ({num_accounts}, {num_generators}), got {result:?}"
+            );
         }
         Ok(())
     }
