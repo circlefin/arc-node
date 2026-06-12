@@ -23,7 +23,7 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use arc_consensus_types::ConsensusParams;
-use arc_consensus_types::{Address, Height, Round, ValidatorSet};
+use arc_consensus_types::{Address, ValidatorSet};
 use malachitebft_app_channel::app::metrics::prometheus::encoding::{
     EncodeLabelSet, EncodeLabelValue, LabelValueEncoder,
 };
@@ -480,22 +480,17 @@ impl AppMetrics {
     }
 
     /// Record that a consensus round failed to decide before advancing.
-    pub fn inc_consensus_round_missed(&self, proposer: Address, height: Height, round: Round) {
+    pub fn inc_consensus_round_missed(&self, proposer: Address) {
         self.consensus_round_missed
-            .get_or_create(&RoundMissedLabel::new(proposer, height, round))
+            .get_or_create(&RoundMissedLabel::new(proposer))
             .inc();
     }
 
     /// Total number of missed consensus rounds since start.
     #[cfg(test)]
-    pub fn get_consensus_round_missed_count(
-        &self,
-        proposer: Address,
-        height: Height,
-        round: Round,
-    ) -> u64 {
+    pub fn get_consensus_round_missed_count(&self, proposer: Address) -> u64 {
         self.consensus_round_missed
-            .get_or_create(&RoundMissedLabel::new(proposer, height, round))
+            .get_or_create(&RoundMissedLabel::new(proposer))
             .get()
     }
 }
@@ -550,16 +545,12 @@ impl EncodeLabelValue for AsLabelValue<u64> {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct RoundMissedLabel {
     proposer: AsLabelValue<Address>,
-    height: AsLabelValue<u64>,
-    round: AsLabelValue<i64>,
 }
 
 impl RoundMissedLabel {
-    fn new(proposer: Address, height: Height, round: Round) -> Self {
+    fn new(proposer: Address) -> Self {
         Self {
             proposer: AsLabelValue(proposer),
-            height: AsLabelValue(height.as_u64()),
-            round: AsLabelValue(round.as_i64()),
         }
     }
 }
@@ -706,21 +697,10 @@ mod tests {
         let metrics = AppMetrics::new();
         let proposer = Address::new([0xAA; 20]);
 
-        metrics.inc_consensus_round_missed(proposer, Height::new(1), Round::new(0));
-        metrics.inc_consensus_round_missed(proposer, Height::new(2), Round::new(0));
-        metrics.inc_consensus_round_missed(proposer, Height::new(2), Round::new(1));
+        metrics.inc_consensus_round_missed(proposer);
+        metrics.inc_consensus_round_missed(proposer);
+        metrics.inc_consensus_round_missed(proposer);
 
-        assert_eq!(
-            metrics.get_consensus_round_missed_count(proposer, Height::new(1), Round::new(0)),
-            1
-        );
-        assert_eq!(
-            metrics.get_consensus_round_missed_count(proposer, Height::new(2), Round::new(0)),
-            1
-        );
-        assert_eq!(
-            metrics.get_consensus_round_missed_count(proposer, Height::new(2), Round::new(1)),
-            1
-        );
+        assert_eq!(metrics.get_consensus_round_missed_count(proposer), 3);
     }
 }
