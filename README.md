@@ -31,6 +31,39 @@ Arc is an open EVM-compatible layer 1 built on [Malachite](https://github.com/ci
 - 🗳️ **[Consensus](crates/malachite-app/README.md)** - Consensus binary and configuration
 - More: see Arc [developer docs](https://docs.arc.network/arc/concepts/welcome-to-arc) for guides, APIs, and specs
 
+## Networks
+
+Arc's official chain IDs:
+
+| Network | Chain ID  | Hex        |
+| ------- | --------- | ---------- |
+| Mainnet | `5042`    | `0x13b2`   |
+| Testnet | `5042002` | `0x4cef52` |
+| Devnet  | `5042001` | `0x4cef51` |
+
+To connect a wallet to Arc Testnet:
+
+| Parameter       | Value                           |
+| --------------- | ------------------------------- |
+| Network name    | Arc Testnet                     |
+| Chain ID        | `5042002` (`0x4cef52`)          |
+| RPC URL         | https://rpc.testnet.arc.network |
+| Currency symbol | USDC                            |
+| Block explorer  | https://testnet.arcscan.app     |
+
+> [!IMPORTANT]
+> Arc Testnet's chain ID is **`5042002`** (`0x4cef52`). Some third-party chain
+> registries and older community guides incorrectly list `1516` — that value is
+> **wrong** and will cause wallet connection failures. You can verify the chain
+> ID returned by a node directly:
+>
+> ```bash
+> curl -X POST https://rpc.testnet.arc.network \
+>   -H "Content-Type: application/json" \
+>   -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'
+> # {"result":"0x4cef52"}  =  5042002
+> ```
+
 ## Install and Run a Node
 
 ### Install
