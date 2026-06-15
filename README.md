@@ -65,11 +65,10 @@ To connect a wallet to Arc Testnet:
 > ```
 
 > [!NOTE]
-> The canonical Arc Testnet block explorer is **https://testnet.arcscan.app** and
-> documentation lives at **https://docs.arc.network**. Older explorer URLs such as
-> `explorer.testnet.arc.network`, `explorer.arc.io`, and `docs.arc.io` are dead
-> (unreachable, login-gated, or 404) — do not use them in wallet `blockExplorerUrls`
-> configs or transaction links.
+> The canonical Arc Testnet block explorer is **https://testnet.arcscan.app**. Other
+> explorer URLs that circulate in older guides — `explorer.testnet.arc.network`
+> (unreachable) and `explorer.arc.io` (team-login-gated) — are not publicly usable;
+> don't put them in wallet `blockExplorerUrls` configs or transaction links.
 
 ## Install and Run a Node
 
