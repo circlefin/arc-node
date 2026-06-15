@@ -921,6 +921,83 @@ mod tests {
         );
     }
 
+    /// Lock in the error messages for the non-numeric / negative / overflow
+    /// branches of `parse_max_batch_entries`. The existing test only
+    /// covers the `0`-rejection path; clap surfaces the parser's error
+    /// verbatim, so any change to the message text would silently leak
+    /// out to operators reading `--help` output. The four cases below
+    /// match the kinds of bad input a misconfigured CI script or a
+    /// copy-pasted shell snippet is most likely to produce.
+    #[test]
+    fn test_arc_rpc_max_batch_entries_invalid_inputs() {
+        // Helper: returns the clap error string if parse failed, otherwise
+        // an empty string. Used by the assert! messages below so the
+        // operator can see *what* was wrong, not just *that* something
+        // was wrong.
+        fn err_str(result: &Result<ArcCli, clap::Error>) -> String {
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        }
+
+        // Non-numeric: parser fails before our `must be >= 1` check runs.
+        let result = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.max-batch-entries",
+            "abc",
+        ]);
+        assert!(
+            err_str(&result).contains("invalid number: abc"),
+            "non-numeric input must surface 'invalid number: <input>' message; got: {result:?}"
+        );
+
+        // Negative numbers: `usize::from_str` rejects them, so they take
+        // the same `invalid number` branch as non-numeric input.
+        let result = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.max-batch-entries",
+            "-1",
+        ]);
+        assert!(
+            err_str(&result).contains("invalid number: -1"),
+            "negative input must surface 'invalid number: <input>' message; got: {result:?}"
+        );
+
+        // Overflow: the parser tries to fit the digits into usize and
+        // fails. The error must mention the offending input so an
+        // operator can see what got passed in.
+        let result = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.max-batch-entries",
+            "999999999999999999999",
+        ]);
+        assert!(
+            err_str(&result).contains("invalid number"),
+            "overflow input must surface 'invalid number' message; got: {result:?}"
+        );
+
+        // Empty string: clap's `value_name = "COUNT"` is decorative; the
+        // parser is what sees the empty input. Must fail with a clear
+        // message rather than silently defaulting to 0 (which would
+        // then be rejected by the `must be >= 1` check with a confusing
+        // trail of two errors).
+        let result = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.max-batch-entries",
+            "",
+        ]);
+        assert!(
+            result.is_err(),
+            "empty string must be rejected, not default to 0; got: {result:?}"
+        );
+    }
+
     #[test]
     fn test_arc_builder_deadline_default_unset() {
         let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
