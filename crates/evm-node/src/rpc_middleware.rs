@@ -1179,6 +1179,33 @@ mod tests {
         assert_eq!(response.as_error_code(), Some(BATCH_TOO_LARGE_ERROR_CODE));
     }
 
+    /// `max_entries = 0` is rejected at the CLI level by
+    /// `parse_max_batch_entries`, but the in-process constructor has no
+    /// such guard — callers can build a "no batches allowed" layer
+    /// intentionally. The middleware must reject any non-empty batch
+    /// with `BATCH_TOO_LARGE_ERROR_CODE`. The empty-batch case is
+    /// covered by the JSON-RPC layer below the middleware and is
+    /// deliberately not asserted here, because the mock service
+    /// itself rejects empty batches with a different error code and
+    /// we don't want to lock in that quirk.
+    #[tokio::test]
+    async fn test_batch_size_limit_zero_max_entries_rejects_non_empty() {
+        let middleware = BatchSizeLimitMiddleware::new(MockRpcService, 0);
+        let batch = Batch::from(vec![Ok(make_call_entry("eth_blockNumber", 1))]);
+        let response = middleware.batch(batch).await;
+        assert_eq!(
+            response.as_error_code(),
+            Some(BATCH_TOO_LARGE_ERROR_CODE),
+            "max_entries=0 must reject any non-empty batch"
+        );
+        let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+        let message = json["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("batch size 1") && message.contains("limit of 0"),
+            "error message should name the offending size and limit; got: {message}"
+        );
+    }
+
     #[tokio::test]
     async fn test_batch_size_limit_applies_when_pending_filter_disabled() {
         // The batch cap must apply even when --arc.expose-pending-txs disables
