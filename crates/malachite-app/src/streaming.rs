@@ -226,6 +226,9 @@ enum StreamInsertResult {
     Incomplete(Option<Height>),
     ExceededMaxMessages,
     ExceededMaxChunkSize(usize),
+    /// A `Fin` declared a sequence outside `[0, MAX_MESSAGES_PER_STREAM - 1]`,
+    /// so the stream could never complete within the per-stream message cap.
+    FinSequenceOutOfRange(Sequence),
     Complete(Vec<ProposalPart>),
 }
 
@@ -275,13 +278,31 @@ impl StreamState {
 
         // This is the `Fin` message.
         if msg.is_fin() {
+            // `expected_messages` is taken directly from the `Fin` sequence,
+            // which is an unauthenticated wire field the sending peer fully
+            // controls. A stream can hold at most `MAX_MESSAGES_PER_STREAM`
+            // parts (sequences `0..MAX_MESSAGES_PER_STREAM`), so the only
+            // sequences a stream can ever satisfy are `[0, MAX_MESSAGES_PER_STREAM - 1]`.
+            // Reject anything larger up front:
+            //   * `msg.sequence as usize + 1` would otherwise overflow for
+            //     sequences near `u64::MAX` — a panic in debug / overflow-checked
+            //     builds (a single gossip message could crash the node) and a
+            //     silent wrap in release, and
+            //   * even a non-overflowing but out-of-range sequence makes
+            //     `expected_messages` exceed the message cap, so the stream
+            //     could never complete and would squat a per-peer slot until
+            //     the age sweep clears it.
+            if msg.sequence >= MAX_MESSAGES_PER_STREAM as Sequence {
+                return StreamInsertResult::FinSequenceOutOfRange(msg.sequence);
+            }
+
             self.fin_received = true;
 
             // If we have received the fin message, we can determine when we will be done.
             // We are done if we have already received all messages from 0 to fin.sequence,
             // included. That is to say, if we have received `fin.sequence + 1` messages.
-            // Sequence is a u64 protocol field; on 64-bit targets usize == u64.
-            // The +1 cannot overflow because MAX_MESSAGES_PER_STREAM << u64::MAX.
+            // Bounded by the check above: `msg.sequence < MAX_MESSAGES_PER_STREAM`,
+            // so `msg.sequence + 1 <= MAX_MESSAGES_PER_STREAM` and cannot overflow.
             #[allow(clippy::cast_possible_truncation, clippy::arithmetic_side_effects)]
             {
                 self.expected_messages = msg.sequence as usize + 1;
@@ -510,6 +531,19 @@ impl PartStreamsMap {
                     actual,
                     max = CHUNK_SIZE,
                     "Stream sent oversized data chunk, evicting"
+                );
+
+                self.evict(&key);
+                return InsertResult::Pending;
+            }
+
+            StreamInsertResult::FinSequenceOutOfRange(sequence) => {
+                warn!(
+                    %peer_id,
+                    %stream_id,
+                    sequence,
+                    max = MAX_MESSAGES_PER_STREAM,
+                    "Stream Fin declared an out-of-range sequence, evicting"
                 );
 
                 self.evict(&key);
@@ -1991,6 +2025,74 @@ mod tests {
             map.must_insert(low_volume_peer, msg_part).is_none(),
             "Follow up message on the low-volume stream should be accepted"
         );
+    }
+
+    #[test]
+    fn test_fin_with_out_of_range_sequence_is_rejected_without_overflow() {
+        // Regression for the unvalidated `Fin` sequence: a lone `Fin` whose
+        // sequence is `u64::MAX` must not overflow `expected_messages =
+        // sequence + 1` (a panic in overflow-checked builds, a silent wrap in
+        // release). It must be evicted immediately rather than wedging a
+        // per-peer slot until the age sweep.
+        let peer = PeerId::random();
+        let stream = new_stream_id(Height::new(1), Round::new(0), 0);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        let msg = make_fin_message(&stream, u64::MAX);
+        assert!(matches!(map.insert(peer, msg), InsertResult::Pending));
+        assert_eq!(
+            map.streams.len(),
+            0,
+            "out-of-range Fin must not leave a lingering stream"
+        );
+        assert!(
+            map.evicted.peek(&(peer, stream)).is_some(),
+            "out-of-range Fin stream should be marked evicted so retries are dropped"
+        );
+
+        // A `Fin` exactly at the cap is also out of range: a stream holds at
+        // most MAX_MESSAGES_PER_STREAM parts, so the largest satisfiable
+        // sequence is MAX_MESSAGES_PER_STREAM - 1.
+        let stream2 = new_stream_id(Height::new(1), Round::new(0), 1);
+        let msg = make_fin_message(&stream2, MAX_MESSAGES_PER_STREAM as u64);
+        assert!(matches!(map.insert(peer, msg), InsertResult::Pending));
+        assert_eq!(map.streams.len(), 0);
+    }
+
+    #[test]
+    fn test_fin_at_max_in_range_sequence_completes() {
+        // Boundary guard for the fix above: the largest *valid* Fin sequence is
+        // MAX_MESSAGES_PER_STREAM - 1, a full stream of MAX_MESSAGES_PER_STREAM
+        // parts. The new bound must not over-reject it — it must still complete.
+        let peer = PeerId::random();
+        let stream = new_stream_id(Height::new(1), Round::new(0), 0);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        let last = (MAX_MESSAGES_PER_STREAM - 1) as u64;
+
+        // Fill every sequence 0..=last (MAX_MESSAGES_PER_STREAM messages):
+        //   seq 0        : Init
+        //   seq 1..last-1: data parts
+        //   seq last-1   : the proposal's Fin signature part
+        //   seq last     : the stream-terminator Fin (completes the stream)
+        assert!(map
+            .must_insert(peer, make_message(&stream, 0, make_init_part()))
+            .is_none());
+        for seq in 1..(last - 1) {
+            assert!(map
+                .must_insert(peer, make_message(&stream, seq, make_data_part(seq as u8)))
+                .is_none());
+        }
+        assert!(map
+            .must_insert(peer, make_message(&stream, last - 1, make_fin_part()))
+            .is_none());
+
+        let result = map.must_insert(peer, make_fin_message(&stream, last));
+        assert!(
+            result.is_some(),
+            "a full-length stream (Fin sequence = MAX_MESSAGES_PER_STREAM - 1) must complete"
+        );
+        assert!(map.streams.is_empty());
     }
 
     // --- Property-Based Tests ---
