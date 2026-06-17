@@ -475,6 +475,12 @@ impl Db {
             blocks.insert(height, block_bytes)?;
         }
 
+        // `insert_certificate` records its own write bytes and write time, so
+        // stop this function's block-write timer before calling it. Otherwise
+        // the certificate insert would be double-counted in `write_time`: once
+        // by the outer span here and once by `insert_certificate` internally.
+        let block_write_time = start.elapsed();
+
         self.insert_certificate(
             &tx,
             decided_block.certificate,
@@ -482,9 +488,15 @@ impl Db {
             Some(proposer),
         )?;
 
+        // The single commit flushes both the block and the certificate. Attribute
+        // its cost to the block write (counted once) rather than dropping it.
+        let commit_start = Instant::now();
         tx.commit()?;
 
-        self.update_write_metrics(write_bytes, start.elapsed());
+        self.update_write_metrics(
+            write_bytes,
+            block_write_time.saturating_add(commit_start.elapsed()),
+        );
 
         Ok(())
     }
