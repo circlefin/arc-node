@@ -100,7 +100,16 @@ impl PartitionMode {
             (n + d / 2) / d
         }
 
-        if round_div(num_accounts, 1 << (num_generators - 1)) == 0 {
+        // The smallest (first) bucket is `num_accounts` halved `num_generators - 1`
+        // times, i.e. divided by `1 << (num_generators - 1)`. Once that shift
+        // amount reaches the platform word size the shift itself overflows
+        // (panic in debug, silent wrap in release) before the guard can fire, so
+        // check the shift width first: a divisor of `2^(num_generators - 1)` that
+        // does not fit in a `usize` already exceeds `num_accounts`, so the
+        // smallest bucket necessarily rounds to 0. `||` short-circuits, so the
+        // `1 << shift` below is only evaluated when `shift < usize::BITS`.
+        let shift = num_generators - 1;
+        if shift >= usize::BITS as usize || round_div(num_accounts, 1 << shift) == 0 {
             eyre::bail!("too many generators: it would result in a bucket with size 0");
         }
 
@@ -184,6 +193,28 @@ mod tests {
             let ranges =
                 PartitionMode::Exponential.partition_accounts(num_accounts, num_generators);
             assert_eq!(ranges.ok(), expected);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partition_accounts_exponential_rejects_too_many_generators() -> Result<()> {
+        // `num_generators - 1 >= usize::BITS` makes the `1 << (num_generators - 1)`
+        // bucket-count guard overflow its shift (panic in debug, garbage
+        // partition in release). It must instead return the graceful
+        // "too many generators" error, like the in-range `(100, 9)` case does.
+        let shift_overflow_cases = [
+            (130, 65),   // shift == usize::BITS exactly (the overflowing boundary)
+            (1000, 100), // shift well past the word size
+            (200, 64),   // shift == usize::BITS - 1: valid shift, bucket still rounds to 0
+        ];
+        for (num_accounts, num_generators) in shift_overflow_cases {
+            let result =
+                PartitionMode::Exponential.partition_accounts(num_accounts, num_generators);
+            assert!(
+                result.is_err(),
+                "expected graceful error for ({num_accounts}, {num_generators}), got {result:?}"
+            );
         }
         Ok(())
     }
