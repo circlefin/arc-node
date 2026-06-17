@@ -894,21 +894,13 @@ fn install_sigterm_handler(_handle: &Handle) {}
 /// authentication, malformed responses) return `false` so they still park for
 /// manual intervention rather than restart-looping.
 ///
-/// Note: gRPC `Status` errors (`RemoteSigningError::Status`) are intentionally out
-/// of scope here — the failure this guards against is the eager `connect()` at
-/// startup, which surfaces as `Transport`. Keeping the set narrow avoids
-/// restart-looping on errors whose transience is ambiguous.
+/// The exact retryability rules live with `RemoteSigningError`, where tonic status
+/// codes and retry-exhaustion sources can be classified without string matching.
 fn is_retryable_startup_error(error: &eyre::Report) -> bool {
-    error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<RemoteSigningError>(),
-            Some(
-                RemoteSigningError::Transport(_)
-                    | RemoteSigningError::ServiceUnavailable(_)
-                    | RemoteSigningError::Timeout(_)
-            )
-        )
-    })
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<RemoteSigningError>())
+        .any(RemoteSigningError::is_retryable_startup_error)
 }
 
 /// Wait for a termination signal (SIGTERM on Unix)
@@ -1049,6 +1041,14 @@ mod tests {
             .wrap_err("Node failed to start")
     }
 
+    fn wrapped_validator_proof_signing(err: RemoteSigningError) -> eyre::Report {
+        let signing_error = arc_consensus_types::signing::SigningError::from_source(err);
+        eyre::Report::new(signing_error)
+            .wrap_err("Failed to sign validator proof")
+            .wrap_err("Failed to create network identity with validator proof")
+            .wrap_err("Node failed to start")
+    }
+
     #[test]
     fn transient_remote_signer_errors_are_retryable() {
         assert!(is_retryable_startup_error(&wrapped(
@@ -1057,6 +1057,22 @@ mod tests {
         assert!(is_retryable_startup_error(&wrapped(
             RemoteSigningError::Timeout("slow".into())
         )));
+        assert!(is_retryable_startup_error(&wrapped(
+            RemoteSigningError::Status(Box::new(tonic::Status::unavailable("signer warming up")))
+        )));
+        assert!(is_retryable_startup_error(&wrapped(
+            RemoteSigningError::Status(Box::new(tonic::Status::deadline_exceeded(
+                "signer request timed out"
+            )))
+        )));
+        assert!(is_retryable_startup_error(
+            &wrapped_validator_proof_signing(RemoteSigningError::RetryExhausted {
+                retries: 3,
+                source: Box::new(RemoteSigningError::Status(Box::new(
+                    tonic::Status::unavailable("signer warming up")
+                ))),
+            })
+        ));
     }
 
     #[test]
@@ -1067,6 +1083,17 @@ mod tests {
         assert!(!is_retryable_startup_error(&wrapped(
             RemoteSigningError::Authentication("denied".into())
         )));
+        assert!(!is_retryable_startup_error(&wrapped(
+            RemoteSigningError::Status(Box::new(tonic::Status::unauthenticated("bad credentials")))
+        )));
+        assert!(!is_retryable_startup_error(
+            &wrapped_validator_proof_signing(RemoteSigningError::RetryExhausted {
+                retries: 3,
+                source: Box::new(RemoteSigningError::Status(Box::new(
+                    tonic::Status::unauthenticated("bad credentials")
+                ))),
+            })
+        ));
     }
 
     #[test]
