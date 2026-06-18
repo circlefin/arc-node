@@ -1,0 +1,44 @@
+name: Prepare test-release/0.7
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/prepare-test-release-0.7.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  create-branch:
+    if: github.repository == 'circlefin/arc-node'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create test-release/0.7
+        env:
+          BRANCH: test-release/0.7
+          BASE_REF: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          repo_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_header="AUTHORIZATION: bearer ${GH_TOKEN}"
+
+          if git -c "http.https://github.com/.extraheader=${auth_header}" \
+            ls-remote --exit-code --heads "${repo_url}" "${BRANCH}" >/dev/null 2>&1; then
+            echo "${BRANCH} already exists"
+            exit 0
+          fi
+
+          workdir="$(mktemp -d)"
+          cd "${workdir}"
+          git init
+          git remote add origin "${repo_url}"
+          git -c "http.https://github.com/.extraheader=${auth_header}" \
+            fetch --depth=1 origin "${BASE_REF}"
+          git -c "http.https://github.com/.extraheader=${auth_header}" \
+            push origin "FETCH_HEAD:refs/heads/${BRANCH}"
