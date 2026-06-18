@@ -19,7 +19,7 @@ runs:
   steps:
     - name: Get Cloudsmith token
       id: get-token
-      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         CLOUDSMITH_ORG: ${{ inputs.org }}
         CLOUDSMITH_SERVICE_SLUG: ${{ inputs.service-slug }}
@@ -59,7 +59,7 @@ runs:
           }
 
     - name: Login to Cloudsmith
-      uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+      uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
       with:
         registry: ${{ inputs.registry }}
         username: ${{ steps.get-token.outputs.cloudsmith_user }}
