@@ -5,23 +5,23 @@
 | Status        | Draft          |
 | Author(s)     | @asoghoian     |
 | Created       | 2026-03-03     |
-| Updated       | 2026-05-12     |
+| Updated       | 2026-06-08     |
 | Supersedes    | -              |
 | Superseded by | -              |
 
 ## Context
 
-On Arc, the base fee calculation combines: 1) an EIP-1559-style algorithm, 2)  several at-runtime-governance-tunable values, and 3) an exponentially-smoothed view of historical gas use. 
+On Arc, the base fee calculation combines: 1) an EIP-1559-style algorithm, 2)  several at-runtime-governance-tunable values, and 3) an exponentially-smoothed view of historical gas use.
 
 The value of 1) is that it is familiar and well-understood. The value of 2) is to enable rapid adjusting of fee parameters and strictly enforcing block gas limits through governance. The value of 3) is to dampen fee increases against sudden shocks in usage with Arc's fast blocktimes.
 
-The combination of these makes it challenging for integrators to precisely understand the next block base fee as the calculation is more involved. To address this, Arc includes the next block base fee in the header, computed at the end of the parent's block execution, since it is fully known at that point. 
+The combination of these makes it challenging for integrators to precisely understand the next block base fee as the calculation is more involved. To address this, Arc includes the next block base fee in the header, computed at the end of the parent's block execution, since it is fully known at that point.
 
 Currently, the implementation has several gaps in validation. This ADR, similar to ADR-003, seeks to document solutions to these gaps.
 
 ### Gap 1: No validation of the base fee computation
 
-There is currently no validation of the base fee calculation, just a check that the parent's header contains the next block's base fee. This is clearly insufficient -- a proposer could miscalculate a base fee, store it in the block header, and force the next proposer to use it. 
+There is currently no validation of the base fee calculation, just a check that the parent's header contains the next block's base fee. This is clearly insufficient -- a proposer could miscalculate a base fee, store it in the block header, and force the next proposer to use it.
 
 ### Gap 2: The current fallback behavior is complex for integrators
 
@@ -31,7 +31,7 @@ This adds complexity as: 1) an integrator may not know how to "derive" the base 
 
 ## Decision
 
-Always include the next block base fee, use a consistent algorithm, and apply strict validation. 
+Always include the next block base fee, use a consistent algorithm, and apply strict validation.
 
 ### Chainspec Updates
 
@@ -41,8 +41,8 @@ Two new types are attached to the chainspec via `base_fee_config(block_height)`:
 /// Bounds on the three calculation parameters from ProtocolConfig.
 struct BaseFeeCalcParams {
     alpha: u64,                  // EMA smoothing factor [0, 100]
-    k_rate: u64,                 // Max change rate in basis points (200 = 2%)
-    elasticity_multiplier: u64,  // Target gas ratio in basis points (5000 = 50%)
+    k_rate: u64,                 // Base fee adjustment coefficient, in basis points (200 = 2%)
+    inverse_elasticity_multiplier: u64,  // Target gas ratio in basis points (5000 = 50%)
 }
 
 /// Complete base fee configuration for a network.
@@ -72,7 +72,7 @@ The two absolute bounds control the *output*: after computation and after the Pr
 | testnet | 1 | 20 | 100 |
 | mainnet | 1 | 20 | 100 |
 
-**k_rate** — max base fee change rate per block (basis points). 200 = 2%.
+**k_rate** — Base fee adjustment coefficient per block (basis points). 200 = 2%.
 
 | Network | min | default | max |
 |---------|-----|---------|-----|
@@ -81,7 +81,7 @@ The two absolute bounds control the *output*: after computation and after the Pr
 | testnet | 1 | 200 | 1000 |
 | mainnet | 1 | 200 | 1000 |
 
-**elasticity_multiplier** — target gas utilization (basis points). 5000 = 50%.
+**inverse_elasticity_multiplier** — target gas utilization (basis points). 5000 = 50%.
 
 | Network | min | default | max |
 |---------|-----|---------|-----|
@@ -119,14 +119,14 @@ else:
     calc = BaseFeeCalcParams(
         alpha             = validated(fee_params.alpha, alpha),
         k_rate            = validated(fee_params.kRate, k_rate),
-        elasticity_multiplier = validated(fee_params.elasticityMultiplier, elasticity_multiplier),
-    )
+        inverse_elasticity_multiplier = validated(fee_params.inverseElasticityMultiplier, inverse_elasticity_multiplier),
+   )
 
 # 1. Compute smoothed gas
 smoothed_gas = ema(parent_smoothed_gas, block_gas_used, calc.alpha)
 
 # 2. Compute next base fee
-next_base_fee = arc_calc_next_block_base_fee(smoothed_gas, gas_limit, base_fee, calc.k_rate, calc.elasticity_multiplier)
+next_base_fee = arc_calc_next_block_base_fee(smoothed_gas, gas_limit, base_fee, calc.k_rate, calc.inverse_elasticity_multiplier)
 
 # 3. Apply ProtocolConfig's own minBaseFee/maxBaseFee clamp (if available)
 if fee_params is not None:
@@ -148,13 +148,8 @@ The assembler always writes `next_base_fee` from SystemAccounting to `extra_data
 ```python
 config = chainspec.base_fee_config(block_height)
 
-# 1. Absolute bounds check
+# Absolute bounds check
 assert config.absolute_min_base_fee <= header.base_fee <= config.absolute_max_base_fee
-
-# 2. Rate check (proportional, using max allowed k_rate)
-if parent.number > 0:
-    max_delta = parent.base_fee * config.params_max.k_rate / 10000
-    assert abs(header.base_fee - parent.base_fee) <= max_delta
 ```
 
 **Stateful** (after block execution):
