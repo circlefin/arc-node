@@ -6,10 +6,13 @@ on:
     branches:
       - main
       - release/*
-  push:
-    tags:
-      - 'v*'
   workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to build and publish Docker images for (e.g. v0.6.0)'
+        required: true
+        type: string
+  workflow_dispatch:
     inputs:
       tag:
         description: 'Tag to build and publish Docker images for (e.g. v0.6.0)'
@@ -17,7 +20,7 @@ on:
         type: string
 
 concurrency:
-  group: docker-${{ github.event_name == 'workflow_call' && inputs.tag || github.ref }}
+  group: docker-${{ (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch') && inputs.tag || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -27,8 +30,8 @@ env:
 jobs:
   build:
     if: >-
-      github.event_name == 'push' ||
       github.event_name == 'workflow_call' ||
+      github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'build-docker')
     name: Build ${{ matrix.image }} (${{ matrix.platform }})
     permissions:
@@ -55,7 +58,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ github.event_name == 'workflow_call' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          ref: ${{ (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch') && format('refs/tags/{0}', inputs.tag) || github.ref }}
           submodules: recursive
 
       - name: Resolve image metadata
@@ -65,10 +68,8 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           SHA="$(git rev-parse HEAD)"
-          if [[ "$EVENT_NAME" == "workflow_call" ]]; then
+          if [[ "$EVENT_NAME" == "workflow_call" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
             RELEASE_TAG="$INPUT_TAG"
-          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
           else
             RELEASE_TAG=""
           fi
@@ -122,13 +123,13 @@ jobs:
           path: trivy-results.sarif
 
       - name: Login to Cloudsmith
-        if: ${{ github.event_name == 'push' || github.event_name == 'workflow_call' }}
+        if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' }}
         uses: ./.github/actions/cloudsmith-login
         with:
           registry: ${{ env.REGISTRY }}
 
       - name: Push image by digest
-        if: ${{ github.event_name == 'push' || github.event_name == 'workflow_call' }}
+        if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' }}
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}
           BAKE_METADATA: ${{ steps.build.outputs.metadata }}
@@ -151,7 +152,7 @@ jobs:
           echo "${REGISTRY_DIGEST}" > "/tmp/digests/${MATRIX_IMAGE}/${PLATFORM_SLUG}"
 
       - name: Upload digest
-        if: ${{ github.event_name == 'push' || github.event_name == 'workflow_call' }}
+        if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: digest-${{ matrix.image }}-${{ matrix.arch }}
@@ -159,7 +160,7 @@ jobs:
           if-no-files-found: error
 
   manifest:
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_call' }}
+    if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' }}
     name: Manifest ${{ matrix.image }}
     permissions:
       contents: read
@@ -198,7 +199,7 @@ jobs:
         id: manifest
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}
-          RELEASE_TAG: ${{ github.event_name == 'workflow_call' && inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           VERSION="${RELEASE_TAG#v}"
           TAG="${IMAGE}:${VERSION}"
