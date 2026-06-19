@@ -178,8 +178,8 @@ fetch_base_and_target() {
   TARGET_SHA="$(git rev-parse --verify "${MERGE_COMMIT_SHA}^{commit}")" || die "Merge commit does not exist locally: ${MERGE_COMMIT_SHA}"
   BASE_SHA="$(git rev-parse --verify "origin/${PR_BASE_REF}^{commit}")" || die "Base branch does not exist locally: ${PR_BASE_REF}"
 
-  if [[ "${BASE_SHA}" != "${TARGET_SHA}" ]]; then
-    die "Base branch ${PR_BASE_REF} is at ${BASE_SHA}, expected merge commit ${TARGET_SHA}"
+  if ! git merge-base --is-ancestor "${TARGET_SHA}" "${BASE_SHA}"; then
+    die "Merge commit ${TARGET_SHA} is not reachable from base branch ${PR_BASE_REF}@${BASE_SHA}"
   fi
 }
 

@@ -23,6 +23,7 @@ jobs:
     if: >-
       github.event.action != 'closed' &&
       contains(github.event.pull_request.labels.*.name, 'release') &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.head.ref, 'sync/copybara-export-')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -47,6 +48,7 @@ jobs:
     if: >-
       github.event.pull_request.merged == true &&
       contains(github.event.pull_request.labels.*.name, 'release') &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.head.ref, 'sync/copybara-export-')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
