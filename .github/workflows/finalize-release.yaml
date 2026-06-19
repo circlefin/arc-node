@@ -34,13 +34,14 @@ jobs:
           fetch-depth: 0
 
       - name: Validate release metadata
-        env:
-          RELEASE_NAMESPACE: auto
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-        run: bash .github/scripts/finalize-release.sh validate
+        uses: ./.github/actions/finalize-release
+        with:
+          mode: validate
+          release-namespace: auto
+          pr-title: ${{ github.event.pull_request.title }}
+          pr-body: ${{ github.event.pull_request.body }}
+          pr-base-ref: ${{ github.event.pull_request.base.ref }}
+          pr-head-ref: ${{ github.event.pull_request.head.ref }}
 
   finalize-release:
     name: Create release branch and tag
@@ -61,11 +62,12 @@ jobs:
           fetch-depth: 0
 
       - name: Create release branch and tag
-        env:
-          RELEASE_NAMESPACE: auto
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          MERGE_COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-        run: bash .github/scripts/finalize-release.sh finalize
+        uses: ./.github/actions/finalize-release
+        with:
+          mode: finalize
+          release-namespace: auto
+          pr-title: ${{ github.event.pull_request.title }}
+          pr-body: ${{ github.event.pull_request.body }}
+          pr-base-ref: ${{ github.event.pull_request.base.ref }}
+          pr-head-ref: ${{ github.event.pull_request.head.ref }}
+          merge-commit-sha: ${{ github.event.pull_request.merge_commit_sha }}

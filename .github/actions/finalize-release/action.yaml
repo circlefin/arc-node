@@ -1,0 +1,49 @@
+name: Finalize Public Release
+description: Validate or finalize a public release PR.
+
+inputs:
+  mode:
+    description: validate or finalize.
+    required: true
+  repository-path:
+    description: Path to the checked out public repository.
+    required: false
+    default: .
+  release-namespace:
+    description: Release namespace to enforce.
+    required: false
+    default: auto
+  pr-title:
+    description: Release PR title.
+    required: false
+    default: ""
+  pr-body:
+    description: Release PR body.
+    required: true
+  pr-base-ref:
+    description: Release PR base branch.
+    required: true
+  pr-head-ref:
+    description: Release PR head branch.
+    required: true
+  merge-commit-sha:
+    description: Merge commit SHA for finalize mode.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Run release finalizer
+      shell: bash
+      env:
+        RELEASE_NAMESPACE: ${{ inputs.release-namespace }}
+        PR_TITLE: ${{ inputs.pr-title }}
+        PR_BODY: ${{ inputs.pr-body }}
+        PR_BASE_REF: ${{ inputs.pr-base-ref }}
+        PR_HEAD_REF: ${{ inputs.pr-head-ref }}
+        MERGE_COMMIT_SHA: ${{ inputs.merge-commit-sha }}
+      run: |
+        set -euo pipefail
+        cd "${{ inputs.repository-path }}"
+        bash "${{ github.action_path }}/../../scripts/finalize-release.sh" "${{ inputs.mode }}"
