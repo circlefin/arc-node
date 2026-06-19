@@ -27,10 +27,25 @@ inputs:
     required: false
     default: ""
 
+outputs:
+  namespace:
+    description: Resolved release namespace.
+    value: ${{ steps.finalizer.outputs.namespace }}
+  tag:
+    description: Resolved release tag.
+    value: ${{ steps.finalizer.outputs.tag }}
+  release_branch:
+    description: Resolved release branch.
+    value: ${{ steps.finalizer.outputs.release_branch }}
+  release_kind:
+    description: Resolved release kind.
+    value: ${{ steps.finalizer.outputs.release_kind }}
+
 runs:
   using: composite
   steps:
     - name: Run release finalizer
+      id: finalizer
       shell: bash
       env:
         RELEASE_NAMESPACE: ${{ inputs.release-namespace }}

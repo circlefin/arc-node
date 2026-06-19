@@ -55,6 +55,11 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
+    outputs:
+      namespace: ${{ steps.finalize.outputs.namespace }}
+      tag: ${{ steps.finalize.outputs.tag }}
+      release_branch: ${{ steps.finalize.outputs.release_branch }}
+      release_kind: ${{ steps.finalize.outputs.release_kind }}
     steps:
       - name: Checkout base branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -63,6 +68,7 @@ jobs:
           fetch-depth: 0
 
       - name: Create release branch and tag
+        id: finalize
         uses: ./.github/actions/finalize-release
         with:
           mode: finalize
@@ -71,3 +77,26 @@ jobs:
           pr-base-ref: ${{ github.event.pull_request.base.ref }}
           pr-head-ref: ${{ github.event.pull_request.head.ref }}
           merge-commit-sha: ${{ github.event.pull_request.merge_commit_sha }}
+
+  release-binaries:
+    name: Release binaries
+    needs: finalize-release
+    if: needs.finalize-release.outputs.namespace == 'production'
+    uses: ./.github/workflows/release-binaries.yaml
+    with:
+      tag: ${{ needs.finalize-release.outputs.tag }}
+    secrets: inherit
+    permissions:
+      contents: write
+
+  release-docker:
+    name: Release Docker images
+    needs: finalize-release
+    if: needs.finalize-release.outputs.namespace == 'production'
+    uses: ./.github/workflows/build-docker.yaml
+    with:
+      tag: ${{ needs.finalize-release.outputs.tag }}
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
