@@ -1,0 +1,69 @@
+name: Finalize Public Release
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, closed]
+    branches:
+      - main
+      - test-main
+      - release/**
+      - test-release/**
+
+concurrency:
+  group: public-release-finalizer-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  validate-release-pr:
+    name: Validate release metadata
+    if: >-
+      github.event.action != 'closed' &&
+      startsWith(github.event.pull_request.head.ref, 'sync/copybara-export-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - name: Validate release metadata
+        env:
+          RELEASE_NAMESPACE: auto
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: bash .github/scripts/finalize-release.sh validate
+
+  finalize-release:
+    name: Create release branch and tag
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'sync/copybara-export-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - name: Create release branch and tag
+        env:
+          RELEASE_NAMESPACE: auto
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          MERGE_COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: bash .github/scripts/finalize-release.sh finalize
