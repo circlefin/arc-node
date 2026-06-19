@@ -55,8 +55,8 @@ pub enum Chain {
 }
 
 impl Chain {
-    /// Default execution data directory for this chain.
-    pub fn default_execution_path(self) -> Option<PathBuf> {
+    /// Default execution data directory (same for all chains).
+    pub fn default_execution_path() -> Option<PathBuf> {
         directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".arc").join("execution"))
     }
 
@@ -583,7 +583,7 @@ mod tests {
     #[test]
     fn chain_default_execution_path_ends_with_arc_execution() {
         // BaseDirs resolves on any OS with a home dir; in CI HOME is always set.
-        if let Some(p) = Chain::Testnet.default_execution_path() {
+        if let Some(p) = Chain::default_execution_path() {
             assert!(p.ends_with(".arc/execution"));
         }
     }

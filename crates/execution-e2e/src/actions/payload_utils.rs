@@ -68,6 +68,7 @@ pub(crate) async fn build_payload_for_next_block_with_client<C: EngineApiClient<
         suggested_fee_recipient: address!("0x65E0a200006D4FF91bD59F9694220dafc49dbBC1"),
         withdrawals: Some(vec![]),
         parent_beacon_block_root: Some(parent_beacon_block_root),
+        slot_number: None,
     };
 
     let fcu_result = EngineApiClient::<EthEngineTypes>::fork_choice_updated_v3(

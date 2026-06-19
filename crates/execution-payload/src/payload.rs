@@ -22,7 +22,7 @@
 //! `arc_ethereum_payload` and converted to `UnprocessableTransactionError`.
 
 use alloy_primitives::U256;
-use alloy_primitives::{hex, TxHash};
+use alloy_primitives::{hex, TxHash, B256};
 use alloy_rlp::Encodable;
 use eyre::Result;
 use reth_basic_payload_builder::{
@@ -32,25 +32,31 @@ use reth_basic_payload_builder::{
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
 use reth_errors::{BlockExecutionError, BlockValidationError, ConsensusError};
+use reth_ethereum::trie::updates::TrieUpdates;
+use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
 use reth_evm::{
-    execute::{BlockBuilder, BlockBuilderOutcome},
+    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutor},
     ConfigureEvm, Evm, NextBlockEnvAttributes,
+};
+use reth_execution_cache::{
+    CachedStateMetrics, CachedStateMetricsSource, CachedStateProvider, SavedCache,
 };
 use reth_node_api::{NodeTypes, PrimitivesTy};
 use reth_node_builder::{
     components::PayloadBuilderBuilder, node::FullNodeTypes, BuilderContext, PayloadBuilderConfig,
 };
-use reth_payload_builder::{BlobSidecars, EthBuiltPayload, EthPayloadBuilderAttributes};
-use reth_payload_primitives::{PayloadBuilderAttributes, PayloadBuilderError};
+use reth_payload_builder::{BlobSidecars, EthBuiltPayload};
+use reth_payload_primitives::PayloadBuilderError;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
 use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_storage_api::StateProviderFactory;
+use reth_storage_api::{StateProviderBox, StateProviderFactory};
 use reth_transaction_pool::{
     error::InvalidPoolTransactionError, BestTransactions, BestTransactionsAttributes,
     PoolTransaction, TransactionPool, ValidPoolTransaction,
 };
+use reth_trie_parallel::state_root_task::StateRootHandle;
 use revm::context_interface::Block as _;
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
@@ -109,7 +115,6 @@ where
     <Node::Types as NodeTypes>::Payload: reth_node_api::PayloadTypes<
         BuiltPayload = EthBuiltPayload,
         PayloadAttributes = reth_ethereum_engine_primitives::EthPayloadAttributes,
-        PayloadBuilderAttributes = EthPayloadBuilderAttributes,
     >,
 {
     type PayloadBuilder = InvalidTxFilteringPayloadBuilder<
@@ -422,12 +427,12 @@ where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
 {
-    type Attributes = EthPayloadBuilderAttributes;
+    type Attributes = EthPayloadAttributes;
     type BuiltPayload = EthBuiltPayload;
 
     fn try_build(
         &self,
-        args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
+        args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
         arc_ethereum_payload(
             self.evm_config.clone(),
@@ -455,9 +460,16 @@ where
 
     fn build_empty_payload(
         &self,
-        config: PayloadConfig<Self::Attributes>,
+        config: PayloadConfig<Self::Attributes, HeaderForPayload<Self::BuiltPayload>>,
     ) -> Result<Self::BuiltPayload, PayloadBuilderError> {
-        let args = BuildArguments::new(Default::default(), config, Default::default(), None);
+        let args = BuildArguments::new(
+            Default::default(),
+            Default::default(),
+            None,
+            config,
+            Default::default(),
+            None,
+        );
 
         // This is what's done in upstream EthereumPayloadBuilder::build_empty_payload
         arc_ethereum_payload(
@@ -489,6 +501,130 @@ fn proposer_revenue<T: alloy_consensus::Transaction>(tx: &T, gas_used: u64, base
     }
 }
 
+/// Outcome of running a single transaction in the payload-building loop.
+enum TxOutcome {
+    /// Transaction executed successfully — record `gas_used`, advance.
+    Included(u64),
+    /// Skip this tx silently (e.g. nonce too low). Caller continues.
+    Skip,
+    /// Skip and mark the tx invalid in the pool so descendants are evicted.
+    SkipAndMarkInvalid,
+    /// Tx gas limit exceeds the gas remaining in the block. Skip and mark invalid
+    /// with the executor's reported limits so descendants are evicted.
+    SkipExceedsGasLimit {
+        transaction_gas_limit: u64,
+        block_available_gas: u64,
+    },
+    /// Unrecoverable error for this build attempt — propagate.
+    Fatal(PayloadBuilderError),
+}
+
+/// Classifies the result of `catch_unwind(|| builder.execute_transaction(...))`
+/// into one of five loop-control outcomes. The caller is responsible for
+/// invoking `best_txs.mark_invalid(...)` on the `SkipAndMarkInvalid` and
+/// `SkipExceedsGasLimit` arms — kept out of this helper so the signature stays
+/// non-generic.
+fn classify_tx_outcome(
+    result: std::thread::Result<Result<u64, BlockExecutionError>>,
+    tx_hash: TxHash,
+    tx: &TransactionSigned,
+) -> TxOutcome {
+    match result {
+        Ok(Ok(gas_used)) => TxOutcome::Included(gas_used),
+        Ok(Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
+            error, ..
+        }))) => {
+            if error.is_nonce_too_low() {
+                trace!(target: "payload_builder", %error, ?tx, "(arc) skipping nonce too low transaction");
+                TxOutcome::Skip
+            } else {
+                trace!(target: "payload_builder", %error, ?tx, "(arc) skipping invalid transaction and its descendants");
+                TxOutcome::SkipAndMarkInvalid
+            }
+        }
+        // The executor is the source of truth for block gas availability. Keep this
+        // non-fatal in case local builder accounting diverges from executor rules.
+        Ok(Err(BlockExecutionError::Validation(
+            BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                transaction_gas_limit,
+                block_available_gas,
+            },
+        ))) => {
+            trace!(target: "payload_builder", %transaction_gas_limit, %block_available_gas, ?tx, "(arc) skipping transaction exceeding block gas limit");
+            TxOutcome::SkipExceedsGasLimit {
+                transaction_gas_limit,
+                block_available_gas,
+            }
+        }
+        Ok(Err(err)) => TxOutcome::Fatal(PayloadBuilderError::evm(err)),
+        Err(_panic_payload) => {
+            TxOutcome::Fatal(PayloadBuilderError::other(UnprocessableTransactionError {
+                tx_hash,
+            }))
+        }
+    }
+}
+
+/// True when an optional time budget has been exceeded.
+fn time_budget_exhausted(started: Instant, limit: Option<Duration>) -> bool {
+    limit.is_some_and(|l| started.elapsed() >= l)
+}
+
+/// True when the Osaka hardfork is active AND the candidate block size
+/// exceeds [`MAX_RLP_BLOCK_SIZE`].
+fn osaka_size_exceeded(is_osaka: bool, size: usize) -> bool {
+    is_osaka && size > MAX_RLP_BLOCK_SIZE
+}
+
+/// Returns `state_provider` wrapped in a [`CachedStateProvider`] when an
+/// execution cache is present, otherwise returns it unwrapped. Centralises
+/// the conditional so the caller stays free of control flow.
+fn maybe_wrap_with_execution_cache(
+    state_provider: StateProviderBox,
+    execution_cache: Option<SavedCache>,
+) -> StateProviderBox {
+    if let Some(cache) = execution_cache {
+        // reth 2.2 removed `SavedCache::metrics()`, so we construct fresh builder-sourced
+        // metrics per build, matching the default payload builder. Per-cache hit/miss
+        // continuity is lost; global Prometheus aggregates are unaffected because the
+        // metric handles are shared.
+        Box::new(CachedStateProvider::new(
+            state_provider,
+            cache.cache().clone(),
+            CachedStateMetrics::zeroed(CachedStateMetricsSource::Builder),
+        ))
+    } else {
+        state_provider
+    }
+}
+
+/// Drives the sparse-trie state-root task to completion, falling back to
+/// sync state-root computation (returns `None`) on failure. Returns the
+/// precomputed `(state_root, trie_updates)` pair to hand to
+/// `BlockBuilder::finish` when the parallel result is usable.
+///
+/// Caller must clear the builder's state hook before invoking — the helper
+/// stays non-generic by keeping the builder out of its signature.
+fn try_precomputed_state_root(
+    trie_handle: Option<StateRootHandle>,
+    payload_id: &impl std::fmt::Display,
+) -> Option<(B256, TrieUpdates)> {
+    let mut handle = trie_handle?;
+    match handle.state_root() {
+        Ok(outcome) => {
+            debug!(target: "payload_builder", id=%payload_id, state_root=?outcome.state_root, "(arc) received state root from sparse trie");
+            Some((
+                outcome.state_root,
+                Arc::unwrap_or_clone(outcome.trie_updates),
+            ))
+        }
+        Err(err) => {
+            warn!(target: "payload_builder", id=%payload_id, %err, "(arc) sparse trie failed, falling back to sync state root");
+            None
+        }
+    }
+}
+
 /// Constructs an transaction payload using the best transactions from the pool.
 /// It follows the upstream Ethereum payload building logic with a Arc-specific deadline for the main loop.
 ///
@@ -503,7 +639,7 @@ pub fn arc_ethereum_payload<EvmConfig, Client, Pool, F>(
     _pool: Pool,
     builder_config: EthereumBuilderConfig,
     loop_time_limit: Option<Duration>,
-    args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
+    args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
     best_txs: F,
 ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
 where
@@ -514,6 +650,8 @@ where
 {
     let BuildArguments {
         mut cached_reads,
+        execution_cache,
+        trie_handle,
         config,
         cancel,
         best_payload,
@@ -521,12 +659,16 @@ where
     let PayloadConfig {
         parent_header,
         attributes,
+        payload_id,
     } = config;
 
     let total_start = Instant::now();
 
     let stage_start = Instant::now();
-    let state_provider = client.state_by_block_hash(parent_header.hash())?;
+    let state_provider = maybe_wrap_with_execution_cache(
+        client.state_by_block_hash(parent_header.hash())?,
+        execution_cache,
+    );
     let state = StateProviderDatabase::new(state_provider.as_ref());
     let mut db = State::builder()
         .with_database(cached_reads.as_db_mut(state))
@@ -539,20 +681,21 @@ where
             &mut db,
             &parent_header,
             NextBlockEnvAttributes {
-                timestamp: attributes.timestamp(),
-                suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                prev_randao: attributes.prev_randao(),
+                timestamp: attributes.timestamp,
+                suggested_fee_recipient: attributes.suggested_fee_recipient,
+                prev_randao: attributes.prev_randao,
                 gas_limit: builder_config.gas_limit(parent_header.gas_limit),
-                parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                withdrawals: Some(attributes.withdrawals().clone()),
+                parent_beacon_block_root: attributes.parent_beacon_block_root,
+                withdrawals: attributes.withdrawals.clone().map(Into::into),
                 extra_data: builder_config.extra_data,
+                slot_number: None,
             },
         )
         .map_err(PayloadBuilderError::other)?;
 
     let chain_spec = client.chain_spec();
 
-    info!(target: "payload_builder", id=%attributes.id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "(arc) building new payload");
+    info!(target: "payload_builder", id=%payload_id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "(arc) building new payload");
     let mut cumulative_gas_used = 0u64;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
@@ -562,6 +705,12 @@ where
         None, // Explicitly disable blob transactions by not providing a blob gas price.
     ));
     let mut total_fees = U256::ZERO;
+
+    trie_handle.as_ref().inspect(|handle| {
+        builder
+            .executor_mut()
+            .set_state_hook(Some(Box::new(handle.state_hook())));
+    });
 
     let stage_start = Instant::now();
     builder.apply_pre_execution_changes().map_err(|err| {
@@ -573,19 +722,16 @@ where
     let mut block_transactions_rlp_length = 0usize;
     let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp);
 
-    let withdrawals_rlp_length = attributes.withdrawals().length();
+    let withdrawals_rlp_length = attributes.withdrawals.as_ref().map_or(0, |w| w.length());
 
     let loop_started = Instant::now();
 
     while let Some(pool_tx) = best_txs.next() {
-        // Break early if loop time budget exhausted
-        if let Some(limit) = loop_time_limit {
-            if loop_started.elapsed() >= limit {
-                #[allow(clippy::cast_possible_truncation)]
-                let elapsed_ms = loop_started.elapsed().as_millis() as u64;
-                warn!(elapsed_ms, "(arc) loop time budget reached; sealing early");
-                break;
-            }
+        if time_budget_exhausted(loop_started, loop_time_limit) {
+            #[allow(clippy::cast_possible_truncation)]
+            let elapsed_ms = loop_started.elapsed().as_millis() as u64;
+            warn!(elapsed_ms, "(arc) loop time budget reached; sealing early");
+            break;
         }
 
         // ensure we still have capacity for this transaction
@@ -622,7 +768,7 @@ where
             .saturating_add(withdrawals_rlp_length)
             .saturating_add(1024); // 1Kb of overhead for the block header
 
-        if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
+        if osaka_size_exceeded(is_osaka, estimated_block_size_with_tx) {
             best_txs.mark_invalid(
                 &pool_tx,
                 &InvalidPoolTransactionError::OversizedData {
@@ -633,40 +779,37 @@ where
             continue;
         }
 
-        let gas_used = match catch_unwind(AssertUnwindSafe(|| {
-            builder.execute_transaction(tx.clone())
-        })) {
-            Ok(Ok(gas_used)) => gas_used,
-            Ok(Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
-                error,
-                ..
-            }))) => {
-                if error.is_nonce_too_low() {
-                    // if the nonce is too low, we can skip this transaction
-                    trace!(target: "payload_builder", %error, ?tx, "(arc) skipping nonce too low transaction");
-                } else {
-                    // if the transaction is invalid, we can skip it and all of its
-                    // descendants
-                    trace!(target: "payload_builder", %error, ?tx, "(arc) skipping invalid transaction and its descendants");
-                    best_txs.mark_invalid(
-                        &pool_tx,
-                        &InvalidPoolTransactionError::Consensus(
-                            InvalidTransactionError::TxTypeNotSupported,
-                        ),
-                    );
-                }
+        let raw_result = catch_unwind(AssertUnwindSafe(|| {
+            builder
+                .execute_transaction(tx.clone())
+                .map(|out| out.tx_gas_used())
+        }));
+        let gas_used = match classify_tx_outcome(raw_result, *pool_tx.hash(), &tx) {
+            TxOutcome::Included(g) => g,
+            TxOutcome::Skip => continue,
+            TxOutcome::SkipAndMarkInvalid => {
+                best_txs.mark_invalid(
+                    &pool_tx,
+                    &InvalidPoolTransactionError::Consensus(
+                        InvalidTransactionError::TxTypeNotSupported,
+                    ),
+                );
                 continue;
             }
-            // this is an error that we should treat as fatal for this attempt
-            Ok(Err(err)) => return Err(PayloadBuilderError::evm(err)),
-            // a single transaction caused a panic — wrap it so handle_build_res
-            // can identify the offending tx and purge it from the mempool
-            Err(_panic_payload) => {
-                let tx_hash = *pool_tx.hash();
-                return Err(PayloadBuilderError::other(UnprocessableTransactionError {
-                    tx_hash,
-                }));
+            TxOutcome::SkipExceedsGasLimit {
+                transaction_gas_limit,
+                block_available_gas,
+            } => {
+                best_txs.mark_invalid(
+                    &pool_tx,
+                    &InvalidPoolTransactionError::ExceedsGasLimit(
+                        transaction_gas_limit,
+                        block_available_gas,
+                    ),
+                );
+                continue;
             }
+            TxOutcome::Fatal(e) => return Err(e),
         };
 
         block_transactions_rlp_length = block_transactions_rlp_length.saturating_add(tx_rlp_len);
@@ -696,11 +839,15 @@ where
     }
 
     let builder_finish = Instant::now();
+    // `set_state_hook(None)` is idempotent; call unconditionally so the
+    // sparse-trie hook (if any) is always cleared before block finalization.
+    builder.executor_mut().set_state_hook(None);
+    let precomputed = try_precomputed_state_root(trie_handle, &payload_id);
     let BlockBuilderOutcome {
         execution_result,
         block,
         ..
-    } = builder.finish(state_provider.as_ref())?;
+    } = builder.finish(state_provider.as_ref(), precomputed)?;
     PayloadBuildMetrics::record_stage_post_execution(builder_finish.elapsed());
 
     let stage_start = Instant::now();
@@ -709,9 +856,9 @@ where
         .then_some(execution_result.requests);
 
     let sealed_block = Arc::new(block.sealed_block().clone());
-    debug!(target: "payload_builder", id=%attributes.id, sealed_block_header = ?sealed_block.sealed_header(), "(arc) sealed built block");
+    debug!(target: "payload_builder", id=%payload_id, sealed_block_header = ?sealed_block.sealed_header(), "(arc) sealed built block");
 
-    if is_osaka && sealed_block.rlp_length() > MAX_RLP_BLOCK_SIZE {
+    if osaka_size_exceeded(is_osaka, sealed_block.rlp_length()) {
         PayloadBuildMetrics::record_stage_assembly_and_sealing(stage_start.elapsed());
         PayloadBuildMetrics::record_total_duration(total_start);
         return Err(PayloadBuilderError::other(ConsensusError::BlockTooLarge {
@@ -720,7 +867,7 @@ where
         }));
     }
 
-    let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests)
+    let payload = EthBuiltPayload::new(sealed_block, total_fees, requests, None)
         // add blob sidecars from the executed txs; empty for now
         .with_sidecars(BlobSidecars::Empty);
     PayloadBuildMetrics::record_stage_assembly_and_sealing(stage_start.elapsed());
@@ -1018,20 +1165,20 @@ mod tests {
 
     impl MockInnerBuilder {
         fn build_payload() -> EthBuiltPayload {
-            use reth_payload_builder::{BlobSidecars, PayloadId};
+            use reth_payload_builder::BlobSidecars;
 
             let block = reth_ethereum::Block {
                 header: alloy_consensus::Header::default(),
                 body: Default::default(),
             };
             let sealed = reth_ethereum::primitives::SealedBlock::from(block);
-            EthBuiltPayload::new(PayloadId::new([0u8; 8]), Arc::new(sealed), U256::ZERO, None)
+            EthBuiltPayload::new(Arc::new(sealed), U256::ZERO, None, None)
                 .with_sidecars(BlobSidecars::Empty)
         }
     }
 
     impl RethPayloadBuilder for MockInnerBuilder {
-        type Attributes = EthPayloadBuilderAttributes;
+        type Attributes = EthPayloadAttributes;
         type BuiltPayload = EthBuiltPayload;
 
         fn try_build(
@@ -1057,20 +1204,20 @@ mod tests {
         }
     }
 
-    fn empty_payload_config() -> PayloadConfig<EthPayloadBuilderAttributes> {
-        let attributes = EthPayloadBuilderAttributes::new(
-            Default::default(),
-            reth_ethereum_engine_primitives::EthPayloadAttributes {
-                timestamp: 1,
-                prev_randao: Default::default(),
-                suggested_fee_recipient: Default::default(),
-                withdrawals: Some(vec![]),
-                parent_beacon_block_root: Some(Default::default()),
-            },
-        );
+    fn empty_payload_config(
+    ) -> PayloadConfig<EthPayloadAttributes, HeaderForPayload<EthBuiltPayload>> {
+        let attributes = EthPayloadAttributes {
+            timestamp: 1,
+            prev_randao: Default::default(),
+            suggested_fee_recipient: Default::default(),
+            withdrawals: Some(vec![]),
+            parent_beacon_block_root: Some(Default::default()),
+            slot_number: None,
+        };
         PayloadConfig {
             parent_header: Arc::new(reth_ethereum::primitives::SealedHeader::default()),
             attributes,
+            payload_id: reth_payload_builder::PayloadId::new([0u8; 8]),
         }
     }
 
@@ -1227,5 +1374,47 @@ mod tests {
 
         let expected = U256::from(gas_price) * U256::from(gas_used);
         assert_eq!(proposer_revenue(&tx, gas_used, base_fee), expected);
+    }
+
+    // A tx whose gas limit exceeds the gas remaining in the block must skip and
+    // mark-invalid (matching the default builder), never abort the build. Before
+    // reth 2.2 this error fell into the catch-all `Fatal` arm, which would have
+    // killed payload production for one oversized pool tx.
+    #[test]
+    fn classify_gas_limit_exceeded_skips_with_executor_limits() {
+        use alloy_consensus::{Signed, TxEip1559};
+        use alloy_primitives::{Address, Signature, TxKind};
+
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 0,
+            gas_limit: 30_000_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 0,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Default::default(),
+        };
+        let signed: TransactionSigned =
+            Signed::new_unhashed(tx, Signature::test_signature()).into();
+
+        let err = BlockExecutionError::Validation(
+            BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                transaction_gas_limit: 30_000_000,
+                block_available_gas: 1_000_000,
+            },
+        );
+
+        match classify_tx_outcome(Ok(Err(err)), TxHash::ZERO, &signed) {
+            TxOutcome::SkipExceedsGasLimit {
+                transaction_gas_limit,
+                block_available_gas,
+            } => {
+                assert_eq!(transaction_gas_limit, 30_000_000);
+                assert_eq!(block_available_gas, 1_000_000);
+            }
+            _ => panic!("expected SkipExceedsGasLimit"),
+        }
     }
 }

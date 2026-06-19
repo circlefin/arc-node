@@ -100,6 +100,8 @@ impl Terraform {
     /// Terraform leaves the AMI default root volume size.
     /// `node_volume_type` and `node_volume_iops` configure the node root EBS volume type
     /// and provisioned IOPS; when omitted, Terraform falls back to `gp3` at the AMI default IOPS.
+    /// `node_data_on_instance_store` relocates the node data directory onto the local
+    /// instance-store NVMe; a no-op on instance types without instance store.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create(
         &self,
@@ -111,6 +113,7 @@ impl Terraform {
         cc_disk_gb: Option<u32>,
         node_volume_type: Option<&str>,
         node_volume_iops: Option<u32>,
+        node_data_on_instance_store: bool,
     ) -> Result<()> {
         // Ensure testnet directory exists
         if !dry_run {
@@ -128,6 +131,7 @@ impl Terraform {
             cc_disk_gb,
             node_volume_type,
             node_volume_iops,
+            node_data_on_instance_store,
         )?;
         args.extend(vars.iter().map(String::as_str));
 
@@ -149,7 +153,8 @@ impl Terraform {
     pub(crate) fn destroy(&self, yes: bool) -> Result<()> {
         let mut args: Vec<&str> = vec!["destroy"];
 
-        let vars = self.build_variables(&self.node_names, None, None, None, None, None, None)?;
+        let vars =
+            self.build_variables(&self.node_names, None, None, None, None, None, None, false)?;
         args.extend(vars.iter().map(String::as_str));
 
         let state_flag = self.state_flag();
@@ -212,6 +217,7 @@ impl Terraform {
         cc_disk_gb: Option<u32>,
         node_volume_type: Option<&str>,
         node_volume_iops: Option<u32>,
+        node_data_on_instance_store: bool,
     ) -> Result<Vec<String>> {
         let mut args: Vec<String> = Vec::new();
 
@@ -300,6 +306,12 @@ impl Terraform {
         if let Some(iops) = node_volume_iops {
             args.push("-var".to_string());
             args.push(format!("node_volume_iops={iops}"));
+        }
+
+        // Only push when enabled; the Terraform variable defaults to false.
+        if node_data_on_instance_store {
+            args.push("-var".to_string());
+            args.push("node_data_on_instance_store=true".to_string());
         }
 
         Ok(args)

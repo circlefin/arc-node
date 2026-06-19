@@ -15,17 +15,15 @@
 // limitations under the License.
 
 use crate::helpers::{
-    abi_decode_raw_with_zero6_validation, check_delegatecall, check_staticcall,
-    new_reverted_with_early_penalty, read, record_cost_or_out_of_gas, write,
-    PrecompileErrorOrRevert, ERR_EXECUTION_REVERTED, ERR_INVALID_CALLER,
-    PRECOMPILE_EARLY_REVERT_GAS_PENALTY, PRECOMPILE_SLOAD_GAS_COST,
+    abi_decode_raw_validated, check_delegatecall, check_staticcall,
+    new_reverted_with_early_penalty, read, write, PrecompileErrorOrRevert, ERR_EXECUTION_REVERTED,
+    ERR_INVALID_CALLER, PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
 };
 use crate::precompile;
 use alloy_evm::Evm;
 use alloy_primitives::B256;
 use alloy_primitives::{address, keccak256, Address, Bytes, StorageKey};
 use alloy_sol_types::{sol, SolCall, SolValue};
-use arc_execution_config::hardforks::ArcHardfork;
 use reth_ethereum::evm::revm::precompile::PrecompileOutput;
 use revm::handler::SYSTEM_ADDRESS;
 use revm::state::EvmState;
@@ -134,10 +132,11 @@ pub fn compute_gas_values_storage_slot(block_number: u64) -> StorageKey {
     StorageKey::new(keccak256(data).0)
 }
 
-precompile!(run_system_accounting, precompile_input, hardfork_flags; {
+precompile!(run_system_accounting, precompile_input, _hardfork_flags; {
     ISystemAccounting::storeGasValuesCall => |input| {
         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
             let mut gas_counter = Gas::new(precompile_input.gas);
+            let reservoir = precompile_input.reservoir;
             let mut precompile_input = precompile_input;
 
             // Check if static call is attempting to modify state
@@ -147,25 +146,16 @@ precompile!(run_system_accounting, precompile_input, hardfork_flags; {
             )?;
 
             // Decode arguments passed to blocklist function
-            let args = abi_decode_raw_with_zero6_validation::<ISystemAccounting::storeGasValuesCall>(
-                input,
-                hardfork_flags,
-            )
+            let args = abi_decode_raw_validated::<ISystemAccounting::storeGasValuesCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
+                        gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
                     )
                 )?;
 
-            // Redundant 2100-gas charge — no SLOAD occurs here, but kept pre-Zero6 to
-            // preserve consensus on already-finalized blocks.
-            if !hardfork_flags.is_active(ArcHardfork::Zero6) {
-                record_cost_or_out_of_gas(&mut gas_counter, PRECOMPILE_SLOAD_GAS_COST)?;
-            }
-
             // Check caller
             if precompile_input.caller != ARC_SYSTEM_CALLER {
-                return Err(new_reverted_with_early_penalty(gas_counter, ERR_INVALID_CALLER, hardfork_flags));
+                return Err(new_reverted_with_early_penalty(gas_counter, reservoir, ERR_INVALID_CALLER));
             }
 
             // Check delegatecall
@@ -184,26 +174,24 @@ precompile!(run_system_accounting, precompile_input, hardfork_flags; {
                 storage_slot,
                 &updated_value_bytes,
                 &mut gas_counter,
-                hardfork_flags,
+                reservoir,
             )?;
 
             let output = true.abi_encode();
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(gas_counter.used(), output.into(), reservoir))
         })()
     },
     ISystemAccounting::getGasValuesCall => |input| {
         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
             let mut gas_counter = Gas::new(precompile_input.gas);
+            let reservoir = precompile_input.reservoir;
             let mut precompile_input = precompile_input;
 
             // Decode arguments passed to blocklist function
-            let args = abi_decode_raw_with_zero6_validation::<ISystemAccounting::getGasValuesCall>(
-                input,
-                hardfork_flags,
-            )
+            let args = abi_decode_raw_validated::<ISystemAccounting::getGasValuesCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
+                        gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
                     )
                 )?;
 
@@ -214,12 +202,12 @@ precompile!(run_system_accounting, precompile_input, hardfork_flags; {
                 SYSTEM_ACCOUNTING_ADDRESS,
                 storage_slot,
                 &mut gas_counter,
-                hardfork_flags,
+                reservoir,
             )?;
             let gas_values = unpack_gas_values_from_storage(B256::from_slice(slot_value.as_ref()));
             let output = gas_values.abi_encode();
 
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(gas_counter.used(), output.into(), reservoir))
         })()
     },
 });
@@ -357,11 +345,11 @@ mod tests {
     };
     use arc_execution_config::hardforks::{ArcHardfork, ArcHardforkFlags};
 
-    // EIP-2929 warm/cold gas costs for Zero5
+    // Baseline EIP-2929 warm/cold gas costs.
     const WARM_SLOAD_GAS_COST: u64 = 100;
     // Cold SSTORE (0→non-zero) per EIP-2200
     const COLD_SSTORE_ZERO_TO_NONZERO_GAS_COST: u64 = 22100;
-    use alloy_primitives::{address, Bytes, U256};
+    use alloy_primitives::{address, Bytes, B256, U256};
     use alloy_sol_types::SolValue;
     use reth_ethereum::evm::revm::{
         context::{Context, ContextTr, JournalTr},
@@ -370,11 +358,21 @@ mod tests {
     };
     use reth_evm::precompiles::{DynPrecompile, PrecompilesMap};
     use revm::{
+        bytecode::Bytecode,
         handler::PrecompileProvider,
         interpreter::InterpreterResult,
         precompile::{PrecompileId, Precompiles},
     };
     use serde_with::NoneAsEmptyString;
+
+    fn baseline_flags() -> ArcHardforkFlags {
+        ArcHardforkFlags::with(&[
+            ArcHardfork::Zero3,
+            ArcHardfork::Zero4,
+            ArcHardfork::Zero5,
+            ArcHardfork::Zero6,
+        ])
+    }
 
     fn call_system_accounting<DB: revm::database_interface::Database + std::fmt::Debug>(
         ctx: &mut revm::context::Context<
@@ -424,7 +422,7 @@ mod tests {
             scheme: CallScheme::Call,
             target_address: SYSTEM_ACCOUNTING_ADDRESS,
             bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
-            known_bytecode: None,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
             caller: ARC_SYSTEM_CALLER,
             value: CallValue::Transfer(U256::ZERO),
             input: CallInput::Bytes(
@@ -438,9 +436,10 @@ mod tests {
             gas_limit,
             is_static: false,
             return_memory_offset: 0..0,
+            reservoir: 0,
         };
 
-        call_system_accounting(ctx, &inputs, ArcHardforkFlags::with(&[ArcHardfork::Zero5]))
+        call_system_accounting(ctx, &inputs, baseline_flags())
             .unwrap()
             .unwrap()
     }
@@ -454,7 +453,7 @@ mod tests {
             scheme: CallScheme::Call,
             target_address: SYSTEM_ACCOUNTING_ADDRESS,
             bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
-            known_bytecode: None,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
             caller: ARC_SYSTEM_CALLER,
             value: CallValue::Transfer(U256::ZERO),
             input: CallInput::Bytes(
@@ -467,12 +466,12 @@ mod tests {
             gas_limit,
             is_static: false,
             return_memory_offset: 0..0,
+            reservoir: 0,
         };
 
-        let res =
-            call_system_accounting(ctx, &inputs, ArcHardforkFlags::with(&[ArcHardfork::Zero5]))
-                .unwrap()
-                .unwrap();
+        let res = call_system_accounting(ctx, &inputs, baseline_flags())
+            .unwrap()
+            .unwrap();
         let decoded = ISystemAccounting::getGasValuesCall::abi_decode_returns(res.output.as_ref())
             .expect("decode getGasValues");
         (res, decoded)
@@ -595,22 +594,19 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: SYSTEM_ACCOUNTING_ADDRESS,
                 bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
-                known_bytecode: None,
+                known_bytecode: (B256::ZERO, Bytecode::default()),
                 caller: tc.caller,
                 value: CallValue::Transfer(U256::ZERO),
                 input: CallInput::Bytes(tc.calldata.clone()),
                 gas_limit: tc.gas_limit,
                 is_static: false,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             };
 
-            let res = call_system_accounting(
-                &mut ctx,
-                &inputs,
-                ArcHardforkFlags::with(&[ArcHardfork::Zero5]),
-            )
-            .unwrap()
-            .unwrap();
+            let res = call_system_accounting(&mut ctx, &inputs, baseline_flags())
+                .unwrap()
+                .unwrap();
 
             // Result
             assert_eq!(res.result, tc.expected_result, "{}", tc.name);
@@ -626,8 +622,102 @@ mod tests {
                 assert_eq!(res.output, *expected_return, "{}", tc.name);
             }
 
-            // Gas used
-            assert_eq!(res.gas.used(), tc.gas_used, "{}", tc.name);
+            // Gas used. Skip on PrecompileOOG: under revm 38 the precompile-result
+            // converter always `spend_all()`s on Halt, so `res.gas.used()` is
+            // tautologically the gas_limit.
+            if tc.expected_result != InstructionResult::PrecompileOOG {
+                assert_eq!(res.gas.used(), tc.gas_used, "{}", tc.name);
+            }
+        }
+    }
+
+    struct StoreCase {
+        name: &'static str,
+        caller: Address,
+        calldata: Bytes,
+        gas_limit: u64,
+        /// If set, overrides `gas_limit` when Zero6 is active. Needed when
+        /// the Zero6 early-revert penalty pushes required gas above the
+        /// Zero5 limit.
+        zero6_gas_limit: Option<u64>,
+        expected_result: InstructionResult,
+        expected_revert_str: Option<&'static str>,
+        return_data: Option<Bytes>,
+        gas_used: u64,
+        /// If set, overrides `gas_used` for pre-Zero5 hardforks (fixed
+        /// SSTORE cost vs. EIP-2929/EIP-2200 warm/cold pricing).
+        pre_zero5_gas_used: Option<u64>,
+        /// If set, overrides `gas_used` when Zero6 is active (auth reverts
+        /// charge `PRECOMPILE_EARLY_REVERT_GAS_PENALTY`).
+        zero6_gas_used: Option<u64>,
+        target_address: Address,
+        bytecode_address: Address,
+    }
+
+    impl StoreCase {
+        fn gas_limit_for(&self, flags: ArcHardforkFlags) -> u64 {
+            if flags.is_active(ArcHardfork::Zero6) {
+                self.zero6_gas_limit.unwrap_or(self.gas_limit)
+            } else {
+                self.gas_limit
+            }
+        }
+
+        fn expected_gas_used_for(&self, flags: ArcHardforkFlags) -> u64 {
+            if flags.is_active(ArcHardfork::Zero6) {
+                self.zero6_gas_used.unwrap_or(self.gas_used)
+            } else if flags.is_active(ArcHardfork::Zero5) {
+                self.gas_used
+            } else {
+                self.pre_zero5_gas_used.unwrap_or(self.gas_used)
+            }
+        }
+    }
+
+    fn run_store_case(tc: &StoreCase, hardfork_flags: ArcHardforkFlags) {
+        let tc_name = format!("{} (hardfork_flags: {hardfork_flags:?})", tc.name);
+
+        let mut ctx = Context::mainnet();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("Unable to load system accounting account");
+
+        let inputs = CallInputs {
+            scheme: CallScheme::Call,
+            target_address: tc.target_address,
+            bytecode_address: tc.bytecode_address,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
+            caller: tc.caller,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(tc.calldata.clone()),
+            gas_limit: tc.gas_limit_for(hardfork_flags),
+            is_static: false,
+            return_memory_offset: 0..0,
+            reservoir: 0,
+        };
+
+        let res = call_system_accounting(&mut ctx, &inputs, hardfork_flags)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(res.result, tc.expected_result, "{tc_name}");
+
+        if let Some(expected_revert_str) = tc.expected_revert_str {
+            let reason = bytes_to_revert_message(res.output.as_ref()).expect("revert reason");
+            assert_eq!(reason, expected_revert_str, "{tc_name}");
+        }
+
+        if let Some(expected_return) = &tc.return_data {
+            assert_eq!(res.output, *expected_return, "{tc_name}");
+        }
+
+        // Skip on PrecompileOOG (see comment in failure-case table test).
+        if tc.expected_result != InstructionResult::PrecompileOOG {
+            assert_eq!(
+                res.gas.used(),
+                tc.expected_gas_used_for(hardfork_flags),
+                "{tc_name}"
+            );
         }
     }
 
@@ -638,20 +728,10 @@ mod tests {
             caller: Address,
             calldata: Bytes,
             gas_limit: u64,
-            /// If set, overrides `gas_limit` when Zero6 is active. Needed when
-            /// the Zero6 early-revert penalty pushes required gas above the
-            /// Zero5 limit.
-            zero6_gas_limit: Option<u64>,
             expected_result: InstructionResult,
             expected_revert_str: Option<&'static str>,
             return_data: Option<Bytes>,
             gas_used: u64,
-            /// If set, overrides `gas_used` for pre-Zero5 hardforks (fixed
-            /// SSTORE cost vs. EIP-2929/EIP-2200 warm/cold pricing).
-            pre_zero5_gas_used: Option<u64>,
-            /// If set, overrides `gas_used` when Zero6 is active (auth reverts
-            /// charge `PRECOMPILE_EARLY_REVERT_GAS_PENALTY`).
-            zero6_gas_used: Option<u64>,
             target_address: Address,
             bytecode_address: Address,
         }
@@ -662,11 +742,7 @@ mod tests {
             gasUsedSmoothed: 22,
             nextBaseFee: 33,
         };
-        // Zero5: 2100 (redundant pre-auth charge, no real SLOAD) + 22100 (cold SSTORE 0→non-zero)
-        //        = 24200.
-        // Zero6: 22100 only — redundant charge dropped (see `zero6_gas_used` override below).
-        // Pre-Zero5 uses the fixed SSTORE path (see `pre_zero5_gas_used` override below).
-        let expected_gas_success = PRECOMPILE_SLOAD_GAS_COST + COLD_SSTORE_ZERO_TO_NONZERO_GAS_COST;
+        let expected_gas_success = COLD_SSTORE_ZERO_TO_NONZERO_GAS_COST;
 
         let cases: &[StoreCase] = &[
             StoreCase {
@@ -679,13 +755,10 @@ mod tests {
                 .abi_encode()
                 .into(),
                 gas_limit: expected_gas_success,
-                zero6_gas_limit: None,
                 expected_result: InstructionResult::Return,
                 expected_revert_str: None,
                 return_data: Some(true.abi_encode().into()),
-                gas_used: expected_gas_success,
-                pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST + PRECOMPILE_SSTORE_GAS_COST),
-                zero6_gas_used: Some(COLD_SSTORE_ZERO_TO_NONZERO_GAS_COST),
+                gas_used: COLD_SSTORE_ZERO_TO_NONZERO_GAS_COST,
                 target_address: SYSTEM_ACCOUNTING_ADDRESS,
                 bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
             },
@@ -694,13 +767,10 @@ mod tests {
                 caller: ARC_SYSTEM_CALLER,
                 calldata: ISystemAccounting::storeGasValuesCall::SELECTOR.into(),
                 gas_limit: PRECOMPILE_SLOAD_GAS_COST,
-                zero6_gas_limit: None,
                 expected_result: InstructionResult::Revert,
                 expected_revert_str: Some(ERR_EXECUTION_REVERTED),
                 return_data: None,
                 gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
                 target_address: SYSTEM_ACCOUNTING_ADDRESS,
                 bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
             },
@@ -713,17 +783,12 @@ mod tests {
                 }
                 .abi_encode()
                 .into(),
-                // Pre-Zero6: OOGs at the redundant 2100-gas pre-auth charge.
-                gas_limit: PRECOMPILE_SLOAD_GAS_COST - 1,
-                // Zero6: redundant charge dropped, so the next gas-charging point is the
-                // cold SSTORE inside `write()`. One gas short of that cost OOGs there.
-                zero6_gas_limit: Some(COLD_SSTORE_ZERO_TO_NONZERO_GAS_COST - 1),
+                // One gas short of the cold SSTORE cost OOGs while storing.
+                gas_limit: COLD_SSTORE_ZERO_TO_NONZERO_GAS_COST - 1,
                 expected_result: InstructionResult::PrecompileOOG,
                 expected_revert_str: None,
                 return_data: None,
                 gas_used: 0,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
                 target_address: SYSTEM_ACCOUNTING_ADDRESS,
                 bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
             },
@@ -736,21 +801,16 @@ mod tests {
                 }
                 .abi_encode()
                 .into(),
-                gas_limit: PRECOMPILE_SLOAD_GAS_COST,
-                // Zero6: redundant 2100-gas charge dropped, so only the early-revert
-                // penalty is consumed. Limit must still cover the penalty exactly.
-                zero6_gas_limit: Some(PRECOMPILE_EARLY_REVERT_GAS_PENALTY),
+                gas_limit: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
                 expected_result: InstructionResult::Revert,
                 expected_revert_str: Some(ERR_INVALID_CALLER),
                 return_data: None,
-                gas_used: PRECOMPILE_SLOAD_GAS_COST,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: Some(PRECOMPILE_EARLY_REVERT_GAS_PENALTY),
+                gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
                 target_address: SYSTEM_ACCOUNTING_ADDRESS,
                 bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
             },
             StoreCase {
-                name: "reverts from zero-address caller (legacy system caller)",
+                name: "reverts from zero-address caller",
                 caller: Address::ZERO,
                 calldata: ISystemAccounting::storeGasValuesCall {
                     blockNumber: bn_ok,
@@ -758,14 +818,11 @@ mod tests {
                 }
                 .abi_encode()
                 .into(),
-                gas_limit: PRECOMPILE_SLOAD_GAS_COST,
-                zero6_gas_limit: Some(PRECOMPILE_EARLY_REVERT_GAS_PENALTY),
+                gas_limit: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
                 expected_result: InstructionResult::Revert,
                 expected_revert_str: Some(ERR_INVALID_CALLER),
                 return_data: None,
-                gas_used: PRECOMPILE_SLOAD_GAS_COST,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: Some(PRECOMPILE_EARLY_REVERT_GAS_PENALTY),
+                gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
                 target_address: SYSTEM_ACCOUNTING_ADDRESS,
                 bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
             },
@@ -779,16 +836,10 @@ mod tests {
                 .abi_encode()
                 .into(),
                 gas_limit: expected_gas_success,
-                zero6_gas_limit: None,
                 expected_result: InstructionResult::Revert,
                 expected_revert_str: Some(ERR_DELEGATE_CALL_NOT_ALLOWED),
                 return_data: None,
-                gas_used: PRECOMPILE_SLOAD_GAS_COST,
-                pre_zero5_gas_used: None,
-                // Zero6: nothing is charged before check_delegatecall reverts (auth passes,
-                // redundant pre-auth charge dropped). System-tx callers never delegatecall in
-                // production, so the 0-gas exit here is unreachable on real workloads.
-                zero6_gas_used: Some(0),
+                gas_used: 0,
                 target_address: address!("0x0000000000000000000000000000000000000123"),
                 bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
             },
@@ -802,42 +853,19 @@ mod tests {
                 .abi_encode()
                 .into(),
                 gas_limit: expected_gas_success,
-                zero6_gas_limit: None,
                 expected_result: InstructionResult::Revert,
                 expected_revert_str: Some(ERR_DELEGATE_CALL_NOT_ALLOWED),
                 return_data: None,
-                gas_used: PRECOMPILE_SLOAD_GAS_COST,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: Some(0),
+                gas_used: 0,
                 target_address: SYSTEM_ACCOUNTING_ADDRESS,
                 bytecode_address: address!("0x0000000000000000000000000000000000000123"),
             },
         ];
 
         for tc in cases {
-            for hardfork_flags in ArcHardforkFlags::all_combinations() {
-                // ZeroX hardforks are cumulative; Zero6 implies Zero5.
-                if hardfork_flags.is_active(ArcHardfork::Zero6)
-                    && !hardfork_flags.is_active(ArcHardfork::Zero5)
-                {
-                    continue;
-                }
-
+            {
+                let hardfork_flags = baseline_flags();
                 let tc_name = format!("{} (hardfork_flags: {:?})", tc.name, hardfork_flags);
-
-                let gas_limit = if hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    tc.zero6_gas_limit.unwrap_or(tc.gas_limit)
-                } else {
-                    tc.gas_limit
-                };
-
-                let expected_gas_used = if hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    tc.zero6_gas_used.unwrap_or(tc.gas_used)
-                } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
-                    tc.gas_used
-                } else {
-                    tc.pre_zero5_gas_used.unwrap_or(tc.gas_used)
-                };
 
                 let mut ctx = Context::mainnet();
                 ctx.journal_mut()
@@ -848,13 +876,14 @@ mod tests {
                     scheme: CallScheme::Call,
                     target_address: tc.target_address,
                     bytecode_address: tc.bytecode_address,
-                    known_bytecode: None,
+                    known_bytecode: (B256::ZERO, Bytecode::default()),
                     caller: tc.caller,
                     value: CallValue::Transfer(U256::ZERO),
                     input: CallInput::Bytes(tc.calldata.clone()),
-                    gas_limit,
+                    gas_limit: tc.gas_limit,
                     is_static: false,
                     return_memory_offset: 0..0,
+                    reservoir: 0,
                 };
 
                 let res = call_system_accounting(&mut ctx, &inputs, hardfork_flags)
@@ -874,8 +903,11 @@ mod tests {
                 if let Some(expected_return) = &tc.return_data {
                     assert_eq!(res.output, *expected_return, "{tc_name}");
                 }
-                // Gas used
-                assert_eq!(res.gas.used(), expected_gas_used, "{tc_name}");
+                // Gas used (skip on PrecompileOOG: revm 38 spend_all()s on Halt,
+                // so used() is tautologically the gas limit).
+                if tc.expected_result != InstructionResult::PrecompileOOG {
+                    assert_eq!(res.gas.used(), tc.gas_used, "{tc_name}");
+                }
             }
         }
     }
@@ -940,15 +972,15 @@ mod tests {
         assert_eq!(decoded_read_original_block.gasUsedSmoothed, 5);
     }
 
-    /// Under Zero6+, any SSTORE through `helpers::write` must fail with
+    /// With the baseline rules, any SSTORE through `helpers::write` must fail with
     /// `PrecompileOOG` and consume zero gas when the remaining gas is at or
     /// below `CALL_STIPEND` (2,300), mirroring revm's `ReentrancySentryOOG`
     /// halt for the SSTORE opcode.
     #[test]
-    fn store_gas_values_eip_2200_sentry_zero6() {
+    fn store_gas_values_eip_2200_sentry_baseline() {
         use revm_context_interface::cfg::gas::CALL_STIPEND;
 
-        let zero6_flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+        let hardfork_flags = baseline_flags();
 
         let calldata: Bytes = ISystemAccounting::storeGasValuesCall {
             blockNumber: 1,
@@ -965,13 +997,14 @@ mod tests {
             scheme: CallScheme::Call,
             target_address: SYSTEM_ACCOUNTING_ADDRESS,
             bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
-            known_bytecode: None,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
             caller: ARC_SYSTEM_CALLER,
             value: CallValue::Transfer(U256::ZERO),
             input: CallInput::Bytes(calldata.clone()),
             gas_limit,
             is_static: false,
             return_memory_offset: 0..0,
+            reservoir: 0,
         };
 
         // gas_limit == CALL_STIPEND: sentry fires immediately; no auth check,
@@ -982,19 +1015,21 @@ mod tests {
                 .load_account(SYSTEM_ACCOUNTING_ADDRESS)
                 .expect("load system accounting account");
 
-            let res = call_system_accounting(&mut ctx, &make_inputs(gas_limit), zero6_flags)
+            let res = call_system_accounting(&mut ctx, &make_inputs(gas_limit), hardfork_flags)
                 .unwrap()
                 .unwrap();
 
             assert_eq!(
                 res.result,
                 InstructionResult::PrecompileOOG,
-                "Zero6 sentry must OOG at gas_limit={gas_limit}"
+                "baseline sentry must OOG at gas_limit={gas_limit}"
             );
+            // revm 38: PrecompileOOG drains all gas at the converter, so
+            // `res.gas.used()` is always `gas_limit` here.
             assert_eq!(
                 res.gas.used(),
-                0,
-                "Zero6 sentry must charge zero gas at gas_limit={gas_limit}"
+                gas_limit,
+                "baseline sentry OOG must drain all gas at gas_limit={gas_limit}"
             );
         }
 
@@ -1005,7 +1040,7 @@ mod tests {
         ctx.journal_mut()
             .load_account(SYSTEM_ACCOUNTING_ADDRESS)
             .expect("load system accounting account");
-        let res = call_system_accounting(&mut ctx, &make_inputs(CALL_STIPEND + 1), zero6_flags)
+        let res = call_system_accounting(&mut ctx, &make_inputs(CALL_STIPEND + 1), hardfork_flags)
             .unwrap()
             .unwrap();
         assert_eq!(res.result, InstructionResult::PrecompileOOG);
@@ -1017,7 +1052,7 @@ mod tests {
         ctx.journal_mut()
             .load_account(SYSTEM_ACCOUNTING_ADDRESS)
             .expect("load system accounting account");
-        let res = call_system_accounting(&mut ctx, &make_inputs(happy_gas), zero6_flags)
+        let res = call_system_accounting(&mut ctx, &make_inputs(happy_gas), hardfork_flags)
             .unwrap()
             .unwrap();
         assert_eq!(res.result, InstructionResult::Return);
@@ -1048,13 +1083,14 @@ mod tests {
             scheme: CallScheme::Call,
             target_address: SYSTEM_ACCOUNTING_ADDRESS,
             bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
-            known_bytecode: None,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
             caller: ARC_SYSTEM_CALLER,
             value: CallValue::Transfer(U256::ZERO),
             input: CallInput::Bytes(calldata.clone()),
             gas_limit,
             is_static: false,
             return_memory_offset: 0..0,
+            reservoir: 0,
         };
 
         // Gas = COLD_SLOAD_COST - 1: must OOG at the cold charge, zero DB reads.
@@ -1131,13 +1167,14 @@ mod tests {
             scheme: CallScheme::Call,
             target_address: SYSTEM_ACCOUNTING_ADDRESS,
             bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
-            known_bytecode: None,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
             caller: ARC_SYSTEM_CALLER,
             value: CallValue::Transfer(U256::ZERO),
             input: CallInput::Bytes(calldata.clone()),
             gas_limit,
             is_static: false,
             return_memory_offset: 0..0,
+            reservoir: 0,
         };
 
         // Gas = COLD_SLOAD_COST - 1: OOG at the cold charge, before the sload DB read.
@@ -1309,7 +1346,8 @@ mod tests {
     fn test_static_call_reverts_store_gas_values() {
         use crate::helpers::ERR_STATE_CHANGE_DURING_STATIC_CALL;
 
-        for hardfork_flags in ArcHardforkFlags::all_combinations() {
+        {
+            let hardfork_flags = baseline_flags();
             let mut ctx = Context::mainnet();
             ctx.journal_mut()
                 .load_account(SYSTEM_ACCOUNTING_ADDRESS)
@@ -1320,7 +1358,7 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: SYSTEM_ACCOUNTING_ADDRESS,
                 bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
-                known_bytecode: None,
+                known_bytecode: (B256::ZERO, Bytecode::default()),
                 caller: ARC_SYSTEM_CALLER,
                 value: CallValue::Transfer(U256::ZERO),
                 input: CallInput::Bytes(
@@ -1338,6 +1376,7 @@ mod tests {
                 gas_limit: 100_000,
                 is_static: true,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             };
 
             let result = call_system_accounting(&mut ctx, &inputs, hardfork_flags)
@@ -1361,7 +1400,7 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: SYSTEM_ACCOUNTING_ADDRESS,
                 bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
-                known_bytecode: None,
+                known_bytecode: (B256::ZERO, Bytecode::default()),
                 caller: ARC_SYSTEM_CALLER,
                 value: CallValue::Transfer(U256::ZERO),
                 input: CallInput::Bytes(
@@ -1372,6 +1411,7 @@ mod tests {
                 gas_limit: 100_000,
                 is_static: true,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             };
 
             let result = call_system_accounting(&mut ctx, &read_inputs, hardfork_flags)

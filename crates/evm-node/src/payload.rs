@@ -59,6 +59,7 @@ where
         );
 
         EthPayloadAttributes {
+            slot_number: None,
             timestamp,
             prev_randao: B256::random(),
             // Mock CL uses genesis coinbase as suggested fee recipient

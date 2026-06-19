@@ -124,8 +124,7 @@ fn estimate_percentile(buckets: &[(f64, f64)], total_count: f64, quantile: f64) 
 
     buckets
         .iter()
-        .filter(|(le, _)| !le.is_infinite())
-        .next_back()
+        .rfind(|(le, _)| !le.is_infinite())
         .map(|(le, _)| *le)
         .unwrap_or(0.0)
 }

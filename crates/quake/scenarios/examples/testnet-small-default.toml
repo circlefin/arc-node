@@ -10,7 +10,7 @@ cl.config.discovery_num_inbound_peers = 50
 cl.config.discovery_num_outbound_peers = 50
 
 latency_emulation = true
-engine_api_connection = "rpc"
+engine_api_connection = "ipc"
 monitoring_bind_host = "0.0.0.0"
 
 # ==============================================================================

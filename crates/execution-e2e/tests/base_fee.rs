@@ -122,17 +122,16 @@ async fn test_incorrect_extra_data_base_fee_rejected_as_invalid_payload() -> Res
     Ok(())
 }
 
-/// arc_validate_header_base_fee enforces absolute bounds on base_fee_per_gas under Zero5.
+/// arc_validate_header_base_fee enforces absolute bounds on base_fee_per_gas.
 ///
-/// - Zero5 active (LOCAL_DEV default): base_fee_per_gas = 0 is below absolute_min = 1
-///   → INVALID with "block base fee mismatch" (ConsensusError::BaseFeeDiff).
-/// - Zero5 not yet active: same override passes the bounds check (the block may still
-///   fail for other reasons such as state root mismatch, but NOT with the bounds error).
+/// Even when chain metadata schedules Zero5 later, base_fee_per_gas = 0 is
+/// below absolute_min = 1 and must be INVALID with "block base fee mismatch"
+/// (ConsensusError::BaseFeeDiff).
 #[tokio::test]
-async fn test_base_fee_absolute_bounds_enforced_only_after_zero5() -> Result<()> {
+async fn test_base_fee_absolute_bounds_enforced_before_zero5_activation() -> Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Zero5 active: base_fee_per_gas=0 must be rejected with the bounds error.
+    // Default localdev: base_fee_per_gas=0 must be rejected with the bounds error.
     let status = submit_with_base_fee(ArcSetup::new(), U256::ZERO).await?;
     assert!(
         matches!(
@@ -140,24 +139,27 @@ async fn test_base_fee_absolute_bounds_enforced_only_after_zero5() -> Result<()>
             PayloadStatusEnum::Invalid { validation_error }
                 if validation_error.contains("block base fee mismatch")
         ),
-        "Zero5 active: expected INVALID with 'block base fee mismatch', got {status:?}"
+        "default localdev: expected INVALID with 'block base fee mismatch', got {status:?}"
     );
 
-    // Zero5 not yet active: the bounds check is skipped — "block base fee mismatch" must not appear.
-    let pre_zero5_spec = localdev_with_hardforks(&[
+    // Delayed Zero5 metadata: the baseline still enforces the bounds error.
+    let delayed_zero5_spec = localdev_with_hardforks(&[
         (ArcHardfork::Zero3, ForkCondition::Block(0)),
         (ArcHardfork::Zero4, ForkCondition::Block(0)),
         (ArcHardfork::Zero5, ForkCondition::Block(10)),
     ]);
-    let status =
-        submit_with_base_fee(ArcSetup::new().with_chain_spec(pre_zero5_spec), U256::ZERO).await?;
+    let status = submit_with_base_fee(
+        ArcSetup::new().with_chain_spec(delayed_zero5_spec),
+        U256::ZERO,
+    )
+    .await?;
     assert!(
-        !matches!(
+        matches!(
             &status,
             PayloadStatusEnum::Invalid { validation_error }
                 if validation_error.contains("block base fee mismatch")
         ),
-        "Zero5 inactive: expected bounds check to be skipped, got {status:?}"
+        "delayed Zero5 metadata: expected INVALID with 'block base fee mismatch', got {status:?}"
     );
 
     Ok(())

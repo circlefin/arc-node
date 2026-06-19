@@ -18,9 +18,10 @@ use alloy_signer_local::{coins_bip39::English, LocalSigner, MnemonicBuilder};
 use clap::{builder::PossibleValue, ValueEnum};
 use color_eyre::eyre::{self, Context, Result};
 use k256::ecdsa::SigningKey;
+use serde::{Deserialize, Serialize};
 use strum_macros::EnumString;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct AccountBuilder {
     mnemonic: String,
 }

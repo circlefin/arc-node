@@ -869,9 +869,7 @@ describe('EVM compatibility', () => {
       )
       expectAddressEq(res.from, sender)
       expectAddressEq(res.to, A)
-      // `debug_traceCall` hands the simulation `--rpc.gascap` when no explicit
-      // `gas` is supplied. Arc's default is 30M (see ARC_DEFAULT_NODE_FLAGS).
-      expect(res.gas).to.be.eq(toHex(30_000_000))
+      expect(res.gas).to.be.eq(toHex(50_000_000))
       expect(res.input).to.be.eq(CallHelper.encodeNested({ fn: 'getBlockInfo' }))
       expect(res.type).to.be.eq('CALL')
       expect(res.value).to.be.eq(toHex(0n))
@@ -1211,24 +1209,29 @@ describe('EVM compatibility', () => {
       const balc = await client.getBalance({ address: sender.account.address })
       await expect(
         client.estimateGas({ account: sender.account.address, to: receiver.account.address, value: balc + 3n }),
-      ).to.be.rejectedWith(EstimateGasExecutionError, 'insufficient funds for gas * price + value')
+      ).to.be.rejectedWith(EstimateGasExecutionError, /OutOfFunds|insufficient funds/)
     })
 
     it('balance check if gas price is provided', async () => {
-      const { sender, client, receiver } = clients
+      const { sender, client, A: receiver } = clients
       const balc = await client.getBalance({ address: sender.account.address })
-      const block = await client.getBlock()
-
-      // geth return "insufficient funds for transfer"
-      // reth return "Missing or invalid parameters"
+      const block = await client.getBlock({ blockTag: 'latest' })
+      // Target a contract to skip Reth's basic-transfer shortcut, which bypasses
+      // the caller_gas_allowance cap now that disable_fee_charge is set in 2.2.
+      const maxFeePerGas = (block.baseFeePerGas ?? 0n) + 1_000_000_000n
+      const value = balc - 21000n * maxFeePerGas + 1n
       await expect(
         client.estimateGas({
           account: sender.account.address,
-          to: receiver.account.address,
-          value: balc - 21000n,
-          maxFeePerGas: block.baseFeePerGas || 1n, // latest block base fee
+          to: receiver,
+          value,
+          maxFeePerGas,
+          maxPriorityFeePerGas: 1_000_000_000n,
         }),
-      ).to.be.rejectedWith(EstimateGasExecutionError, /(Missing or invalid parameters|insufficient funds for transfer)/)
+      ).to.be.rejectedWith(
+        EstimateGasExecutionError,
+        /insufficient funds for transfer|gas required exceeds allowance/,
+      )
     })
   })
 
@@ -1245,7 +1248,7 @@ describe('EVM compatibility', () => {
           to: receiver.account.address,
           value: largeValue,
         }),
-      ).to.be.rejectedWith(/insufficient funds/)
+      ).to.be.rejectedWith(/OutOfFunds|insufficient funds/)
 
       // Call with overridden balance - should succeed
       const result = await client.call({

@@ -136,7 +136,7 @@ runcmd:
   - sysctl -p /etc/sysctl.d/99-swap.conf
 # Install packages via dnf (Amazon Linux 2023)
 # Note: curl-minimal, jq, nfs-utils are pre-installed
-  - dnf install -y docker tmux iproute-tc
+  - dnf install -y docker tmux iproute-tc mdadm
 # Activate the secondary ENI service. For bridge nodes (EXPECTED > 0), the
 # oneshot start blocks until ENIs are fully configured — before Docker starts.
   - systemctl daemon-reload
@@ -153,6 +153,35 @@ runcmd:
   - docker pull ${consensus_image}
   - docker pull ${execution_image}
   - docker images
+# Optionally relocate the node data directory onto local instance-store NVMe
+# (set by --node-data-on-instance-store). Must run before the data dirs are
+# created and before Docker bind-mounts them. Instance-store volumes are detected
+# by device model rather than nvmeN numbering, which is not stable across boots.
+# Multiple instance-store volumes are striped RAID0 into one device. A no-op when
+# the flag is off or the instance type has no instance store. Shell vars avoid the
+# `${...}` form so Terraform templatefile does not treat them as interpolations.
+  - |
+    if [ "${data_on_instance_store}" = "true" ]; then
+      DEVS=$(lsblk -dno NAME,MODEL | awk '/Amazon EC2 NVMe Instance Storage/{print "/dev/"$1}')
+      COUNT=$(printf '%s\n' "$DEVS" | grep -c .)
+      TARGET=""
+      if [ "$COUNT" -eq 1 ]; then
+        TARGET="$DEVS"
+        mkfs.xfs -f "$TARGET" || { echo "ERROR: mkfs failed on $TARGET"; exit 1; }
+      elif [ "$COUNT" -gt 1 ]; then
+        mdadm --create --run --verbose /dev/md0 --level=0 --raid-devices="$COUNT" $DEVS || { echo "ERROR: mdadm RAID0 create failed"; exit 1; }
+        TARGET=/dev/md0
+        mkfs.xfs -f "$TARGET" || { echo "ERROR: mkfs failed on $TARGET"; exit 1; }
+      fi
+      if [ -n "$TARGET" ]; then
+        echo "Node data directory on instance-store NVMe ($COUNT device(s)) -> $TARGET"
+        mkdir -p /home/${username}/data
+        mount "$TARGET" /home/${username}/data || { echo "ERROR: mount failed for $TARGET"; exit 1; }
+        echo "$TARGET /home/${username}/data xfs defaults,nofail 0 0" >> /etc/fstab
+      else
+        echo "WARNING: --node-data-on-instance-store set but no instance-store NVMe found; data directory stays on root EBS."
+      fi
+    fi
 # Create directories for Arc files (config will be symlinked to NFS after mount)
   - mkdir -p /home/${username}/data/malachite
   - mkdir -p /home/${username}/data/reth

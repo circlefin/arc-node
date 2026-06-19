@@ -38,7 +38,56 @@ macro_rules! impl_versioned_codec {
                     return Err($crate::codec::error::CodecError::EmptyBytes);
                 }
 
-                // TODO: Phase 3: Remove after all nodes are upgraded to use versioning
+                let version_byte = bytes.get_u8();
+                let version = <$version_ty>::try_from(version_byte)
+                    .map_err($crate::codec::error::CodecError::UnsupportedVersion)?;
+                if version != $version_val {
+                    return Err($crate::codec::error::CodecError::UnsupportedVersion(
+                        version_byte,
+                    ));
+                }
+
+                malachitebft_codec::Codec::decode(&$crate::codec::proto::ProtobufCodec, bytes)
+                    .map_err($crate::codec::error::CodecError::Protobuf)
+            }
+
+            fn encode(&self, msg: &$ty) -> Result<bytes::Bytes, Self::Error> {
+                use bytes::BufMut;
+
+                let encoded =
+                    malachitebft_codec::Codec::encode(&$crate::codec::proto::ProtobufCodec, msg)
+                        .map_err($crate::codec::error::CodecError::Protobuf)?;
+
+                #[allow(clippy::arithmetic_side_effects)] // 1 + valid allocation length
+                let mut result = bytes::BytesMut::with_capacity(1 + encoded.len());
+                result.put_u8($version_val as u8);
+                result.put(encoded);
+
+                Ok(result.freeze())
+            }
+        }
+    };
+}
+
+/// Shared macro for implementing versioned codecs that can still read legacy
+/// unversioned protobuf bytes.
+///
+/// This is only for persisted data formats that predate version bytes, such as
+/// the WAL. Networked types are already versioned and should use
+/// `impl_versioned_codec!` instead.
+macro_rules! impl_versioned_codec_with_legacy_fallback {
+    ($codec_ty:ty, $ty:ty, $version_ty:ty, $version_val:expr) => {
+        impl malachitebft_codec::Codec<$ty> for $codec_ty {
+            type Error = $crate::codec::error::CodecError;
+
+            fn decode(&self, mut bytes: bytes::Bytes) -> Result<$ty, Self::Error> {
+                use bytes::Buf;
+
+                if bytes.is_empty() {
+                    return Err($crate::codec::error::CodecError::EmptyBytes);
+                }
+
+                // TODO: Phase 3: Remove after all persisted WAL entries use versioning.
                 if let Ok(msg) = malachitebft_codec::Codec::decode(
                     &$crate::codec::proto::ProtobufCodec,
                     bytes.clone(),
@@ -76,8 +125,6 @@ macro_rules! impl_versioned_codec {
         }
     };
 }
-
-pub(crate) use impl_versioned_codec;
 
 pub mod error;
 pub mod network;

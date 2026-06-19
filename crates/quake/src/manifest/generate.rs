@@ -274,6 +274,7 @@ impl Manifest {
             block_gas_limit: None,
             node_volume_type: None,
             node_volume_iops: None,
+            node_data_on_instance_store: false,
             el_cpu_limit: None,
             el_memory_limit_gb: None,
             cl_cpu_limit: None,

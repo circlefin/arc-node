@@ -48,7 +48,7 @@ pub fn create_oog_frame_result(frame_init: &FrameInit) -> FrameResult {
         FrameInput::Call(call_input) => {
             // All gas is consumed on OOG
             let mut gas_counter = Gas::new(call_input.gas_limit);
-            let _ = gas_counter.record_cost(call_input.gas_limit);
+            let _ = gas_counter.record_regular_cost(call_input.gas_limit);
 
             let interpreter_result = InterpreterResult::new(
                 InstructionResult::OutOfGas,
@@ -65,7 +65,7 @@ pub fn create_oog_frame_result(frame_init: &FrameInit) -> FrameResult {
         FrameInput::Create(create_input) => {
             // All gas is consumed on OOG
             let mut gas_counter = Gas::new(create_input.gas_limit());
-            let _ = gas_counter.record_cost(create_input.gas_limit());
+            let _ = gas_counter.record_regular_cost(create_input.gas_limit());
 
             let interpreter_result = InterpreterResult::new(
                 InstructionResult::OutOfGas,
@@ -137,6 +137,7 @@ mod tests {
             U256::ZERO,
             Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xF3]), // minimal bytecode
             100_000,
+            0,
         );
 
         let frame_init = FrameInit {

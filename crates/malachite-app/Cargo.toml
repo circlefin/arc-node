@@ -8,6 +8,12 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
+byzantine = [
+    "arc-consensus-types/byzantine",
+    "arc-node-consensus-cli/byzantine",
+    "malachitebft-app-channel/byzantine",
+    "dep:malachitebft-engine-byzantine",
+]
 pprof = ["dep:pprof_hyper_server"]
 
 # allocator
@@ -50,6 +56,7 @@ itertools.workspace = true
 malachitebft-app-channel.workspace = true
 malachitebft-core-state-machine.workspace = true
 malachitebft-core-types.workspace = true
+malachitebft-engine-byzantine = { workspace = true, optional = true }
 malachitebft-network.workspace = true
 malachitebft-peer.workspace = true
 malachitebft-sync.workspace = true

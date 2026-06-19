@@ -25,6 +25,8 @@ pub use malachitebft_app::config::{
     ConsensusConfig, LogFormat, LogLevel, LoggingConfig, MetricsConfig, NodeConfig, RuntimeConfig,
     ValueSyncConfig,
 };
+#[cfg(feature = "byzantine")]
+pub use malachitebft_engine_byzantine::{ByzantineConfig, Trigger as ByzantineTrigger};
 
 use crate::Height;
 
@@ -70,6 +72,12 @@ pub struct Config {
 
     /// Signing config
     pub signing: SigningConfig,
+
+    /// Byzantine behavior configuration (testnet only).
+    /// When present and active, the node exhibits configurable Byzantine faults.
+    #[cfg(feature = "byzantine")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byzantine: Option<ByzantineConfig>,
 }
 
 impl Config {
@@ -79,6 +87,10 @@ impl Config {
         }
         if self.execution.persistence_backpressure_threshold == 0 {
             bail!("execution.persistence_backpressure_threshold must be greater than 0");
+        }
+        #[cfg(feature = "byzantine")]
+        if let Some(ref byz) = self.byzantine {
+            byz.validate()?;
         }
         Ok(())
     }
@@ -397,6 +409,31 @@ mod tests {
 
             config.execution.persistence_backpressure_threshold = 0;
             assert!(config.validate().is_err());
+        }
+
+        #[cfg(feature = "byzantine")]
+        #[test]
+        fn config_rejects_invalid_byzantine_config() {
+            use crate::config::{ByzantineConfig, ByzantineTrigger};
+
+            let mut config = Config::default();
+            assert!(config.validate().is_ok());
+
+            // Mutually-exclusive triggers must be rejected. Without the
+            // Config::validate() call in start(), an ad-hoc
+            // `--byzantine=<JSON>` would reach the engine with this combo.
+            config.byzantine = Some(
+                ByzantineConfig::new(Some(42))
+                    .with_drop_votes(ByzantineTrigger::Always)
+                    .with_equivocate_votes(ByzantineTrigger::Always),
+            );
+            let err = config
+                .validate()
+                .expect_err("drop_votes + equivocate_votes must be rejected");
+            assert!(
+                format!("{err:#}").contains("drop_votes and equivocate_votes cannot both be set"),
+                "unexpected error: {err:#}"
+            );
         }
     }
 }

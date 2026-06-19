@@ -96,6 +96,14 @@ variable "node_volume_iops" {
   nullable = true
 }
 
+# Place the node data directory on local instance-store NVMe instead of the root EBS volume.
+# Override via `quake remote create --node-data-on-instance-store`. Requires an instance type
+# with local NVMe (e.g. i4i.*, i3.*, m6id.*); a no-op on instance types without instance store.
+variable "node_data_on_instance_store" {
+  type    = bool
+  default = false
+}
+
 variable "tags" {
   type    = list(string)
   default = ["arc-quake-testnet"]

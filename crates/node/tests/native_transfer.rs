@@ -25,8 +25,6 @@ use alloy_rlp::Bytes;
 use alloy_rpc_types_trace::geth::call::CallConfig;
 use alloy_sol_types::SolEvent;
 use arc_evm::ArcEvm;
-use arc_precompiles::NATIVE_COIN_AUTHORITY_ADDRESS;
-use common::NativeCoinAuthority;
 use reth_chainspec::{EthChainSpec, ForkCondition, DEV};
 use reth_e2e_test_utils::wallet::Wallet;
 use reth_ethereum::evm::revm::{inspector::Inspector, interpreter::interpreter::EthInterpreter};
@@ -74,8 +72,7 @@ where
     let exec: ExecResultAndState<ExecutionResult> =
         evm.transact_raw(tx.clone()).expect("Tx should be accepted");
     assert!(exec.result.is_success(), "execution failed, {exec:?}",);
-    // Localdev activates Zero5: CALL transfers emit an EIP-7708 Transfer log
-    // from the system address 0xfffe...fffe instead of NativeCoinTransferred.
+    // CALL transfers emit an EIP-7708 Transfer log from the system address.
     let logs = exec.result.logs();
     assert_eq!(logs.len(), 1);
     let log: &Log = &logs[0];
@@ -123,7 +120,7 @@ fn inspect_evm_native_transfer() {
     let frame = inspector
         .with_transaction_gas_limit(21_000)
         .into_geth_builder()
-        .geth_call_traces(call_config, exec.result.gas_used());
+        .geth_call_traces(call_config, exec.result.tx_gas_used());
 
     assert_eq!(frame.from, tx.caller);
     assert_eq!(frame.to, tx.kind.to().cloned());
@@ -182,8 +179,7 @@ fn evm_native_transfer_zero5_eip7708_log() {
         "Log should be from EIP-7708 system address"
     );
 
-    // Decode as ERC-20 Transfer event — same topic signature as NativeCoinTransferred
-    // but emitted from the EIP-7708 system address instead of the native coin authority.
+    // Decode as ERC-20 Transfer event emitted from the EIP-7708 system address.
     let decoded = common::NativeFiatTokenV2_2::Transfer::decode_log(&logs[0])
         .expect("Failed to decode EIP-7708 Transfer log");
     assert_eq!(decoded.from, sender.address());
@@ -191,9 +187,9 @@ fn evm_native_transfer_zero5_eip7708_log() {
     assert_eq!(decoded.value, amount);
 }
 
-/// Pre-Zero5: plain CALL value transfer emits 1 NativeCoinTransferred log.
+/// Plain CALL value transfer emits EIP-7708 even without Zero5 metadata active.
 #[test]
-fn evm_native_transfer_pre_zero5_emits_native_coin_transferred() {
+fn evm_native_transfer_eip7708_does_not_depend_on_zero5_metadata() {
     use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
     // Zero4 active but NOT Zero5
     let chain_spec = localdev_with_hardforks(&[
@@ -220,20 +216,19 @@ fn evm_native_transfer_pre_zero5_emits_native_coin_transferred() {
         evm.transact_raw(tx).expect("Tx should be accepted");
     assert!(exec.result.is_success(), "execution failed, {exec:?}");
 
-    // Pre-Zero5: should emit 1 NativeCoinTransferred log
     let logs = exec.result.logs();
     assert_eq!(
         logs.len(),
         1,
-        "Pre-Zero5 should emit 1 NativeCoinTransferred log"
+        "baseline should emit 1 EIP-7708 Transfer log"
     );
     let log: &Log = &logs[0];
-    assert_eq!(log.address, NATIVE_COIN_AUTHORITY_ADDRESS);
-    let decoded = NativeCoinAuthority::NativeCoinTransferred::decode_log(log)
-        .expect("Failed to decode NativeCoinTransferred log");
+    assert_eq!(log.address, EIP7708_LOG_ADDRESS);
+    let decoded = common::NativeFiatTokenV2_2::Transfer::decode_log(log)
+        .expect("Failed to decode EIP-7708 Transfer log");
     assert_eq!(decoded.from, sender.address());
     assert_eq!(decoded.to, receiver.address());
-    assert_eq!(decoded.amount, amount);
+    assert_eq!(decoded.value, amount);
 }
 
 /// Helper to create a chainspec with Zero4 active but NOT Zero5.
@@ -416,18 +411,17 @@ fn evm_native_transfer_zero5_to_zero_address_reverts() {
     );
 }
 
-/// B6: Event ordering is preserved across the Zero5 hardfork boundary.
-/// The Transfer log should appear at the same position (index 0) as the old
-/// NativeCoinTransferred log for plain CALL value transfers.
+/// B6: Event ordering is stable regardless of Zero5 metadata activation.
+/// The Transfer log appears at index 0 for plain CALL value transfers.
 #[test]
-fn evm_native_transfer_event_ordering_preserved_across_zero5() {
+fn evm_native_transfer_event_ordering_ignores_zero5_metadata() {
     let sender_idx = WALLET_SENDER_INDEX;
     let receiver_idx = WALLET_RECEIVER_INDEX;
     let amount = U256::from(42);
 
-    // Pre-Zero5: NativeCoinTransferred
-    let chain_spec_pre = chainspec_pre_zero5();
-    let (mut evm_pre, wallet) = common::setup_evm_with_chainspec(chain_spec_pre);
+    // Zero5 metadata inactive: EIP-7708 baseline still applies.
+    let chain_spec_delayed = chainspec_pre_zero5();
+    let (mut evm_delayed, wallet) = common::setup_evm_with_chainspec(chain_spec_delayed);
     let sender = wallet.wallet_gen()[sender_idx].clone();
     let receiver = wallet.wallet_gen()[receiver_idx].clone();
     let tx_pre = TxEnv {
@@ -439,10 +433,10 @@ fn evm_native_transfer_event_ordering_preserved_across_zero5() {
         gas_price: 0,
         ..Default::default()
     };
-    let exec_pre = evm_pre
+    let exec_delayed = evm_delayed
         .transact_raw(tx_pre)
-        .expect("Pre-Zero5 tx should be accepted");
-    assert!(exec_pre.result.is_success());
+        .expect("delayed-Zero5 tx should be accepted");
+    assert!(exec_delayed.result.is_success());
 
     // Zero5: EIP-7708 Transfer
     let chain_spec_z5 = chainspec_with_zero5();
@@ -463,29 +457,28 @@ fn evm_native_transfer_event_ordering_preserved_across_zero5() {
         .expect("Zero5 tx should be accepted");
     assert!(exec_z5.result.is_success());
 
-    let logs_pre = exec_pre.result.logs();
+    let logs_delayed = exec_delayed.result.logs();
     let logs_z5 = exec_z5.result.logs();
 
     // Same number of logs
     assert_eq!(
-        logs_pre.len(),
+        logs_delayed.len(),
         logs_z5.len(),
         "log count should be identical"
     );
     assert_eq!(
-        logs_pre.len(),
+        logs_delayed.len(),
         1,
         "plain CALL value transfer should emit exactly 1 log"
     );
 
-    // Both logs are at index 0 — ordering is preserved
-    // Pre-Zero5: NativeCoinTransferred from authority address
-    assert_eq!(logs_pre[0].address, NATIVE_COIN_AUTHORITY_ADDRESS);
-    let decoded_pre = NativeCoinAuthority::NativeCoinTransferred::decode_log(&logs_pre[0])
-        .expect("Failed to decode NativeCoinTransferred");
-    assert_eq!(decoded_pre.from, sender.address());
-    assert_eq!(decoded_pre.to, receiver.address());
-    assert_eq!(decoded_pre.amount, amount);
+    // Both logs are at index 0 and use the baseline EIP-7708 format.
+    assert_eq!(logs_delayed[0].address, EIP7708_LOG_ADDRESS);
+    let decoded_delayed = common::NativeFiatTokenV2_2::Transfer::decode_log(&logs_delayed[0])
+        .expect("Failed to decode delayed-Zero5 EIP-7708 Transfer");
+    assert_eq!(decoded_delayed.from, sender.address());
+    assert_eq!(decoded_delayed.to, receiver.address());
+    assert_eq!(decoded_delayed.value, amount);
 
     // Zero5: EIP-7708 Transfer from system address
     assert_eq!(logs_z5[0].address, EIP7708_LOG_ADDRESS);
@@ -546,11 +539,10 @@ fn evm_native_transfer_zero5_amsterdam_eip7708_log() {
     assert_eq!(balance_after + amount, balance_before);
 }
 
-/// Hardfork boundary test: proves that behavior switches exactly at the Zero5 activation block.
-/// Block 9 (pre-Zero5) emits NativeCoinTransferred from NATIVE_COIN_AUTHORITY_ADDRESS;
-/// Block 10 (Zero5 active) emits EIP-7708 Transfer from the system address.
+/// Hardfork boundary test: proves the EIP-7708 baseline is independent of the
+/// Zero5 metadata activation block.
 #[test]
-fn evm_native_transfer_hardfork_boundary_zero5_activation() {
+fn evm_native_transfer_hardfork_boundary_keeps_eip7708_baseline() {
     use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
     use reth_evm::ConfigureEvm;
 
@@ -562,7 +554,7 @@ fn evm_native_transfer_hardfork_boundary_zero5_activation() {
 
     let amount = U256::from(42);
 
-    // --- Block 9: pre-Zero5 ---
+    // --- Block 9: Zero5 metadata inactive ---
     let (evm_config, db, mut evm_env, wallet) =
         common::setup_evm_env_with_chainspec(chain_spec.clone());
     evm_env.block_env.number = U256::from(9);
@@ -583,7 +575,7 @@ fn evm_native_transfer_hardfork_boundary_zero5_activation() {
 
     let exec_pre = evm_pre
         .transact_raw(tx_pre)
-        .expect("Pre-Zero5 tx should be accepted");
+        .expect("delayed-Zero5 tx should be accepted");
     assert!(
         exec_pre.result.is_success(),
         "block 9 tx should succeed: {:?}",
@@ -594,17 +586,17 @@ fn evm_native_transfer_hardfork_boundary_zero5_activation() {
     assert_eq!(
         logs_pre.len(),
         1,
-        "block 9: should emit exactly 1 NativeCoinTransferred log"
+        "block 9: should emit exactly 1 EIP-7708 Transfer log"
     );
     assert_eq!(
-        logs_pre[0].address, NATIVE_COIN_AUTHORITY_ADDRESS,
-        "block 9: log should come from NativeCoinAuthority"
+        logs_pre[0].address, EIP7708_LOG_ADDRESS,
+        "block 9: log should come from EIP-7708 system address"
     );
-    let decoded_pre = NativeCoinAuthority::NativeCoinTransferred::decode_log(&logs_pre[0])
-        .expect("Failed to decode NativeCoinTransferred log at block 9");
+    let decoded_pre = common::NativeFiatTokenV2_2::Transfer::decode_log(&logs_pre[0])
+        .expect("Failed to decode EIP-7708 Transfer log at block 9");
     assert_eq!(decoded_pre.from, sender.address());
     assert_eq!(decoded_pre.to, receiver.address());
-    assert_eq!(decoded_pre.amount, amount);
+    assert_eq!(decoded_pre.value, amount);
 
     // --- Block 10: Zero5 active ---
     let (evm_config, db, mut evm_env, wallet) =
@@ -776,8 +768,8 @@ fn blocklist_enforced_on_inspect_path() {
 
     // Both paths should consume the same gas
     assert_eq!(
-        exec_no_inspect.result.gas_used(),
-        exec_inspect.result.gas_used(),
+        exec_no_inspect.result.tx_gas_used(),
+        exec_inspect.result.tx_gas_used(),
         "inspect and non-inspect paths should consume identical gas"
     );
 }
@@ -947,7 +939,7 @@ fn evm_native_create2_with_value_zero5_emits_eip7708_log() {
     let frame = inspector
         .with_transaction_gas_limit(tx.gas_limit)
         .into_geth_builder()
-        .geth_call_traces(call_config, trace_exec.result.gas_used());
+        .geth_call_traces(call_config, trace_exec.result.tx_gas_used());
     assert_eq!(frame.typ, "CALL");
     assert_eq!(frame.to, Some(factory));
     assert_eq!(

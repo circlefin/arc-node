@@ -18,7 +18,6 @@ use eyre::Context;
 use tracing::{error, info, warn};
 
 use malachitebft_app_channel::app::consensus::Role;
-use malachitebft_app_channel::app::types::core::Validity;
 use malachitebft_app_channel::app::types::ProposedValue;
 use malachitebft_app_channel::Reply;
 
@@ -131,8 +130,12 @@ async fn fetch_and_process_pending_proposals(
 
     info!(%height, %round, "StartedRound: Found {} pending proposal parts", pending_parts.len());
 
-    // Convert the pending proposal parts for the current round,
-    // into blocks and add them to undecided blocks table.
+    let payload_validator = EnginePayloadValidator::new(engine, metrics);
+
+    // Validate each pending block with the engine and insert the row into
+    // the undecided table with the engine's verdict. Rows always reflect a
+    // real verdict; on a transient engine error we skip the insert. The
+    // parts are pruned when height advances past them.
     process_pending_proposal_parts(
         store,
         pending_parts,
@@ -140,28 +143,36 @@ async fn fetch_and_process_pending_proposals(
         round,
         validator_set,
         proposer_selector,
+        &payload_validator,
+        store,
         signing_provider,
         metrics,
     )
     .await
     .wrap_err("Failed to validate pending proposal parts")?;
 
-    let blocks = validate_undecided_blocks(
-        height,
-        round,
-        store,
-        &EnginePayloadValidator::new(engine, metrics),
-        store,
-        metrics,
-    )
-    .await
-    .wrap_err("failed to validate undecided blocks")?;
+    // Re-validate undecided blocks that already exist in the store. This is
+    // needed after a restart, when the execution client may have lost the
+    // payloads from its in-memory tree and must be re-fed them.
+    let blocks =
+        validate_undecided_blocks(height, round, store, &payload_validator, store, metrics)
+            .await
+            .wrap_err("failed to validate undecided blocks")?;
 
     Ok(blocks.iter().map(ProposedValue::from).collect())
 }
 
 /// Process the pending proposal parts for the current height, assembling them
-/// into blocks and moving the blocks to the undecided table.
+/// into blocks, validating each block against the execution client, and
+/// moving the validated blocks to the undecided table with their engine
+/// verdict.
+///
+/// A row in the undecided table always reflects the engine's verdict at
+/// insertion time: no placeholder `Valid` ever leaks. If the engine cannot
+/// be reached (transport error, `SYNCING`/`ACCEPTED`, …) the pending parts
+/// are left in place and pruned when height advances past them. BFT
+/// liveness covers the gap: the round times out and a later proposer's
+/// block gets decided — this specific proposal does not need to land.
 ///
 /// ## Important
 /// This function assumes that the pending parts are for the current height and round.
@@ -173,6 +184,8 @@ async fn process_pending_proposal_parts(
     current_round: Round,
     validator_set: &ValidatorSet,
     proposer_selector: &dyn ProposerSelector,
+    payload_validator: &impl PayloadValidator,
+    invalid_payloads: &impl InvalidPayloadsRepository,
     signing_provider: &ArcSigningProvider,
     metrics: &AppMetrics,
 ) -> eyre::Result<()> {
@@ -188,23 +201,8 @@ async fn process_pending_proposal_parts(
             continue;
         }
 
-        // NOTE: The block is initially assigned a default validity status
-        // (i.e., `Validity::Valid`), even though it has not yet been validated
-        // by the execution client.
-        // By inserting this block into the undecided blocks table, we are
-        // temporarily violating the assumption that all blocks in that table
-        // have been validated at least once by the execution client.
-        // This temporary inconsistency is acceptable here because all blocks
-        // in the undecided table are immediately validated by the subsequent
-        // `validate_undecided_blocks` in `AppMsg::StartedRound` handler.
-        match assemble_block_from_parts(&parts) {
-            Ok(block) => {
-                info!(%height, %round, %proposer, "Added pending block to undecided");
-
-                // Atomically remove from pending and store as undecided
-                // This ensures that if the process fails, the parts are not lost
-                remove_pending_parts_and_store_undecided_block(store, parts, block).await?;
-            }
+        let mut block = match assemble_block_from_parts(&parts) {
+            Ok(block) => block,
             Err(e) => {
                 warn!(%height, %round, %proposer, "Failed to assemble block from pending parts: {e}");
                 metrics.inc_invalid_payloads_count(InvalidPayloadSource::AssemblyFailure);
@@ -214,26 +212,50 @@ async fn process_pending_proposal_parts(
                         "Failed to store invalid payload after assembling block from pending parts (height={height}, round={round}, proposer={proposer})",
                     )
                 })?;
+                continue;
             }
-        }
+        };
+
+        // Engine verdict before insert: a transient engine error must not be
+        // recorded as a permanent `Invalid` verdict against this block.
+        let validity =
+            match validate_consensus_block(payload_validator, &block, invalid_payloads, metrics)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        %height, %round, %proposer,
+                        "Skipping pending parts: transient engine validation error: {e}"
+                    );
+                    continue;
+                }
+            };
+
+        block.validity = validity;
+
+        info!(%height, %round, %proposer, ?validity, "Added pending block to undecided");
+
+        // Atomically remove from pending and store as undecided.
+        // This ensures that if the process fails, the parts are not lost.
+        remove_pending_parts_and_store_undecided_block(store, parts, block).await?;
     }
 
     Ok(())
 }
 
-/// Sends all undecided blocks for the given height and round to the execution
-/// client, ensuring the client has the corresponding payloads locally.
-/// This is important in two scenarios:
-/// 1. when validating newly created undecided blocks reconstructed from proposal
-///    parts.
-/// 2. when re-validating undecided blocks after a crash or restart.
+/// Re-sends every undecided block for the given height and round to the
+/// execution client. This is the **restart recovery** path: after a crash,
+/// the EL may have lost the in-memory tree state for these blocks and must
+/// be re-fed them so subsequent `forkchoice_updated` calls can succeed.
 ///
-/// The second case addresses the EL "amnesia" issue, where the execution client may
-/// have forgotten previously validated payloads that were only stored in memory and
-/// lost after a restart.
+/// The stored row's `validity` was set by `process_pending_proposal_parts`
+/// at insertion time, so this function does not need to *establish* a verdict
+/// — it only refreshes the EL's view and reconciles any change.
 ///
-/// After each block is validated, the engine's verdict is persisted back to the
-/// undecided blocks table.
+/// On a transient engine error (`Err`), the existing verdict is kept: the row
+/// already reflects a real engine call, so a momentary engine outage must not
+/// flip it.
 async fn validate_undecided_blocks(
     height: Height,
     round: Round,
@@ -252,49 +274,47 @@ async fn validate_undecided_blocks(
             )
         })?;
 
-    // Holds all blocks that were validated (either valid or invalid)
     let mut validated_blocks = Vec::with_capacity(blocks.len());
 
     for mut block in blocks {
         let block_hash = block.block_hash();
+        let existing_validity = block.validity;
 
-        info!(%height, %round, %block_hash, "Validating undecided block");
+        info!(%height, %round, %block_hash, ?existing_validity, "Re-validating undecided block");
 
-        let validity = match validate_consensus_block(
-            payload_validator,
-            &block,
-            invalid_payloads,
-            metrics,
-        )
-        .await
-        {
-            Ok(validity) => validity,
-            Err(e) => {
-                error!(%height, %round, %block_hash, "Failed to validate undecided block, marking Invalid: {e}");
-                Validity::Invalid
+        match validate_consensus_block(payload_validator, &block, invalid_payloads, metrics).await {
+            Ok(new_validity) => {
+                if new_validity != existing_validity {
+                    warn!(
+                        %height, %round, %block_hash,
+                        from = ?existing_validity, to = ?new_validity,
+                        "Engine verdict changed on re-validation",
+                    );
+                    block.validity = new_validity;
+                    undecided_blocks
+                        .store_undecided_block(block.clone())
+                        .await
+                        .wrap_err_with(|| {
+                            format!(
+                                "Failed to persist re-validated undecided block {block_hash} \
+                                 at height={height} round={round}"
+                            )
+                        })?;
+                }
             }
-        };
+            Err(e) => {
+                warn!(
+                    %height, %round, %block_hash, ?existing_validity,
+                    "Re-validation failed transiently; keeping existing verdict: {e}",
+                );
+            }
+        }
 
-        block.validity = validity;
-
-        // Persist the engine's verdict before returning the block to consensus.
-        undecided_blocks
-            .store_undecided_block(block.clone())
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to persist validated undecided block {block_hash} \
-                     at height={height} round={round}"
-                )
-            })?;
-
-        validated_blocks.push(block);
-
-        if !validity.is_valid() {
-            // It is possible that we had multiple blocks before restart,
-            // and one or more of them are invalid. We continue to the next block.
+        if !block.validity.is_valid() {
             warn!(%height, %round, %block_hash, "Undecided block is invalid");
         }
+
+        validated_blocks.push(block);
     }
 
     Ok(validated_blocks)
@@ -344,6 +364,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::handlers::test_utils::signed_parts_without_data;
+    use crate::proposal_parts::make_proposal_parts;
 
     fn create_dummy_block(height: Height, round: Round, seed: u8) -> ConsensusBlock {
         let bytes = [seed; 1024];
@@ -375,6 +396,9 @@ mod tests {
 
     #[tokio::test]
     async fn validate_undecided_blocks_all_valid() {
+        // Stored rows already reflect a real Valid verdict from
+        // process_pending_proposal_parts, so re-validation that returns Valid
+        // does not write anything back.
         let height = Height::new(1);
         let round = Round::new(0);
 
@@ -386,11 +410,7 @@ mod tests {
         undecided
             .expect_get_by_round()
             .returning(move |_, _| Ok(blocks.clone()));
-        undecided
-            .expect_store_undecided_block()
-            .times(2)
-            .withf(|b| b.validity == Validity::Valid)
-            .returning(|_| Ok(()));
+        undecided.expect_store_undecided_block().times(0);
 
         let mut validator = MockPayloadValidator::new();
         validator
@@ -413,7 +433,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_undecided_blocks_mixed_validity() {
+    async fn validate_undecided_blocks_engine_flips_verdict_persists_change() {
+        // If the engine's verdict on re-validation differs from the stored
+        // row's validity, the new verdict is persisted. Verdicts that match
+        // are not re-written.
         let height = Height::new(1);
         let round = Round::new(0);
 
@@ -426,12 +449,12 @@ mod tests {
             .expect_get_by_round()
             .returning(move |_, _| Ok(blocks.clone()));
 
-        // Record the validity of every block persisted, in call order.
+        // Only block2 (flipped Valid -> Invalid) is persisted; block1 (Valid -> Valid) is not.
         let persisted = Arc::new(Mutex::new(Vec::<Validity>::new()));
         let persisted_clone = Arc::clone(&persisted);
         undecided
             .expect_store_undecided_block()
-            .times(2)
+            .times(1)
             .returning(move |b| {
                 persisted_clone.lock().unwrap().push(b.validity);
                 Ok(())
@@ -467,8 +490,8 @@ mod tests {
         assert_eq!(result[1].validity, Validity::Invalid);
         assert_eq!(
             *persisted.lock().unwrap(),
-            vec![Validity::Valid, Validity::Invalid],
-            "persisted validity should match engine verdict, not the placeholder"
+            vec![Validity::Invalid],
+            "only the block whose verdict changed should be persisted",
         );
         assert_eq!(metrics.get_invalid_payloads_count(), 1);
     }
@@ -521,12 +544,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_undecided_blocks_validation_error_marks_invalid() {
-        // When the engine call fails (transport error, SYNCING/ACCEPTED, etc.)
-        // we treat the block as `Invalid` for the current round so the placeholder
-        // `Valid` written by `process_pending_proposal_parts` does not leak.
-        // Malachite's `FullProposalKeeper::handle_validity_change` rejects any
-        // subsequent `Valid -> Invalid` flip on the same WAL entry.
+    async fn validate_undecided_blocks_validation_error_keeps_existing_verdict() {
+        // When the engine call fails transiently during re-validation we keep
+        // the stored row's existing verdict. The row already reflects a real
+        // engine verdict set at insertion time by process_pending_proposal_parts,
+        // so a momentary outage must not flip it.
         let height = Height::new(1);
         let round = Round::new(0);
 
@@ -539,17 +561,9 @@ mod tests {
             .expect_get_by_round()
             .returning(move |_, _| Ok(blocks.clone()));
 
-        // Both blocks must be persisted: the errored block with `Invalid`,
-        // the successful one with `Valid`. Order matches the input order.
-        let persisted = Arc::new(Mutex::new(Vec::<Validity>::new()));
-        let persisted_clone = Arc::clone(&persisted);
-        undecided
-            .expect_store_undecided_block()
-            .times(2)
-            .returning(move |b| {
-                persisted_clone.lock().unwrap().push(b.validity);
-                Ok(())
-            });
+        // Neither block triggers a store: the errored block keeps its verdict
+        // (no write), the successful one re-validates to the same verdict (no write).
+        undecided.expect_store_undecided_block().times(0);
 
         let mut call_count = 0usize;
         let mut validator = MockPayloadValidator::new();
@@ -576,15 +590,12 @@ mod tests {
                 .expect("should succeed despite one block erroring");
 
         assert_eq!(result.len(), 2, "both blocks should be returned");
-        assert_eq!(result[0].validity, Validity::Invalid);
-        assert_eq!(result[1].validity, Validity::Valid);
         assert_eq!(
-            *persisted.lock().unwrap(),
-            vec![Validity::Invalid, Validity::Valid],
-            "errored block must be persisted as Invalid, not left with placeholder Valid",
+            result[0].validity,
+            Validity::Valid,
+            "errored block keeps its existing Valid verdict — not flipped to Invalid",
         );
-        // Engine failure is not counted as an engine rejection; the metric
-        // tracks `EngineReject` and `AssemblyFailure`, not transport errors.
+        assert_eq!(result[1].validity, Validity::Valid);
         assert_eq!(metrics.get_invalid_payloads_count(), 0);
     }
 
@@ -604,6 +615,12 @@ mod tests {
         let provider = ArcSigningProvider::Local(LocalSigningProvider::new(signing_key));
         let metrics = AppMetrics::default();
 
+        // Assembly fails before validation, so the engine is never called.
+        let mut payload_validator = MockPayloadValidator::new();
+        payload_validator.expect_validate_payload().times(0);
+        let mut invalid_payloads = MockInvalidPayloadsRepository::new();
+        invalid_payloads.expect_append().times(0);
+
         process_pending_proposal_parts(
             &store,
             vec![parts],
@@ -611,6 +628,8 @@ mod tests {
             round,
             &validator_set,
             &selector,
+            &payload_validator,
+            &invalid_payloads,
             &provider,
             &metrics,
         )
@@ -620,11 +639,234 @@ mod tests {
         assert_eq!(metrics.get_invalid_payloads_count(), 1);
     }
 
+    /// Builds a signed `ProposalParts` from a real `ConsensusBlock` whose
+    /// proposer matches the single-validator set used by these tests.
+    /// Returns the parts and the block hash so callers can query the store.
+    async fn signed_parts_for_single_validator(
+        height: Height,
+        round: Round,
+        signing_key: &PrivateKey,
+        seed: u8,
+    ) -> (ProposalParts, arc_consensus_types::BlockHash) {
+        let proposer = Address::from_public_key(&signing_key.public_key());
+        let bytes = [seed; 1024];
+        let mut u = Unstructured::new(&bytes);
+        let block = ConsensusBlock {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer,
+            validity: Validity::Valid,
+            execution_payload: ExecutionPayloadV3::arbitrary(&mut u).unwrap(),
+            signature: None,
+        };
+        let block_hash = block.block_hash();
+
+        let provider = LocalSigningProvider::new(signing_key.clone());
+        let (raw_parts, _sig) = make_proposal_parts(&provider, &block).await.unwrap();
+        (ProposalParts::new(raw_parts).unwrap(), block_hash)
+    }
+
+    #[tokio::test]
+    async fn process_pending_proposal_parts_inserts_valid_block_and_clears_pending() {
+        let (store, _dir) = test_store().await;
+
+        let signing_key = PrivateKey::generate(rand::rngs::OsRng);
+        let validator = Validator::new(signing_key.public_key(), 1);
+        let validator_set = ValidatorSet::new(vec![validator]);
+
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let (parts, block_hash) =
+            signed_parts_for_single_validator(height, round, &signing_key, 0xAA).await;
+
+        store
+            .store_pending_proposal_parts(parts.clone(), 100, height)
+            .await
+            .unwrap();
+
+        let selector = RoundRobin;
+        let provider = ArcSigningProvider::Local(LocalSigningProvider::new(signing_key));
+        let metrics = AppMetrics::default();
+
+        let mut payload_validator = MockPayloadValidator::new();
+        payload_validator
+            .expect_validate_payload()
+            .times(1)
+            .returning(|_| Ok(PayloadValidationResult::Valid));
+        let mut invalid_payloads = MockInvalidPayloadsRepository::new();
+        invalid_payloads.expect_append().times(0);
+
+        process_pending_proposal_parts(
+            &store,
+            vec![parts],
+            height,
+            round,
+            &validator_set,
+            &selector,
+            &payload_validator,
+            &invalid_payloads,
+            &provider,
+            &metrics,
+        )
+        .await
+        .expect("validate-and-insert should succeed");
+
+        let stored = store
+            .get_undecided_block(height, round, block_hash)
+            .await
+            .unwrap()
+            .expect("undecided block should be stored");
+        assert_eq!(stored.validity, Validity::Valid);
+
+        let remaining = store
+            .get_pending_proposal_parts(height, round)
+            .await
+            .unwrap();
+        assert!(remaining.is_empty(), "pending parts must be removed");
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn process_pending_proposal_parts_inserts_invalid_block_and_clears_pending() {
+        let (store, _dir) = test_store().await;
+
+        let signing_key = PrivateKey::generate(rand::rngs::OsRng);
+        let validator = Validator::new(signing_key.public_key(), 1);
+        let validator_set = ValidatorSet::new(vec![validator]);
+
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let (parts, block_hash) =
+            signed_parts_for_single_validator(height, round, &signing_key, 0xBB).await;
+
+        store
+            .store_pending_proposal_parts(parts.clone(), 100, height)
+            .await
+            .unwrap();
+
+        let selector = RoundRobin;
+        let provider = ArcSigningProvider::Local(LocalSigningProvider::new(signing_key));
+        let metrics = AppMetrics::default();
+
+        let mut payload_validator = MockPayloadValidator::new();
+        payload_validator
+            .expect_validate_payload()
+            .times(1)
+            .returning(|_| {
+                Ok(PayloadValidationResult::Invalid {
+                    reason: "engine rejected".into(),
+                })
+            });
+        let mut invalid_payloads = MockInvalidPayloadsRepository::new();
+        invalid_payloads
+            .expect_append()
+            .times(1)
+            .returning(|_| Ok(()));
+
+        process_pending_proposal_parts(
+            &store,
+            vec![parts],
+            height,
+            round,
+            &validator_set,
+            &selector,
+            &payload_validator,
+            &invalid_payloads,
+            &provider,
+            &metrics,
+        )
+        .await
+        .expect("validate-and-insert should succeed with Invalid verdict");
+
+        let stored = store
+            .get_undecided_block(height, round, block_hash)
+            .await
+            .unwrap()
+            .expect("undecided block should be stored");
+        assert_eq!(stored.validity, Validity::Invalid);
+
+        let remaining = store
+            .get_pending_proposal_parts(height, round)
+            .await
+            .unwrap();
+        assert!(remaining.is_empty(), "pending parts must be removed");
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn process_pending_proposal_parts_skips_insert_on_transient_engine_error() {
+        let (store, _dir) = test_store().await;
+
+        let signing_key = PrivateKey::generate(rand::rngs::OsRng);
+        let validator = Validator::new(signing_key.public_key(), 1);
+        let validator_set = ValidatorSet::new(vec![validator]);
+
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let (parts, block_hash) =
+            signed_parts_for_single_validator(height, round, &signing_key, 0xCC).await;
+
+        store
+            .store_pending_proposal_parts(parts.clone(), 100, height)
+            .await
+            .unwrap();
+
+        let selector = RoundRobin;
+        let provider = ArcSigningProvider::Local(LocalSigningProvider::new(signing_key));
+        let metrics = AppMetrics::default();
+
+        let mut payload_validator = MockPayloadValidator::new();
+        payload_validator
+            .expect_validate_payload()
+            .times(1)
+            .returning(|_| Err(eyre::eyre!("engine unreachable")));
+        let mut invalid_payloads = MockInvalidPayloadsRepository::new();
+        invalid_payloads.expect_append().times(0);
+
+        process_pending_proposal_parts(
+            &store,
+            vec![parts],
+            height,
+            round,
+            &validator_set,
+            &selector,
+            &payload_validator,
+            &invalid_payloads,
+            &provider,
+            &metrics,
+        )
+        .await
+        .expect("transient engine error must not fail the handler");
+
+        let stored = store
+            .get_undecided_block(height, round, block_hash)
+            .await
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "no undecided row should be inserted when the engine errors",
+        );
+
+        let remaining = store
+            .get_pending_proposal_parts(height, round)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "pending parts must stay in place for cleanup on commit",
+        );
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
+    }
+
     #[tokio::test]
     async fn validate_undecided_blocks_propagates_persist_error() {
         let height = Height::new(1);
         let round = Round::new(0);
 
+        // Stored block is Valid; re-validation returns Invalid (verdict
+        // change) so persist is attempted and fails — the error must propagate.
         let block = create_dummy_block(height, round, 0x33);
         let blocks = vec![block];
 
@@ -638,12 +880,14 @@ mod tests {
             .returning(|_| Err(std::io::Error::other("disk full")));
 
         let mut validator = MockPayloadValidator::new();
-        validator
-            .expect_validate_payload()
-            .times(1)
-            .returning(|_| Ok(PayloadValidationResult::Valid));
+        validator.expect_validate_payload().times(1).returning(|_| {
+            Ok(PayloadValidationResult::Invalid {
+                reason: "engine rejected".into(),
+            })
+        });
 
-        let invalid = MockInvalidPayloadsRepository::new();
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(1).returning(|_| Ok(()));
 
         let metrics = AppMetrics::default();
         let err =
@@ -653,9 +897,9 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("Failed to persist validated undecided block"),
+                .contains("Failed to persist re-validated undecided block"),
             "error should describe the persist failure, got: {err}",
         );
-        assert_eq!(metrics.get_invalid_payloads_count(), 0);
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
     }
 }

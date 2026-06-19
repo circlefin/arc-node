@@ -158,12 +158,25 @@ fn default_rpc_api() -> Vec<String> {
 }
 
 /// Execution layer (Reth) transaction pool configuration overrides.
+///
+/// Reth caps each sub-pool on two independent dimensions — `count` and
+/// `size in megabytes` — and treats either as binding. Quake exposes both:
+/// the `*_max_count` fields cap transaction count and the `*_max_size` fields
+/// cap the cumulative wire size in MB. Either limit alone leaves the pool
+/// subject to the other's default (10 000 txs and 20 MB respectively in Reth
+/// v1.11), so high-throughput saturation experiments typically need to lift
+/// both.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ElTxpoolConfig {
     pub pending_max_count: Option<u64>,
+    pub pending_max_size: Option<u64>,
     pub basefee_max_count: Option<u64>,
+    pub basefee_max_size: Option<u64>,
     pub queued_max_count: Option<u64>,
+    pub queued_max_size: Option<u64>,
+    pub blobpool_max_count: Option<u64>,
+    pub blobpool_max_size: Option<u64>,
     pub max_account_slots: Option<u64>,
     pub lifetime: Option<u64>,
     pub max_batch_size: Option<u64>,
@@ -174,8 +187,13 @@ impl Default for ElTxpoolConfig {
     fn default() -> Self {
         Self {
             pending_max_count: None,
+            pending_max_size: None,
             basefee_max_count: None,
+            basefee_max_size: None,
             queued_max_count: None,
+            queued_max_size: None,
+            blobpool_max_count: None,
+            blobpool_max_size: None,
             max_account_slots: None,
             lifetime: None,
             max_batch_size: None,
@@ -543,6 +561,9 @@ pub(crate) struct Manifest {
     /// Provisioned IOPS for the node root EBS volume (remote only).
     /// Only meaningful for `gp3`, `io1`, and `io2` volume types.
     pub node_volume_iops: Option<u32>,
+    /// Place the node data directory on local instance-store NVMe instead of the root EBS
+    /// volume (remote only). Requires an instance type with local NVMe; a no-op otherwise.
+    pub node_data_on_instance_store: bool,
     /// CPU limit for the EL container (Docker `cpus`). Whole or fractional CPUs.
     pub el_cpu_limit: Option<f64>,
     /// Memory limit for the EL container, in GiB. Fractional values are allowed (e.g. 2.5).
@@ -599,6 +620,7 @@ pub struct ClGossipSubConfig {
 /// - `Modern`: for CL >= v0.5.0, maps directly to CLI flags via [`StartCmd`].
 /// - `Legacy`: for CL < v0.5.0, serializes to `config.toml` via [`ClConfigOverride`].
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // StartCmd and ClConfigOverride differ by ~700 bytes; boxing Legacy would regress ergonomics for the common path.
 pub enum NodeClConfig {
     Modern(StartCmd),
     Legacy(ClConfigOverride),
@@ -837,6 +859,21 @@ impl Manifest {
         Ok(resolved.into_iter().collect())
     }
 
+    /// Resolve node selectors if selectors is Some, or default to all nodes if None.
+    pub(crate) fn resolve_optional_node_selectors(
+        &self,
+        selectors: Option<&[String]>,
+    ) -> Result<Vec<NodeName>> {
+        let node_names = match selectors {
+            None => self.nodes.keys().cloned().collect(),
+            Some(sel) => self.resolve_node_selectors(sel)?,
+        };
+        if node_names.is_empty() {
+            bail!("Target selector resolved to zero nodes");
+        }
+        Ok(node_names)
+    }
+
     /// Collects explicit voting powers from validators, or `None` if none are set.
     pub(crate) fn validator_voting_powers(&self) -> Option<Vec<u64>> {
         let powers: Vec<u64> = self
@@ -1029,6 +1066,20 @@ impl Manifest {
 
         // Check that all subnets are connected through bridge nodes.
         self.subnets.validate_topology()?;
+
+        // Validate per-node byzantine configuration.
+        #[cfg(feature = "byzantine")]
+        for (node_name, node) in self.nodes.iter() {
+            let byz = match &node.cl_config {
+                NodeClConfig::Modern(cmd) => cmd.byzantine.as_ref(),
+                NodeClConfig::Legacy(cfg) => cfg.byzantine.as_ref(),
+            };
+            if let Some(byz) = byz {
+                byz.validate().with_context(|| {
+                    format!("Invalid byzantine configuration for node '{node_name}'")
+                })?;
+            }
+        }
 
         Ok(())
     }
@@ -1513,6 +1564,30 @@ mod tests {
     }
 
     #[test]
+    fn test_el_cli_flags_forward_trusted_only_but_not_trusted_peers() {
+        let str = r#"
+        [nodes.validator1.el.config]
+        trusted_peers = ["validator2"]
+        trusted_only = true
+        [nodes.validator2]
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+        let node = &manifest.nodes["validator1"];
+
+        assert_eq!(node.el_trusted_peers, Some(vec!["validator2".to_string()]));
+
+        let flags = node.el_cli_flags().unwrap();
+        assert!(
+            flags.iter().any(|flag| flag == "--trusted-only"),
+            "trusted_only=true should be forwarded as --trusted-only: {flags:?}"
+        );
+        assert!(
+            !flags.iter().any(|flag| flag.starts_with("--trusted-peers")),
+            "trusted_peers is generated by Quake setup and should not be forwarded directly: {flags:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_valid_cl_persistent_peers() {
         let str = r#"
         [nodes.validator1]
@@ -1715,6 +1790,49 @@ mod tests {
             .el_cli_flags()
             .unwrap()
             .contains(&"--http".to_string()));
+    }
+
+    #[test]
+    fn test_el_config_txpool_subpool_size_flags() {
+        // Setting `txpool.*_max_size` in the manifest must emit the corresponding
+        // `--txpool.*-max-size=N` Reth CLI flag for every node. Reth caps each
+        // sub-pool on both count and size in MB independently, so the size
+        // dimension must be tunable from the manifest just like count.
+        let str = r#"
+        [el.config.txpool]
+        pending_max_size = 200
+        basefee_max_size = 100
+        queued_max_size = 150
+        blobpool_max_size = 50
+        blobpool_max_count = 75
+
+        [nodes.validator1]
+        [nodes.validator2]
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+        for node_name in ["validator1", "validator2"] {
+            let flags = manifest.nodes[node_name].el_cli_flags().unwrap();
+            assert!(
+                flags.contains(&"--txpool.pending-max-size=200".to_string()),
+                "{node_name} missing pending-max-size flag: {flags:?}"
+            );
+            assert!(
+                flags.contains(&"--txpool.basefee-max-size=100".to_string()),
+                "{node_name} missing basefee-max-size flag: {flags:?}"
+            );
+            assert!(
+                flags.contains(&"--txpool.queued-max-size=150".to_string()),
+                "{node_name} missing queued-max-size flag: {flags:?}"
+            );
+            assert!(
+                flags.contains(&"--txpool.blobpool-max-size=50".to_string()),
+                "{node_name} missing blobpool-max-size flag: {flags:?}"
+            );
+            assert!(
+                flags.contains(&"--txpool.blobpool-max-count=75".to_string()),
+                "{node_name} missing blobpool-max-count flag: {flags:?}"
+            );
+        }
     }
 
     #[test]

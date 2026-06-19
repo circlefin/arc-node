@@ -174,6 +174,7 @@ mod tests {
                 current_beacon_root: None,
                 current_withdrawals_root: None,
                 current_excess_blob_gas: None,
+                slot_number: None,
             },
             pre: alloy_primitives::map::HashMap::default(),
             post: BTreeMap::default(),

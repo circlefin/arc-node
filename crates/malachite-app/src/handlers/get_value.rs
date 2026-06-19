@@ -17,6 +17,7 @@
 use std::time::{Duration, Instant};
 
 use eyre::{eyre, Context};
+use itertools::Itertools;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -27,6 +28,7 @@ use malachitebft_app_channel::{NetworkMsg, Reply};
 use malachitebft_core_types::Validity;
 
 use arc_consensus_types::{Address, ArcContext, Height};
+use arc_eth_engine::deadline::EngineDeadline;
 use arc_eth_engine::engine::Engine;
 use arc_eth_engine::json_structures::ExecutionBlock;
 use arc_signer::ArcSigningProvider;
@@ -47,13 +49,17 @@ type NetworkHandle = mpsc::Sender<NetworkMsg<ArcContext>>;
 
 /// Handles the `GetValue` message from the consensus engine.
 ///
-/// This is called when the consensus engine requests a value to propose for a specific height and round.
+/// Called when the consensus engine requests a new value to propose in a given height and round.
 ///
-/// - The application first checks if there are any previously built blocks for the given height and round.
-/// - If such blocks exist, it selects the first one to propose.
-/// - If no previously built blocks are found, the application builds a new block using the execution engine,
-///   validates it, and prepares it for proposal.
-/// - Finally, it sends the proposed value back to the consensus engine and streams the proposal parts over the network.
+/// Malachite assumes that the application is deterministic when providing proposals, namely replies
+/// to the `getValue()` primitive implemented by this handler. This requires storing and re-using
+/// previously produced values.
+///
+/// - First, check if there is a previously built block for the given height and round.
+/// - If so, to adhere to the crash-recovery model, the same block must be re-proposed.
+/// - Otherwise, which should be common case, build a new block using the execution engine.
+/// - Start a new stream to propagate the proposal, with the stored or new block, to all processes.
+/// - Returns to the consensus engine the stored or new block's hash as the proposed value.
 pub async fn handle(
     state: &mut State,
     network: NetworkHandle,
@@ -68,7 +74,7 @@ pub async fn handle(
 
     let address = state.address();
     let fee_recipient = state.fee_recipient();
-    let stream_id = state.next_stream_id(height, round);
+    let stream_id = state.next_stream_id();
     let previous_block = state.previous_block.as_ref();
     let signing_provider = state.signing_provider();
 
@@ -98,6 +104,16 @@ pub async fn handle(
             }
         }
 
+        // Feed the byzantine amnesia state machine with the value we're about
+        // to propose locally, so a later nil-prevote at this (height, round)
+        // can be overridden with `NilOrVal::Val(value_id)`. No-op when the
+        // byzantine feature is off or the amnesia trigger is inactive.
+        #[cfg(feature = "byzantine")]
+        if let Some(byz) = &state.ctx.byzantine {
+            byz.amnesia
+                .record_proposed_value(height, round, proposed_value.value.id());
+        }
+
         if let Err(e) = reply.send(proposed_value) {
             error!("🔴 GetValue: Failed to send reply: {e:?}");
         }
@@ -125,7 +141,7 @@ async fn on_get_value(
         .await
         .wrap_err_with(|| {
             format!(
-                "Proposer failed to get previously built blocks (if any) for height {} and round {}",
+                "Proposer failed to get previously built block for height {} and round {}",
                 height, round,
             )
         })?;
@@ -142,6 +158,11 @@ async fn on_get_value(
                 eyre!("No previous block available to build new block at height={height} and round={round}")
             })?;
 
+            // Engine API calls below share the round's full propose budget;
+            // this outer timeout is the binding deadline (per-call timeouts
+            // never undercut it, see `EngineDeadline::call_timeout`).
+            let deadline = EngineDeadline::within(timeout);
+
             let task = build_and_validate_block(
                 engine,
                 &metrics,
@@ -151,9 +172,10 @@ async fn on_get_value(
                 address,
                 previous_block,
                 &fee_recipient,
+                deadline,
             );
 
-            let result = match tokio::time::timeout(timeout, task).await {
+            let result = match tokio::time::timeout_at(deadline.timeout_at(), task).await {
                 Ok(result) => result,
                 Err(_) => {
                     error!(%height, %round, "⏰ Proposer timed out while building block after {timeout:?}");
@@ -220,6 +242,7 @@ async fn build_and_validate_block(
     proposer: Address,
     previous_block: &ExecutionBlock,
     fee_recipient: &Address,
+    deadline: EngineDeadline,
 ) -> eyre::Result<ConsensusBlock> {
     let start = Instant::now();
 
@@ -231,10 +254,11 @@ async fn build_and_validate_block(
         proposer,
         previous_block,
         fee_recipient,
+        deadline,
     )
     .await?;
 
-    let validator = EnginePayloadValidator::new(engine, metrics);
+    let validator = EnginePayloadValidator::new_with_deadline(engine, metrics, deadline);
     let validity = validate_consensus_block(&validator, &block, store, metrics)
         .await
         .wrap_err_with(|| {
@@ -258,9 +282,8 @@ async fn build_and_validate_block(
     Ok(block)
 }
 
-/// Build a new block, validate it, and store it alongside its corresponding proposal.
-///
-/// Includes timing delay enforcement to ensure proper block intervals
+/// Build a new block.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_block(
     engine: &Engine,
     metrics: &AppMetrics,
@@ -269,8 +292,12 @@ pub async fn build_block(
     proposer: Address,
     previous_block: &ExecutionBlock,
     fee_recipient: &Address,
+    deadline: EngineDeadline,
 ) -> eyre::Result<ConsensusBlock> {
-    let generator = EnginePayloadGenerator { engine }; // TODO: make this configurable
+    let generator = EnginePayloadGenerator {
+        engine,
+        deadline: Some(deadline),
+    }; // TODO: make this configurable
 
     let execution_payload =
         generate_payload_with_retry(previous_block, fee_recipient, &generator, metrics).await?;
@@ -291,13 +318,10 @@ pub async fn build_block(
     })
 }
 
-/// Retrieves the previously built block for the given height and round.
-/// Called by the consensus engine to re-use a previously built block.
-/// Returns the first block found for the given height and round with the matching proposer.
+/// Retrieves a previously built block by a proposer for the given height and round, if any.
 ///
-/// There should be at most one block for a given height and round when the proposer is not byzantine.
-/// We assume this implementation is not byzantine and we are the proposer for the given height and round.
-/// Therefore there must be a single block for the rounds where we are the proposer, with the proposer address matching our own.
+/// There should be at most one block for a given height, round, and proposer.
+/// Produces an error if multiple matching blocks are found in the undecided blocks database.
 async fn get_previously_built_block(
     undecided_blocks: impl UndecidedBlocksRepository,
     proposer: Address,
@@ -305,6 +329,188 @@ async fn get_previously_built_block(
     round: Round,
 ) -> eyre::Result<Option<ConsensusBlock>> {
     let blocks = undecided_blocks.get_by_round(height, round).await?;
-    let block = blocks.into_iter().find(|p| p.proposer == proposer);
+    let block = blocks
+        .into_iter()
+        .filter(|p| p.proposer == proposer)
+        .at_most_one()
+        .map_err(|dups| {
+            let hashes: Vec<_> = dups.map(|b| b.block_hash()).collect();
+            eyre!("Multiple undecided blocks found for proposer {proposer} at height {height} and round {round}: {hashes:?}")
+        })?;
+
     Ok(block)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use mockall::predicate::*;
+
+    use alloy_primitives::{Address as AlloyAddress, Bloom, Bytes as AlloyBytes, U256};
+    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3};
+    use arc_consensus_types::{signing::Signature, B256};
+    use malachitebft_core_types::Validity;
+
+    use crate::store::repositories::mocks::MockUndecidedBlocksRepository;
+
+    fn test_execution_payload(block_hash_byte: u8) -> ExecutionPayloadV3 {
+        ExecutionPayloadV3 {
+            payload_inner: ExecutionPayloadV2 {
+                payload_inner: ExecutionPayloadV1 {
+                    parent_hash: B256::ZERO,
+                    fee_recipient: AlloyAddress::ZERO,
+                    state_root: B256::ZERO,
+                    receipts_root: B256::ZERO,
+                    logs_bloom: Bloom::default(),
+                    prev_randao: B256::ZERO,
+                    block_number: 1,
+                    gas_limit: 30000000,
+                    gas_used: 0,
+                    timestamp: 1000,
+                    extra_data: AlloyBytes::default(),
+                    base_fee_per_gas: U256::from(1u64),
+                    block_hash: B256::repeat_byte(block_hash_byte),
+                    transactions: vec![],
+                },
+                withdrawals: vec![],
+            },
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        }
+    }
+
+    fn test_block(
+        height: Height,
+        round: Round,
+        proposer: Address,
+        block_hash_byte: u8,
+    ) -> ConsensusBlock {
+        ConsensusBlock {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer,
+            validity: Validity::Valid,
+            execution_payload: test_execution_payload(block_hash_byte),
+            signature: Some(Signature::test()),
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_no_blocks_stored() {
+        let height = Height::new(1);
+        let round = Round::new(0);
+
+        let mut mock = MockUndecidedBlocksRepository::new();
+        mock.expect_get_by_round()
+            .with(eq(height), eq(round))
+            .return_once(|_, _| Ok(vec![]));
+
+        let result = get_previously_built_block(mock, Address::new([1u8; 20]), height, round).await;
+
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn returns_block_when_single_match() {
+        let height = Height::new(5);
+        let round = Round::new(2);
+        let proposer = Address::new([1u8; 20]);
+        let block = test_block(height, round, proposer, 0xAA);
+        let expected_hash = block.block_hash();
+
+        let mut mock = MockUndecidedBlocksRepository::new();
+        mock.expect_get_by_round()
+            .with(eq(height), eq(round))
+            .return_once(move |_, _| Ok(vec![block]));
+
+        let result = get_previously_built_block(mock, proposer, height, round).await;
+
+        let found = result.unwrap().unwrap();
+        assert_eq!(found.block_hash(), expected_hash);
+        assert_eq!(found.proposer, proposer);
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_proposer_does_not_match() {
+        let height = Height::new(5);
+        let round = Round::new(2);
+        let stored_proposer = Address::new([1u8; 20]);
+        let queried_proposer = Address::new([2u8; 20]);
+        let block = test_block(height, round, stored_proposer, 0xAA);
+
+        let mut mock = MockUndecidedBlocksRepository::new();
+        mock.expect_get_by_round()
+            .with(eq(height), eq(round))
+            .return_once(move |_, _| Ok(vec![block]));
+
+        let result = get_previously_built_block(mock, queried_proposer, height, round).await;
+
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn returns_matching_block_among_different_proposers() {
+        let height = Height::new(5);
+        let round = Round::new(2);
+        let proposer_a = Address::new([1u8; 20]);
+        let proposer_b = Address::new([2u8; 20]);
+        let block_a = test_block(height, round, proposer_a, 0xAA);
+        let block_b = test_block(height, round, proposer_b, 0xBB);
+        let expected_hash = block_a.block_hash();
+
+        let mut mock = MockUndecidedBlocksRepository::new();
+        mock.expect_get_by_round()
+            .with(eq(height), eq(round))
+            .return_once(move |_, _| Ok(vec![block_a, block_b]));
+
+        let result = get_previously_built_block(mock, proposer_a, height, round).await;
+
+        let found = result.unwrap().unwrap();
+        assert_eq!(found.block_hash(), expected_hash);
+        assert_eq!(found.proposer, proposer_a);
+    }
+
+    #[tokio::test]
+    async fn errors_when_multiple_blocks_for_same_proposer() {
+        let height = Height::new(5);
+        let round = Round::new(2);
+        let proposer = Address::new([1u8; 20]);
+        let block_1 = test_block(height, round, proposer, 0xAA);
+        let block_2 = test_block(height, round, proposer, 0xBB);
+
+        let mut mock = MockUndecidedBlocksRepository::new();
+        mock.expect_get_by_round()
+            .with(eq(height), eq(round))
+            .return_once(move |_, _| Ok(vec![block_1, block_2]));
+
+        let result = get_previously_built_block(mock, proposer, height, round).await;
+
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Multiple undecided blocks found"),
+            "Expected 'Multiple undecided blocks found' in error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn propagates_repository_error() {
+        let height = Height::new(5);
+        let round = Round::new(2);
+
+        let mut mock = MockUndecidedBlocksRepository::new();
+        mock.expect_get_by_round()
+            .with(eq(height), eq(round))
+            .return_once(|_, _| Err(std::io::Error::other("db connection lost")));
+
+        let result = get_previously_built_block(mock, Address::new([1u8; 20]), height, round).await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("db connection lost"));
+    }
 }

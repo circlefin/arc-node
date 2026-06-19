@@ -19,11 +19,11 @@ extern crate alloc;
 use crate::assembler::ArcBlockAssembler;
 use crate::executor::ArcBlockExecutor;
 use crate::frame_result::{create_frame_result, create_oog_frame_result, BeforeFrameInitResult};
-use crate::log::{create_eip7708_transfer_log, create_native_transfer_log};
+use crate::log::create_eip7708_transfer_log;
 use alloc::sync::Arc;
 use alloy_evm::eth::EthEvmContext;
 use alloy_evm::{
-    block::{BlockExecutorFactory, BlockExecutorFor},
+    block::{state::StateDB, BlockExecutorFactory},
     eth::EthBlockExecutionCtx,
     precompiles::PrecompilesMap,
     Evm as AlloyEvmTrait, EvmFactory,
@@ -35,7 +35,6 @@ use arc_execution_config::native_coin_control::{
 };
 use arc_precompiles::helpers::{
     ERR_BLOCKED_ADDRESS, ERR_SELFDESTRUCTED_BALANCE_INCREASED, ERR_ZERO_ADDRESS,
-    PRECOMPILE_SLOAD_GAS_COST,
 };
 use arc_precompiles::NATIVE_COIN_CONTROL_ADDRESS;
 use core::fmt::Debug;
@@ -43,7 +42,7 @@ use reth_ethereum::evm::revm::context::block::BlockEnv;
 use reth_ethereum::evm::revm::primitives::U256;
 use reth_ethereum::{
     evm::{
-        primitives::{Database, EvmEnv, InspectorFor, NextBlockEnvAttributes},
+        primitives::{Database, EvmEnv, NextBlockEnvAttributes},
         revm::{
             context::{Context, ContextTr, JournalTr, TxEnv},
             context_interface::result::{EVMError, HaltReason},
@@ -55,14 +54,14 @@ use reth_ethereum::{
         EthEvmConfig,
     },
     node::api::ConfigureEvm,
-    primitives::{Header, SealedBlock, SealedHeader},
+    primitives::{Header, Log, SealedBlock, SealedHeader},
     Receipt, TransactionSigned,
 };
 use reth_evm::execute::BlockBuilder;
+use reth_evm::BlockExecutorForEvm;
 use reth_evm::{ConfigureEngineEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor};
 use reth_primitives_traits::NodePrimitives;
 use revm::bytecode::opcode::SELFDESTRUCT;
-use revm::bytecode::Bytecode;
 use revm::context_interface::result::ResultAndState;
 use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::InstructionProvider;
@@ -76,7 +75,7 @@ use revm::{
         result::{ExecResultAndState, ExecutionResult, InvalidTransaction},
         ContextSetters, Evm as RevmEvm,
     },
-    handler::{instructions::EthInstructions, EthFrame, PrecompileProvider, SystemCallTx},
+    handler::{instructions::EthInstructions, EthFrame, PrecompileProvider},
     interpreter::{CallOutcome, Gas, InstructionResult, InterpreterResult},
     state::EvmState,
     InspectEvm, SystemCallEvm,
@@ -89,9 +88,7 @@ use revm_primitives::{Address, Bytes};
 use std::collections::{HashMap, HashSet};
 
 use crate::handler::ArcEvmHandler;
-use crate::opcode::{
-    arc_network_selfdestruct_zero4, arc_network_selfdestruct_zero5, arc_network_selfdestruct_zero7,
-};
+use crate::opcode::arc_network_selfdestruct;
 use crate::subcall::{SubcallContinuation, SubcallRegistry};
 use arc_execution_config::chainspec::{ArcChainSpec, BlockGasLimitProvider};
 use arc_execution_config::protocol_config::{expected_gas_limit, retrieve_fee_params};
@@ -110,7 +107,7 @@ fn init_subcall_revert(message: &str, call_inputs: &CallInputs) -> FrameResult {
     let revert_bytes = arc_precompiles::helpers::revert_message_to_bytes(message);
     let mut gas = Gas::new(call_inputs.gas_limit);
     // Charge a flat dispatch cost. If the caller doesn't have enough gas, consume all of it.
-    if !gas.record_cost(SUBCALL_DISPATCH_COST) {
+    if !gas.record_regular_cost(SUBCALL_DISPATCH_COST) {
         gas.spend_all();
     }
     let result = InterpreterResult::new(InstructionResult::Revert, revert_bytes, gas);
@@ -167,7 +164,7 @@ fn load_account_with_code_metered<J: JournalTr>(
             } else {
                 revm_interpreter::gas::WARM_STORAGE_READ_COST
             };
-            if !gas.record_cost(cost) {
+            if !gas.record_regular_cost(cost) {
                 return Ok(None);
             }
             Ok(Some(info.account.into_owned()))
@@ -191,7 +188,7 @@ pub struct ArcEvm<CTX, INSP, I, P, F = EthFrame<EthInterpreter>> {
 }
 
 /// ArcEvm implementation, wrapping an inner revm EVM instance to apply handler
-/// 1. Hook frame_init to add the NativeCoinTransferred event log.
+/// 1. Hook frame_init to add the EIP-7708 Transfer event log.
 /// 2. Add the blocklist check for each frame.
 /// 3. Check static context to the precompiles.
 impl<CTX: ContextTr, INSP, P> ArcEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, P> {
@@ -364,7 +361,7 @@ where
 
     let res = EthFrame::init_with_context(new_frame, ctx, precompiles, frame_input)?;
 
-    Ok(res.map_frame(|token| {
+    Ok(res.map_item(|token| {
         if is_first_init {
             unsafe { frame_stack.end_init(token) };
         } else {
@@ -372,6 +369,15 @@ where
         }
         frame_stack.get()
     }))
+}
+
+fn frame_init_outcome(
+    frame_res: FrameInitResult<'_, EthFrame<EthInterpreter>>,
+) -> FrameInitOutcome {
+    match frame_res {
+        ItemOrResult::Item(_) => FrameInitOutcome::Pushed,
+        ItemOrResult::Result(result) => FrameInitOutcome::Immediate(result),
+    }
 }
 
 /// ArcEvm implementation for customized operations.
@@ -403,14 +409,10 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
     }
 
     fn sload_cost(&self, is_cold: bool) -> u64 {
-        if self.hardfork_flags.is_active(ArcHardfork::Zero6) {
-            if is_cold {
-                revm_interpreter::gas::COLD_SLOAD_COST
-            } else {
-                revm_interpreter::gas::WARM_STORAGE_READ_COST
-            }
+        if is_cold {
+            revm_interpreter::gas::COLD_SLOAD_COST
         } else {
-            PRECOMPILE_SLOAD_GAS_COST
+            revm_interpreter::gas::WARM_STORAGE_READ_COST
         }
     }
 
@@ -479,16 +481,14 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
         // Currently SLOAD gas metering is disabled — blocklist checks are unmetered.
         let meter_sloads = false;
 
-        // Zero5: reject CALL/CREATE value transfers involving the zero address.
+        // Reject CALL/CREATE value transfers involving the zero address.
         // This prevents accidental burn/mint semantics at the EVM execution layer.
         //
         // Note: this check only applies to CALL/CREATE frame value transfers — it does NOT
         // affect the NativeCoinAuthority precompile, which legitimately uses Address::ZERO in
         // ERC-20 Transfer events for mint (from=0x0) and burn (to=0x0). The precompile operates
         // via direct journal balance mutations within its own frame, never triggering frame_init.
-        if self.hardfork_flags.is_active(ArcHardfork::Zero5)
-            && (from == Address::ZERO || to == Address::ZERO)
-        {
+        if from == Address::ZERO || to == Address::ZERO {
             return Ok(BeforeFrameInitResult::Reverted(create_frame_result(
                 frame_input,
                 ERR_ZERO_ADDRESS,
@@ -523,48 +523,25 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
                 ERR_BLOCKED_ADDRESS,
             ));
         }
-        if self.hardfork_flags.is_active(ArcHardfork::Zero5) {
-            // Probe inside a checkpoint so this unmetered selfdestructed-target check does not
-            // leave a previously-cold account warm for the later path.
-            let target_is_selfdestructed = {
-                let journal = self.inner.journal_mut();
-                if self.hardfork_flags.is_active(ArcHardfork::Zero7) {
-                    let checkpoint = journal.checkpoint();
-                    let result = journal
-                        .load_account(to)
-                        .map(|target_account| target_account.is_selfdestructed());
-                    journal.checkpoint_revert(checkpoint);
-                    result?
-                } else {
-                    journal
-                        .load_account(to)
-                        .map(|target_account| target_account.is_selfdestructed())?
-                }
-            };
-
-            if target_is_selfdestructed {
-                return Ok(metered_revert(
-                    frame_input,
-                    meter_sloads,
-                    total_sload_cost,
-                    ERR_SELFDESTRUCTED_BALANCE_INCREASED,
-                ));
-            }
+        // Note: this selfdestructed-target check uses an unmetered `load_account(to)`.
+        // In the common value-transfer path REVM will touch the same target again during
+        // execution, so this usually has no practical gas impact even if the first load is cold.
+        let target_account = self.inner.journal_mut().load_account(to)?;
+        if target_account.is_selfdestructed() {
+            return Ok(metered_revert(
+                frame_input,
+                meter_sloads,
+                total_sload_cost,
+                ERR_SELFDESTRUCTED_BALANCE_INCREASED,
+            ));
         }
 
-        if self.hardfork_flags.is_active(ArcHardfork::Zero5) {
-            if from == to {
-                // EIP-7708: self-transfers do not emit a log
-                Ok(BeforeFrameInitResult::Checked(total_sload_cost))
-            } else {
-                Ok(BeforeFrameInitResult::Log(
-                    create_eip7708_transfer_log(from, to, amount),
-                    total_sload_cost,
-                ))
-            }
+        if from == to {
+            // EIP-7708: self-transfers do not emit a log.
+            Ok(BeforeFrameInitResult::Checked(total_sload_cost))
         } else {
             Ok(BeforeFrameInitResult::Log(
-                create_native_transfer_log(from, to, amount),
+                create_eip7708_transfer_log(from, to, amount),
                 total_sload_cost,
             ))
         }
@@ -768,7 +745,7 @@ where
     /// Runs `before_frame_init` (blocklist checks, transfer log), then initializes the
     /// frame via revm's standard machinery and emits the transfer log on success.
     ///
-    /// For Zero5+ precompile CALLs, the EIP-7708 Transfer log is pushed before frame init
+    /// For precompile CALLs, the EIP-7708 Transfer log is pushed before frame init
     /// (wrapped in a journal checkpoint) so it precedes precompile-emitted logs. For all
     /// other cases, the log is pushed after frame init only on success.
     ///
@@ -789,69 +766,74 @@ where
 
         // Log emission strategy for the EIP-7708 Transfer log:
         //
-        // **Zero5+ precompile CALL**: Push the Transfer log BEFORE init_frame so it
+        // **Precompile CALL**: Push the Transfer log BEFORE init_frame so it
         // precedes any logs the precompile emits (EIP-7708 requires the native Transfer
         // log to appear before precompile-emitted logs). The precompile runs synchronously
         // inside init_with_context and returns a Result, so a journal checkpoint can
         // correctly commit/revert based on the outcome.
         //
-        // **All other cases** (non-precompile CALLs/CREATEs at any hardfork, and pre-Zero5
-        // precompile CALLs): Execute first, then push the log only if the result indicates
+        // **All other cases** (non-precompile CALLs/CREATEs): Execute first, then push the log only if the result indicates
         // success. For non-precompile frames that return Item (pending execution), REVM's
         // internal frame checkpoint already covers this log — if the frame later reverts,
         // logs.truncate(log_i) removes it automatically.
-        let is_precompile = is_precompile_call(&frame_input, &self.inner.precompiles);
-
-        let frame_res = if is_precompile && self.hardfork_flags.is_active(ArcHardfork::Zero5) {
-            // Zero5+ precompile path: push the Transfer log BEFORE init_frame so it
-            // precedes any logs the precompile emits, wrapped in a journal checkpoint so
-            // the log is reverted if the precompile fails.
-            let log_checkpoint = if let Some(log) = maybe_log {
-                let cp = self.inner.ctx.journal_mut().checkpoint();
-                self.inner.ctx.journal_mut().log(log);
-                Some(cp)
-            } else {
-                None
-            };
-
-            let res = init_frame(
-                &mut self.inner.frame_stack,
-                &mut self.inner.ctx,
-                &mut self.inner.precompiles,
-                frame_input,
-            )?;
-
-            if let Some(cp) = log_checkpoint {
-                if should_emit_transfer_log(&res) {
-                    self.inner.ctx.journal_mut().checkpoint_commit();
-                } else {
-                    self.inner.ctx.journal_mut().checkpoint_revert(cp);
-                }
-            }
-
-            res
+        if is_precompile_call(&frame_input, &self.inner.precompiles) {
+            self.init_precompile_frame_with_transfer_log(frame_input, maybe_log)
         } else {
-            // Common path: execute first, then push the log only if successful.
-            let res = init_frame(
-                &mut self.inner.frame_stack,
-                &mut self.inner.ctx,
-                &mut self.inner.precompiles,
-                frame_input,
-            )?;
+            self.init_deferred_frame_with_transfer_log(frame_input, maybe_log)
+        }
+    }
 
-            if let Some(log) = maybe_log {
-                if should_emit_transfer_log(&res) {
-                    self.inner.ctx.journal_mut().log(log);
-                }
-            }
-
-            res
+    fn init_precompile_frame_with_transfer_log(
+        &mut self,
+        frame_input: FrameInit,
+        maybe_log: Option<Log>,
+    ) -> Result<FrameInitOutcome, ContextDbError<CTX>> {
+        // Push the Transfer log before init_frame so it precedes any logs the precompile emits.
+        let log_checkpoint = if let Some(log) = maybe_log {
+            let cp = self.inner.ctx.journal_mut().checkpoint();
+            self.inner.ctx.journal_mut().log(log);
+            Some(cp)
+        } else {
+            None
         };
 
-        match frame_res {
-            ItemOrResult::Item(_) => Ok(FrameInitOutcome::Pushed),
-            ItemOrResult::Result(result) => Ok(FrameInitOutcome::Immediate(result)),
+        let res = init_frame(
+            &mut self.inner.frame_stack,
+            &mut self.inner.ctx,
+            &mut self.inner.precompiles,
+            frame_input,
+        )?;
+
+        if let Some(cp) = log_checkpoint {
+            if should_emit_transfer_log(&res) {
+                self.inner.ctx.journal_mut().checkpoint_commit();
+            } else {
+                self.inner.ctx.journal_mut().checkpoint_revert(cp);
+            }
         }
+
+        Ok(frame_init_outcome(res))
+    }
+
+    fn init_deferred_frame_with_transfer_log(
+        &mut self,
+        frame_input: FrameInit,
+        maybe_log: Option<Log>,
+    ) -> Result<FrameInitOutcome, ContextDbError<CTX>> {
+        let res = init_frame(
+            &mut self.inner.frame_stack,
+            &mut self.inner.ctx,
+            &mut self.inner.precompiles,
+            frame_input,
+        )?;
+
+        if let Some(log) = maybe_log {
+            if should_emit_transfer_log(&res) {
+                self.inner.ctx.journal_mut().log(log);
+            }
+        }
+
+        Ok(frame_init_outcome(res))
     }
 
     /// Intercept a call to a subcall-capable precompile and initialize the child frame.
@@ -960,7 +942,7 @@ where
         // Access costs are charged explicitly because our pre-loads warm the accounts,
         // so revm's internal CALL handler won't charge them.
         let mut gas = Gas::new(call_inputs.gas_limit);
-        if !gas.record_cost(init_result.gas_overhead) {
+        if !gas.record_regular_cost(init_result.gas_overhead) {
             gas.spend_all();
             return Ok(ItemOrResult::Result(subcall_oog(
                 gas,
@@ -981,11 +963,11 @@ where
             )));
         };
 
-        // Resolve EIP-7702 delegation: if the target has a delegation designator,
-        // load the delegate's code so the child frame executes correct bytecode.
-        if let Some(Bytecode::Eip7702(delegation)) = &target.code {
-            let delegate_address = delegation.address();
-
+        // Populate known_bytecode for the child frame. If the target has an EIP-7702
+        // delegation designator, follow it and use the delegate's code; otherwise use
+        // the target's own code. revm 38 requires this field to be set by the caller.
+        if let Some(delegate_address) = target.code.as_ref().and_then(|code| code.eip7702_address())
+        {
             let Some(delegate) = load_account_with_code_metered(
                 self.inner.ctx.journal_mut(),
                 delegate_address,
@@ -1000,8 +982,10 @@ where
             };
 
             if let Some(code) = delegate.code {
-                child_inputs.known_bytecode = Some((delegate.code_hash, code));
+                child_inputs.known_bytecode = (delegate.code_hash, code);
             }
+        } else if let Some(code) = target.code {
+            child_inputs.known_bytecode = (target.code_hash, code);
         }
 
         // Take a journal checkpoint AFTER account loading so warmups always persist,
@@ -1046,7 +1030,7 @@ where
                     SubcallContinuation {
                         precompile,
                         gas_limit,
-                        init_subcall_gas_overhead: gas.spent(),
+                        init_subcall_gas_overhead: gas.total_gas_spent(),
                         return_memory_offset,
                         continuation_data: init_result.continuation_data,
                         checkpoint,
@@ -1060,7 +1044,7 @@ where
                 let continuation = SubcallContinuation {
                     precompile,
                     gas_limit,
-                    init_subcall_gas_overhead: gas.spent(),
+                    init_subcall_gas_overhead: gas.total_gas_spent(),
                     return_memory_offset,
                     continuation_data: init_result.continuation_data,
                     checkpoint,
@@ -1127,8 +1111,8 @@ where
         // becomes OOG below instead of silently discarding that cost.
         let metered_gas_used = continuation
             .init_subcall_gas_overhead
-            .checked_add(child_gas.spent())
-            .expect("gas overflow: init_subcall_overhead + child_gas.spent()")
+            .checked_add(child_gas.total_gas_spent())
+            .expect("gas overflow: init_subcall_overhead + child_gas.total_gas_spent()")
             .checked_add(completion_gas)
             .expect("gas overflow: metered_gas_used + completion_gas");
         let gas_used = if child_halted {
@@ -1138,7 +1122,7 @@ where
         };
 
         let mut gas = Gas::new(continuation.gas_limit);
-        if !gas.record_cost(gas_used) {
+        if !gas.record_regular_cost(gas_used) {
             gas.spend_all();
 
             // If the child succeeded, its state was committed before completion
@@ -1511,6 +1495,10 @@ where
         &self.inner.ctx.block
     }
 
+    fn cfg_env(&self) -> &revm::context::CfgEnv<Self::Spec> {
+        &self.inner.ctx.cfg
+    }
+
     fn chain_id(&self) -> u64 {
         self.inner.ctx.cfg.chain_id
     }
@@ -1534,37 +1522,21 @@ where
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
         debug_assert!(
             self.subcall_continuations.is_empty(),
-            "system calls must not start with active Arc subcall continuations"
+            "system calls bypass ArcEvm::frame_init and must not start with active Arc subcall continuations"
         );
         debug_assert!(
             self.subcall_registry.get(&contract).is_none(),
-            "system-call target {contract:?} is an Arc subcall precompile; explicitly decide whether this target is allowed"
+            "system-call target {contract:?} is an Arc subcall precompile; explicitly decide whether bypassing ArcEvm::frame_init is correct"
         );
 
-        if !self.hardfork_flags.is_active(ArcHardfork::Zero7) {
-            return self.inner.system_call_with_caller(caller, contract, data);
-        }
-
-        self.inner
-            .ctx
-            .journal_mut()
-            .load_account(NATIVE_COIN_CONTROL_ADDRESS)?;
-
-        self.inner
-            .ctx
-            .set_tx(TxEnv::new_system_tx_with_caller(caller, contract, data));
-
-        let result =
-            ArcEvmHandler::<_, Self::Error>::new(self.hardfork_flags).run_system_call(self);
-        debug_assert!(
-            self.subcall_continuations.is_empty(),
-            "stale subcall continuations after system call"
-        );
-        self.subcall_continuations.clear();
-
-        let result = result?;
-        let state = self.inner.journal_mut().finalize();
-        Ok(ResultAndState::new(result, state))
+        // Intentionally delegate to revm's system-call path. Current Arc system calls are
+        // zero-value calls, and upstream EIP system calls are expected to follow revm's
+        // semantics. Arc frame_init hooks (blocklist checks, transfer logs, SLOAD gas
+        // deduction, subcall interception) are therefore intentionally not applied here.
+        // If a future Arc system call depends on those hooks, treat that as an explicit
+        // execution-semantics design change instead of silently routing through
+        // ArcEvmHandler.
+        self.inner.system_call_with_caller(caller, contract, data)
     }
 
     fn finish(self) -> (Self::DB, EvmEnv<Self::Spec>) {
@@ -1665,9 +1637,13 @@ impl EvmFactory for ArcEvmFactory {
     type BlockEnv = BlockEnv;
     type Precompiles = PrecompilesMap;
 
-    fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> Self::Evm<DB, NoOpInspector> {
+    fn create_evm<DB: Database>(&self, db: DB, mut input: EvmEnv) -> Self::Evm<DB, NoOpInspector> {
         let spec = input.cfg_env.spec;
         let hardfork_flags = self.get_hardfork_flags(&input.block_env);
+
+        // Arc self-implements EIP-7708 log emission across all specs (see `create_eip7708_transfer_log`).
+        // Disable revm's native AMSTERDAM emission to avoid duplicate logs once the spec is enabled.
+        input.cfg_env.amsterdam_eip7708_disabled = true;
 
         let ctx = Self::Context::new(db, spec)
             .with_cfg(input.cfg_env)
@@ -1677,22 +1653,10 @@ impl EvmFactory for ArcEvmFactory {
         let inspector = NoOpInspector {};
         let subcall_registry = self.build_subcall_registry(hardfork_flags);
 
-        if hardfork_flags.is_active(ArcHardfork::Zero7) {
-            instruction.insert_instruction(
-                SELFDESTRUCT,
-                Instruction::new(arc_network_selfdestruct_zero7, 5000),
-            );
-        } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
-            instruction.insert_instruction(
-                SELFDESTRUCT,
-                Instruction::new(arc_network_selfdestruct_zero5, 5000),
-            );
-        } else {
-            instruction.insert_instruction(
-                SELFDESTRUCT,
-                Instruction::new(arc_network_selfdestruct_zero4, 5000),
-            );
-        }
+        instruction.insert_instruction(
+            SELFDESTRUCT,
+            Instruction::new(arc_network_selfdestruct, 5000),
+        );
 
         ArcEvm::new(
             ctx,
@@ -1708,11 +1672,13 @@ impl EvmFactory for ArcEvmFactory {
     fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>, EthInterpreter>>(
         &self,
         db: DB,
-        input: EvmEnv,
+        mut input: EvmEnv,
         inspector: I,
     ) -> Self::Evm<DB, I> {
         let spec = input.cfg_env.spec;
         let hardfork_flags = self.get_hardfork_flags(&input.block_env);
+
+        input.cfg_env.amsterdam_eip7708_disabled = true;
 
         let ctx = Self::Context::new(db, spec)
             .with_cfg(input.cfg_env)
@@ -1721,22 +1687,10 @@ impl EvmFactory for ArcEvmFactory {
         let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
         let subcall_registry = self.build_subcall_registry(hardfork_flags);
 
-        if hardfork_flags.is_active(ArcHardfork::Zero7) {
-            instruction.insert_instruction(
-                SELFDESTRUCT,
-                Instruction::new(arc_network_selfdestruct_zero7, 5000),
-            );
-        } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
-            instruction.insert_instruction(
-                SELFDESTRUCT,
-                Instruction::new(arc_network_selfdestruct_zero5, 5000),
-            );
-        } else {
-            instruction.insert_instruction(
-                SELFDESTRUCT,
-                Instruction::new(arc_network_selfdestruct_zero4, 5000),
-            );
-        }
+        instruction.insert_instruction(
+            SELFDESTRUCT,
+            Instruction::new(arc_network_selfdestruct, 5000),
+        );
 
         ArcEvm::new(
             ctx,
@@ -1776,6 +1730,16 @@ impl BlockExecutorFactory for ArcEvmConfig {
     type ExecutionCtx<'a> = EthBlockExecutionCtx<'a>;
     type Transaction = TransactionSigned;
     type Receipt = Receipt;
+    type TxExecutionResult = crate::executor::ArcTxResult<
+        HaltReason,
+        <TransactionSigned as alloy_consensus::transaction::TransactionEnvelope>::TxType,
+    >;
+    type Executor<'a, DB: StateDB, I: Inspector<EthEvmContext<DB>>> = ArcBlockExecutor<
+        'a,
+        <ArcEvmFactory as EvmFactory>::Evm<DB, I>,
+        &'a Arc<ArcChainSpec>,
+        &'a reth_ethereum::evm::RethReceiptBuilder,
+    >;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         &self.evm_factory_instance
@@ -1783,12 +1747,12 @@ impl BlockExecutorFactory for ArcEvmConfig {
 
     fn create_executor<'a, DB, I>(
         &'a self,
-        evm: <Self::EvmFactory as EvmFactory>::Evm<&'a mut State<DB>, I>,
+        evm: <Self::EvmFactory as EvmFactory>::Evm<DB, I>,
         ctx: EthBlockExecutionCtx<'a>,
-    ) -> impl BlockExecutorFor<'a, Self, DB, I>
+    ) -> Self::Executor<'a, DB, I>
     where
-        DB: Database + 'a,
-        I: InspectorFor<Self, &'a mut State<DB>> + 'a,
+        DB: StateDB,
+        I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>>,
     {
         ArcBlockExecutor::new(
             evm,
@@ -1824,10 +1788,7 @@ impl ConfigureEvm for ArcEvmConfig {
         parent: &'a SealedHeader<<Self::Primitives as NodePrimitives>::BlockHeader>,
         attributes: Self::NextBlockEnvCtx,
     ) -> Result<
-        impl BlockBuilder<
-            Primitives = Self::Primitives,
-            Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, DB>,
-        >,
+        impl BlockBuilder<Primitives = Self::Primitives, Executor = BlockExecutorForEvm<'a, Self, DB>>,
         Self::Error,
     > {
         // Query the ProtocolConfig contract for the reward beneficiary using system call
@@ -1914,17 +1875,12 @@ mod tests {
     use super::*;
     use crate::frame_result::BeforeFrameInitResult;
 
-    use crate::log::NativeCoinTransferred;
-    use crate::log::Transfer;
     use alloy_consensus::Block;
     use alloy_primitives::{address, Bytes, B256, U256};
     use alloy_rpc_types_engine::ExecutionData;
-    use alloy_sol_types::SolEvent;
     use arc_execution_config::chainspec::{DEVNET, LOCAL_DEV, TESTNET};
     use arc_precompiles::precompile_provider::ArcPrecompileProvider;
-    use arc_precompiles::{
-        native_coin_control, NATIVE_COIN_AUTHORITY_ADDRESS, NATIVE_COIN_CONTROL_ADDRESS,
-    };
+    use arc_precompiles::{native_coin_control, NATIVE_COIN_CONTROL_ADDRESS};
     use reth_chainspec::{EthChainSpec, ForkCondition};
     use reth_ethereum::evm::revm::{
         context::CfgEnv,
@@ -1953,37 +1909,19 @@ mod tests {
     use revm_interpreter::interpreter::EthInterpreter;
     use revm_interpreter::CreateScheme;
     use revm_primitives::hardfork::SpecId;
-    use rstest::rstest;
-
-    struct TestCase {
-        name: &'static str,
-        frame_input: FrameInput,
-        expected_log: Option<NativeCoinTransferred>,
-    }
 
     const ADDRESS_A: Address = address!("1000000000000000000000000000000000000001");
     const ADDRESS_B: Address = address!("2000000000000000000000000000000000000002");
 
-    type TestEvm = ArcEvm<
+    fn create_arc_evm(
+        chain_spec: Arc<ArcChainSpec>,
+        db: InMemoryDB,
+    ) -> ArcEvm<
         EthEvmContext<InMemoryDB>,
         NoOpInspector,
         EthInstructions<EthInterpreter, EthEvmContext<InMemoryDB>>,
         PrecompilesMap,
-    >;
-
-    fn is_account_cold(evm: &TestEvm, address: Address) -> bool {
-        let journal = evm.inner.ctx.journal();
-        let transaction_id = journal.inner.transaction_id;
-        let account_is_cold = journal
-            .inner
-            .state
-            .get(&address)
-            .is_none_or(|account| account.is_cold_transaction_id(transaction_id));
-
-        account_is_cold && journal.inner.warm_addresses.is_cold(&address)
-    }
-
-    fn create_arc_evm(chain_spec: Arc<ArcChainSpec>, db: InMemoryDB) -> TestEvm {
+    > {
         let spec = revm_spec_by_timestamp_and_block_number(&chain_spec, 0, 0);
         let hardfork_flags = chain_spec.get_hardfork_flags(0, 0);
         let cfg_env = CfgEnv::new()
@@ -1998,22 +1936,10 @@ mod tests {
         let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
         let inspector = NoOpInspector {};
 
-        if hardfork_flags.is_active(ArcHardfork::Zero7) {
-            instruction.insert_instruction(
-                SELFDESTRUCT,
-                revm_interpreter::Instruction::new(arc_network_selfdestruct_zero7, 5000),
-            );
-        } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
-            instruction.insert_instruction(
-                SELFDESTRUCT,
-                revm_interpreter::Instruction::new(arc_network_selfdestruct_zero5, 5000),
-            );
-        } else {
-            instruction.insert_instruction(
-                SELFDESTRUCT,
-                revm_interpreter::Instruction::new(arc_network_selfdestruct_zero4, 5000),
-            );
-        }
+        instruction.insert_instruction(
+            SELFDESTRUCT,
+            revm_interpreter::Instruction::new(arc_network_selfdestruct, 5000),
+        );
 
         let factory = ArcEvmFactory::new(chain_spec);
         let subcall_registry = factory.build_subcall_registry(hardfork_flags);
@@ -2091,13 +2017,17 @@ mod tests {
             scheme,
             target_address: target,
             bytecode_address: address!("2000000000000000000000000000000000000002"),
-            known_bytecode: None,
+            known_bytecode: (
+                revm_primitives::B256::ZERO,
+                revm::bytecode::Bytecode::default(),
+            ),
             value: CallValue::Transfer(value),
             input: CallInput::Bytes(Bytes::new()),
             gas_limit: 100_000,
             is_static: false,
             caller,
             return_memory_offset: 0..1,
+            reservoir: 0,
         })
     }
 
@@ -2108,6 +2038,7 @@ mod tests {
             value,
             Bytes::new(),
             100_000,
+            0,
         ))
     }
 
@@ -2276,6 +2207,7 @@ mod tests {
             parent_beacon_block_root: None,
             withdrawals: None,
             extra_data: Default::default(),
+            slot_number: None,
         };
 
         let result = evm_config.builder_for_next_block(&mut db, &sealed_parent, attributes);
@@ -2286,7 +2218,7 @@ mod tests {
     }
 
     #[test]
-    fn test_system_call_preserves_system_call_semantics() {
+    fn test_system_call_delegates_to_revm_system_call_path() {
         let chain_spec = LOCAL_DEV.clone();
         let system_contract = Address::repeat_byte(0x21);
         let return_value = U256::from(42);
@@ -2330,211 +2262,6 @@ mod tests {
                 .expect("successful system call should return output")
                 .as_ref(),
             &return_value.to_be_bytes::<32>()
-        );
-    }
-
-    #[test]
-    fn test_zero7_system_call_uses_arc_frame_init_for_nested_blocklist_checks() {
-        let chain_spec = LOCAL_DEV.clone();
-        let system_contract = Address::repeat_byte(0x21);
-        let blocklisted_target = Address::repeat_byte(0x22);
-        let transfer_amount = U256::from(1);
-        let runtime = call_with_value_bytecode(blocklisted_target, transfer_amount);
-
-        let mut db = create_db(&[]);
-        db.insert_account_info(
-            system_contract,
-            revm::state::AccountInfo {
-                balance: U256::from(10),
-                nonce: 1,
-                code_hash: keccak256(runtime.bytecode()),
-                code: Some(runtime),
-                account_id: None,
-            },
-        );
-        let slot = native_coin_control::compute_is_blocklisted_storage_slot(blocklisted_target);
-        db.insert_account_storage(NATIVE_COIN_CONTROL_ADDRESS, slot.into(), U256::from(1))
-            .expect("insert blocklist storage");
-        let mut evm = create_arc_evm(chain_spec, db);
-
-        let result = alloy_evm::Evm::transact_system_call(
-            &mut evm,
-            Address::ZERO,
-            system_contract,
-            Bytes::new(),
-        )
-        .expect("system call should execute");
-
-        assert!(
-            result.result.is_success(),
-            "parent system call should succeed after catching failed child CALL"
-        );
-        assert_eq!(
-            result.result.logs().len(),
-            0,
-            "blocked child value transfer should not emit an EIP-7708 log"
-        );
-
-        let target_balance = result
-            .state
-            .get(&blocklisted_target)
-            .map(|account| account.info.balance)
-            .unwrap_or(U256::ZERO);
-        assert_eq!(
-            target_balance,
-            U256::ZERO,
-            "nested CALL to blocklisted target should be rejected before value transfer"
-        );
-    }
-
-    #[test]
-    fn test_pre_zero7_system_call_preserves_nested_call_blocklist_bypass() {
-        use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
-        use reth_chainspec::ForkCondition;
-
-        let chain_spec = localdev_with_hardforks(&[
-            (ArcHardfork::Zero3, ForkCondition::Block(0)),
-            (ArcHardfork::Zero4, ForkCondition::Block(0)),
-            (ArcHardfork::Zero5, ForkCondition::Block(0)),
-            (ArcHardfork::Zero6, ForkCondition::Block(0)),
-        ]);
-        let system_contract = Address::repeat_byte(0x21);
-        let blocklisted_target = Address::repeat_byte(0x22);
-        let transfer_amount = U256::from(1);
-        let runtime = call_with_value_bytecode(blocklisted_target, transfer_amount);
-
-        let mut db = create_db(&[]);
-        db.insert_account_info(
-            system_contract,
-            revm::state::AccountInfo {
-                balance: U256::from(10),
-                nonce: 1,
-                code_hash: keccak256(runtime.bytecode()),
-                code: Some(runtime),
-                account_id: None,
-            },
-        );
-        let slot = native_coin_control::compute_is_blocklisted_storage_slot(blocklisted_target);
-        db.insert_account_storage(NATIVE_COIN_CONTROL_ADDRESS, slot.into(), U256::from(1))
-            .expect("insert blocklist storage");
-        let mut evm = create_arc_evm(chain_spec, db);
-
-        let result = alloy_evm::Evm::transact_system_call(
-            &mut evm,
-            Address::ZERO,
-            system_contract,
-            Bytes::new(),
-        )
-        .expect("system call should execute");
-
-        assert!(
-            result.result.is_success(),
-            "pre-Zero7 parent system call should succeed"
-        );
-
-        let target_balance = result
-            .state
-            .get(&blocklisted_target)
-            .map(|account| account.info.balance)
-            .unwrap_or(U256::ZERO);
-        assert_eq!(
-            target_balance, transfer_amount,
-            "pre-Zero7 nested CALL to blocklisted target should preserve old blocklist bypass"
-        );
-    }
-
-    #[test]
-    fn test_system_call_preloads_native_coin_control_for_selfdestruct_blocklist() {
-        let chain_spec = LOCAL_DEV.clone();
-        let system_contract = Address::repeat_byte(0x21);
-        let blocklisted_target = Address::repeat_byte(0x22);
-
-        // PUSH20 <blocklisted_target> SELFDESTRUCT
-        let mut runtime = vec![opcode::PUSH20];
-        runtime.extend_from_slice(blocklisted_target.as_slice());
-        runtime.push(SELFDESTRUCT);
-        let runtime = Bytecode::new_raw(Bytes::from(runtime));
-
-        let mut db = create_db(&[]);
-        db.insert_account_info(
-            system_contract,
-            revm::state::AccountInfo {
-                balance: U256::from(1),
-                nonce: 1,
-                code_hash: keccak256(runtime.bytecode()),
-                code: Some(runtime),
-                account_id: None,
-            },
-        );
-        let slot = native_coin_control::compute_is_blocklisted_storage_slot(blocklisted_target);
-        db.insert_account_storage(NATIVE_COIN_CONTROL_ADDRESS, slot.into(), U256::from(1))
-            .expect("insert blocklist storage");
-        let mut evm = create_arc_evm(chain_spec, db);
-
-        let result = alloy_evm::Evm::transact_system_call(
-            &mut evm,
-            Address::ZERO,
-            system_contract,
-            Bytes::new(),
-        )
-        .expect("system call should execute");
-
-        let ExecutionResult::Revert { output, .. } = result.result else {
-            panic!("system call selfdestruct to blocklisted target should revert");
-        };
-        assert_eq!(
-            output,
-            arc_precompiles::helpers::revert_message_to_bytes(ERR_BLOCKED_ADDRESS),
-        );
-    }
-
-    #[test]
-    fn test_pre_zero7_system_call_preserves_selfdestruct_blocklist_fail_open() {
-        use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
-        use reth_chainspec::ForkCondition;
-
-        let chain_spec = localdev_with_hardforks(&[
-            (ArcHardfork::Zero3, ForkCondition::Block(0)),
-            (ArcHardfork::Zero4, ForkCondition::Block(0)),
-            (ArcHardfork::Zero5, ForkCondition::Block(0)),
-            (ArcHardfork::Zero6, ForkCondition::Block(0)),
-        ]);
-        let system_contract = Address::repeat_byte(0x21);
-        let blocklisted_target = Address::repeat_byte(0x22);
-
-        // PUSH20 <blocklisted_target> SELFDESTRUCT
-        let mut runtime = vec![opcode::PUSH20];
-        runtime.extend_from_slice(blocklisted_target.as_slice());
-        runtime.push(SELFDESTRUCT);
-        let runtime = Bytecode::new_raw(Bytes::from(runtime));
-
-        let mut db = create_db(&[]);
-        db.insert_account_info(
-            system_contract,
-            revm::state::AccountInfo {
-                balance: U256::from(1),
-                nonce: 1,
-                code_hash: keccak256(runtime.bytecode()),
-                code: Some(runtime),
-                account_id: None,
-            },
-        );
-        let slot = native_coin_control::compute_is_blocklisted_storage_slot(blocklisted_target);
-        db.insert_account_storage(NATIVE_COIN_CONTROL_ADDRESS, slot.into(), U256::from(1))
-            .expect("insert blocklist storage");
-        let mut evm = create_arc_evm(chain_spec, db);
-
-        let result = alloy_evm::Evm::transact_system_call(
-            &mut evm,
-            Address::ZERO,
-            system_contract,
-            Bytes::new(),
-        )
-        .expect("system call should execute");
-
-        assert!(
-            result.result.is_success(),
-            "pre-Zero7 system call should preserve old fail-open behavior"
         );
     }
 
@@ -2670,11 +2397,11 @@ mod tests {
         );
     }
 
-    /// Zero-value CALL under Zero5 emits no log (transfer amount check short-circuits).
+    /// Zero-value CALL emits no log (transfer amount check short-circuits).
     #[test]
-    fn test_zero5_zero_value_call_no_log() {
+    fn test_baseline_zero_value_call_no_log() {
         let db = CacheDB::new(EmptyDB::default());
-        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5]);
+        let flags = ArcHardforkFlags::default();
         let mut evm = create_test_evm(db, flags);
 
         evm.ctx_mut()
@@ -2696,150 +2423,8 @@ mod tests {
         let result = evm.before_frame_init(&mut frame).unwrap();
         assert!(
             matches!(result, BeforeFrameInitResult::None),
-            "Zero-value call under Zero5 should return None (no log, no blocklist checks)"
+            "zero-value call should return None (no log, no blocklist checks)"
         );
-    }
-
-    #[test]
-    fn test_capture_transfer_events() {
-        let test_cases = vec![
-            TestCase {
-                name: "call with value",
-                frame_input: FrameInput::Call(call_input(
-                    CallScheme::Call,
-                    U256::from(1),
-                    ADDRESS_A,
-                    ADDRESS_B,
-                )),
-                expected_log: Some(NativeCoinTransferred {
-                    from: ADDRESS_A,
-                    to: ADDRESS_B,
-                    amount: U256::from(1),
-                }),
-            },
-            TestCase {
-                name: "call with no value",
-                frame_input: FrameInput::Call(call_input(
-                    CallScheme::Call,
-                    U256::ZERO,
-                    ADDRESS_A,
-                    ADDRESS_B,
-                )),
-                expected_log: None,
-            },
-            TestCase {
-                name: "create with value",
-                frame_input: FrameInput::Create(create_input(
-                    CreateScheme::Create,
-                    U256::from(1),
-                    ADDRESS_A,
-                )),
-                expected_log: Some(NativeCoinTransferred {
-                    from: ADDRESS_A,
-                    to: ADDRESS_A.create(0),
-                    amount: U256::from(1),
-                }),
-            },
-            TestCase {
-                name: "create with no value",
-                frame_input: FrameInput::Create(create_input(
-                    CreateScheme::Create,
-                    U256::ZERO,
-                    ADDRESS_A,
-                )),
-                expected_log: None,
-            },
-            TestCase {
-                name: "create2 with value",
-                frame_input: FrameInput::Create(create_input(
-                    CreateScheme::Create2 {
-                        salt: U256::from(123),
-                    },
-                    U256::from(1),
-                    ADDRESS_A,
-                )),
-                expected_log: Some(NativeCoinTransferred {
-                    from: ADDRESS_A,
-                    to: ADDRESS_A.create2(U256::from(123).to_be_bytes(), keccak256(Bytes::new())),
-                    amount: U256::from(1),
-                }),
-            },
-            TestCase {
-                name: "create2 with no value",
-                frame_input: FrameInput::Create(create_input(
-                    CreateScheme::Create2 {
-                        salt: U256::from(123),
-                    },
-                    U256::ZERO,
-                    ADDRESS_A,
-                )),
-                expected_log: None,
-            },
-        ];
-
-        // Test pre-Zero5 hardforks only — Zero5 enables EIP-7708 which emits different logs.
-        for hardfork in [ArcHardfork::Zero3, ArcHardfork::Zero4] {
-            for test in &test_cases {
-                let mut frame = FrameInit {
-                    frame_input: test.frame_input.clone(),
-                    memory: SharedMemory::default(),
-                    depth: 0,
-                };
-
-                let db = CacheDB::new(EmptyDB::default());
-                let mut evm = create_test_evm(db, ArcHardforkFlags::with(&[hardfork]));
-
-                // Load native coin control account
-                evm.ctx_mut()
-                    .journal_mut()
-                    .load_account(NATIVE_COIN_CONTROL_ADDRESS)
-                    .unwrap();
-
-                let transfer_result = evm.before_frame_init(&mut frame).unwrap();
-
-                // No early return should occur for basic tests
-                assert!(
-                    !matches!(transfer_result, BeforeFrameInitResult::Reverted(_)),
-                    "{} (hardfork: {:?}): unexpected blocklist violation",
-                    test.name,
-                    hardfork
-                );
-
-                let log_opt = match transfer_result {
-                    BeforeFrameInitResult::Log(log, _gas) => Some(log),
-                    _ => None,
-                };
-
-                assert_eq!(
-                    log_opt.is_some(),
-                    test.expected_log.is_some(),
-                    "{} (hardfork: {:?}): unexpected log result",
-                    test.name,
-                    hardfork
-                );
-
-                if let Some(log) = log_opt {
-                    assert_eq!(
-                        log.address, NATIVE_COIN_AUTHORITY_ADDRESS,
-                        "{} (hardfork: {:?}): wrong log address",
-                        test.name, hardfork
-                    );
-
-                    let log_data = NativeCoinTransferred::decode_log(&log);
-                    assert!(
-                        log_data.is_ok(),
-                        "{} (hardfork: {:?}): failed to decode log",
-                        test.name,
-                        hardfork
-                    );
-                    assert_eq!(
-                        &log_data.unwrap().data,
-                        test.expected_log.as_ref().unwrap(),
-                        "Native send event mismatch"
-                    );
-                }
-            }
-        }
     }
 
     #[test]
@@ -2861,6 +2446,7 @@ mod tests {
                 U256::from(1),
                 init_code,
                 100_000,
+                0,
             ))),
             memory: SharedMemory::default(),
             depth: 0,
@@ -2914,6 +2500,7 @@ mod tests {
                 U256::from(1),
                 init_code,
                 100_000,
+                0,
             ))),
             memory: SharedMemory::default(),
             depth: 0,
@@ -3030,7 +2617,7 @@ mod tests {
             );
             if let BeforeFrameInitResult::Reverted(reverted) = transfer_result {
                 assert_eq!(
-                    reverted.gas().spent(),
+                    reverted.gas().total_gas_spent(),
                     0,
                     "{} (hardfork: {:?}): depth-0 reverts should have zero gas spent",
                     test_case.name,
@@ -3260,70 +2847,6 @@ mod tests {
         );
     }
 
-    /// Verifies that `create_arc_evm` dispatches the pre-Zero5 SELFDESTRUCT variant when
-    /// only Zero3+Zero4 are active.  Pre-Zero5 allows SELFDESTRUCT to the zero address
-    /// (unlike Zero5) and emits `NativeCoinTransferred` (unlike EIP-7708).
-    #[test]
-    fn create_arc_evm_dispatches_selfdestruct_zero4() {
-        use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
-        use revm_primitives::TxKind;
-
-        let chain_spec = localdev_with_hardforks(&[
-            (ArcHardfork::Zero3, ForkCondition::Block(0)),
-            (ArcHardfork::Zero4, ForkCondition::Block(0)),
-        ]);
-        let sender = Address::repeat_byte(0x11);
-        let contract = Address::repeat_byte(0xBB);
-
-        // Bytecode: PUSH20 0x00..00 SELFDESTRUCT  (target = zero address)
-        let mut code = vec![opcode::PUSH20];
-        code.extend_from_slice(Address::ZERO.as_slice());
-        code.push(SELFDESTRUCT);
-        let runtime = Bytecode::new_raw(Bytes::from(code.clone()));
-
-        let mut db = create_db(&[(sender, 1000)]);
-        db.insert_account_info(
-            contract,
-            revm::state::AccountInfo {
-                balance: U256::from(500),
-                nonce: 1,
-                code_hash: keccak256(&code),
-                code: Some(runtime),
-                account_id: None,
-            },
-        );
-
-        let mut evm = create_arc_evm(chain_spec.clone(), db);
-        let tx = TxEnv {
-            caller: sender,
-            kind: TxKind::Call(contract),
-            value: U256::ZERO,
-            gas_limit: 100_000,
-            gas_price: 0,
-            chain_id: Some(chain_spec.chain_id()),
-            ..Default::default()
-        };
-
-        let result = evm.transact_one(tx).expect("transaction should execute");
-        // Zero4 allows SELFDESTRUCT to the zero address — not a revert.
-        assert!(
-            result.is_success(),
-            "Zero4 SELFDESTRUCT to zero address should succeed, got {:?}",
-            result
-        );
-        // Zero4 emits the custom NativeCoinTransferred log, not EIP-7708.
-        let logs = result.logs();
-        assert!(
-            !logs.is_empty(),
-            "Zero4 SELFDESTRUCT with nonzero balance should emit a transfer log"
-        );
-        assert_ne!(
-            logs[0].address,
-            revm::handler::SYSTEM_ADDRESS,
-            "Zero4 should emit NativeCoinTransferred, not an EIP-7708 Transfer log"
-        );
-    }
-
     /// Transaction-level regression test: a Zero5 SELFDESTRUCT with nonzero balance
     /// must produce exactly one EIP-7708 Transfer log in the final receipt.
     #[test]
@@ -3444,142 +2967,27 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: ADDRESS_B,
                 bytecode_address: ADDRESS_A,
-                known_bytecode: None,
+                known_bytecode: (
+                    revm_primitives::B256::ZERO,
+                    revm::bytecode::Bytecode::default(),
+                ),
                 value: CallValue::Transfer(U256::from(100)),
                 input: CallInput::Bytes(Bytes::new()),
                 gas_limit: 100_000,
                 caller: ADDRESS_A,
                 is_static: false,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             })),
             memory: SharedMemory::default(),
             depth: 0,
         };
-
-        assert!(
-            !is_account_cold(&evm, ADDRESS_B),
-            "selfdestructed target should be warm after setup"
-        );
 
         // 3. Should revert on transferring to destructed account
         let result = evm.before_frame_init(&mut frame);
         assert!(
             matches!(result, Ok(BeforeFrameInitResult::Reverted(_))),
             "expect revert on transferring to destructed account"
-        );
-
-        assert!(
-            !is_account_cold(&evm, ADDRESS_B),
-            "checkpointed selfdestruct probe should not make an already-warm target cold"
-        );
-    }
-
-    #[rstest]
-    #[case::zero7_enabled(
-        &[ArcHardfork::Zero4, ArcHardfork::Zero5, ArcHardfork::Zero6, ArcHardfork::Zero7],
-        true
-    )]
-    #[case::zero6_enabled(
-        &[ArcHardfork::Zero4, ArcHardfork::Zero5, ArcHardfork::Zero6],
-        false
-    )]
-    fn transfer_to_cold_target_preserves_cold_status(
-        #[case] hardforks: &[ArcHardfork],
-        #[case] expected_target_is_cold: bool,
-    ) {
-        let db = create_db(&[(ADDRESS_A, 1000), (ADDRESS_B, 0)]);
-        let mut evm = create_test_evm(db, ArcHardforkFlags::with(hardforks));
-
-        evm.ctx_mut()
-            .journal_mut()
-            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
-            .unwrap();
-
-        assert!(
-            is_account_cold(&evm, ADDRESS_B),
-            "target should start cold before frame init"
-        );
-
-        let mut frame = FrameInit {
-            frame_input: FrameInput::Call(call_input(
-                CallScheme::Call,
-                U256::from(100),
-                ADDRESS_A,
-                ADDRESS_B,
-            )),
-            memory: SharedMemory::default(),
-            depth: 0,
-        };
-
-        let result = evm.before_frame_init(&mut frame).unwrap();
-        assert!(
-            matches!(result, BeforeFrameInitResult::Log(_, _)),
-            "normal value transfer should still produce a transfer log, got {result:?}"
-        );
-
-        assert_eq!(
-            is_account_cold(&evm, ADDRESS_B),
-            expected_target_is_cold,
-            "unexpected target warmth after selfdestruct probe for hardforks {hardforks:?}"
-        );
-    }
-
-    #[rstest]
-    #[case::zero7_enabled(
-        &[ArcHardfork::Zero4, ArcHardfork::Zero5, ArcHardfork::Zero6, ArcHardfork::Zero7],
-        true
-    )]
-    #[case::zero6_enabled(
-        &[ArcHardfork::Zero4, ArcHardfork::Zero5, ArcHardfork::Zero6],
-        false
-    )]
-    fn create_to_cold_target_preserves_cold_status(
-        #[case] hardforks: &[ArcHardfork],
-        #[case] expected_target_is_cold: bool,
-    ) {
-        let db = create_db(&[(ADDRESS_A, 1000)]);
-        let mut evm = create_test_evm(db, ArcHardforkFlags::with(hardforks));
-
-        evm.ctx_mut()
-            .journal_mut()
-            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
-            .unwrap();
-
-        let amount = U256::from(1);
-        let target_address = ADDRESS_A.create(0);
-
-        assert!(
-            is_account_cold(&evm, target_address),
-            "target should start cold before frame init"
-        );
-
-        let mut frame = FrameInit {
-            frame_input: FrameInput::Create(Box::new(CreateInputs::new(
-                ADDRESS_A,
-                CreateScheme::Create,
-                amount,
-                Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xF3]), // dummy contract byte code
-                100_000,
-            ))),
-            memory: SharedMemory::default(),
-            depth: 0,
-        };
-
-        let result = evm.before_frame_init(&mut frame).unwrap();
-        assert!(
-            matches!(result, BeforeFrameInitResult::Log(_, _)),
-            "normal value transfer should still produce a transfer log, got {result:?}"
-        );
-        if let BeforeFrameInitResult::Log(log, _gas) = result {
-            let t = Transfer::decode_log(&log).expect("decode EIP-7708 Transfer log");
-            assert_eq!(t.data.to, target_address);
-            assert_eq!(t.data.amount, amount)
-        }
-
-        assert_eq!(
-            is_account_cold(&evm, target_address),
-            expected_target_is_cold,
-            "unexpected target warmth after selfdestruct probe for hardforks {hardforks:?}"
         );
     }
 
@@ -3656,6 +3064,7 @@ mod tests {
             parent_beacon_block_root: None,
             withdrawals: None,
             extra_data: Default::default(),
+            slot_number: None,
         };
 
         let ctx = evm_config
@@ -4006,17 +3415,10 @@ mod tests {
                 .with_block(BlockEnv::default());
             let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
             let mut instruction = EthInstructions::new_mainnet_with_spec(spec);
-            if hardfork_flags.is_active(ArcHardfork::Zero7) {
-                instruction.insert_instruction(
-                    SELFDESTRUCT,
-                    revm_interpreter::Instruction::new(arc_network_selfdestruct_zero7, 5000),
-                );
-            } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
-                instruction.insert_instruction(
-                    SELFDESTRUCT,
-                    revm_interpreter::Instruction::new(arc_network_selfdestruct_zero5, 5000),
-                );
-            }
+            instruction.insert_instruction(
+                SELFDESTRUCT,
+                revm_interpreter::Instruction::new(arc_network_selfdestruct, 5000),
+            );
 
             let mut registry = SubcallRegistry::new();
             registry.register(
@@ -4044,9 +3446,7 @@ mod tests {
         }
 
         fn insert_eip7702_account(evm: &mut NoOpTestEvm, address: Address, delegate: Address) {
-            use revm::bytecode::eip7702::Eip7702Bytecode;
-
-            let eip7702_code = Bytecode::Eip7702(Arc::new(Eip7702Bytecode::new(delegate)));
+            let eip7702_code = Bytecode::new_eip7702(delegate);
             evm.inner.ctx.journal_mut().db_mut().insert_account_info(
                 address,
                 AccountInfo {
@@ -4367,17 +3767,10 @@ mod tests {
                 .with_block(BlockEnv::default());
             let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
             let mut instruction = EthInstructions::new_mainnet_with_spec(spec);
-            if hardfork_flags.is_active(ArcHardfork::Zero7) {
-                instruction.insert_instruction(
-                    SELFDESTRUCT,
-                    revm_interpreter::Instruction::new(arc_network_selfdestruct_zero7, 5000),
-                );
-            } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
-                instruction.insert_instruction(
-                    SELFDESTRUCT,
-                    revm_interpreter::Instruction::new(arc_network_selfdestruct_zero5, 5000),
-                );
-            }
+            instruction.insert_instruction(
+                SELFDESTRUCT,
+                revm_interpreter::Instruction::new(arc_network_selfdestruct, 5000),
+            );
 
             // Custom registry: restrict subcall_test to `authorized_caller` only
             let mut registry = SubcallRegistry::new();
@@ -4632,7 +4025,7 @@ mod tests {
                 .transact_one(tx_echo)
                 .expect("transact_one should succeed");
             let gas_used_echo = match &result_echo {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success, got {other:?}"),
             };
 
@@ -4655,7 +4048,7 @@ mod tests {
                 .transact_one(tx_burner)
                 .expect("transact_one should succeed");
             let gas_used_burner = match &result_burner {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success, got {other:?}"),
             };
 
@@ -4906,9 +4299,7 @@ mod tests {
 
             let result = evm.transact_one(tx).expect("transact_one should succeed");
             let (output, gas_used) = match &result {
-                ExecutionResult::Success {
-                    output, gas_used, ..
-                } => (output, *gas_used),
+                ExecutionResult::Success { output, gas, .. } => (output, gas.total_gas_spent()),
                 other => panic!("expected Success (wrapper catches revert), got {other:?}"),
             };
 
@@ -5393,7 +4784,7 @@ mod tests {
             };
             let result_callfrom = evm.transact_one(tx_callfrom).expect("callfrom tx");
             let gas_used_callfrom = match &result_callfrom {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success (wrapper catches OOG), got {other:?}"),
             };
 
@@ -5411,7 +4802,7 @@ mod tests {
             };
             let result_direct = evm.transact_one(tx_direct).expect("direct tx");
             let gas_used_direct = match &result_direct {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success, got {other:?}"),
             };
 
@@ -5597,17 +4988,10 @@ mod tests {
                 .with_block(BlockEnv::default());
             let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
             let mut instruction = EthInstructions::new_mainnet_with_spec(spec);
-            if hardfork_flags.is_active(ArcHardfork::Zero7) {
-                instruction.insert_instruction(
-                    SELFDESTRUCT,
-                    revm_interpreter::Instruction::new(arc_network_selfdestruct_zero7, 5000),
-                );
-            } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
-                instruction.insert_instruction(
-                    SELFDESTRUCT,
-                    revm_interpreter::Instruction::new(arc_network_selfdestruct_zero5, 5000),
-                );
-            }
+            instruction.insert_instruction(
+                SELFDESTRUCT,
+                revm_interpreter::Instruction::new(arc_network_selfdestruct, 5000),
+            );
 
             let mut registry = SubcallRegistry::new();
             registry.register(
@@ -5703,7 +5087,7 @@ mod tests {
                 .inspect_one_tx(tx)
                 .expect("inspect_one_tx should succeed");
             let gas_used = match &result {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success, got {other:?}"),
             };
 
@@ -5801,7 +5185,7 @@ mod tests {
                 .inspect_one_tx(tx)
                 .expect("inspect_one_tx should succeed");
             let gas_used = match &result {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success, got {other:?}"),
             };
 
@@ -5877,7 +5261,7 @@ mod tests {
                 .inspect_one_tx(tx)
                 .expect("inspect_one_tx should succeed");
             let gas_used = match &result {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success, got {other:?}"),
             };
 
@@ -5941,13 +5325,17 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: CALL_FROM_ADDRESS,
                 bytecode_address: CALL_FROM_ADDRESS,
-                known_bytecode: None,
+                known_bytecode: (
+                    revm_primitives::B256::ZERO,
+                    revm::bytecode::Bytecode::default(),
+                ),
                 value: CallValue::Transfer(U256::ZERO),
                 input: CallInput::Bytes(Bytes::from(calldata)),
                 gas_limit,
                 is_static: false,
                 caller: WRAPPER,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             };
 
             let result = precompile
@@ -5986,13 +5374,17 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: CALL_FROM_ADDRESS,
                 bytecode_address: CALL_FROM_ADDRESS,
-                known_bytecode: None,
+                known_bytecode: (
+                    revm_primitives::B256::ZERO,
+                    revm::bytecode::Bytecode::default(),
+                ),
                 value: CallValue::Transfer(U256::ZERO),
                 input: CallInput::Bytes(Bytes::from(calldata)),
                 gas_limit: abi_decode_gas(child_data.len()) - 1, // Not enough
                 is_static: false,
                 caller: WRAPPER,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             };
 
             let result = precompile.init_subcall(&inputs);
@@ -6060,7 +5452,7 @@ mod tests {
             };
             let result_success = evm.transact_one(tx_success).expect("success tx");
             let gas_used_success = match &result_success {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.tx_gas_used(),
                 other => panic!("expected Success, got {other:?}"),
             };
 
@@ -6079,7 +5471,7 @@ mod tests {
             };
             let result_revert = evm.transact_one(tx_revert).expect("revert tx");
             let gas_used_revert = match &result_revert {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.tx_gas_used(),
                 other => panic!("expected Success (wrapper catches revert), got {other:?}"),
             };
 
@@ -6293,10 +5685,11 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: CALL_FROM_ADDRESS,
                 bytecode_address: CALL_FROM_ADDRESS,
-                known_bytecode: None,
+                known_bytecode: (B256::ZERO, Bytecode::default()),
                 value: CallValue::Transfer(U256::ZERO),
                 input: CallInput::Bytes(Bytes::from(calldata)),
                 gas_limit,
+                reservoir: 0,
                 is_static: false,
                 caller: WRAPPER,
                 return_memory_offset: 0..0,
@@ -6318,7 +5711,7 @@ mod tests {
                 ItemOrResult::Result(FrameResult::Call(outcome)) => {
                     assert_eq!(outcome.result.result, InstructionResult::OutOfGas);
                     assert_eq!(
-                        outcome.result.gas.spent(),
+                        outcome.result.gas.total_gas_spent(),
                         gas_limit,
                         "OOG should consume the whole subcall gas budget"
                     );
@@ -6490,7 +5883,7 @@ mod tests {
 
             let result_failing = evm.transact_one(tx_failing).expect("tx should succeed");
             let gas_used_failing = match &result_failing {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success (wrapper catches revert), got {other:?}"),
             };
 
@@ -6509,7 +5902,7 @@ mod tests {
 
             let result_normal = evm.transact_one(tx_normal).expect("tx should succeed");
             let gas_used_normal = match &result_normal {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success, got {other:?}"),
             };
 
@@ -6843,9 +6236,14 @@ mod tests {
 
             let result = evm.transact_one(tx).expect("tx should execute");
             match result {
-                ExecutionResult::Revert { gas_used, output } => {
+                ExecutionResult::Revert {
+                    gas,
+                    output,
+                    logs: _,
+                } => {
                     assert_eq!(
-                        gas_used, gas_limit,
+                        gas.total_gas_spent(),
+                        gas_limit,
                         "halted child with fitting completion gas should burn the full subcall allocation"
                     );
                     assert!(
@@ -6904,7 +6302,7 @@ mod tests {
                 evm.inner.ctx.journal_mut().checkpoint_commit();
 
                 let mut child_gas = Gas::new(10);
-                assert!(child_gas.record_cost(child_gas_spent));
+                assert!(child_gas.record_regular_cost(child_gas_spent));
                 let child_result = FrameResult::Call(CallOutcome {
                     result: InterpreterResult::new(
                         child_instruction_result,
@@ -6946,7 +6344,7 @@ mod tests {
                 "exact gas fit should not OOG"
             );
             assert_eq!(
-                exact_outcome.result.gas.spent(),
+                exact_outcome.result.gas.total_gas_spent(),
                 12,
                 "exact gas fit should spend the metered gas"
             );
@@ -6962,7 +6360,7 @@ mod tests {
                 "one gas below metered cost should OOG"
             );
             assert_eq!(
-                oog_outcome.result.gas.spent(),
+                oog_outcome.result.gas.total_gas_spent(),
                 11,
                 "OOG should spend the full subcall gas limit"
             );
@@ -6978,7 +6376,7 @@ mod tests {
                 "halted child with exact gas fit should not OOG"
             );
             assert_eq!(
-                halted_exact_outcome.result.gas.spent(),
+                halted_exact_outcome.result.gas.total_gas_spent(),
                 18,
                 "halted exact gas fit should spend the metered gas"
             );
@@ -6994,7 +6392,7 @@ mod tests {
                 "halted child one gas below metered cost should OOG"
             );
             assert_eq!(
-                halted_oog_outcome.result.gas.spent(),
+                halted_oog_outcome.result.gas.total_gas_spent(),
                 17,
                 "halted OOG should spend the full subcall gas limit"
             );
@@ -7318,7 +6716,7 @@ mod tests {
                 });
                 let result = evm.replay().expect("replay should succeed");
                 assert!(result.result.is_success(), "double wrapper should succeed");
-                result.result.gas_used()
+                result.result.tx_gas_used()
             };
 
             // Both-cold: target A then target B (different addresses, both cold)
@@ -7441,7 +6839,7 @@ mod tests {
 
             let result_zero = evm.transact_one(tx_zero).expect("tx should succeed");
             let gas_used_zero = match &result_zero {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success, got {other:?}"),
             };
 
@@ -7461,7 +6859,7 @@ mod tests {
 
             let result_costly = evm.transact_one(tx_costly).expect("tx should succeed");
             let gas_used_costly = match &result_costly {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success, got {other:?}"),
             };
 
@@ -7574,7 +6972,7 @@ mod tests {
 
             let result_zero = evm.transact_one(tx_zero).expect("tx should succeed");
             let gas_used_zero = match &result_zero {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success (wrapper catches revert), got {other:?}"),
             };
 
@@ -7594,7 +6992,7 @@ mod tests {
 
             let result_costly = evm.transact_one(tx_costly).expect("tx should succeed");
             let gas_used_costly = match &result_costly {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success (wrapper catches revert), got {other:?}"),
             };
 
@@ -7708,7 +7106,7 @@ mod tests {
                 .transact_one(tx_cold)
                 .expect("cold tx should succeed");
             let gas_cold = match &result_cold {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success, got {other:?}"),
             };
 
@@ -7740,7 +7138,7 @@ mod tests {
                 .transact_one(tx_warm)
                 .expect("warm tx should succeed");
             let gas_warm = match &result_warm {
-                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
                 other => panic!("expected Success, got {other:?}"),
             };
 
@@ -7796,13 +7194,17 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: CALL_FROM_ADDRESS,
                 bytecode_address: CALL_FROM_ADDRESS,
-                known_bytecode: None,
+                known_bytecode: (
+                    revm_primitives::B256::ZERO,
+                    revm::bytecode::Bytecode::default(),
+                ),
                 value: CallValue::Transfer(U256::ZERO),
                 input: CallInput::Bytes(Bytes::from(calldata)),
                 gas_limit,
                 is_static: false,
                 caller: WRAPPER,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             };
 
             let frame_input = FrameInit {
@@ -7883,13 +7285,17 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: CALL_FROM_ADDRESS,
                 bytecode_address: CALL_FROM_ADDRESS,
-                known_bytecode: None,
+                known_bytecode: (
+                    revm_primitives::B256::ZERO,
+                    revm::bytecode::Bytecode::default(),
+                ),
                 value: CallValue::Transfer(U256::ZERO),
                 input: CallInput::Bytes(Bytes::from(calldata)),
                 gas_limit,
                 is_static: false,
                 caller: WRAPPER,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             };
 
             let frame_input = FrameInit {
@@ -7964,13 +7370,17 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: CALL_FROM_ADDRESS,
                 bytecode_address: CALL_FROM_ADDRESS,
-                known_bytecode: None,
+                known_bytecode: (
+                    revm_primitives::B256::ZERO,
+                    revm::bytecode::Bytecode::default(),
+                ),
                 value: CallValue::Transfer(U256::ZERO),
                 input: CallInput::Bytes(Bytes::from(calldata)),
                 gas_limit,
                 is_static: false,
                 caller: WRAPPER,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             };
 
             let frame_input = FrameInit {
@@ -8045,13 +7455,17 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: CALL_FROM_ADDRESS,
                 bytecode_address: CALL_FROM_ADDRESS,
-                known_bytecode: None,
+                known_bytecode: (
+                    revm_primitives::B256::ZERO,
+                    revm::bytecode::Bytecode::default(),
+                ),
                 value: CallValue::Transfer(U256::ZERO),
                 input: CallInput::Bytes(Bytes::from(calldata)),
                 gas_limit: insufficient_gas,
                 is_static: false,
                 caller: WRAPPER,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             };
 
             let frame_input = FrameInit {
@@ -8074,7 +7488,7 @@ mod tests {
                         "should OOG when gas is insufficient for account access cost"
                     );
                     assert_eq!(
-                        outcome.result.gas.spent(),
+                        outcome.result.gas.total_gas_spent(),
                         insufficient_gas,
                         "OOG should consume all allocated gas"
                     );
@@ -8136,13 +7550,17 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: CALL_FROM_ADDRESS,
                 bytecode_address: CALL_FROM_ADDRESS,
-                known_bytecode: None,
+                known_bytecode: (
+                    revm_primitives::B256::ZERO,
+                    revm::bytecode::Bytecode::default(),
+                ),
                 value: CallValue::Transfer(U256::ZERO),
                 input: CallInput::Bytes(Bytes::from(calldata)),
                 gas_limit: exact_gas,
                 is_static: false,
                 caller: WRAPPER,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             };
 
             let frame_input = FrameInit {
@@ -8182,7 +7600,8 @@ mod tests {
         EthInstructions<EthInterpreter, EthEvmContext<InMemoryDB>>,
         PrecompilesMap,
     > {
-        let ctx = Context::new(db, spec);
+        let mut ctx = Context::new(db, spec);
+        ctx.cfg.amsterdam_eip7708_disabled = true;
         let instruction = EthInstructions::new_mainnet_with_spec(spec);
         let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
         ArcEvm::new(
@@ -8197,11 +7616,9 @@ mod tests {
     }
 
     #[test]
-    fn test_zero5_emits_eip7708_transfer_log() {
-        use revm::handler::SYSTEM_ADDRESS;
-
+    fn test_baseline_emits_eip7708_transfer_log() {
         let db = CacheDB::new(EmptyDB::default());
-        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5]);
+        let flags = ArcHardforkFlags::default();
         let mut evm = create_test_evm(db, flags);
 
         evm.ctx_mut()
@@ -8220,26 +7637,28 @@ mod tests {
             depth: 1,
         };
 
+        let amount = U256::from(100);
         let result = evm.before_frame_init(&mut frame).unwrap();
         match result {
             BeforeFrameInitResult::Log(log, gas) => {
                 assert!(gas > 0, "Should have SLOAD gas cost");
                 assert_eq!(
-                    log.address, SYSTEM_ADDRESS,
-                    "Zero5 should emit EIP-7708 Transfer log from system address"
+                    log,
+                    create_eip7708_transfer_log(ADDRESS_A, ADDRESS_B, amount),
+                    "baseline should emit EIP-7708 Transfer log from system address"
                 );
             }
             other => panic!(
-                "Expected Log result with EIP-7708 Transfer under Zero5, got {:?}",
+                "Expected Log result with EIP-7708 Transfer under baseline flags, got {:?}",
                 other
             ),
         }
     }
 
     #[test]
-    fn test_zero5_self_transfer_no_log() {
+    fn test_baseline_self_transfer_no_log() {
         let db = CacheDB::new(EmptyDB::default());
-        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5]);
+        let flags = ArcHardforkFlags::default();
         let mut evm = create_test_evm(db, flags);
 
         evm.ctx_mut()
@@ -8265,40 +7684,9 @@ mod tests {
                 assert!(gas > 0, "Should have SLOAD gas cost");
             }
             other => panic!(
-                "Expected Checked result for self-transfer under Zero5, got {:?}",
+                "Expected Checked result for self-transfer under baseline flags, got {:?}",
                 other
             ),
-        }
-    }
-
-    #[test]
-    fn test_pre_zero5_still_emits_custom_log() {
-        let db = CacheDB::new(EmptyDB::default());
-        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero4]);
-        let mut evm = create_test_evm(db, flags);
-
-        evm.ctx_mut()
-            .journal_mut()
-            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
-            .unwrap();
-
-        let mut frame = FrameInit {
-            frame_input: FrameInput::Call(call_input(
-                CallScheme::Call,
-                U256::from(100),
-                ADDRESS_A,
-                ADDRESS_B,
-            )),
-            memory: SharedMemory::default(),
-            depth: 1,
-        };
-
-        let result = evm.before_frame_init(&mut frame).unwrap();
-        match result {
-            BeforeFrameInitResult::Log(log, _gas) => {
-                assert_eq!(log.address, NATIVE_COIN_AUTHORITY_ADDRESS);
-            }
-            other => panic!("Expected Log result pre-Zero5, got {:?}", other),
         }
     }
 
@@ -8319,7 +7707,7 @@ mod tests {
 
         // Verify that an EVM can be created with AMSTERDAM spec (for future use)
         let db = create_db(&[(ADDRESS_A, 1000)]);
-        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5]);
+        let flags = ArcHardforkFlags::default();
         let evm = create_test_evm_with_spec(db, flags, SpecId::AMSTERDAM);
         assert_eq!(
             evm.inner.ctx.cfg.spec,
@@ -8328,15 +7716,12 @@ mod tests {
         );
     }
 
-    /// Verifies that Zero5 emits EIP-7708 Transfer logs regardless of SpecId.
+    /// Verifies that the baseline emits EIP-7708 Transfer logs regardless of SpecId.
     /// Arc self-implements EIP-7708 log emission, so PRAGUE vs AMSTERDAM doesn't matter.
     #[test]
-    fn test_zero5_emits_eip7708_regardless_of_spec() {
-        use revm::handler::SYSTEM_ADDRESS;
-
-        // Zero5 + PRAGUE: Arc emits EIP-7708 Transfer logs itself
+    fn test_baseline_emits_eip7708_regardless_of_spec() {
         let db = CacheDB::new(EmptyDB::default());
-        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5]);
+        let flags = ArcHardforkFlags::default();
         let mut evm = create_test_evm_with_spec(db, flags, SpecId::PRAGUE);
 
         evm.ctx_mut()
@@ -8355,26 +7740,27 @@ mod tests {
             depth: 1,
         };
 
+        let amount = U256::from(100);
         let result = evm.before_frame_init(&mut frame).unwrap();
         match result {
             BeforeFrameInitResult::Log(log, _gas) => {
                 assert_eq!(
-                    log.address, SYSTEM_ADDRESS,
-                    "Zero5 + PRAGUE: should emit EIP-7708 Transfer log"
+                    log,
+                    create_eip7708_transfer_log(ADDRESS_A, ADDRESS_B, amount),
+                    "baseline + PRAGUE should emit EIP-7708 Transfer log"
                 );
             }
-            other => panic!(
-                "Expected Log result with EIP-7708 Transfer, got {:?}",
-                other
-            ),
+            other => {
+                panic!("Expected Log result with EIP-7708 Transfer under PRAGUE, got {other:?}")
+            }
         }
     }
 
-    /// Zero5: CALL with value to Address::ZERO should revert.
+    /// CALL with value to Address::ZERO should revert.
     #[test]
-    fn test_zero5_call_to_zero_address_reverts() {
+    fn test_baseline_call_to_zero_address_reverts() {
         let db = CacheDB::new(EmptyDB::default());
-        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5]);
+        let flags = ArcHardforkFlags::default();
         let mut evm = create_test_evm(db, flags);
 
         evm.ctx_mut()
@@ -8396,16 +7782,16 @@ mod tests {
         let result = evm.before_frame_init(&mut frame).unwrap();
         assert!(
             matches!(result, BeforeFrameInitResult::Reverted(_)),
-            "Zero5 should revert CALL with value to zero address, got {:?}",
+            "baseline should revert CALL with value to zero address, got {:?}",
             result,
         );
     }
 
-    /// Zero5: CALL from Address::ZERO with value should revert.
+    /// CALL from Address::ZERO with value should revert.
     #[test]
-    fn test_zero5_call_from_zero_address_reverts() {
+    fn test_baseline_call_from_zero_address_reverts() {
         let db = CacheDB::new(EmptyDB::default());
-        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5]);
+        let flags = ArcHardforkFlags::default();
         let mut evm = create_test_evm(db, flags);
 
         evm.ctx_mut()
@@ -8427,38 +7813,7 @@ mod tests {
         let result = evm.before_frame_init(&mut frame).unwrap();
         assert!(
             matches!(result, BeforeFrameInitResult::Reverted(_)),
-            "Zero5 should revert CALL with value from zero address, got {:?}",
-            result,
-        );
-    }
-
-    /// Pre-Zero5: CALL to Address::ZERO is NOT blocked (backwards compatible).
-    #[test]
-    fn test_pre_zero5_call_to_zero_address_allowed() {
-        let db = CacheDB::new(EmptyDB::default());
-        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero4]);
-        let mut evm = create_test_evm(db, flags);
-
-        evm.ctx_mut()
-            .journal_mut()
-            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
-            .unwrap();
-
-        let mut frame = FrameInit {
-            frame_input: FrameInput::Call(call_input(
-                CallScheme::Call,
-                U256::from(100),
-                ADDRESS_A,
-                Address::ZERO,
-            )),
-            memory: SharedMemory::default(),
-            depth: 1,
-        };
-
-        let result = evm.before_frame_init(&mut frame).unwrap();
-        assert!(
-            matches!(result, BeforeFrameInitResult::Log(_, _)),
-            "Pre-Zero5 should allow CALL to zero address, got {:?}",
+            "baseline should revert CALL with value from zero address, got {:?}",
             result,
         );
     }
@@ -8617,7 +7972,7 @@ mod tests {
                             address: MOCK_LOG_ADDRESS,
                             data: LogData::new_unchecked(vec![], Bytes::new()),
                         });
-                        Ok(PrecompileOutput::new(0, Bytes::new()))
+                        Ok(PrecompileOutput::new(0, Bytes::new(), 0))
                     },
                 ))
             } else {
@@ -8647,13 +8002,17 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: MOCK_PRECOMPILE,
                 bytecode_address: MOCK_PRECOMPILE,
-                known_bytecode: None,
+                known_bytecode: (
+                    revm_primitives::B256::ZERO,
+                    revm::bytecode::Bytecode::default(),
+                ),
                 value: CallValue::Transfer(U256::from(100)),
                 input: CallInput::Bytes(Bytes::new()),
                 gas_limit: 500_000,
                 is_static: false,
                 caller: ADDRESS_A,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             })),
             memory: SharedMemory::default(),
             depth: 1,
@@ -8697,7 +8056,7 @@ mod tests {
     #[test]
     fn test_zero5_reverted_precompile_call_with_value_emits_no_eip7708_log() {
         use reth_evm::precompiles::DynPrecompile;
-        use revm::precompile::{PrecompileError, PrecompileId};
+        use revm::precompile::{PrecompileId, PrecompileOutput};
 
         const MOCK_PRECOMPILE: Address = address!("ff00000000000000000000000000000000000099");
 
@@ -8708,7 +8067,10 @@ mod tests {
             if *address == MOCK_PRECOMPILE {
                 Some(DynPrecompile::new_stateful(
                     PrecompileId::Custom("MOCK_REVERTER".into()),
-                    move |_input| Err(PrecompileError::other("authorization failed")),
+                    // revm 38: `PrecompileError` is `Fatal`-only (propagates as
+                    // EVMError::Custom). To simulate a revert, return Ok with a
+                    // Revert-status output.
+                    move |_input| Ok(PrecompileOutput::revert(0, Bytes::new(), 0)),
                 ))
             } else {
                 None
@@ -8735,13 +8097,17 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: MOCK_PRECOMPILE,
                 bytecode_address: MOCK_PRECOMPILE,
-                known_bytecode: None,
+                known_bytecode: (
+                    revm_primitives::B256::ZERO,
+                    revm::bytecode::Bytecode::default(),
+                ),
                 value: CallValue::Transfer(U256::from(100)),
                 input: CallInput::Bytes(Bytes::new()),
                 gas_limit: 500_000,
                 is_static: false,
                 caller: ADDRESS_A,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             })),
             memory: SharedMemory::default(),
             depth: 1,
@@ -8777,7 +8143,7 @@ mod tests {
     ///    — mirrors `Evm::frame_init` from `revm-handler` (borrow-split variant)
     ///    — see [`revm::handler::EvmTr::frame_init`]
     ///
-    /// 3. `arc_network_selfdestruct_impl` in `crates/evm/src/opcode.rs`
+    /// 3. `arc_network_selfdestruct` in `crates/evm/src/opcode.rs`
     ///    — forked from `revm/crates/interpreter/src/instructions/host.rs` (SELFDESTRUCT)
     ///    — <https://github.com/bluealloy/revm/blob/v97/crates/interpreter/src/instructions/host.rs#L387>
     ///
@@ -8785,7 +8151,7 @@ mod tests {
     ///    — mirrors revm's `istanbul_sstore_cost` gas calculation
     #[test]
     fn revm_version_check() {
-        const EXPECTED_REVM_VERSION: &str = "34.0.0";
+        const EXPECTED_REVM_VERSION: &str = "38.0.0";
         let workspace_toml = include_str!("../../../Cargo.toml");
         let expected = format!("revm = {{ version = \"{EXPECTED_REVM_VERSION}\"");
         assert!(

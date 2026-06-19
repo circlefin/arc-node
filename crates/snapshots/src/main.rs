@@ -62,8 +62,14 @@ struct DownloadArgs {
     consensus_url: Option<String>,
 
     /// Network to download a snapshot for.
-    #[arg(long, default_value = "arc-testnet")]
-    chain: Chain,
+    ///
+    /// Required when --execution-url and --consensus-url are not provided (used to
+    /// look up the latest snapshot URLs from the snapshot listing API). When both
+    /// URLs are provided, --chain is only used to pick the default --execution-path
+    /// — pass it if you want that default, otherwise pass --execution-path explicitly
+    /// and --chain can be omitted entirely.
+    #[arg(long)]
+    chain: Option<Chain>,
 
     /// Directory to extract execution layer data into.
     ///
@@ -98,14 +104,17 @@ async fn main() -> Result<()> {
 }
 
 pub(crate) async fn run_download(args: DownloadArgs) -> Result<()> {
-    let chain = args.chain;
-
     let (execution_url, consensus_url) = match (args.execution_url, args.consensus_url) {
         (Some(el), Some(cl)) => (el, cl),
         (Some(_), None) | (None, Some(_)) => {
             eyre::bail!("provide both --execution-url and --consensus-url, or neither")
         }
         (None, None) => {
+            let chain = args.chain.ok_or_else(|| {
+                eyre::eyre!(
+                    "--chain is required when --execution-url and --consensus-url are not provided"
+                )
+            })?;
             info!(chain = %chain, "Fetching latest snapshot URLs");
             download::fetch_latest_snapshot_urls(chain).await?
         }
@@ -113,7 +122,7 @@ pub(crate) async fn run_download(args: DownloadArgs) -> Result<()> {
 
     let execution_dir = args
         .execution_path
-        .or_else(|| chain.default_execution_path())
+        .or_else(Chain::default_execution_path)
         .ok_or_else(|| {
             eyre::eyre!("Could not determine default execution path; use --execution-path")
         })?;
@@ -186,10 +195,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_download_chain_default_is_testnet() {
+    fn parse_download_chain_default_is_none() {
         let cli = parse(&["arc-snapshots", "download"]).unwrap();
         let Commands::Download(args) = cli.command;
-        assert!(matches!(args.chain, Chain::Testnet));
+        assert!(args.chain.is_none());
     }
 
     #[test]
@@ -206,7 +215,27 @@ mod tests {
         ])
         .unwrap();
         let Commands::Download(args) = cli.command;
-        assert!(matches!(args.chain, Chain::Devnet));
+        assert!(matches!(args.chain, Some(Chain::Devnet)));
+    }
+
+    #[test]
+    fn parse_download_no_chain_with_urls_is_ok() {
+        // Explicit URLs make --chain unnecessary — should parse cleanly.
+        let cli = parse(&[
+            "arc-snapshots",
+            "download",
+            "--execution-url",
+            "http://x/el",
+            "--consensus-url",
+            "http://x/cl",
+            "--execution-path",
+            "/tmp/el",
+            "--consensus-path",
+            "/tmp/cl",
+        ])
+        .unwrap();
+        let Commands::Download(args) = cli.command;
+        assert!(args.chain.is_none());
     }
 
     #[test]
@@ -264,7 +293,7 @@ mod tests {
         let args = DownloadArgs {
             execution_url: None,
             consensus_url: Some("http://x/cl".into()),
-            chain: Chain::Devnet,
+            chain: Some(Chain::Devnet),
             execution_path: Some("/tmp/el".into()),
             consensus_path: Some("/tmp/cl".into()),
             force_redownload: false,
@@ -275,12 +304,26 @@ mod tests {
         let args = DownloadArgs {
             execution_url: Some("http://x/el".into()),
             consensus_url: None,
-            chain: Chain::Devnet,
+            chain: Some(Chain::Devnet),
             execution_path: Some("/tmp/el".into()),
             consensus_path: Some("/tmp/cl".into()),
             force_redownload: false,
         };
         let err = run_download(args).await.unwrap_err();
         assert!(err.to_string().contains("both"));
+    }
+
+    #[tokio::test]
+    async fn run_download_errors_with_no_chain_and_no_urls() {
+        let args = DownloadArgs {
+            execution_url: None,
+            consensus_url: None,
+            chain: None,
+            execution_path: Some("/tmp/el".into()),
+            consensus_path: Some("/tmp/cl".into()),
+            force_redownload: false,
+        };
+        let err = run_download(args).await.unwrap_err();
+        assert!(err.to_string().contains("--chain is required"));
     }
 }

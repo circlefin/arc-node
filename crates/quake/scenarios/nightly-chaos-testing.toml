@@ -4,7 +4,7 @@ name = "nightly-chaos-testing"
 cl.config.log_level = "debug"
 
 latency_emulation = true
-engine_api_connection = "rpc"
+engine_api_connection = "ipc"
 
 # Topology:
 # 10 validators in 4 AWS regions

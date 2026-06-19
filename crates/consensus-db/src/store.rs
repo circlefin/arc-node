@@ -1209,9 +1209,15 @@ impl Db {
         Ok(())
     }
 
-    /// Prune up to PRUNE_BATCH_LIMIT historical certificates below retain_height.
-    /// This should only run when pruning is enabled.
-    fn prune_historical_certs(&self, retain_height: Height) -> Result<Vec<Height>, StoreError> {
+    /// Prune up to `PRUNE_BATCH_LIMIT` entries below `retain_height` from a height-keyed table.
+    /// Reads the batch of stale keys in a read transaction, then deletes them in a short
+    /// write transaction.
+    fn prune_height_table_batch(
+        &self,
+        retain_height: Height,
+        table: redb::TableDefinition<HeightKey, Vec<u8>>,
+        label: &str,
+    ) -> Result<Vec<Height>, StoreError> {
         let start = Instant::now();
 
         let curr_height = self.max_height()?.unwrap_or_default();
@@ -1219,26 +1225,25 @@ impl Db {
 
         let keys = {
             let tx_read = self.db.begin_read()?;
-            let certificates = tx_read.open_table(CERTIFICATES_TABLE)?;
-            self.height_range(&certificates, ..retain_height, Self::PRUNE_BATCH_LIMIT)?
+            let t = tx_read.open_table(table)?;
+            self.height_range(&t, ..retain_height, Self::PRUNE_BATCH_LIMIT)?
         };
 
         if keys.is_empty() {
             if log_info {
-                info!(%retain_height, %curr_height, "No historical certificates to prune in this batch");
+                info!(%retain_height, %curr_height, table = label, "No entries to prune in this batch");
             } else {
-                debug!(%retain_height, %curr_height, "No historical certificates to prune in this batch");
+                debug!(%retain_height, %curr_height, table = label, "No entries to prune in this batch");
             }
             self.update_delete_metrics(start.elapsed());
             return Ok(keys);
         }
 
-        // Remove collected keys within a short write transaction
         let tx_write = self.db.begin_write()?;
         {
-            let mut certificates = tx_write.open_table(CERTIFICATES_TABLE)?;
+            let mut t = tx_write.open_table(table)?;
             for h in &keys {
-                let _ = certificates.remove(h)?;
+                let _ = t.remove(h)?;
             }
         }
         tx_write.commit()?;
@@ -1252,7 +1257,8 @@ impl Db {
                 current_height = %curr_height,
                 %first_pruned,
                 %last_pruned,
-                "Pruned historical certificates batch"
+                table = label,
+                "Pruned entries batch"
             );
         } else {
             debug!(
@@ -1261,7 +1267,8 @@ impl Db {
                 current_height = %curr_height,
                 %first_pruned,
                 %last_pruned,
-                "Pruned historical certificates batch"
+                table = label,
+                "Pruned entries batch"
             );
         }
 
@@ -1270,67 +1277,47 @@ impl Db {
         Ok(keys)
     }
 
-    /// Prune up to PRUNE_BATCH_LIMIT blocks below (current_height - `EL_AMNESIA_HEIGHT_COUNT`).
+    /// Prune up to PRUNE_BATCH_LIMIT historical certificates below retain_height.
+    /// This should only run when pruning is enabled.
+    fn prune_historical_certs(&self, retain_height: Height) -> Result<Vec<Height>, StoreError> {
+        self.prune_height_table_batch(retain_height, CERTIFICATES_TABLE, "certificates")
+    }
+
+    /// Prune up to PRUNE_BATCH_LIMIT blocks below (current_height - `RETH_AMNESIA_HEIGHT_COUNT`).
     /// This should run regardless of whether pruning is enabled.
     fn prune_blocks(&self) -> Result<Vec<Height>, StoreError> {
-        let start = Instant::now();
-
         let curr_height = self.max_height()?.unwrap_or_default();
-        let log_info = curr_height.as_u64() % Self::PRUNING_LOG_INFO_HEIGHTS == 0;
         let retain_height = curr_height.saturating_sub(Self::RETH_AMNESIA_HEIGHT_COUNT);
+        self.prune_height_table_batch(retain_height, DECIDED_BLOCKS_TABLE, "decided_blocks")
+    }
 
-        let keys = {
-            let tx_read = self.db.begin_read()?;
-            let decided = tx_read.open_table(DECIDED_BLOCKS_TABLE)?;
-            self.height_range(&decided, ..retain_height, Self::PRUNE_BATCH_LIMIT)?
-        };
+    /// Prune up to PRUNE_BATCH_LIMIT proposal-monitor records below retain_height.
+    /// This should only run when pruning is enabled.
+    fn prune_proposal_monitor_data(
+        &self,
+        retain_height: Height,
+    ) -> Result<Vec<Height>, StoreError> {
+        self.prune_height_table_batch(
+            retain_height,
+            PROPOSAL_MONITOR_DATA_TABLE,
+            "proposal_monitor_data",
+        )
+    }
 
-        if keys.is_empty() {
-            if log_info {
-                info!(%retain_height, %curr_height, "No decided blocks to prune in this batch");
-            } else {
-                debug!(%retain_height, %curr_height, "No decided blocks to prune in this batch");
-            }
-            self.update_delete_metrics(start.elapsed());
-            return Ok(keys);
-        }
+    /// Prune up to PRUNE_BATCH_LIMIT misbehavior-evidence records below retain_height.
+    /// This should only run when pruning is enabled.
+    fn prune_misbehavior_evidence(&self, retain_height: Height) -> Result<Vec<Height>, StoreError> {
+        self.prune_height_table_batch(
+            retain_height,
+            MISBEHAVIOR_EVIDENCE_TABLE,
+            "misbehavior_evidence",
+        )
+    }
 
-        // Remove collected keys within a short write transaction
-        let tx_write = self.db.begin_write()?;
-        {
-            let mut decided = tx_write.open_table(DECIDED_BLOCKS_TABLE)?;
-            for h in &keys {
-                let _ = decided.remove(h)?;
-            }
-        }
-        tx_write.commit()?;
-
-        let first_pruned = keys.first().expect("'keys' should not be empty").as_u64();
-        let last_pruned = keys.last().expect("'keys' should not be empty").as_u64();
-
-        if log_info {
-            info!(
-                pruned_count = keys.len(),
-                %retain_height,
-                current_height = %curr_height,
-                %first_pruned,
-                %last_pruned,
-                "Pruned decided blocks batch"
-            );
-        } else {
-            debug!(
-                pruned_count = keys.len(),
-                %retain_height,
-                current_height = %curr_height,
-                %first_pruned,
-                %last_pruned,
-                "Pruned decided blocks batch"
-            );
-        }
-
-        self.update_delete_metrics(start.elapsed());
-
-        Ok(keys)
+    /// Prune up to PRUNE_BATCH_LIMIT invalid-payload records below retain_height.
+    /// This should only run when pruning is enabled.
+    fn prune_invalid_payloads(&self, retain_height: Height) -> Result<Vec<Height>, StoreError> {
+        self.prune_height_table_batch(retain_height, INVALID_PAYLOADS_TABLE, "invalid_payloads")
     }
 
     fn limit_height(&self, min: bool) -> Result<Option<Height>, StoreError> {
@@ -1762,6 +1749,39 @@ impl Store {
         tokio::task::spawn_blocking(move || db.prune_blocks()).await?
     }
 
+    /// Prune historical proposal-monitor records.
+    /// Should only be called when pruning is enabled.
+    /// - retain_height: The minimum height to retain.
+    pub async fn prune_proposal_monitor_data(
+        &self,
+        retain_height: Height,
+    ) -> Result<Vec<Height>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.prune_proposal_monitor_data(retain_height)).await?
+    }
+
+    /// Prune historical misbehavior-evidence records.
+    /// Should only be called when pruning is enabled.
+    /// - retain_height: The minimum height to retain.
+    pub async fn prune_misbehavior_evidence(
+        &self,
+        retain_height: Height,
+    ) -> Result<Vec<Height>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.prune_misbehavior_evidence(retain_height)).await?
+    }
+
+    /// Prune historical invalid-payload records.
+    /// Should only be called when pruning is enabled.
+    /// - retain_height: The minimum height to retain.
+    pub async fn prune_invalid_payloads(
+        &self,
+        retain_height: Height,
+    ) -> Result<Vec<Height>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.prune_invalid_payloads(retain_height)).await?
+    }
+
     /// Create a savepoint in the database to ensure the allocator state table is up to date.
     /// Doing this before shutting down the database can help avoid repair on next startup.
     pub fn savepoint(&self) {
@@ -1773,6 +1793,8 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
+
     use alloy_rpc_types_engine::ExecutionPayloadV3;
     use arbitrary::Unstructured;
     use arc_consensus_types::signing::Signature;
@@ -2466,6 +2488,160 @@ mod tests {
             store.max_height().await.unwrap().unwrap(),
             Height::new(curr_height)
         );
+    }
+
+    async fn store_proposal_monitor_at_height(store: &Store, height: Height) {
+        let monitor = ProposalMonitor::new(height, Address::new([0u8; 20]), SystemTime::now());
+        store.store_proposal_monitor_data(monitor).await.unwrap();
+    }
+
+    async fn store_empty_misbehavior_evidence_at_height(store: &Store, height: Height) {
+        store
+            .store_misbehavior_evidence(StoredMisbehaviorEvidence::empty(height))
+            .await
+            .unwrap();
+    }
+
+    async fn append_invalid_payload_at_height(store: &Store, height: Height) {
+        let payload = InvalidPayload::new_without_payload(
+            height,
+            Round::new(0),
+            Address::new([0u8; 20]),
+            "test",
+        );
+        store.append_invalid_payload(payload).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_prune_proposal_monitor_data() {
+        let store = create_store().await;
+
+        let heights = [1u64, 2, 3, 4];
+        for h in heights.iter() {
+            store_block_at_height(&store, Height::new(*h)).await;
+            store_proposal_monitor_at_height(&store, Height::new(*h)).await;
+        }
+
+        let pruned = store
+            .prune_proposal_monitor_data(Height::new(3))
+            .await
+            .unwrap();
+        assert_eq!(pruned, vec![Height::new(1), Height::new(2)]);
+
+        for h in heights.iter() {
+            let height = Height::new(*h);
+            let exists = store
+                .get_proposal_monitor_data(Some(height))
+                .await
+                .unwrap()
+                .is_some();
+            if *h < 3 {
+                assert!(!exists, "Proposal monitor at height {h} should be pruned");
+            } else {
+                assert!(exists, "Proposal monitor at height {h} should be retained");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prune_misbehavior_evidence() {
+        let store = create_store().await;
+
+        let heights = [1u64, 2, 3, 4];
+        for h in heights.iter() {
+            store_block_at_height(&store, Height::new(*h)).await;
+            store_empty_misbehavior_evidence_at_height(&store, Height::new(*h)).await;
+        }
+
+        let pruned = store
+            .prune_misbehavior_evidence(Height::new(3))
+            .await
+            .unwrap();
+        assert_eq!(pruned, vec![Height::new(1), Height::new(2)]);
+
+        // Re-running with the same retain_height must be a no-op once rows are gone.
+        let pruned_again = store
+            .prune_misbehavior_evidence(Height::new(3))
+            .await
+            .unwrap();
+        assert!(pruned_again.is_empty());
+
+        // Raising retain_height must still find the remaining rows at heights 3 and 4.
+        let pruned_more = store
+            .prune_misbehavior_evidence(Height::new(5))
+            .await
+            .unwrap();
+        assert_eq!(pruned_more, vec![Height::new(3), Height::new(4)]);
+    }
+
+    #[tokio::test]
+    async fn test_prune_invalid_payloads() {
+        let store = create_store().await;
+
+        let heights = [1u64, 2, 3, 4];
+        for h in heights.iter() {
+            store_block_at_height(&store, Height::new(*h)).await;
+            append_invalid_payload_at_height(&store, Height::new(*h)).await;
+        }
+
+        let pruned = store.prune_invalid_payloads(Height::new(3)).await.unwrap();
+        assert_eq!(pruned, vec![Height::new(1), Height::new(2)]);
+
+        let pruned_again = store.prune_invalid_payloads(Height::new(3)).await.unwrap();
+        assert!(pruned_again.is_empty());
+
+        let pruned_more = store.prune_invalid_payloads(Height::new(5)).await.unwrap();
+        assert_eq!(pruned_more, vec![Height::new(3), Height::new(4)]);
+    }
+
+    #[tokio::test]
+    async fn test_prune_proposal_monitor_data_batch_cap() {
+        let store = create_store().await;
+
+        let limit = Db::PRUNE_BATCH_LIMIT as u64;
+        let retain_height = limit + 50;
+        let curr_height = retain_height + 2;
+
+        for h in 1..=curr_height {
+            let height = Height::new(h);
+            store_block_at_height(&store, height).await;
+            store_proposal_monitor_at_height(&store, height).await;
+        }
+
+        let pruned1 = store
+            .prune_proposal_monitor_data(Height::new(retain_height))
+            .await
+            .unwrap();
+        assert_eq!(pruned1.len() as u64, limit);
+        let expected1 = (1..=limit).map(Height::new).collect::<Vec<_>>();
+        assert_eq!(pruned1, expected1);
+
+        let pruned2 = store
+            .prune_proposal_monitor_data(Height::new(retain_height))
+            .await
+            .unwrap();
+        assert_eq!(pruned2.len() as u64, retain_height - 1 - limit);
+        let expected2 = ((limit + 1)..retain_height)
+            .map(Height::new)
+            .collect::<Vec<_>>();
+        assert_eq!(pruned2, expected2);
+
+        for h in 1..retain_height {
+            let exists = store
+                .get_proposal_monitor_data(Some(Height::new(h)))
+                .await
+                .unwrap()
+                .is_some();
+            assert!(!exists, "Proposal monitor at height {h} should be pruned");
+        }
+        for h in retain_height..=curr_height {
+            let exists = store
+                .get_proposal_monitor_data(Some(Height::new(h)))
+                .await
+                .unwrap()
+                .is_some();
+            assert!(exists, "Proposal monitor at height {h} should be retained");
+        }
     }
 
     async fn store_block_at_height(store: &Store, height: Height) {

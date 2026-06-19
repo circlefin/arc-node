@@ -77,9 +77,9 @@ async fn test_zero_address_zero_value_succeeds() {
         .expect("test_zero_address_zero_value_succeeds failed");
 }
 
-/// Test #26: Pre-Zero5 — value transfer to Address::ZERO is not rejected.
+/// Test #26: Value transfer to Address::ZERO is rejected before Zero5 metadata activation.
 #[tokio::test]
-async fn test_pre_zero5_zero_address_allowed() {
+async fn test_zero_address_rejected_before_zero5_metadata_activation() {
     reth_tracing::init_test_tracing();
 
     let chain_spec = localdev_with_hardforks(&[
@@ -100,10 +100,10 @@ async fn test_pre_zero5_zero_address_allowed() {
                 .with_gas_limit(100_000),
         )
         .with_action(ProduceBlocks::new(1))
-        // Pre-Zero5: zero-address value transfer should succeed
-        .with_action(AssertTxIncluded::new("zero_addr").expect(TxStatus::Success))
+        .with_action(AssertTxIncluded::new("zero_addr").expect(TxStatus::Reverted))
+        .with_action(AssertTxLogs::new("zero_addr").expect_no_logs())
         .with_action(AssertTxTrace::new("zero_addr"))
         .run()
         .await
-        .expect("test_pre_zero5_zero_address_allowed failed");
+        .expect("test_zero_address_rejected_before_zero5_metadata_activation failed");
 }

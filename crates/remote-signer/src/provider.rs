@@ -356,18 +356,14 @@ mod integration_tests {
         let config = RemoteSigningConfig::new("http://localhost:9999".to_string());
         let result = RemoteSigningProvider::new(config).await;
 
-        // With lazy connection, provider creation may succeed but operations will fail
-        if result.is_ok() {
-            let provider = result.unwrap();
-            // Try to get public key - this should fail
+        // With lazy connection, provider creation may succeed but operations will fail.
+        // If it failed outright, that is also acceptable.
+        if let Ok(provider) = result {
             let public_key_result = provider.public_key().await;
             assert!(
                 public_key_result.is_err(),
                 "Public key retrieval should fail with bad endpoint"
             );
-        } else {
-            // If provider creation failed, that's also acceptable
-            assert!(result.is_err());
         }
     }
 

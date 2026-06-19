@@ -24,6 +24,7 @@ use malachitebft_app_channel::app::types::core::Validity;
 use alloy_rpc_types_engine::{ExecutionPayloadV3, PayloadStatusEnum};
 
 use arc_consensus_types::Address;
+use arc_eth_engine::deadline::EngineDeadline;
 use arc_eth_engine::engine::Engine;
 use arc_eth_engine::json_structures::ExecutionBlock;
 use arc_eth_engine::rpc::EngineApiRpcError;
@@ -109,6 +110,9 @@ pub trait PayloadGenerator: Send + Sync {
 
 pub struct EnginePayloadGenerator<'a> {
     pub engine: &'a Engine,
+    /// Consensus budget for the proposer's build sequence; extends the
+    /// engine's per-call timeout floors when set.
+    pub deadline: Option<EngineDeadline>,
 }
 
 impl<'a> PayloadGenerator for EnginePayloadGenerator<'a> {
@@ -119,7 +123,7 @@ impl<'a> PayloadGenerator for EnginePayloadGenerator<'a> {
         fee_recipient: &Address,
     ) -> eyre::Result<ExecutionPayloadV3> {
         self.engine
-            .generate_block(parent, timestamp, fee_recipient)
+            .generate_block(parent, timestamp, fee_recipient, self.deadline)
             .await
     }
 }
@@ -158,11 +162,30 @@ where
 pub struct EnginePayloadValidator<'a> {
     engine: &'a Engine,
     metrics: &'a AppMetrics,
+    deadline: Option<EngineDeadline>,
 }
 
 impl<'a> EnginePayloadValidator<'a> {
     pub fn new(engine: &'a Engine, metrics: &'a AppMetrics) -> Self {
-        Self { engine, metrics }
+        Self {
+            engine,
+            metrics,
+            deadline: None,
+        }
+    }
+
+    /// Validator for the proposer's self-validation path: the consensus
+    /// budget extends the engine's per-call timeout floor.
+    pub fn new_with_deadline(
+        engine: &'a Engine,
+        metrics: &'a AppMetrics,
+        deadline: EngineDeadline,
+    ) -> Self {
+        Self {
+            engine,
+            metrics,
+            deadline: Some(deadline),
+        }
     }
 }
 
@@ -171,7 +194,7 @@ impl PayloadValidator for EnginePayloadValidator<'_> {
         &self,
         payload: &ExecutionPayloadV3,
     ) -> eyre::Result<PayloadValidationResult> {
-        validate_payload(self.engine, payload, self.metrics).await
+        validate_payload(self.engine, payload, self.metrics, self.deadline).await
     }
 }
 
@@ -213,6 +236,7 @@ async fn validate_payload(
     engine: &Engine,
     execution_payload: &ExecutionPayloadV3,
     metrics: &AppMetrics,
+    deadline: Option<EngineDeadline>,
 ) -> eyre::Result<PayloadValidationResult> {
     let block_hash = execution_payload.payload_inner.payload_inner.block_hash;
 
@@ -232,7 +256,7 @@ async fn validate_payload(
     let _guard = metrics.start_engine_api_timer("notify_new_block");
 
     match engine
-        .notify_new_block(execution_payload, versioned_hashes)
+        .notify_new_block(execution_payload, versioned_hashes, deadline)
         .await
     {
         Ok(status) => match status.status {
@@ -394,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn validate_payload_returns_valid_on_ok_status() {
         let mut mock = MockEngineAPI::new();
-        mock.expect_new_payload().returning(|_, _, _| {
+        mock.expect_new_payload().returning(|_, _, _, _| {
             Ok(PayloadStatus {
                 status: PayloadStatusEnum::Valid,
                 latest_valid_hash: None,
@@ -405,7 +429,7 @@ mod tests {
         let payload = test_payload(0);
         let metrics = AppMetrics::default();
 
-        let result = validate_payload(&engine, &payload, &metrics)
+        let result = validate_payload(&engine, &payload, &metrics, None)
             .await
             .expect("payload validation should succeed");
 
@@ -415,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn validate_payload_returns_invalid_on_invalid_status() {
         let mut mock = MockEngineAPI::new();
-        mock.expect_new_payload().returning(|_, _, _| {
+        mock.expect_new_payload().returning(|_, _, _, _| {
             Ok(PayloadStatus {
                 status: PayloadStatusEnum::Invalid {
                     validation_error: "validation error".to_string(),
@@ -428,7 +452,7 @@ mod tests {
         let payload = test_payload(0);
         let metrics = AppMetrics::default();
 
-        let result = validate_payload(&engine, &payload, &metrics)
+        let result = validate_payload(&engine, &payload, &metrics, None)
             .await
             .expect("payload validation should succeed");
 
@@ -443,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn validate_payload_returns_invalid_on_rpc_error() {
         let mut mock = MockEngineAPI::new();
-        mock.expect_new_payload().returning(|_, _, _| {
+        mock.expect_new_payload().returning(|_, _, _, _| {
             let rpc_error = EngineApiRpcError::new(42, "engine API error", None);
             Err(eyre::Report::new(rpc_error))
         });
@@ -452,7 +476,7 @@ mod tests {
         let payload = test_payload(0);
         let metrics = AppMetrics::default();
 
-        let result = validate_payload(&engine, &payload, &metrics)
+        let result = validate_payload(&engine, &payload, &metrics, None)
             .await
             .expect("should succeed without error");
 
@@ -473,13 +497,13 @@ mod tests {
     async fn validate_payload_propagates_other_errors() {
         let mut mock = MockEngineAPI::new();
         mock.expect_new_payload()
-            .returning(|_, _, _| Err(eyre::eyre!("some error")));
+            .returning(|_, _, _, _| Err(eyre::eyre!("some error")));
 
         let engine = Engine::new(Box::new(mock), Box::new(MockEthereumAPI::new()));
         let payload = test_payload(0);
         let metrics = AppMetrics::default();
 
-        let err = validate_payload(&engine, &payload, &metrics)
+        let err = validate_payload(&engine, &payload, &metrics, None)
             .await
             .expect_err("payload validation should return an error");
 
@@ -497,7 +521,7 @@ mod tests {
         for status in test_cases {
             let mut mock = MockEngineAPI::new();
             let status_for_mock = status.clone();
-            mock.expect_new_payload().returning(move |_, _, _| {
+            mock.expect_new_payload().returning(move |_, _, _, _| {
                 Ok(PayloadStatus {
                     status: status_for_mock.clone(),
                     latest_valid_hash: None,
@@ -508,7 +532,7 @@ mod tests {
             let payload = test_payload(0);
             let metrics = AppMetrics::default();
 
-            let result = validate_payload(&engine, &payload, &metrics)
+            let result = validate_payload(&engine, &payload, &metrics, None)
                 .await
                 .expect_err("payload validation should return an error");
 

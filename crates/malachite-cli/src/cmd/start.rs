@@ -155,7 +155,7 @@ pub struct StartCmd {
     /// Run as a validator node.
     ///
     /// When set, the node loads its consensus signing key,
-    /// signs a validator proof, and advertises a
+    /// signs a validator proof (ADR-006), and advertises a
     /// validator identity on the P2P network. Requires
     /// `--suggested-fee-recipient` so tips and rewards go to
     /// an explicit address rather than being silently burned.
@@ -469,6 +469,28 @@ pub struct StartCmd {
     #[clap(long = "follow.endpoint", value_name = "ENDPOINT", requires = "follow")]
     #[serde(skip)]
     pub follow_endpoints: Vec<SyncEndpointUrl>,
+
+    /// Byzantine behavior configuration as a JSON blob. Testnet / Quake only.
+    ///
+    /// Deserializes into `arc_consensus_types::ByzantineConfig` and enables
+    /// configurable Byzantine faults: vote/proposal equivocation, message
+    /// dropping, inbound-proposal drops, amnesia, force-precommit-nil.
+    ///
+    /// Example: --byzantine='{"equivocate_votes":{"mode":"always"},"seed":42}'
+    #[cfg(feature = "byzantine")]
+    #[clap(
+        long,
+        value_name = "JSON",
+        value_parser = parse_byzantine_json,
+        help_heading = "Byzantine (testnet only)"
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byzantine: Option<arc_consensus_types::ByzantineConfig>,
+}
+
+#[cfg(feature = "byzantine")]
+fn parse_byzantine_json(s: &str) -> Result<arc_consensus_types::ByzantineConfig, String> {
+    serde_json::from_str(s).map_err(|e| format!("invalid --byzantine JSON: {e}"))
 }
 
 fn parse_non_zero_address(s: &str) -> Result<Address, String> {
@@ -524,6 +546,8 @@ impl Default for StartCmd {
             skip_db_upgrade: false,
             signing_remote: None,
             signing_tls_cert_path: None,
+            #[cfg(feature = "byzantine")]
+            byzantine: None,
             follow: false,
             follow_endpoints: Vec::new(),
         }
@@ -639,6 +663,13 @@ impl StartCmd {
         push_if_some!("signing.tls-cert-path", self.signing_tls_cert_path);
         push_if!("follow", self.follow);
         push_each!("follow.endpoint", &self.follow_endpoints);
+
+        #[cfg(feature = "byzantine")]
+        if let Some(ref byz) = self.byzantine {
+            let json =
+                serde_json::to_string(byz).expect("ByzantineConfig serialization cannot fail");
+            flags.push(format!("--byzantine={json}"));
+        }
 
         flags
     }
@@ -1620,6 +1651,10 @@ mod tests {
             skip_db_upgrade: true,
             signing_remote: Some("http://signer:10340".to_string()),
             signing_tls_cert_path: Some("/etc/arc/signer.pem".to_string()),
+            #[cfg(feature = "byzantine")]
+            byzantine: Some(
+                serde_json::from_str(r#"{"equivocate_votes":{"mode":"always"}}"#).unwrap(),
+            ),
             follow: true,
             follow_endpoints: vec!["http://rpc-1:8545,ws=8546".parse().unwrap()],
         };

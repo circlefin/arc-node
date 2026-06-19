@@ -17,6 +17,7 @@
 use std::ops::RangeInclusive;
 
 use alloy_rpc_types_engine::ExecutionPayloadV3;
+use alloy_rpc_types_eth::BlockNumberOrTag;
 use arc_eth_engine::engine::Engine;
 use bytesize::ByteSize;
 use eyre::{eyre, WrapErr};
@@ -119,7 +120,7 @@ async fn get_decided_values(
     let heights = range.clone().iter_heights().collect::<Vec<_>>();
     let block_numbers = heights
         .iter()
-        .map(|height| format!("0x{:x}", height.as_u64()))
+        .map(|height| BlockNumberOrTag::Number(height.as_u64()))
         .collect::<Vec<_>>();
 
     let execution_payloads = engine.eth.get_execution_payloads(&block_numbers).await?;

@@ -51,6 +51,7 @@ mod load;
 mod manifest;
 mod mcp;
 mod mesh;
+mod metrics;
 mod monitor;
 mod node;
 mod nodekey;
@@ -58,6 +59,7 @@ mod nodes;
 mod perturb;
 mod report;
 mod rpc;
+mod rpc_cmd;
 mod setup;
 mod shell;
 mod testnet;
@@ -183,6 +185,14 @@ enum Commands {
         #[command(subcommand)]
         command: MonitoringSubcommand,
     },
+    /// Download monitoring data (metrics and/or node databases).
+    ///
+    /// Without a subcommand, downloads both metrics and a single-node database
+    /// snapshot using defaults. Works in both local and remote mode.
+    Download {
+        #[command(subcommand)]
+        command: Option<DownloadKindSubcommand>,
+    },
     /// Send transaction load to the testnet (backpressure mode: waits for each
     /// response and only advances the nonce on success).
     /// Use --mix to blend transaction types (e.g., --mix transfer=70,erc20=30).
@@ -230,6 +240,23 @@ enum Commands {
     Wait {
         #[clap(subcommand)]
         command: WaitSubcommand,
+    },
+    /// Send a JSON-RPC call (EL) or REST call (CL) to one or more nodes.
+    ///
+    /// `el` targets Reth's JSON-RPC; `cl` targets Malachite's REST API.
+    /// `list` shows the live CL endpoint catalog plus a link to the Reth docs.
+    ///
+    /// Examples:
+    ///   quake rpc list
+    ///   quake rpc el admin_clearTxpool
+    ///   quake rpc el eth_blockNumber ALL_VALIDATORS
+    ///   quake rpc el eth_getBalance validator1 0xabc... latest
+    ///   quake rpc cl /status
+    ///   quake rpc cl /commit ALL_VALIDATORS
+    #[command(verbatim_doc_comment)]
+    Rpc {
+        #[command(subcommand)]
+        command: RpcSubcommand,
     },
     /// Run tests against the testnet (or list with --dry-run)
     ///
@@ -467,6 +494,14 @@ pub(crate) struct InfraArgs {
     /// violations (per-type maxima, volume-size ratio) at apply time.
     #[clap(long, value_name = "IOPS", value_parser = clap::value_parser!(u32).range(100..=256_000))]
     node_volume_iops: Option<u32>,
+    /// Place the node data directory on the local instance-store NVMe instead of the root EBS volume.
+    ///
+    /// Requires an instance type that ships local NVMe instance storage (e.g. `i4i.*`, `i3.*`,
+    /// `m6id.*`); pair with `--node-size`. On instance types without instance store this is a
+    /// no-op and the data directory stays on the root EBS volume. Independent of
+    /// `--node-volume-type`/`--node-volume-iops`, which keep configuring the root EBS volume.
+    #[clap(long)]
+    node_data_on_instance_store: bool,
 }
 
 #[derive(Args)]
@@ -496,6 +531,33 @@ impl CleanArgs {
             self.consensus_data,
         )
     }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RpcSubcommand {
+    /// List available endpoints: CL live catalog + EL docs link.
+    List,
+    /// Send a JSON-RPC request to the Execution Layer (Reth).
+    ///
+    /// Examples:
+    ///   quake rpc el admin_clearTxpool
+    ///   quake rpc el eth_blockNumber ALL_VALIDATORS
+    ///   quake rpc el eth_getBalance validator1 0xabc... latest
+    ///   quake rpc el eth_call validator1 --raw '[{"to":"0x..."},"latest"]'
+    #[command(verbatim_doc_comment)]
+    El(rpc_cmd::ElArgs),
+    /// Send a REST request to the Consensus Layer (Malachite).
+    ///
+    /// The leading `/` on the path is optional.
+    ///
+    /// Examples:
+    ///   quake rpc cl /status
+    ///   quake rpc cl consensus-state
+    ///   quake rpc cl /commit ALL_VALIDATORS
+    ///   quake rpc cl '/commit?height=42' validator1
+    ///   quake rpc cl /persistent-peers validator1 --method POST --body '{"addr":"/ip4/..."}'
+    #[command(verbatim_doc_comment)]
+    Cl(rpc_cmd::ClArgs),
 }
 
 #[derive(Debug, Subcommand, PartialEq)]
@@ -682,7 +744,10 @@ pub(crate) enum RemoteSubcommand {
         /// Path to the JSON file created by `quake remote export`
         path: PathBuf,
     },
-    /// Download metrics or database data from remote infrastructure
+    /// [DEPRECATED] Download metrics or database data from remote infrastructure.
+    ///
+    /// Use `quake download {metrics,db}` instead — it works in both
+    /// local and remote mode.
     Download {
         #[clap(subcommand)]
         command: DownloadSubcommand,
@@ -697,6 +762,58 @@ pub(crate) enum MonitoringSubcommand {
     Stop,
     /// Stop monitoring services and clean monitoring data
     Clean,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum DownloadKindSubcommand {
+    /// Download a Prometheus metrics snapshot for the testnet.
+    ///
+    /// Queries the `query_range` API directly over HTTP (local Docker port for
+    /// local testnets, SSM-tunnelled port for remote) and bundles the JSON
+    /// responses into a single `.tar.gz` under `.quake/metrics/<testnet>/`.
+    Metrics {
+        /// Start of the time range (default: headStats.minTime from Prometheus; e.g. 2024-01-15T10:30:00Z or 2024-01-15)
+        #[clap(long)]
+        from: Option<CliTimestamp>,
+        /// End of the time range (default: now; e.g. 2024-01-15T10:30:00Z or 2024-01-15)
+        #[clap(long)]
+        to: Option<CliTimestamp>,
+        /// Query resolution — interval between data points (e.g. 30s, 1m, 5m).
+        /// Defaults to ceil((end-start)/10000) to stay within Prometheus' 11 000-point limit.
+        #[clap(long)]
+        step: Option<String>,
+        /// Metric names to download (pass after `--`; downloads every metric Prometheus knows about by default)
+        #[clap(last = true)]
+        metric_names: Vec<String>,
+        /// Output file path (default: .quake/metrics/<testnet>/quake-metrics-<timestamp>.tar.gz)
+        #[clap(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
+    /// Download node database(s).
+    ///
+    /// In remote mode: archives DB data from the selected node(s) via the CC and
+    /// downloads the resulting `.tar.gz` to `.quake/db/<testnet>/`.
+    ///
+    /// In local mode: prints the path to the selected node's on-disk DB files;
+    /// no archiving is performed since they are already on the local filesystem.
+    ///
+    /// Defaults to the first node in the manifest (DBs across nodes are typically
+    /// identical; downloading from all of them is wasteful). Pass node names
+    /// after `--` to override.
+    Db {
+        /// Node names to download from (default: first node in manifest)
+        #[clap(last = true)]
+        nodes: Vec<String>,
+        /// Download only execution layer (Reth) data
+        #[clap(long, conflicts_with = "consensus_only")]
+        execution_only: bool,
+        /// Download only consensus layer (Malachite) data
+        #[clap(long)]
+        consensus_only: bool,
+        /// Output file path (remote only; default: .quake/db/<testnet>/quake-db-<timestamp>.tar.gz)
+        #[clap(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
 }
 
 /// A datetime accepted by `--from`/`--to` flags, converted to a Unix timestamp.
@@ -741,7 +858,8 @@ impl std::str::FromStr for CliTimestamp {
 pub(crate) enum DownloadSubcommand {
     /// Download Prometheus metrics from the Control Center.
     ///
-    /// SSHes to CC and queries the Prometheus query_range API — no local SSM tunnel required.
+    /// Alias of `quake metrics download` kept for backward compatibility.
+    /// Requires the SSM tunnel to be open (start with `quake remote ssm start`).
     /// Downloads all metrics by default; pass metric names after -- to filter.
     /// Without --from/--to, start defaults to headStats.minTime (Prometheus head block only, ~2h max).
     Metrics {
@@ -781,8 +899,7 @@ pub(crate) enum DownloadSubcommand {
     },
 }
 
-#[derive(Debug, Subcommand, serde::Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Subcommand)]
 pub(crate) enum SSMSubcommand {
     /// Start SSM tunnels to the Control Center server
     Start,
@@ -790,10 +907,24 @@ pub(crate) enum SSMSubcommand {
     Stop,
     /// List all active SSM tunnels
     List,
+    /// Keep all SSM tunnels alive for the given duration
+    ///
+    /// AWS closes SSM sessions after 20 minutes of inactivity. This command
+    /// periodically opens a TCP connection through each tunnel to reset the
+    /// inactivity timer. Run it in a separate terminal alongside long
+    /// experiments. Cancel with Ctrl-C when no longer needed.
+    #[command(verbatim_doc_comment)]
+    KeepAlive {
+        /// How long to keep tunnels alive (e.g. "30m", "2h", "1h30m")
+        #[clap(value_parser = parse_duration)]
+        duration: Duration,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    reset_sigpipe_to_default();
+
     dotenvy::dotenv().ok();
 
     let cli = Cli::parse();
@@ -806,7 +937,8 @@ async fn main() -> Result<()> {
         .add_directive("arc_node_consensus_cli::new=info".parse()?);
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_ansi(std::io::stdout().is_terminal())
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     tracing::info!(
@@ -946,6 +1078,7 @@ async fn main() -> Result<()> {
         Commands::Info { command } => testnet.info(command).await?,
         Commands::Remote { command } => testnet.remote(command).await?,
         Commands::Monitoring { command } => testnet.monitoring(command).await?,
+        Commands::Download { command } => testnet.download(command).await?,
         Commands::Load { targets, args } => {
             let target_nodes = targets.unwrap_or_default();
             load::run(
@@ -977,6 +1110,7 @@ async fn main() -> Result<()> {
         } => {
             let params = crate::tests::TestParams::from(params);
             testnet
+                .with_seed(cli.seed)
                 .run_tests(&spec, dry_run, rpc_timeout, &params)
                 .await?
         }
@@ -1012,6 +1146,27 @@ async fn main() -> Result<()> {
                     .await?
             }
         },
+        Commands::Rpc { command } => match command {
+            RpcSubcommand::List => {
+                let (node, base_url) = testnet.nodes_metadata.first_consensus_rpc_url();
+                rpc_cmd::run_list(node, base_url).await?
+            }
+            RpcSubcommand::El(args) => {
+                let (target, _params) = args.parse_positionals()?;
+                let selectors = parse_comma_separated_string(target.as_deref())?;
+                let node_urls = testnet
+                    .nodes_metadata
+                    .resolve_el_targets(&testnet.manifest, selectors.as_deref())?;
+                rpc_cmd::run_el(node_urls, args).await?
+            }
+            RpcSubcommand::Cl(args) => {
+                let selectors = parse_comma_separated_string(args.target.as_deref())?;
+                let node_urls = testnet
+                    .nodes_metadata
+                    .resolve_cl_targets(&testnet.manifest, selectors.as_deref())?;
+                rpc_cmd::run_cl(node_urls, args).await?
+            }
+        },
         Commands::Web {
             host,
             port,
@@ -1041,8 +1196,32 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Restore the POSIX default disposition for SIGPIPE so the process exits
+/// quietly on broken pipes (e.g. `quake rpc ... | head -1`) instead of
+/// panicking from a failed `println!`. Rust installs `SIG_IGN` for SIGPIPE at
+/// startup; every well-behaved CLI tool undoes that.
+fn reset_sigpipe_to_default() {
+    #[cfg(unix)]
+    {
+        // SIGPIPE = 13 and SIG_DFL = null sighandler on every POSIX target.
+        const SIGPIPE: i32 = 13;
+        unsafe extern "C" {
+            fn signal(
+                signum: i32,
+                handler: Option<extern "C" fn(i32)>,
+            ) -> Option<extern "C" fn(i32)>;
+        }
+        // SAFETY: `signal` is an atomic process-global operation. No other
+        // code in this process modifies SIGPIPE disposition, so there is no
+        // race.
+        unsafe {
+            signal(SIGPIPE, None);
+        }
+    }
+}
+
 /// Parse a time duration from a string formatted as a human-readable duration.
-fn parse_duration(s: &str) -> Result<Duration> {
+pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
     humantime::parse_duration(s).wrap_err_with(|| format!("invalid duration: {s}"))
 }
 
@@ -1051,6 +1230,24 @@ fn parse_key_value(s: &str) -> Result<(String, String)> {
         .split_once('=')
         .ok_or_else(|| eyre::eyre!("expected key=value, got: {s}"))?;
     Ok((key.to_string(), value.to_string()))
+}
+
+/// Split a comma-separated string into a list of strings.
+fn parse_comma_separated_string(target: Option<&str>) -> Result<Option<Vec<String>>> {
+    target.map(split_comma_names).transpose()
+}
+
+fn split_comma_names(str: &str) -> Result<Vec<String>> {
+    let names: Vec<String> = str
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        bail!("Empty target node list");
+    }
+    Ok(names)
 }
 
 /// Prepare the testnet before starting it
@@ -1074,12 +1271,13 @@ async fn pre_start(
             || m.cc_disk_gb.is_some()
             || m.node_volume_type.is_some()
             || m.node_volume_iops.is_some()
+            || m.node_data_on_instance_store
         {
             warn!(
                 "Manifest sets remote-only infrastructure fields (node_size/cc_size/\
-                 node_disk_gb/cc_disk_gb/node_volume_type/node_volume_iops), but these \
-                 are only applied when creating remote infrastructure (--remote). They \
-                 are ignored in local mode."
+                 node_disk_gb/cc_disk_gb/node_volume_type/node_volume_iops/\
+                 node_data_on_instance_store), but these are only applied when creating \
+                 remote infrastructure (--remote). They are ignored in local mode."
             );
         }
     }
@@ -1111,6 +1309,9 @@ async fn pre_start(
             .infra_args
             .node_volume_iops
             .or(testnet.manifest.node_volume_iops);
+        // Enabled by either the CLI flag or the manifest field.
+        let node_data_on_instance_store = args.infra_args.node_data_on_instance_store
+            || testnet.manifest.node_data_on_instance_store;
         // CLI overrides can mix freely with manifest fields, so re-validate
         // the merged pair before reaching Terraform.
         crate::manifest::validate_node_volume(node_volume_type, node_volume_iops)?;
@@ -1123,6 +1324,7 @@ async fn pre_start(
             cc_disk_gb,
             node_volume_type,
             node_volume_iops,
+            node_data_on_instance_store,
         )?;
 
         // Reload testnet with the recently created infra files
@@ -1204,5 +1406,33 @@ mod cli_tests {
 
         assert_eq!(err.kind(), ErrorKind::UnknownArgument);
         assert!(err.to_string().contains("validator1"));
+    }
+
+    #[test]
+    fn split_comma_names_parses_basic_list() {
+        let v = split_comma_names("validator1,validator2,ALL_VALIDATORS").unwrap();
+        assert_eq!(
+            v,
+            vec![
+                "validator1".to_string(),
+                "validator2".to_string(),
+                "ALL_VALIDATORS".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_comma_names_trims_whitespace_and_skips_empties() {
+        let v = split_comma_names(" validator1 , , ALL_VALIDATORS  ").unwrap();
+        assert_eq!(
+            v,
+            vec!["validator1".to_string(), "ALL_VALIDATORS".to_string(),]
+        );
+    }
+
+    #[test]
+    fn split_comma_names_rejects_empty_input() {
+        assert!(split_comma_names("").is_err());
+        assert!(split_comma_names(",,,").is_err());
     }
 }

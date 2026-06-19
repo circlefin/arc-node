@@ -7,12 +7,11 @@ set -euo pipefail
 
 TAG="${1:?Usage: release-package.sh <TAG> [TARGET]}"
 TARGET="${2:-$(rustc -vV | awk '/^host:/ {print $2}')}"
-ASSET_TAG="${TAG//\//-}"
 
 BINARIES=(arc-node-execution arc-node-consensus arc-snapshots)
 BUILD_DIR="target/release"
 OUT_DIR="release-assets"
-ARCHIVE_NAME="arc-node-${ASSET_TAG}-${TARGET}.tar.gz"
+ARCHIVE_NAME="arc-node-${TAG}-${TARGET}.tar.gz"
 
 mkdir -p "$OUT_DIR"
 

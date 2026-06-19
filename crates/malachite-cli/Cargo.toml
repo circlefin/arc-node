@@ -6,6 +6,9 @@ repository.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+byzantine = ["arc-consensus-types/byzantine"]
+
 [dependencies]
 arc-consensus-types.workspace = true
 

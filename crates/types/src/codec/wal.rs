@@ -19,7 +19,6 @@
 use malachitebft_core_consensus::{ProposedValue, SignedConsensusMsg};
 use malachitebft_core_types::PolkaCertificate;
 
-use crate::codec::impl_versioned_codec;
 use crate::codec::versions::{
     PolkaCertificateVersion, ProposedValueVersion, SignedConsensusMsgVersion,
 };
@@ -28,19 +27,19 @@ use crate::ArcContext;
 #[derive(Copy, Clone, Debug)]
 pub struct WalCodec;
 
-impl_versioned_codec!(
+impl_versioned_codec_with_legacy_fallback!(
     WalCodec,
     SignedConsensusMsg<ArcContext>,
     SignedConsensusMsgVersion,
     SignedConsensusMsgVersion::V1
 );
-impl_versioned_codec!(
+impl_versioned_codec_with_legacy_fallback!(
     WalCodec,
     ProposedValue<ArcContext>,
     ProposedValueVersion,
     ProposedValueVersion::V1
 );
-impl_versioned_codec!(
+impl_versioned_codec_with_legacy_fallback!(
     WalCodec,
     PolkaCertificate<ArcContext>,
     PolkaCertificateVersion,

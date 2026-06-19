@@ -79,7 +79,7 @@ services:
       - "--log.file.directory=/var/log/arc"
       - "--log.file.max-files=0"
       {{#each execution.cli_flags}}
-      - "{{{this}}}"
+      - "{{{yaml_dq_escape this}}}"
       {{/each}}
       - "--arc-rpc-upstream-url=http://{{consensus.inner.name}}:31000"
       {{#if ../rpc}}
@@ -147,7 +147,7 @@ services:
       - "start"
       - "--home=/app/.malachite"
       {{#each consensus.cli_flags}}
-      - "{{{this}}}"
+      - "{{{yaml_dq_escape this}}}"
       {{/each}}
       {{#if ../rpc}}
       - "--eth-rpc-endpoint=http://{{execution.inner.name}}:8545"
@@ -223,7 +223,7 @@ services:
       - "--log.file.directory=/var/log/arc"
       - "--log.file.max-files=0"
       {{#each execution.cli_flags}}
-      - "{{{this}}}"
+      - "{{{yaml_dq_escape this}}}"
       {{/each}}
       - "--arc-rpc-upstream-url=http://{{consensus.inner.name}}{{#if ../images.cl_upgrade}}_u{{/if}}:31000"
       {{#if ../rpc}}
@@ -294,7 +294,7 @@ services:
       - "start"
       - "--home=/app/.malachite"
       {{#each consensus.cli_flags_upgraded}}
-      - "{{{this}}}"
+      - "{{{yaml_dq_escape this}}}"
       {{/each}}
       {{#if ../rpc}}
       - "--eth-rpc-endpoint=http://{{execution.inner.name}}_u:8545"

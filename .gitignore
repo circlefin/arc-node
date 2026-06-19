@@ -63,10 +63,6 @@ node_modules/
 .env.test.local
 .env.production.local
 .env.contract-ops
-/public-release.env
-/public-sync.env
-/release.env
-/release-refs.env
 
 # Rust-specific
 **/*.rs.bk

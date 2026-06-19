@@ -20,13 +20,14 @@ use std::{
     ops::Deref,
     path::Path,
     sync::{Arc, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
 
 use async_trait::async_trait;
 use tracing::debug;
 
+use alloy_rpc_types::BlockNumberOrTag;
 use alloy_rpc_types_engine::{
     ExecutionPayloadV3, ForkchoiceUpdated, PayloadAttributes, PayloadId as AlloyPayloadId,
     PayloadStatus, PayloadStatusEnum,
@@ -36,6 +37,10 @@ use alloy_rpc_types_txpool::{TxpoolInspect, TxpoolStatus};
 use arc_consensus_types::{Address, BlockHash, ConsensusParams, ValidatorSet, B256};
 
 use crate::capabilities::{check_capabilities, EngineCapabilities};
+use crate::constants::{
+    ENGINE_FORKCHOICE_UPDATED_TIMEOUT, ENGINE_GET_PAYLOAD_TIMEOUT, ENGINE_NEW_PAYLOAD_TIMEOUT,
+};
+use crate::deadline::EngineDeadline;
 use crate::ipc::{engine_ipc::EngineIPC, ethereum_ipc::EthereumIPC};
 use crate::json_structures::ExecutionBlock;
 use crate::rpc::{engine_rpc::EngineRpc, ethereum_rpc::EthereumRPC};
@@ -56,24 +61,33 @@ pub trait EngineAPI: Send + Sync {
     /// Exchange capabilities with the engine.
     async fn exchange_capabilities(&self) -> eyre::Result<EngineCapabilities>;
     /// Set the latest forkchoice state.
+    /// `timeout` bounds this single request; resolved by [`Engine`] from the
+    /// static floor and any active consensus deadline.
     async fn forkchoice_updated(
         &self,
         head_block_hash: BlockHash,
         maybe_payload_attributes: Option<PayloadAttributes>,
+        timeout: Duration,
     ) -> eyre::Result<ForkchoiceUpdated>;
     /// Get a payload by its ID.
     /// When `use_v5` is true, uses `engine_getPayloadV5` (Osaka); otherwise uses V4.
+    /// `timeout` bounds this single request; resolved by [`Engine`] from the
+    /// static floor and any active consensus deadline.
     async fn get_payload(
         &self,
         payload_id: AlloyPayloadId,
         use_v5: bool,
+        timeout: Duration,
     ) -> eyre::Result<ExecutionPayloadV3>;
     /// Notify that a new payload has been created.
+    /// `timeout` bounds this single request; resolved by [`Engine`] from the
+    /// static floor and any active consensus deadline.
     async fn new_payload(
         &self,
         execution_payload: &ExecutionPayloadV3,
         versioned_hashes: Vec<B256>,
         parent_block_hash: BlockHash,
+        timeout: Duration,
     ) -> eyre::Result<PayloadStatus>;
 }
 
@@ -84,17 +98,21 @@ pub trait EthereumAPI: Send + Sync {
     async fn get_chain_id(&self) -> eyre::Result<String>;
     /// Get the genesis block.
     async fn get_genesis_block(&self) -> eyre::Result<ExecutionBlock>;
-    /// Get the active validator set at a specific block height.
-    async fn get_active_validator_set(&self, block_height: u64) -> eyre::Result<ValidatorSet>;
+    /// Get the validator set that signs at the given consensus height.
+    /// Queries the registry at `consensus_height - 1` (saturating), because
+    /// the set active at height H is the one committed after executing H-1.
+    async fn get_signing_validator_set(&self, consensus_height: u64) -> eyre::Result<ValidatorSet>;
     /// Get the consensus parameters at a specific block height.
     async fn get_consensus_params(&self, block_height: u64) -> eyre::Result<ConsensusParams>;
-    /// Get a block by its number.
-    async fn get_block_by_number(&self, block_number: &str)
-        -> eyre::Result<Option<ExecutionBlock>>;
+    /// Get a block by its number or tag.
+    async fn get_block_by_number(
+        &self,
+        block_number: BlockNumberOrTag,
+    ) -> eyre::Result<Option<ExecutionBlock>>;
     /// Get multiple full payloads.
     async fn get_execution_payloads(
         &self,
-        block_numbers: &[String],
+        block_numbers: &[BlockNumberOrTag],
     ) -> eyre::Result<Vec<Option<ExecutionPayloadV3>>>;
     /// Get the status of the transaction pool.
     async fn txpool_status(&self) -> eyre::Result<TxpoolStatus>;
@@ -328,7 +346,10 @@ impl Inner {
         let ForkchoiceUpdated {
             payload_status,
             payload_id,
-        } = self.api.forkchoice_updated(head_block_hash, None).await?;
+        } = self
+            .api
+            .forkchoice_updated(head_block_hash, None, ENGINE_FORKCHOICE_UPDATED_TIMEOUT)
+            .await?;
         match (payload_status.status, payload_id) {
             (PayloadStatusEnum::Valid, Some(payload_id)) => Err(eyre!(
                 "When setting latest forkchoice, payload ID should be None, got: {:?}",
@@ -357,11 +378,14 @@ impl Inner {
     /// - latest_block: The latest block to generate a new block on top of.
     /// - timestamp: Unix timestamp for when the payload is expected to be executed.
     ///   It should be greater than or equal to that of forkchoiceState.headBlockHash.
+    /// - deadline: Consensus budget for the whole sequence; extends the
+    ///   per-call timeout floors when set (proposer path).
     pub async fn generate_block(
         &self,
         latest_block: &ExecutionBlock,
         timestamp: u64,
         suggested_fee_recipient: &Address,
+        deadline: Option<EngineDeadline>,
     ) -> eyre::Result<ExecutionPayloadV3> {
         debug!("🟠 Generating block on top of {}", latest_block.block_hash);
 
@@ -388,6 +412,9 @@ impl Inner {
             // Cannot be None in V3. Arc has no beacon chain, so we use the
             // execution block hash as parent_beacon_block_root.
             parent_beacon_block_root: Some(block_hash),
+
+            // EIP-7843 beacon slot number — Arc has no beacon chain.
+            slot_number: None,
         };
         // Build a new block on top of parent_hash
         //
@@ -403,7 +430,11 @@ impl Inner {
             payload_id,
         } = self
             .api
-            .forkchoice_updated(block_hash, Some(payload_attributes))
+            .forkchoice_updated(
+                block_hash,
+                Some(payload_attributes),
+                EngineDeadline::resolve(deadline, ENGINE_FORKCHOICE_UPDATED_TIMEOUT),
+            )
             .await
             .wrap_err_with(|| {
                 format!("generate_block: forkchoice_updated failed; last_block {block_hash}")
@@ -428,7 +459,10 @@ impl Inner {
                 // Complete ExecutionPayloadV3 with all transactions and computed state
                 // See https://github.com/ethereum/consensus-specs/blob/v1.1.5/specs/merge/validator.md#block-proposal
                 let use_v5 = self.use_v5(timestamp);
-                match self.api.get_payload(payload_id, use_v5).await {
+                // Resolved after forkchoice_updated, so time spent there
+                // shrinks what get_payload may claim from the budget.
+                let timeout = EngineDeadline::resolve(deadline, ENGINE_GET_PAYLOAD_TIMEOUT);
+                match self.api.get_payload(payload_id, use_v5, timeout).await {
                     Ok(payload) => Ok(payload),
                     Err(e) => Err(e).wrap_err_with(|| {
                         format!("generate_block: get_payload failed; payload_id {payload_id}")
@@ -451,10 +485,13 @@ impl Inner {
     /// Notify that a new block has been created.
     /// - execution_payload: The execution payload
     /// - versioned_hashes: The hashes of the blobs in the execution payload.
+    /// - deadline: Consensus budget; extends the per-call timeout floor when
+    ///   set (proposer self-validation path).
     pub async fn notify_new_block(
         &self,
         execution_payload: &ExecutionPayloadV3,
         versioned_hashes: Vec<B256>,
+        deadline: Option<EngineDeadline>,
     ) -> eyre::Result<PayloadStatus> {
         let parent_block_hash = execution_payload.payload_inner.payload_inner.parent_hash;
         // Validate the block I just received.
@@ -468,7 +505,12 @@ impl Inner {
         //
         // Hopefully skips re-execution and just moves the pre-computed state to "validated payloads pool" on a proposer.
         self.api
-            .new_payload(execution_payload, versioned_hashes, parent_block_hash)
+            .new_payload(
+                execution_payload,
+                versioned_hashes,
+                parent_block_hash,
+                EngineDeadline::resolve(deadline, ENGINE_NEW_PAYLOAD_TIMEOUT),
+            )
             .await
     }
 }
@@ -486,9 +528,10 @@ where
         &self,
         head_block_hash: BlockHash,
         maybe_payload_attributes: Option<PayloadAttributes>,
+        timeout: Duration,
     ) -> eyre::Result<ForkchoiceUpdated> {
         (**self)
-            .forkchoice_updated(head_block_hash, maybe_payload_attributes)
+            .forkchoice_updated(head_block_hash, maybe_payload_attributes, timeout)
             .await
     }
 
@@ -496,8 +539,9 @@ where
         &self,
         payload_id: AlloyPayloadId,
         use_v5: bool,
+        timeout: Duration,
     ) -> eyre::Result<ExecutionPayloadV3> {
-        (**self).get_payload(payload_id, use_v5).await
+        (**self).get_payload(payload_id, use_v5, timeout).await
     }
 
     async fn new_payload(
@@ -505,9 +549,15 @@ where
         execution_payload: &ExecutionPayloadV3,
         versioned_hashes: Vec<B256>,
         parent_block_hash: BlockHash,
+        timeout: Duration,
     ) -> eyre::Result<PayloadStatus> {
         (**self)
-            .new_payload(execution_payload, versioned_hashes, parent_block_hash)
+            .new_payload(
+                execution_payload,
+                versioned_hashes,
+                parent_block_hash,
+                timeout,
+            )
             .await
     }
 }
@@ -522,9 +572,10 @@ impl EngineAPI for Box<dyn EngineAPI> {
         &self,
         head_block_hash: BlockHash,
         maybe_payload_attributes: Option<PayloadAttributes>,
+        timeout: Duration,
     ) -> eyre::Result<ForkchoiceUpdated> {
         (**self)
-            .forkchoice_updated(head_block_hash, maybe_payload_attributes)
+            .forkchoice_updated(head_block_hash, maybe_payload_attributes, timeout)
             .await
     }
 
@@ -532,8 +583,9 @@ impl EngineAPI for Box<dyn EngineAPI> {
         &self,
         payload_id: AlloyPayloadId,
         use_v5: bool,
+        timeout: Duration,
     ) -> eyre::Result<ExecutionPayloadV3> {
-        (**self).get_payload(payload_id, use_v5).await
+        (**self).get_payload(payload_id, use_v5, timeout).await
     }
 
     async fn new_payload(
@@ -541,9 +593,15 @@ impl EngineAPI for Box<dyn EngineAPI> {
         execution_payload: &ExecutionPayloadV3,
         versioned_hashes: Vec<B256>,
         parent_block_hash: BlockHash,
+        timeout: Duration,
     ) -> eyre::Result<PayloadStatus> {
         (**self)
-            .new_payload(execution_payload, versioned_hashes, parent_block_hash)
+            .new_payload(
+                execution_payload,
+                versioned_hashes,
+                parent_block_hash,
+                timeout,
+            )
             .await
     }
 }
@@ -561,8 +619,8 @@ where
         (**self).get_genesis_block().await
     }
 
-    async fn get_active_validator_set(&self, block_height: u64) -> eyre::Result<ValidatorSet> {
-        (**self).get_active_validator_set(block_height).await
+    async fn get_signing_validator_set(&self, consensus_height: u64) -> eyre::Result<ValidatorSet> {
+        (**self).get_signing_validator_set(consensus_height).await
     }
 
     async fn get_consensus_params(&self, block_height: u64) -> eyre::Result<ConsensusParams> {
@@ -571,14 +629,14 @@ where
 
     async fn get_block_by_number(
         &self,
-        block_number: &str,
+        block_number: BlockNumberOrTag,
     ) -> eyre::Result<Option<ExecutionBlock>> {
         (**self).get_block_by_number(block_number).await
     }
 
     async fn get_execution_payloads(
         &self,
-        block_numbers: &[String],
+        block_numbers: &[BlockNumberOrTag],
     ) -> eyre::Result<Vec<Option<ExecutionPayloadV3>>> {
         (**self).get_execution_payloads(block_numbers).await
     }
@@ -602,8 +660,8 @@ impl EthereumAPI for Box<dyn EthereumAPI> {
         (**self).get_genesis_block().await
     }
 
-    async fn get_active_validator_set(&self, block_height: u64) -> eyre::Result<ValidatorSet> {
-        (**self).get_active_validator_set(block_height).await
+    async fn get_signing_validator_set(&self, consensus_height: u64) -> eyre::Result<ValidatorSet> {
+        (**self).get_signing_validator_set(consensus_height).await
     }
 
     async fn get_consensus_params(&self, block_height: u64) -> eyre::Result<ConsensusParams> {
@@ -612,14 +670,14 @@ impl EthereumAPI for Box<dyn EthereumAPI> {
 
     async fn get_block_by_number(
         &self,
-        block_number: &str,
+        block_number: BlockNumberOrTag,
     ) -> eyre::Result<Option<ExecutionBlock>> {
         (**self).get_block_by_number(block_number).await
     }
 
     async fn get_execution_payloads(
         &self,
-        block_numbers: &[String],
+        block_numbers: &[BlockNumberOrTag],
     ) -> eyre::Result<Vec<Option<ExecutionPayloadV3>>> {
         (**self).get_execution_payloads(block_numbers).await
     }
@@ -680,6 +738,118 @@ mod tests {
     fn test_timestamp_now() {
         let now = Engine::timestamp_now();
         assert!(now > 0);
+    }
+
+    fn test_payload() -> ExecutionPayloadV3 {
+        use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2};
+        ExecutionPayloadV3 {
+            payload_inner: ExecutionPayloadV2 {
+                payload_inner: ExecutionPayloadV1 {
+                    parent_hash: B256::ZERO,
+                    fee_recipient: alloy_primitives::Address::ZERO,
+                    state_root: B256::ZERO,
+                    receipts_root: B256::ZERO,
+                    logs_bloom: alloy_primitives::Bloom::default(),
+                    prev_randao: B256::ZERO,
+                    block_number: 0,
+                    gas_limit: 0,
+                    gas_used: 0,
+                    timestamp: 0,
+                    extra_data: alloy_primitives::Bytes::default(),
+                    base_fee_per_gas: alloy_primitives::U256::from(1u64),
+                    block_hash: B256::ZERO,
+                    transactions: vec![],
+                },
+                withdrawals: vec![],
+            },
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        }
+    }
+
+    fn parent_block() -> ExecutionBlock {
+        ExecutionBlock {
+            block_hash: B256::repeat_byte(0xAA),
+            block_number: 1,
+            parent_hash: B256::ZERO,
+            timestamp: 1000,
+        }
+    }
+
+    /// Mock engine whose FCU/get_payload assert the timeout forwarded by
+    /// `generate_block` against `check`.
+    fn engine_checking_timeouts(check: fn(Duration, Duration)) -> Engine {
+        let parent_hash = parent_block().block_hash;
+        let mut api = MockEngineAPI::new();
+        api.expect_forkchoice_updated()
+            .return_once(move |_, _, timeout| {
+                check(timeout, ENGINE_FORKCHOICE_UPDATED_TIMEOUT);
+                Ok(ForkchoiceUpdated::new(PayloadStatus {
+                    status: PayloadStatusEnum::Valid,
+                    latest_valid_hash: Some(parent_hash),
+                })
+                .with_payload_id(AlloyPayloadId::new([1; 8])))
+            });
+        api.expect_get_payload().return_once(move |_, _, timeout| {
+            check(timeout, ENGINE_GET_PAYLOAD_TIMEOUT);
+            Ok(test_payload())
+        });
+        Engine::new(Box::new(api), Box::new(MockEthereumAPI::new()))
+    }
+
+    #[tokio::test]
+    async fn generate_block_without_deadline_uses_timeout_floors() {
+        let engine = engine_checking_timeouts(|timeout, floor| assert_eq!(timeout, floor));
+        engine
+            .generate_block(
+                &parent_block(),
+                1000,
+                &Address::from(alloy_primitives::Address::ZERO),
+                None,
+            )
+            .await
+            .expect("generate_block should succeed");
+    }
+
+    #[tokio::test]
+    async fn generate_block_with_deadline_extends_timeout_floors() {
+        let engine = engine_checking_timeouts(|timeout, floor| assert!(timeout > floor));
+        let deadline = EngineDeadline::within(Duration::from_secs(60));
+        engine
+            .generate_block(
+                &parent_block(),
+                1000,
+                &Address::from(alloy_primitives::Address::ZERO),
+                Some(deadline),
+            )
+            .await
+            .expect("generate_block should succeed");
+    }
+
+    #[tokio::test]
+    async fn notify_new_block_resolves_timeout_from_deadline() {
+        let mut api = MockEngineAPI::new();
+        api.expect_new_payload()
+            .times(2)
+            .returning(|_, _, _, timeout| {
+                assert!(timeout >= ENGINE_NEW_PAYLOAD_TIMEOUT);
+                Ok(PayloadStatus {
+                    status: PayloadStatusEnum::Valid,
+                    latest_valid_hash: None,
+                })
+            });
+        let engine = Engine::new(Box::new(api), Box::new(MockEthereumAPI::new()));
+
+        engine
+            .notify_new_block(&test_payload(), vec![], None)
+            .await
+            .expect("notify_new_block should succeed");
+
+        let deadline = EngineDeadline::within(Duration::from_secs(60));
+        engine
+            .notify_new_block(&test_payload(), vec![], Some(deadline))
+            .await
+            .expect("notify_new_block should succeed");
     }
 
     #[rstest]

@@ -14,11 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! EIP-7708 hardfork transition e2e tests.
+//! EIP-7708 baseline e2e tests.
 //!
-//! Verifies that EIP-7708 Transfer logs activate correctly at the Zero5 boundary
-//! and that pre-Zero5 blocks emit NativeCoinTransferred logs from
-//! NATIVE_COIN_AUTHORITY_ADDRESS instead.
+//! Verifies that EIP-7708 Transfer logs are emitted even when chain metadata
+//! schedules Zero5 later.
 
 mod helpers;
 
@@ -32,15 +31,12 @@ use arc_execution_e2e::{
     chainspec::localdev_with_hardforks,
     ArcSetup, ArcTestBuilder,
 };
-use helpers::constants::{NATIVE_COIN_AUTHORITY_ADDRESS, SYSTEM_ADDRESS, WALLET_FIRST_ADDRESS};
+use helpers::constants::{SYSTEM_ADDRESS, WALLET_FIRST_ADDRESS};
 use reth_chainspec::ForkCondition;
 
-/// Test #20: Pre-Zero5 value transfer emits NativeCoinTransferred from NativeCoinAuthority.
-///
-/// Verifies exact event format: topic[0] = NativeCoinTransferred signature,
-/// topic[1] = from, topic[2] = to, data = amount.
+/// Test #20: Value transfer emits EIP-7708 Transfer before Zero5 metadata activation.
 #[tokio::test]
-async fn test_pre_zero5_emits_native_coin_transferred() {
+async fn test_baseline_emits_eip7708_before_zero5_metadata_activation() {
     reth_tracing::init_test_tracing();
 
     let chain_spec = localdev_with_hardforks(&[
@@ -66,23 +62,18 @@ async fn test_pre_zero5_emits_native_coin_transferred() {
         .with_action(
             AssertTxLogs::new("transfer")
                 .expect_log_count(1)
-                .expect_emitter_at(0, NATIVE_COIN_AUTHORITY_ADDRESS)
-                // Verify exact NativeCoinTransferred event topics and data
-                .expect_native_coin_transferred_event(0, WALLET_FIRST_ADDRESS, recipient, value),
+                .expect_emitter_at(0, SYSTEM_ADDRESS)
+                .expect_transfer_event(0, WALLET_FIRST_ADDRESS, recipient, value),
         )
         .with_action(AssertTxTrace::new("transfer"))
         .run()
         .await
-        .expect("test_pre_zero5_emits_native_coin_transferred failed");
+        .expect("test_baseline_emits_eip7708_before_zero5_metadata_activation failed");
 }
 
-/// Test #21: Zero5 activation boundary — tx before activation uses old log format,
-/// tx after activation uses EIP-7708 format.
-///
-/// Pre-Zero5 tx emits NativeCoinTransferred with exact topics/data;
-/// post-Zero5 tx emits ERC-20 Transfer with exact topics/data.
+/// Test #21: Zero5 activation metadata does not change the EIP-7708 baseline.
 #[tokio::test]
-async fn test_zero5_activation_boundary() {
+async fn test_zero5_activation_metadata_keeps_eip7708_baseline() {
     reth_tracing::init_test_tracing();
 
     // Zero5 activates at block 3
@@ -111,9 +102,8 @@ async fn test_zero5_activation_boundary() {
         .with_action(
             AssertTxLogs::new("pre_zero5")
                 .expect_log_count(1)
-                .expect_emitter_at(0, NATIVE_COIN_AUTHORITY_ADDRESS)
-                // Exact pre-Zero5 event format
-                .expect_native_coin_transferred_event(0, WALLET_FIRST_ADDRESS, recipient, value),
+                .expect_emitter_at(0, SYSTEM_ADDRESS)
+                .expect_transfer_event(0, WALLET_FIRST_ADDRESS, recipient, value),
         )
         // Produce blocks 2-3 to reach Zero5 activation
         .with_action(ProduceBlocks::new(2))
@@ -137,7 +127,7 @@ async fn test_zero5_activation_boundary() {
         .with_action(AssertTxTrace::new("post_zero5"))
         .run()
         .await
-        .expect("test_zero5_activation_boundary failed");
+        .expect("test_zero5_activation_metadata_keeps_eip7708_baseline failed");
 }
 
 /// Test #22: Post-Zero5 value transfer emits Transfer from SYSTEM_ADDRESS.

@@ -58,7 +58,7 @@ pub struct InvalidTxListConfig {
 impl Default for InvalidTxListConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             capacity: ARC_INVALID_TX_LIST_DEFAULT_CAP,
         }
     }

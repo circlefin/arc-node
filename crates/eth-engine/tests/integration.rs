@@ -32,20 +32,20 @@ use alloy_rpc_types_engine::JwtSecret;
 use reth_node_builder::{NodeBuilder, NodeConfig};
 use reth_tasks::TaskExecutor;
 
+use alloy_rpc_types::BlockNumberOrTag;
 use arc_consensus_types::Address;
 use arc_eth_engine::ipc::engine_ipc::EngineIPC;
 use arc_eth_engine::retry::NoRetry;
 use arc_eth_engine::rpc::EngineApiRpcError;
 use arc_eth_engine::{engine::Engine, rpc::engine_rpc::EngineRpc};
 use arc_evm_node::node::{ArcNode, ArcRpcConfig};
-use arc_evm_node::ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT;
 use arc_execution_config::addresses_denylist::AddressesDenylistConfig;
 use arc_execution_config::chainspec::ArcChainSpec;
 use arc_execution_config::chainspec::LOCAL_DEV;
 use arc_execution_txpool::InvalidTxListConfig;
 
 /// Common test suite for engine implementations
-async fn test_engine_common(engine: &Engine, initial_block_number: &str) {
+async fn test_engine_common(engine: &Engine, initial_block_number: BlockNumberOrTag) {
     // Test getting chain ID
     let chain_id = engine
         .eth
@@ -73,12 +73,12 @@ async fn test_engine_common(engine: &Engine, initial_block_number: &str) {
         .expect("Failed to get block");
     assert!(block.is_some(), "Block should exist");
 
-    // Test get active validator set
+    // Test get signing validator set (queries contract at consensus_height - 1 = 0)
     let validator_set = engine
         .eth
-        .get_active_validator_set(0)
+        .get_signing_validator_set(1)
         .await
-        .expect("Failed to get active validator set");
+        .expect("Failed to get signing validator set");
     assert!(
         !validator_set.validators.is_empty(),
         "Validator set should not be empty"
@@ -106,14 +106,19 @@ async fn test_engine_common(engine: &Engine, initial_block_number: &str) {
     // Test generate new block
     let fee_recipient = Address::repeat_byte(0xBE);
     let block = engine
-        .generate_block(&block.unwrap(), Engine::timestamp_now() + 1, &fee_recipient)
+        .generate_block(
+            &block.unwrap(),
+            Engine::timestamp_now() + 1,
+            &fee_recipient,
+            None,
+        )
         .await
         .expect("Failed to generate new block");
     assert!(block.payload_inner.payload_inner.block_hash.len() == 32);
 
     // Test notify new block
     let status = engine
-        .notify_new_block(&block, Vec::new())
+        .notify_new_block(&block, Vec::new(), None)
         .await
         .expect("Failed to notify new block");
     assert!(
@@ -160,9 +165,7 @@ async fn test_engine() {
         None,
         true,
         true,
-        false,
         160 * 1024 * 1024,
-        ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
         std::time::Duration::from_secs(0), // disable rebroadcast in integration tests
     );
     let node_handle = NodeBuilder::new(node_config)
@@ -209,7 +212,7 @@ async fn test_engine() {
         assert!(txpool_inspect.queued.is_empty());
 
         // Run common engine tests
-        test_engine_common(&engine, "0x0").await;
+        test_engine_common(&engine, BlockNumberOrTag::Number(0)).await;
 
         // Test IPC error handling
         let ipc_client =
@@ -247,7 +250,7 @@ async fn test_engine() {
         engine.set_osaka_from_chain_id(1337);
 
         // Run common engine tests
-        test_engine_common(&engine, "latest").await;
+        test_engine_common(&engine, BlockNumberOrTag::Latest).await;
 
         // Test RPC error handling
         let rpc_client = EngineRpc::new(

@@ -3,10 +3,16 @@
 Inspired by [`reth-bench`](https://github.com/paradigmxyz/reth/tree/main/bin/reth-bench) from the
 upstream Reth project.
 
-`arc-engine-bench` replays historical blocks into an Arc execution node and measures Engine API import
-latency. The current benchmark mode, `new-payload-fcu`, submits each block with
-`engine_newPayloadV4`, follows it with `engine_forkchoiceUpdatedV3`, and writes CSV artifacts for
-per-block latency and aggregate throughput.
+`arc-engine-bench` drives the Arc execution node over the Engine API and measures latency. Two
+benchmark modes:
+
+- `new-payload-fcu` exercises the block-import path: it submits each recorded block with
+  `engine_newPayloadV4`, follows it with `engine_forkchoiceUpdatedV3`, and writes CSV artifacts for
+  per-block latency and aggregate throughput.
+- `build-payload` exercises the block-building path: per recorded block it injects the recorded
+  transactions, starts a build with `engine_forkchoiceUpdatedV3`-with-attributes, waits a fixed
+  window, times `engine_getPayloadV5`/`V4`, then advances the chain on the recorded block. This is
+  the mode that benchmarks the reth payload-builder flags.
 
 ## CLI
 
@@ -14,6 +20,7 @@ per-block latency and aggregate throughput.
 | --- | --- |
 | `arc-engine-bench prepare-payload` | Fetches a contiguous source block range and writes a local payload fixture directory with `genesis.json`, `metadata.json`, and `payloads.jsonl`. |
 | `arc-engine-bench new-payload-fcu` | Replays a prepared payload fixture into a target execution node with `engine_newPayloadV4` followed by `engine_forkchoiceUpdatedV3`. |
+| `arc-engine-bench build-payload` | Drives the payload-builder path: inject recorded txs, `engine_forkchoiceUpdatedV3`-with-attributes, wait the build window, time `engine_getPayload`, then advance on the recorded block. |
 
 ## What You Need
 
@@ -177,6 +184,56 @@ Other flags:
 - `--eth-rpc-timeout-ms <MILLISECONDS>` sets the timeout for target Ethereum RPC requests. The
   default is `10000` ms.
 
+## Run `build-payload`
+
+`build-payload` reuses the same fixture as `new-payload-fcu`. For each recorded block `N`, with the
+target head at `N-1`, it:
+
+1. injects block `N`'s recorded transactions into the target mempool via `eth_sendRawTransaction`;
+2. sends `engine_forkchoiceUpdatedV3` with payload attributes (recorded timestamp, prev_randao, and
+   fee recipient) to start a build;
+3. waits a fixed build window (`--build-window-ms`);
+4. calls `engine_getPayloadV5`/`V4` and times it (the headline metric);
+5. commits the **recorded** block `N` via `engine_newPayloadV4` + `engine_forkchoiceUpdatedV3` to
+   advance the chain deterministically along real history.
+
+The built block from step 4 is discarded; only its metrics are kept. The chain advances on the
+recorded block, so state stays on real history and is identical across flag variants. This is the
+determinism guarantee and a free correctness anchor.
+
+**IPC transport:**
+
+```bash
+arc-engine-bench build-payload \
+  --engine-ipc "$ENGINE_IPC" \
+  --target-eth-rpc-url "$TARGET_ETH_RPC_URL" \
+  --payload "$PAYLOAD_DIR" \
+  --build-window-ms 200
+```
+
+Other flags:
+
+- `--build-window-ms <MILLISECONDS>` is the wait between `forkchoiceUpdated`-with-attributes and
+  `getPayload`. Hold it constant across variants. It should be at or below the production
+  block-build deadline. The default is `200`.
+- `--get-payload-version <auto|v5|v4>` selects the `getPayload` version. `auto` (default) tries V5
+  (Osaka) and falls back to V4. Pass `v4` explicitly if the auto fallback misfires on your target.
+- `--disallow-tx-rejections` makes the run bail when `eth_sendRawTransaction` rejects a tx. By
+  default rejections are tolerated (logged and counted in `txs_rejected`), since recorded txs are
+  routinely rejected (already-known, base-fee too low, nonce gap).
+- `--output <DIR>` and `--eth-rpc-timeout-ms <MILLISECONDS>` behave as in `new-payload-fcu`.
+
+### Benchmarking payload-builder flags
+
+`build-payload` exists to measure the reth v2.2.0 payload-builder flags
+(`--engine.share-execution-cache-with-payload-builder`,
+`--engine.share-sparse-trie-with-payload-builder`, `--engine.suppress-persistence-during-build`).
+Toggle a flag on the target node, hold `--build-window-ms` constant across runs, and compare
+`get_payload_ms`. The state-root timing the flags affect is internal to the node and not observable
+over the Engine API; source it from the node's slow-block log
+(`--engine.slow-block-threshold 0` makes every block emit a detailed timing line) and correlate by
+block number during analysis. It is intentionally not a CSV column.
+
 ## Live Metrics
 
 From the repo root, start the monitoring stack:
@@ -197,5 +254,7 @@ Each run writes to `target/engine-bench/<mode>-<YYYYMMDDTHHMMSSZ>/` unless you p
 
 | File | Content |
 | --- | --- |
-| `combined_latency.csv` | One row per replayed block with block metadata, `new_payload_ms`, `fcu_ms`, `total_ms`, per-block throughput, and cumulative throughput. |
-| `summary.csv` | One-row summary with sample count, total gas and txs, wall-clock time, average throughput, and latency percentiles. |
+| `combined_latency.csv` | (`new-payload-fcu`) One row per replayed block with block metadata, `new_payload_ms`, `fcu_ms`, `total_ms`, per-block throughput, and cumulative throughput. |
+| `summary.csv` | (`new-payload-fcu`) One-row summary with sample count, total gas and txs, wall-clock time, average throughput, and latency percentiles. |
+| `combined_build_latency.csv` | (`build-payload`) One row per block with recorded vs built gas/tx counts, `fcu_attrs_ms`, `get_payload_ms` (headline), `gas_fill_ratio` (built/recorded gas, the build-quality cross-check), and `txs_rejected`. |
+| `build_summary.csv` | (`build-payload`) One-row summary with sample count, build window, total/average built gas and txs, wall-clock time, `get_payload_ms` and `fcu_attrs_ms` percentiles, and average `gas_fill_ratio`. |

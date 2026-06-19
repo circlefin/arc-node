@@ -301,8 +301,7 @@ mod integration_tests {
         let result = RemoteSignerClient::new(config).await;
 
         // With lazy connection, client creation may succeed but operations will fail
-        if result.is_ok() {
-            let client = result.unwrap();
+        if let Ok(client) = result {
             // Try to get public key - this should fail
             let public_key_result = client.get_public_key().await;
             assert!(
@@ -380,8 +379,7 @@ mod integration_tests {
         let result = RemoteSignerClient::new(config).await;
 
         // With lazy connection, client creation may succeed but operations will fail
-        if result.is_ok() {
-            let client = result.unwrap();
+        if let Ok(client) = result {
             // Try to sign a message - this should fail with retry exhaustion
             let sign_result = client.sign_message(b"test").await;
             assert!(

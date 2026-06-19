@@ -15,6 +15,7 @@ path = "src/main.rs"
 alloy-genesis = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-rpc-types-engine = { workspace = true, features = ["jwt", "serde"] }
+alloy-rpc-types-eth = { workspace = true }
 arc-eth-engine = { workspace = true }
 arc-execution-config = { workspace = true }
 arc-version = { workspace = true }
@@ -23,7 +24,7 @@ clap = { workspace = true, features = ["derive", "env"] }
 color-eyre = { workspace = true }
 csv = { workspace = true }
 eyre = { workspace = true }
-reqwest = { workspace = true, features = ["json", "rustls-tls", "native-tls-vendored"] }
+reqwest = { workspace = true, features = ["json", "rustls", "native-tls-vendored"] }
 reth-cli = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

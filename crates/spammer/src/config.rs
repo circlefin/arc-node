@@ -18,9 +18,10 @@ use std::path::PathBuf;
 
 use crate::accounts::PartitionMode;
 use color_eyre::eyre::{self, Result};
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GuzzlerFunction {
     #[default]
     HashLoop,
@@ -30,13 +31,13 @@ pub enum GuzzlerFunction {
     Guzzle2,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuzzlerFnConfig {
     pub weight: u32,
     pub arg: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuzzlerFnWeights {
     pub hash_loop: GuzzlerFnConfig,
     pub storage_write: GuzzlerFnConfig,
@@ -145,7 +146,7 @@ impl FromStr for GuzzlerFnWeights {
 }
 
 /// ERC-20 function the spammer can call.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Erc20Function {
     #[default]
     Transfer,
@@ -158,7 +159,7 @@ pub enum Erc20Function {
 /// Parsed from a comma-separated string such as `transfer=70,approve=20,transfer-from=10`.
 /// Weights are ratios. When all weights are 0 (the default), the generator
 /// defaults to 100% transfer for backward compatibility.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Erc20FnWeights {
     pub transfer: u32,
     pub approve: u32,
@@ -214,7 +215,7 @@ impl FromStr for Erc20FnWeights {
 }
 
 /// Transaction type the spammer can generate.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum TxType {
     /// Native USDC value transfer between prefunded accounts (EIP-1559, Type 2).
     #[default]
@@ -232,7 +233,7 @@ pub enum TxType {
 /// Parsed from a comma-separated string such as `transfer=70,erc20=20,guzzler=10`.
 /// Weights are ratios, not percentages, so `transfer=2,erc20=1` produces ~67% transfers
 /// and ~33% ERC-20 calls.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxTypeMix {
     pub transfer: u32,
     pub legacy: u32,

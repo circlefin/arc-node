@@ -48,7 +48,6 @@
 ///                 ADDRESS,
 ///                 KEY,
 ///                 &mut gas_counter,
-///                 hardfork_flags,
 ///             )?;
 ///             let new_value = U256::from_be_slice(&output) + U256::from(1);
 ///
@@ -58,7 +57,6 @@
 ///                 KEY,
 ///                 &new_value.to_be_bytes_vec(),
 ///                 &mut gas_counter,
-///                 hardfork_flags,
 ///             )?;
 ///
 ///             Ok(PrecompileOutput::new(gas_counter.used(), new_value.abi_encode().into()))
@@ -74,7 +72,6 @@
 ///                 ADDRESS,
 ///                 KEY,
 ///                 &mut gas_counter,
-///                 hardfork_flags,
 ///             )?;
 ///
 ///             Ok(PrecompileOutput::new(gas_counter.used(), output))
@@ -89,7 +86,7 @@
 /// - Conversion of `PrecompileErrorOrRevert` into the final `Result`
 ///
 /// ABI decoding, gas accounting, and output encoding remain the arm body's job; use
-/// `helpers::abi_decode_raw_with_zero6_validation` on the supplied calldata bytes when
+/// `helpers::abi_decode_raw_validated` on the supplied calldata bytes when
 /// you need the decoded arguments.
 #[macro_export]
 macro_rules! precompile {
@@ -103,11 +100,12 @@ macro_rules! precompile {
             $hardfork_flags: arc_execution_config::hardforks::ArcHardforkFlags,
         ) -> Result<reth_ethereum::evm::revm::precompile::PrecompileOutput, reth_ethereum::evm::revm::precompile::PrecompileError> {
             let input_bytes = $precompile_input.data;
+            let reservoir = $precompile_input.reservoir;
             let gas_counter = revm_interpreter::Gas::new($precompile_input.gas);
 
             if input_bytes.len() < 4 {
                 return $crate::helpers::PrecompileErrorOrRevert::new_reverted_with_penalty(
-                    gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, "Input too short").into();
+                    gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, "Input too short").into();
             }
 
             let selector: [u8; 4] = input_bytes[0..4].try_into().unwrap();
@@ -121,7 +119,7 @@ macro_rules! precompile {
                 ),*
                 _ => {
                     return $crate::helpers::PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, "Invalid selector").into();
+                        gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, "Invalid selector").into();
                 },
             };
 

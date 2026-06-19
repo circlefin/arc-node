@@ -483,6 +483,13 @@ impl App {
                 NetworkIdentity::new(identity.moniker.clone(), identity.p2p.keypair.clone(), None)
             };
 
+            #[cfg(feature = "byzantine")]
+            if let Some(byz_cfg) = self.config.byzantine.clone().filter(|c| c.is_active()) {
+                return self
+                    .start_byzantine_engine(ctx, identity, network_identity, wal_path, byz_cfg)
+                    .await;
+            }
+
             let (channels, engine_handle) = malachitebft_app_channel::start_engine(
                 ctx,
                 self.config.clone(),
@@ -499,10 +506,84 @@ impl App {
         }
     }
 
+    /// Start the consensus engine with Byzantine behavior enabled.
+    ///
+    /// Uses the `with_byzantine_network` builder method on `app-channel` to
+    /// spawn the real network actor and wrap it with a `ByzantineNetworkProxy`
+    /// that intercepts votes and proposals per [`ByzantineConfig`]. State-
+    /// machine-layer attacks (`ignore_locks`, `force_precommit_nil`) are
+    /// handled inside `ArcContext::new_prevote` / `new_precommit` when
+    /// `ArcContext.byzantine` is set.
+    #[cfg(feature = "byzantine")]
+    async fn start_byzantine_engine(
+        &self,
+        ctx: ArcContext,
+        identity: NodeIdentity,
+        network_identity: NetworkIdentity,
+        wal_path: std::path::PathBuf,
+        byz_cfg: arc_consensus_types::config::ByzantineConfig,
+    ) -> eyre::Result<(Channels<ArcContext>, EngineHandle)> {
+        use arc_consensus_types::{Value, ValueId};
+        use malachitebft_app_channel::{ByzantineContext, EngineBuilder};
+
+        warn!(
+            ?byz_cfg,
+            "BYZANTINE: Starting node with Byzantine behavior enabled"
+        );
+
+        let address = identity.consensus.address();
+        let signing_provider = identity.consensus.signing_provider().clone();
+
+        // Conflicting value factory: flip the last byte of the block hash.
+        let conflicting_value_fn: malachitebft_engine_byzantine::ConflictingValueFn<ArcContext> =
+            Box::new(|original: &Value| {
+                let mut hash = original.id().block_hash();
+                let bytes = hash.as_mut_slice();
+                bytes[31] ^= 0xFF;
+                Value::new(hash)
+            });
+
+        // Conflicting vote value factory: flip the last byte of the id bytes;
+        // nil votes are replaced with a zero id that still differs after flip.
+        let conflicting_vote_value_fn: malachitebft_engine_byzantine::ConflictingVoteValueFn<
+            ArcContext,
+        > = Box::new(|original: Option<&ValueId>| match original {
+            Some(id) => {
+                let mut hash = id.block_hash();
+                let bytes = hash.as_mut_slice();
+                bytes[31] ^= 0xFF;
+                ValueId::new(hash)
+            }
+            None => ValueId::new(Default::default()),
+        });
+
+        let (channels, engine_handle) = EngineBuilder::new(ctx, self.config.clone())
+            .with_default_wal(WalContext::new(wal_path, WalCodec))
+            .with_byzantine_network(ByzantineContext {
+                identity: network_identity,
+                codec: NetCodec,
+                config: byz_cfg,
+                signer: Box::new(signing_provider),
+                address,
+                conflicting_value_fn: Some(conflicting_value_fn),
+                conflicting_vote_value_fn: Some(conflicting_vote_value_fn),
+            })
+            .await
+            .wrap_err("Failed to install Byzantine network proxy")?
+            .with_default_consensus(ConsensusContext::from(identity.consensus))
+            .with_default_sync(SyncContext::new(NetCodec))
+            .with_default_request(RequestContext::new(CONSENSUS_REQUEST_CHANNEL_SIZE))
+            .build()
+            .await
+            .wrap_err("Failed to start Byzantine consensus engine")?;
+
+        Ok((channels, engine_handle))
+    }
+
     /// Create a NetworkIdentity with a signed validator proof.
     ///
     /// The validator proof binds the consensus public key to the libp2p peer ID,
-    /// proving that the validator controls both keys.
+    /// proving that the validator controls both keys (ADR-006).
     async fn create_network_identity_with_proof(
         &self,
         identity: &NodeIdentity,
@@ -566,6 +647,7 @@ impl App {
     fn start_rpc_server(
         &self,
         channels: &Channels<ArcContext>,
+        metrics: AppMetrics,
     ) -> (
         mpsc::Sender<AppRequest>,
         mpsc::Receiver<AppRequest>,
@@ -578,11 +660,13 @@ impl App {
                 let listen_addr = self.config.rpc.listen_addr;
                 let request_handle = channels.requests.clone();
                 let net_request_handle = channels.net_requests.clone();
-                crate::rpc::serve(
+                let metrics = metrics.clone();
+                crate::rpc::serve_with_metrics(
                     listen_addr,
                     request_handle,
                     tx_rpc_req.clone(),
                     net_request_handle,
+                    metrics,
                 )
             });
             Some(join_handle)
@@ -634,8 +718,6 @@ impl App {
 
     #[tracing::instrument(name = "node", skip_all, fields(moniker = %self.config.moniker))]
     pub async fn start(&mut self) -> eyre::Result<Handle> {
-        let ctx = ArcContext::new();
-
         // Read environment-based configuration once at startup
         let env_config = EnvConfig::from_env();
 
@@ -689,8 +771,35 @@ impl App {
             "Resolved chain identity from execution engine"
         );
 
+        // Build the consensus context. When the byzantine feature is enabled
+        // and the config opts in, attach a `ByzantineState` bundle so
+        // `ArcContext::new_prevote` / `new_precommit` can intercept votes.
+        #[cfg(feature = "byzantine")]
+        let ctx = {
+            let ctx = ArcContext::new();
+            match self.config.byzantine.as_ref() {
+                Some(byz) => {
+                    use arc_consensus_types::context::ByzantineState;
+                    use std::sync::Arc;
+                    let state = Arc::new(ByzantineState::new(
+                        byz.ignore_locks.clone(),
+                        byz.force_precommit_nil.clone(),
+                        identity.consensus.address(),
+                        byz.seed,
+                    ));
+                    ctx.with_byzantine(state)
+                }
+                None => ctx,
+            }
+        };
+        #[cfg(not(feature = "byzantine"))]
+        let ctx = ArcContext::new();
+
         // Initialize the application state with the resolved spec and genesis block
-        let mut state = State::builder(ctx)
+        // NOTE: ArcContext is not always Copy, depending on whether
+        // `byzantine` feature is enabled, so we clone it here to avoid a conditional compilation warning.
+        #[allow(clippy::redundant_clone)]
+        let mut state = State::builder(ctx.clone())
             .identity(identity.consensus.clone())
             .store(store.clone())
             .config(self.config.clone())
@@ -710,7 +819,8 @@ impl App {
         let (channels, engine_handle) = self.start_consensus_engine(ctx, identity).await?;
 
         // Start the application RPC server
-        let (tx_app_req, rx_app_req, rpc_handle) = self.start_rpc_server(&channels);
+        let (tx_app_req, rx_app_req, rpc_handle) =
+            self.start_rpc_server(&channels, state.metrics().clone());
 
         let tx_event = channels.events.clone();
         let cancel_token = CancellationToken::new();

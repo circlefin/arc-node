@@ -25,8 +25,9 @@ use serde_json::json;
 use malachitebft_app_channel::ConsensusRequest;
 use malachitebft_app_channel::NetworkRequest;
 
-use crate::request::AppRequest;
+use crate::metrics::AppMetrics;
 use crate::request::TxAppReq;
+use crate::request::{AppRequest, AppRequestError};
 use crate::rpc::types::persistent_peer_error_to_response;
 use crate::rpc::types::request_error_to_response;
 use crate::rpc::types::RpcVersion;
@@ -72,14 +73,20 @@ pub(crate) async fn get_network_state(
 }
 
 pub(crate) async fn get_commit(
+    metrics: State<AppMetrics>,
     tx_app_req: State<TxAppReq>,
     query: Query<GetCertificateParams>,
     Extension(version): Extension<ApiVersion>,
 ) -> impl IntoResponse {
+    let _guard = metrics.start_rpc_request_timer("/commit");
     tracing::debug!(?version, "get_commit called");
 
-    AppRequest::get_certificate(query.height, &tx_app_req)
-        .await
+    let result = AppRequest::get_certificate(query.height, &tx_app_req).await;
+    if matches!(result, Err(AppRequestError::Full)) {
+        metrics.inc_app_request_full_count("GetCertificate");
+    }
+
+    result
         .map_err(request_error_to_response)?
         .map(|cert| Json(RpcCommitCertificate::from(cert)))
         .ok_or_else(|| {

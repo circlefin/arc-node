@@ -19,8 +19,8 @@
 //! Tests that the EIP-2935 system call persists parent block hashes in the
 //! history storage contract at `0x0000F90827F1C53a10cb7A02335B175320002935`.
 //!
-//! The system call runs at the start of each block (Zero5+), storing
-//! `parent_hash` in a ring buffer of size 8191.
+//! The system call runs at the start of each block, storing `parent_hash` in a
+//! ring buffer of size 8191.
 
 use alloy_primitives::{address, Address, Bytes};
 use arc_execution_config::hardforks::ArcHardfork;
@@ -92,16 +92,14 @@ async fn test_block_hash_history_returns_zero_for_future_block() -> Result<()> {
         .await
 }
 
-/// Crossing the Zero5 activation boundary: hashes must start being written at the
-/// activation block and not before.
+/// Block-hash history writes use the baseline behavior even before Zero5
+/// metadata activation.
 ///
 /// Chain spec: Zero5 activates at block 3.
-/// - Produce blocks 1-2: pre-Zero5, no entries written.
-/// - Produce blocks 3-4: Zero5 active, system call runs.
-/// - Assert: slot for block 1 is zero (pre-activation, no system call wrote there).
-/// - Assert: contract has an entry for block 3 (first Zero5 block).
+/// - Produce blocks 1-4.
+/// - Assert: contract has an entry for block 1 and block 3.
 #[tokio::test]
-async fn test_block_hash_history_starts_at_zero5_activation() -> Result<()> {
+async fn test_block_hash_history_writes_before_zero5_metadata_activation() -> Result<()> {
     reth_tracing::init_test_tracing();
 
     let chain_spec = localdev_with_hardforks(&[
@@ -115,14 +113,12 @@ async fn test_block_hash_history_starts_at_zero5_activation() -> Result<()> {
         .with_setup(ArcSetup::new().with_chain_spec(chain_spec))
         .with_action(ProduceBlocks::new(4))
         .with_action(AssertBlockNumber::new(4))
-        // Block 1 is pre-Zero5 — no system call wrote to slot 1, expect zero.
         .with_action(
-            CallContract::new("block_hash_history_pre_activation")
+            CallContract::new("block_hash_history_before_metadata_activation")
                 .to(HISTORY_STORAGE_ADDRESS)
                 .with_data(block_number_calldata(1))
-                .expect_result(Bytes::from([0u8; 32])),
+                .expect_non_zero_result(),
         )
-        // Block 3 is the first Zero5 block — system call ran, expect non-zero.
         .with_action(
             CallContract::new("block_hash_history_at_activation")
                 .to(HISTORY_STORAGE_ADDRESS)

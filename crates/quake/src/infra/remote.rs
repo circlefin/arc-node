@@ -527,82 +527,6 @@ impl RemoteInfra {
         )
     }
 
-    /// Download Prometheus metrics from CC via the query_range REST API.
-    ///
-    /// Runs `download-metrics.sh` on CC, then SCPs the resulting archive to `local_dest`.
-    /// `metric_names` filters which metrics are fetched; empty means all.
-    /// `from`/`to` are Unix timestamps; when omitted the script defaults to epoch→now.
-    pub fn download_metrics(
-        &self,
-        metric_names: &[String],
-        from: Option<i64>,
-        to: Option<i64>,
-        step: Option<&str>,
-        local_dest: &Path,
-    ) -> Result<()> {
-        let mut cmd = String::from("./download-metrics.sh");
-        if let Some(start) = from {
-            cmd.push_str(&format!(" -s {start}"));
-        }
-        if let Some(end) = to {
-            cmd.push_str(&format!(" -e {end}"));
-        }
-        if let Some(s) = step {
-            cmd.push_str(&format!(" -t {s}"));
-        }
-        for name in metric_names {
-            if !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
-            {
-                return Err(color_eyre::eyre::eyre!(
-                    "Invalid metric name '{name}': must match [a-zA-Z0-9_:]+"
-                ));
-            }
-            cmd.push_str(&format!(" {name}"));
-        }
-
-        info!("📊 Querying Prometheus metrics on CC...");
-        let output = self
-            .ssh_cc_with_output(&cmd)
-            .wrap_err("Failed to collect metrics on CC")?;
-        let last_line = output.lines().last().unwrap_or_default().trim();
-        let result: serde_json::Value = serde_json::from_str(last_line)
-            .wrap_err("Failed to parse download-metrics.sh output")?;
-        let archive = result["archive"]
-            .as_str()
-            .ok_or_else(|| eyre!("missing 'archive' field in download-metrics.sh output"))?;
-        if archive.is_empty() {
-            let errors = result["errors"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|e| e.as_str())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-                .unwrap_or_default();
-            return Err(eyre!("download-metrics.sh failed: {errors}"));
-        }
-        if let Some(errors) = result["errors"].as_array() {
-            for err in errors {
-                warn!("metric query failed: {}", err.as_str().unwrap_or("unknown"));
-            }
-        }
-
-        let local_dest_abs = self.abs_local_path(local_dest);
-        info!("⬇️  Downloading metrics archive...");
-        self.scp_from_cc(archive, &local_dest_abs)
-            .wrap_err("Failed to download metrics archive")?;
-
-        if let Err(err) = self.ssh_cc_with_output(&format!("rm ~/{archive}")) {
-            warn!("⚠️ Failed to clean up temp archive on CC: {err:#}");
-        }
-
-        info!(path=%local_dest_abs.display(), "✅ Metrics downloaded");
-        Ok(())
-    }
-
     /// Download node databases from one or more nodes via CC.
     ///
     /// Runs `download-db.sh` on CC, which archives each node's data in parallel and
@@ -662,6 +586,10 @@ impl RemoteInfra {
         }
 
         let local_dest_abs = self.abs_local_path(local_dest);
+        if let Some(parent) = local_dest_abs.parent() {
+            std::fs::create_dir_all(parent)
+                .wrap_err_with(|| format!("create output dir {}", parent.display()))?;
+        }
         info!("⬇️  Downloading db archive...");
         self.scp_from_cc(archive, &local_dest_abs)
             .wrap_err("Failed to download db archive")?;

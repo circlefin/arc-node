@@ -224,6 +224,10 @@ pub struct RawManifest {
     node_volume_type: Option<String>,
     /// Provisioned IOPS for the node root EBS volume (remote only).
     node_volume_iops: Option<u32>,
+    /// Place the node data directory on local instance-store NVMe instead of the root EBS
+    /// volume (remote only). Requires an instance type with local NVMe; a no-op otherwise.
+    #[serde(skip_serializing_if = "is_default")]
+    node_data_on_instance_store: bool,
     /// CPU limit for the EL container (Docker `cpus`). Whole or fractional CPUs.
     el_cpu_limit: Option<f64>,
     /// Memory limit for the EL container, in GiB. Fractional values are allowed.
@@ -273,6 +277,7 @@ impl Default for RawManifest {
             block_gas_limit: None,
             node_volume_type: None,
             node_volume_iops: None,
+            node_data_on_instance_store: false,
             el_cpu_limit: None,
             el_memory_limit_gb: None,
             cl_cpu_limit: None,
@@ -478,6 +483,7 @@ impl TryFrom<RawManifest> for Manifest {
             block_gas_limit: raw.block_gas_limit,
             node_volume_type: raw.node_volume_type,
             node_volume_iops: raw.node_volume_iops,
+            node_data_on_instance_store: raw.node_data_on_instance_store,
             el_cpu_limit: raw.el_cpu_limit,
             el_memory_limit_gb: raw.el_memory_limit_gb,
             cl_cpu_limit: raw.cl_cpu_limit,
@@ -530,6 +536,7 @@ impl TryFrom<Manifest> for RawManifest {
             block_gas_limit: manifest.block_gas_limit,
             node_volume_type: manifest.node_volume_type,
             node_volume_iops: manifest.node_volume_iops,
+            node_data_on_instance_store: manifest.node_data_on_instance_store,
             el_cpu_limit: manifest.el_cpu_limit,
             el_memory_limit_gb: manifest.el_memory_limit_gb,
             cl_cpu_limit: manifest.cl_cpu_limit,
@@ -945,5 +952,31 @@ rpc_max_size = "42 Mib"
             serialized,
             "[nodes.val0.cl.config]\nlog_level = \"info\"\n\n[nodes.val0.el.config.txpool]\npending_max_count = 2\n\n[nodes.val1]\n"
         );
+    }
+
+    /// node_data_on_instance_store round-trips through TOML → Manifest → RawManifest → TOML.
+    #[test]
+    fn test_node_data_on_instance_store_roundtrip() {
+        let toml = r#"
+        node_data_on_instance_store = true
+        [nodes.val1]
+        "#;
+
+        let manifest1 = Manifest::from_string(toml).unwrap();
+        assert!(manifest1.node_data_on_instance_store);
+
+        let raw = RawManifest::try_from(manifest1).unwrap();
+        let serialized = toml::to_string(&raw).unwrap();
+        assert!(serialized.contains("node_data_on_instance_store = true"));
+
+        let manifest2 = Manifest::from_string(&serialized).unwrap();
+        assert!(manifest2.node_data_on_instance_store);
+    }
+
+    /// Omitting node_data_on_instance_store defaults to false (datadir stays on root EBS).
+    #[test]
+    fn test_node_data_on_instance_store_defaults_to_false() {
+        let manifest = Manifest::from_string("[nodes.val1]\n").unwrap();
+        assert!(!manifest.node_data_on_instance_store);
     }
 }

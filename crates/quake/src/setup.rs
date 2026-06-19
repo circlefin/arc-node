@@ -658,6 +658,10 @@ fn generate_legacy_consensus_config(
         } else {
             SigningConfig::Local
         },
+        // Byzantine behavior is only set by scenarios that opt in; left None
+        // for the default quake setup.
+        #[cfg(feature = "byzantine")]
+        byzantine: None,
     };
 
     Ok(config)
@@ -977,9 +981,18 @@ mod helpers {
         }
     });
 
+    // Escape a string for safe inclusion inside a YAML double-quoted scalar.
+    // Required for CLI flag values that may contain `"` (e.g. --byzantine=<JSON>).
+    // Only escapes `\` and `"`. Literal control characters (newlines, tabs) are
+    // not escaped; callers are expected to pass single-line flag values (which
+    // serde_json::to_string already guarantees by encoding control chars as
+    // `\n`, `\t`, etc. within JSON strings).
+    handlebars_helper!(yaml_dq_escape: |s: str| s.replace('\\', "\\\\").replace('"', "\\\""));
+
     pub fn register(handlebars: &mut Handlebars) {
         handlebars.register_helper("inc", Box::new(inc));
         handlebars.register_helper("default", Box::new(default));
+        handlebars.register_helper("yaml_dq_escape", Box::new(yaml_dq_escape));
     }
 }
 

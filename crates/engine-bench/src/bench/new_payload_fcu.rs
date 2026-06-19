@@ -24,7 +24,11 @@ use super::{
     },
 };
 use crate::cli::NewPayloadFcuArgs;
-use arc_eth_engine::{json_structures::ExecutionBlock, rpc::ethereum_rpc::EthereumRPC};
+use alloy_rpc_types_eth::BlockNumberOrTag;
+use arc_eth_engine::{
+    json_structures::ExecutionBlock, rpc::ethereum_rpc::EthereumRPC,
+    ENGINE_FORKCHOICE_UPDATED_TIMEOUT, ENGINE_NEW_PAYLOAD_TIMEOUT,
+};
 use eyre::{bail, Context};
 use std::time::Instant;
 use tracing::info;
@@ -69,7 +73,12 @@ pub async fn run(args: NewPayloadFcuArgs) -> eyre::Result<()> {
 
         let start = Instant::now();
         let status = engine
-            .new_payload(&payload, Vec::new(), parent_hash)
+            .new_payload(
+                &payload,
+                Vec::new(),
+                parent_hash,
+                ENGINE_NEW_PAYLOAD_TIMEOUT,
+            )
             .await
             .wrap_err_with(|| format!("engine_newPayloadV4 failed for block {block_number}"))?;
         let new_payload_latency = start.elapsed();
@@ -79,7 +88,7 @@ pub async fn run(args: NewPayloadFcuArgs) -> eyre::Result<()> {
         }
 
         let fcu_result = engine
-            .forkchoice_updated(block_hash, None)
+            .forkchoice_updated(block_hash, None, ENGINE_FORKCHOICE_UPDATED_TIMEOUT)
             .await
             .wrap_err_with(|| {
                 format!("engine_forkchoiceUpdatedV3 failed for block {block_number}")
@@ -132,12 +141,12 @@ pub async fn run(args: NewPayloadFcuArgs) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn verify_target_start_state(
+pub(crate) async fn verify_target_start_state(
     target_rpc: &EthereumRPC,
     metadata: &PayloadFixtureMetadata,
 ) -> eyre::Result<()> {
     let target_latest_block = target_rpc
-        .get_block_by_number("latest")
+        .get_block_by_number(BlockNumberOrTag::Latest)
         .await
         .wrap_err("failed to fetch latest block from target node")?
         .ok_or_else(|| eyre::eyre!("latest block not found on target node"))?;

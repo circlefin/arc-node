@@ -29,9 +29,7 @@ use arc_execution_validation::ArcConsensus;
 use reth_chainspec::{EthereumHardforks, Hardforks};
 use reth_engine_primitives::EngineTypes;
 use reth_ethereum::{node::EthEngineTypes, node::EthEvmConfig};
-use reth_ethereum_engine_primitives::{
-    EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
-};
+use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadAttributes};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
 use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, PeersInfo};
@@ -82,7 +80,7 @@ use arc_execution_txpool::{ArcPoolBuilder, InvalidTxList, InvalidTxListConfig};
 // FIXME use the ethereum chain spec temporary, we need to define Arc chain spec
 // original traits for ChainSpec in this file `Hardforks + EthereumHardforks + EthExecutorSpec`
 
-use crate::rpc_middleware::{ArcRpcLayer, ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT};
+use crate::rpc_middleware::ArcRpcLayer;
 use crate::ArcEngineValidator;
 
 /// Type configuration for a regular Arc node.
@@ -104,15 +102,8 @@ pub struct ArcNode {
     /// CLI users opt out of the default via `--arc.expose-pending-txs`.
     /// `--public-api` also forces this to `true` (and conflicts with `--arc.expose-pending-txs`).
     pub filter_pending_txs: bool,
-    /// When true, raw transaction submission RPCs accept pre-EIP-155
-    /// (replay-unprotected) transactions. Defaults to false, matching Geth.
-    /// P2P-received transactions and transactions included in blocks by other
-    /// validators are unaffected.
-    pub allow_unprotected_txs: bool,
     /// Maximum batch response size in bytes, mirrors `--rpc.max-response-size`.
     pub max_response_body_size: u32,
-    /// Maximum number of entries permitted in a JSON-RPC batch request.
-    pub max_batch_entries: usize,
     /// Interval between tx rebroadcast rounds. Zero disables rebroadcast.
     pub rebroadcast_interval: std::time::Duration,
 }
@@ -126,9 +117,7 @@ impl Default for ArcNode {
             payload_builder_deadline_ms: None,
             wait_for_payload: true,
             filter_pending_txs: true,
-            allow_unprotected_txs: false,
             max_response_body_size: 160 * 1024 * 1024,
-            max_batch_entries: ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
             rebroadcast_interval: crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
         }
     }
@@ -144,9 +133,7 @@ impl ArcNode {
         payload_builder_deadline_ms: Option<u64>,
         wait_for_payload: bool,
         filter_pending_txs: bool,
-        allow_unprotected_txs: bool,
         max_response_body_size: u32,
-        max_batch_entries: usize,
         rebroadcast_interval: std::time::Duration,
     ) -> Self {
         Self {
@@ -156,9 +143,7 @@ impl ArcNode {
             payload_builder_deadline_ms,
             wait_for_payload,
             filter_pending_txs,
-            allow_unprotected_txs,
             max_response_body_size,
-            max_batch_entries,
             rebroadcast_interval,
         }
     }
@@ -180,11 +165,8 @@ impl ArcNode {
     >
     where
         Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ArcChainSpec, Primitives = EthPrimitives>>,
-        <Node::Types as NodeTypes>::Payload: PayloadTypes<
-            BuiltPayload = EthBuiltPayload,
-            PayloadAttributes = EthPayloadAttributes,
-            PayloadBuilderAttributes = EthPayloadBuilderAttributes,
-        >,
+        <Node::Types as NodeTypes>::Payload:
+            PayloadTypes<BuiltPayload = EthBuiltPayload, PayloadAttributes = EthPayloadAttributes>,
     {
         let invalid_tx_list_opt = if invalid_tx_list_cfg.enabled {
             info!(
@@ -327,6 +309,7 @@ where
             BasicEngineApiBuilder::default(),
             BasicEngineValidatorBuilder::default(),
             Default::default(),
+            Default::default(),
         );
         Self::new(addons, ArcRpcConfig::default())
     }
@@ -415,7 +398,7 @@ where
             Arc::new(ctx.node.consensus().clone()),
             ctx.node.evm_config().clone(),
             ctx.config.rpc.flashbots_config(),
-            Box::new(ctx.node.task_executor().clone()),
+            ctx.node.task_executor().clone(),
             Arc::new(ArcEngineValidator::new(ctx.config.chain.clone())),
         );
 
@@ -534,9 +517,7 @@ where
             .with_arc_rpc_config(self.rpc_cfg.clone())
             .with_rpc_middleware(ArcRpcLayer::new(
                 self.filter_pending_txs,
-                self.allow_unprotected_txs,
                 self.max_response_body_size as usize,
-                self.max_batch_entries,
             ))
     }
 }
@@ -704,7 +685,7 @@ mod tests {
     #[test]
     fn invalid_tx_list_config_default() {
         let cfg = InvalidTxListConfig::default();
-        assert!(cfg.enabled);
+        assert!(!cfg.enabled);
         assert_eq!(cfg.capacity, 100_000);
     }
 
@@ -726,9 +707,7 @@ mod tests {
             None,
             true,
             true,
-            false,
             160 * 1024 * 1024,
-            ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
         );
 
@@ -757,9 +736,7 @@ mod tests {
             None,
             true,
             true,
-            false,
             160 * 1024 * 1024,
-            ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
         );
         assert!(node.addresses_denylist_config.is_enabled());
@@ -794,9 +771,7 @@ mod tests {
             None,
             true,
             false,
-            false,
             160 * 1024 * 1024,
-            ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
         );
         assert!(!node.filter_pending_txs);
@@ -820,9 +795,7 @@ mod tests {
             None,
             false,
             false,
-            false,
             160 * 1024 * 1024,
-            ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
         );
         assert!(!node.wait_for_payload);
@@ -846,9 +819,7 @@ mod tests {
             None,
             true,
             true,
-            false,
             160 * 1024 * 1024,
-            ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
             std::time::Duration::ZERO,
         );
         assert!(node.rebroadcast_interval.is_zero());

@@ -60,22 +60,23 @@ precompile!(run_pq, precompile_input, hardfork_flags; {
         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
             let _ = hardfork_flags;
             let mut gas_counter = Gas::new(precompile_input.gas);
+            let reservoir = precompile_input.reservoir;
 
             let args = IPQ::verifySlhDsaSha2128sCall::abi_decode_raw_validate(input).map_err(|_| {
                 PrecompileErrorOrRevert::new_reverted_with_penalty(
-                    gas_counter,
+                    gas_counter, reservoir,
                     PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
                     ERR_EXECUTION_REVERTED,
                 )
             })?;
 
             // Charge base gas, then per-word message gas, then validate inputs
-            record_cost_or_out_of_gas(&mut gas_counter, VERIFY_BASE_GAS)?;
+            record_cost_or_out_of_gas(&mut gas_counter, reservoir, VERIFY_BASE_GAS)?;
 
             // GAS_PER_MSG_WORD (6) < 32, so the product cannot exceed u64::MAX
             #[allow(clippy::arithmetic_side_effects)]
             let msg_word_gas = (args.message.len() as u64).div_ceil(32) * GAS_PER_MSG_WORD;
-            record_cost_or_out_of_gas(&mut gas_counter, msg_word_gas)?;
+            record_cost_or_out_of_gas(&mut gas_counter, reservoir, msg_word_gas)?;
 
             // SLH-DSA-SHA2-128s constants from FIPS 205
             const VK_LEN: usize = 32;
@@ -83,27 +84,27 @@ precompile!(run_pq, precompile_input, hardfork_flags; {
 
             if args.vk.len() != VK_LEN {
                 return Err(PrecompileErrorOrRevert::new_reverted(
-                    gas_counter,
+                    gas_counter, reservoir,
                     "Invalid verifying key length",
                 ));
             }
 
             if args.sig.len() != SIG_LEN {
                 return Err(PrecompileErrorOrRevert::new_reverted(
-                    gas_counter,
+                    gas_counter, reservoir,
                     "Invalid signature length",
                 ));
             }
 
             let verifying_key = SlhDsaVerifyingKey::<Sha2_128s>::try_from(args.vk.as_ref())
-                .map_err(|_| PrecompileErrorOrRevert::new_reverted(gas_counter, "Failed to parse verifying key"))?;
+                .map_err(|_| PrecompileErrorOrRevert::new_reverted(gas_counter, reservoir, "Failed to parse verifying key"))?;
 
             let signature = Signature::<Sha2_128s>::try_from(args.sig.as_ref())
-                .map_err(|_| PrecompileErrorOrRevert::new_reverted(gas_counter, "Failed to parse signature"))?;
+                .map_err(|_| PrecompileErrorOrRevert::new_reverted(gas_counter, reservoir, "Failed to parse signature"))?;
 
             let is_valid = verifying_key.verify(args.message.as_ref(), &signature).is_ok();
 
-            Ok(PrecompileOutput::new(gas_counter.used(), is_valid.abi_encode().into()))
+            Ok(PrecompileOutput::new(gas_counter.used(), is_valid.abi_encode().into(), reservoir))
         })()
     },
 });
@@ -290,7 +291,7 @@ mod tests {
 
         // Our precompile cost: 230,000 (base) + 1 word * 6 (message) = 230,006
         // Plus EVM calldata cost for large signature (7856 bytes)
-        let actual_gas = exec_result.result.gas_used();
+        let actual_gas = exec_result.result.tx_gas_used();
 
         // SLH-DSA has largest signatures, expect ~370-390K total gas
         assert!(

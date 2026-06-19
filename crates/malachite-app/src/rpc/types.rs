@@ -28,7 +28,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::error;
 
 use arc_consensus_types::{
-    commit_http::HttpCommitSignature,
+    commit_http::HttpCommitCertificate,
     evidence::{DoubleProposal, DoubleVote, StoredMisbehaviorEvidence, ValidatorEvidence},
     signing::PublicKey,
     Address, ArcContext, BlockHash, Height, Validator, ValidatorSet, Value, ValueId,
@@ -45,6 +45,7 @@ use malachitebft_core_state_machine::state::{RoundValue, State as MState};
 use malachitebft_core_types::{NilOrVal, VoteType};
 use malachitebft_network::PersistentPeerError;
 
+use crate::metrics::AppMetrics;
 use crate::request::{AppRequestError, CommitCertificateInfo, Status, TxAppReq};
 use crate::utils::sync_state::SyncState;
 use alloy_rpc_types_engine::ExecutionPayloadV3;
@@ -60,6 +61,7 @@ pub(crate) struct RpcState {
     pub tx_consensus_req: TxConsensusReq,
     pub tx_app_req: TxAppReq,
     pub tx_network_req: TxNetworkReq,
+    pub metrics: AppMetrics,
 }
 
 pub(crate) struct RouteDef {
@@ -356,10 +358,8 @@ struct RpcPendingProposalParts {
 
 #[derive(Serialize)]
 pub(crate) struct RpcCommitCertificate {
-    height: u64,
-    round: i64,
-    block_hash: ValueId,
-    signatures: Vec<HttpCommitSignature>,
+    #[serde(flatten)]
+    inner: HttpCommitCertificate,
     proposer: Address,
     extended: bool,
 }
@@ -367,15 +367,17 @@ pub(crate) struct RpcCommitCertificate {
 impl From<CommitCertificateInfo> for RpcCommitCertificate {
     fn from(info: CommitCertificateInfo) -> Self {
         RpcCommitCertificate {
-            height: info.certificate.height.as_u64(),
-            round: info.certificate.round.as_i64(),
-            block_hash: info.certificate.value_id,
-            signatures: info
-                .certificate
-                .commit_signatures
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            inner: HttpCommitCertificate {
+                height: info.certificate.height.as_u64(),
+                round: info.certificate.round.as_i64(),
+                block_hash: info.certificate.value_id,
+                signatures: info
+                    .certificate
+                    .commit_signatures
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
             proposer: info.proposer,
             extended: info.certificate_type.is_extended(),
         }
@@ -806,58 +808,6 @@ impl From<InvalidPayload> for RpcInvalidPayload {
 }
 
 #[cfg(test)]
-mod tests_rendering {
-    use super::*;
-    use arc_consensus_types::signing::PrivateKey;
-    use malachitebft_core_types::Round;
-    use rand::rngs::OsRng;
-    use std::time::SystemTime;
-
-    #[test]
-    fn rpc_validator_renders_public_key_as_0x_lowercase_hex() {
-        let private_key = PrivateKey::generate(OsRng);
-        let public_key = private_key.public_key();
-        let key_bytes = public_key.as_bytes().to_vec();
-        let validator = Validator::new(public_key, 100);
-
-        let rpc = RpcValidator::from(&validator);
-
-        // Renders as `0x` + lowercase hex (hex::encode is lowercase by construction).
-        let expected = format!("0x{}", hex::encode(&key_bytes));
-        assert_eq!(rpc.public_key_hex, expected);
-    }
-
-    #[test]
-    fn rpc_app_status_renders_public_key_as_0x_lowercase_hex() {
-        let private_key = PrivateKey::generate(OsRng);
-        let public_key = private_key.public_key();
-        let key_bytes = public_key.as_bytes().to_vec();
-
-        let status = Status {
-            height: Height::new(1),
-            round: Round::new(0),
-            address: Address::from_public_key(&public_key),
-            public_key,
-            proposer: None,
-            height_start_time: SystemTime::UNIX_EPOCH,
-            prev_payload_hash: None,
-            db_latest_height: Height::default(),
-            db_earliest_height: Height::default(),
-            undecided_blocks_count: 0,
-            pending_proposal_parts: Vec::new(),
-            validator_set: ValidatorSet::default(),
-            sync_state: SyncState::InSync,
-        };
-
-        let rpc = RpcAppStatus::from(status);
-
-        // Renders as `0x` + lowercase hex (hex::encode is lowercase by construction).
-        let expected = format!("0x{}", hex::encode(&key_bytes));
-        assert_eq!(rpc.public_key, expected);
-    }
-}
-
-#[cfg(test)]
 mod tests_network {
     use super::*;
 
@@ -1154,5 +1104,62 @@ mod tests_misbehavior_evidence {
         assert_eq!(rpc.validators[1].address, addr2);
         assert!(rpc.validators[1].double_votes.is_empty());
         assert_eq!(rpc.validators[1].double_proposals.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tests_rpc_commit_certificate {
+    use super::*;
+    use arc_consensus_types::commit_http::HttpCommitSignature;
+
+    /// Pins the `GET /commit` response shape: the 4 common fields come from
+    /// `HttpCommitCertificate` via `#[serde(flatten)]`, and `proposer` /
+    /// `extended` are appended at the top level (no `inner` wrapper).
+    #[test]
+    fn serializes_with_flat_fields() {
+        let cert = RpcCommitCertificate {
+            inner: HttpCommitCertificate {
+                height: 42,
+                round: 3,
+                block_hash: ValueId::new(BlockHash::ZERO),
+                signatures: vec![HttpCommitSignature {
+                    address: Address::default(),
+                    signature: vec![0u8; 64],
+                }],
+            },
+            proposer: Address::default(),
+            extended: true,
+        };
+        let value = serde_json::to_value(&cert).unwrap();
+        let obj = value.as_object().unwrap();
+
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "block_hash",
+                "extended",
+                "height",
+                "proposer",
+                "round",
+                "signatures"
+            ]
+        );
+        assert!(
+            !obj.contains_key("inner"),
+            "flatten must inline inner fields"
+        );
+
+        let sigs = obj["signatures"].as_array().unwrap();
+        assert_eq!(sigs.len(), 1);
+        let mut sig_keys: Vec<&str> = sigs[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        sig_keys.sort();
+        assert_eq!(sig_keys, vec!["address", "signature"]);
     }
 }

@@ -26,11 +26,12 @@ reth-basic-payload-builder.workspace = true
 reth-chainspec.workspace = true
 reth-consensus-common.workspace = true
 reth-errors.workspace = true
-reth-ethereum = { workspace = true, features = ["storage-api"] }
+reth-ethereum = { workspace = true, features = ["storage-api", "trie"] }
 reth-ethereum-engine-primitives.workspace = true
 reth-ethereum-payload-builder.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-evm.workspace = true
+reth-execution-cache.workspace = true
 reth-node-api.workspace = true
 reth-node-builder.workspace = true
 reth-payload-builder.workspace = true
@@ -39,6 +40,7 @@ reth-primitives-traits.workspace = true
 reth-revm.workspace = true
 reth-storage-api.workspace = true
 reth-transaction-pool.workspace = true
+reth-trie-parallel.workspace = true
 
 # revm
 revm.workspace = true

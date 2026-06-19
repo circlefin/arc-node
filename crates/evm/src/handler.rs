@@ -64,7 +64,11 @@ where
     type HaltReason = HaltReason;
 
     #[inline]
-    fn pre_execution(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
+    fn pre_execution(
+        &self,
+        evm: &mut Self::Evm,
+        init_and_floor_gas: &mut revm_context_interface::cfg::gas::InitialAndFloorGas,
+    ) -> Result<u64, Self::Error> {
         let ctx = evm.ctx();
         let tx = ctx.tx();
         let caller = tx.caller();
@@ -76,7 +80,7 @@ where
             .load_account(NATIVE_COIN_CONTROL_ADDRESS)?;
         self.check_blocklist(evm, caller, &tx_kind, tx_value)?;
 
-        self.mainnet.pre_execution(evm)
+        self.mainnet.pre_execution(evm, init_and_floor_gas)
     }
 
     #[inline]
@@ -639,7 +643,9 @@ mod tests {
 
             let handler: ArcEvmHandler<_, EVMError<Infallible>> =
                 ArcEvmHandler::new(ArcHardforkFlags::default());
-            let result = handler.pre_execution(&mut evm);
+            let mut init_and_floor_gas =
+                revm_context_interface::cfg::gas::InitialAndFloorGas::default();
+            let result = handler.pre_execution(&mut evm, &mut init_and_floor_gas);
 
             // Check caller balance after pre_execution to verify correct gas deduction behavior
             let final_caller_balance = evm
@@ -731,7 +737,7 @@ mod tests {
 
         assert!(result.is_ok(), "validate_initial_tx_gas should succeed");
         assert_eq!(
-            result.unwrap().initial_gas,
+            result.unwrap().initial_total_gas,
             21000,
             "Native value transfer should cost exactly 21,000 gas (no blocklist surcharge)"
         );

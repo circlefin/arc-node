@@ -22,11 +22,34 @@ use alloy_sol_types::{sol, SolCall};
 use color_eyre::eyre::{self, Result};
 use k256::ecdsa::SigningKey;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{error::TryRecvError, Receiver, Sender};
 use tracing::{debug, info, warn};
+
+/// Outcome of a single fire-and-forget tx submission as observed by the sender.
+///
+/// Sent back from `TxSender` to `TxGenerator` over a dedicated channel so the
+/// generator can refresh the cached nonce on rejection. `Accepted` doesn't
+/// carry an account index because the generator already optimistically
+/// advanced its cache at submit time — the variant is kept so the sender
+/// can still emit "successfully observed" outcomes for diagnostic logging
+/// without forcing every caller to discriminate between "didn't drain" and
+/// "drained Ok".
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AckOutcome {
+    /// Node accepted the tx into its mempool — no-op for the generator
+    /// (cache was already advanced optimistically).
+    Accepted,
+    /// Node rejected the tx (any failure, transient or terminal). The
+    /// payload is the **account index** whose tx was rejected; the generator
+    /// uses it to refresh that account's cached nonce from chain so the next
+    /// submission for that account uses the correct value, which corrects
+    /// any optimistic overshoot.
+    Rejected(usize),
+}
 
 use crate::accounts::AccountBuilder;
 use crate::config::{
@@ -61,6 +84,14 @@ pub(crate) const GAS_CACHE_BUFFER: u64 = 2;
 pub(crate) const GAS_ESTIMATE_MARGIN_NUM: u64 = 5;
 pub(crate) const GAS_ESTIMATE_MARGIN_DEN: u64 = 4;
 
+/// Number of parallel workers used by `resync_nonces` to fan out per-account
+/// nonce queries. Each worker holds its own WS client set, so the total
+/// connection count per node is `RESYNC_CONCURRENCY × num_builders`, kept
+/// small enough to avoid the HTTP 429 storm that motivated the original
+/// single-WS-client design (50k accounts × N builders would otherwise open
+/// 50k+ parallel connections).
+const RESYNC_CONCURRENCY: usize = 8;
+
 /// Generates and signs transactions from a pool of pre-funded genesis accounts.
 ///
 /// Each generator is assigned a non-overlapping slice of the account space and
@@ -80,23 +111,40 @@ pub(crate) const GAS_ESTIMATE_MARGIN_DEN: u64 = 4;
 /// In fire-and-forget mode the generator pushes signed transactions into a
 /// channel for a separate [`TxSender`](crate::sender::TxSender) task; in backpressure mode the sender
 /// owns the generator directly and calls [`next_tx`](Self::next_tx).
+#[derive(Serialize, Deserialize)]
 pub(crate) struct TxGenerator {
     id: usize,
+    /// BIP32-derived signing keys. Skipped on (de)serialise — keys are a
+    /// deterministic function of `account_builder.mnemonic` + account index,
+    /// so the lazy `if signers[i].is_none() { build }` path in `next_tx`
+    /// reconstructs them on first use. `ensure_signers_capacity` is called
+    /// from `Spammer::new_resuming` to size the Vec to `signers_range.len()`
+    /// before any per-account access happens.
+    #[serde(skip, default)]
     signers: Vec<Option<LocalSigner<SigningKey>>>,
     signers_range: Range<usize>,
     next_nonces: Vec<Option<u64>>,
     account_builder: AccountBuilder,
+    /// Skipped — repopulated by `update_ws_client_builders` on resume.
+    #[serde(skip, default)]
     ws_client_builders: Vec<WsClientBuilder>,
-    /// Channel to send signed txs to a separate `TxSender` task (fire-and-forget mode).
+    /// Channel to send `(signed_tx, account_index)` pairs to a separate
+    /// `TxSender` task (fire-and-forget mode). The account_index is plumbed
+    /// through so the sender can correlate ack/refresh outcomes back to a
+    /// specific account via the per-client inflight deques.
     /// `None` in backpressure mode, where the sender owns the generator directly.
-    tx_sender: Option<Sender<TxEnvelope>>,
+    /// Skipped — repopulated by `reset_tx_sender` on resume.
+    #[serde(skip, default)]
+    tx_sender: Option<Sender<(TxEnvelope, usize)>>,
     max_txs_per_account: u64,
     query_latest_nonce: bool,
     tx_input_size: usize,
     guzzler_fn_weights: GuzzlerFnWeights,
     erc20_fn_weights: Erc20FnWeights,
     tx_type_mix: TxTypeMix,
-    /// Lazily built WS clients (used by next_tx for guzzler gas estimation and nonce queries)
+    /// Lazily built WS clients (used by next_tx for guzzler gas estimation and nonce queries).
+    /// Skipped — rebuilt on demand from `ws_client_builders` on resume.
+    #[serde(skip, default)]
     ws_clients: Option<Vec<WsClient>>,
     /// Whether the GasGuzzler contract has been verified as deployed
     guzzler_verified: bool,
@@ -123,7 +171,7 @@ impl TxGenerator {
         signers_range: Range<usize>,
         account_builder: AccountBuilder,
         ws_client_builders: Vec<WsClientBuilder>,
-        tx_sender: Option<Sender<TxEnvelope>>,
+        tx_sender: Option<Sender<(TxEnvelope, usize)>>,
         max_txs_per_account: u64,
         query_latest_nonce: bool,
         tx_input_size: usize,
@@ -211,7 +259,7 @@ impl TxGenerator {
     }
 
     /// Replace the tx channel sender, used when reusing a generator across phases.
-    pub(crate) fn reset_tx_sender(&mut self, sender: Sender<TxEnvelope>) {
+    pub(crate) fn reset_tx_sender(&mut self, sender: Sender<(TxEnvelope, usize)>) {
         self.tx_sender = Some(sender);
         // Clear stale connections so init() rebuilds them on the next run.
         self.ws_clients = None;
@@ -225,8 +273,47 @@ impl TxGenerator {
         self.ws_clients = None;
     }
 
+    /// Size the `signers` Vec to `signers_range.len()`, inserting `None`
+    /// placeholders. Called after deserialising a persisted
+    /// [`SpammerState`](crate::SpammerState) so the lazy per-account
+    /// derivation in `next_tx`/`next_signed_tx` has indexable slots to fill
+    /// on first use. No-op for in-process resumes where `signers` is already
+    /// populated.
+    pub(crate) fn ensure_signers_capacity(&mut self) {
+        let size = self.signers_range.len();
+        if self.signers.len() != size {
+            self.signers = vec![None; size];
+        }
+    }
+
+    /// True when every account in `signers_range` already has a derived key.
+    /// Used by [`SpammerState::eagerly_derive_signers`] to short-circuit the
+    /// `spawn_blocking` fan-out for in-process resumes.
+    pub(crate) fn signers_populated(&self) -> bool {
+        self.signers.len() == self.signers_range.len() && self.signers.iter().all(Option::is_some)
+    }
+
+    /// Pre-derive every BIP32 signing key for this generator's account range,
+    /// matching the warm-cache that local-mode `SpammerState` has after
+    /// ramp-up. Pure CPU work; called via `tokio::task::spawn_blocking` from
+    /// [`SpammerState::eagerly_derive_signers`] so the runtime can parallelise
+    /// across generators. No-op when keys are already populated.
+    pub(crate) fn eagerly_derive_signers(&mut self) -> Result<()> {
+        if self.signers_populated() {
+            return Ok(());
+        }
+        let size = self.signers_range.len();
+        let start = self.signers_range.start;
+        let mut signers = Vec::with_capacity(size);
+        for i in 0..size {
+            signers.push(Some(self.account_builder.build(start + i)?));
+        }
+        self.signers = signers;
+        Ok(())
+    }
+
     async fn build_ws_clients(&self) -> Result<Vec<WsClient>> {
-        let mut ws_clients = Vec::new();
+        let mut ws_clients = Vec::with_capacity(self.ws_client_builders.len());
         for builder in self.ws_client_builders.iter().cloned() {
             ws_clients.push(builder.build().await?);
         }
@@ -586,7 +673,12 @@ impl TxGenerator {
     /// Re-query on-chain nonces for all accounts and overwrite cached values.
     ///
     /// Uses `eth_getTransactionCount` with "pending" to skip nonces already
-    /// accepted by the pool.
+    /// accepted by the pool. The account range is partitioned across
+    /// `RESYNC_CONCURRENCY` worker tasks, each owning its own dedicated set
+    /// of WS clients — total connections per node stay bounded
+    /// (`RESYNC_CONCURRENCY × num_builders`, e.g. 8 × 10 = 80) while restoring
+    /// N-way parallelism inside resync. Per-account queries within a worker
+    /// remain serial (one in-flight per WS client).
     pub(crate) async fn resync_nonces(&mut self) -> Result<()> {
         let size = self.signers_range.len();
         info!(
@@ -601,28 +693,43 @@ impl TxGenerator {
             }
         }
 
-        let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, u64)>>> =
-            Vec::with_capacity(size);
-        for i in 0..size {
-            let address = self.signers[i].as_ref().expect("built above").address();
-            let cached = self.next_nonces[i];
-            let builders = self.ws_client_builders.clone();
+        let workers = RESYNC_CONCURRENCY.min(size).max(1);
+        let mut worker_clients = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            worker_clients.push(self.build_ws_clients().await?);
+        }
+
+        let chunk = size.div_ceil(workers);
+        let mut handles = Vec::with_capacity(workers);
+        for (w, mut clients) in worker_clients.into_iter().enumerate() {
+            let start = (w * chunk).min(size);
+            let end = ((w + 1) * chunk).min(size);
+            if start >= end {
+                continue;
+            }
+            let addresses: Vec<(usize, Address, Option<u64>)> = (start..end)
+                .map(|i| {
+                    (
+                        i,
+                        self.signers[i].as_ref().expect("built above").address(),
+                        self.next_nonces[i],
+                    )
+                })
+                .collect();
             handles.push(tokio::spawn(async move {
-                let mut ws_clients = {
-                    let mut clients = Vec::with_capacity(builders.len());
-                    for builder in builders {
-                        clients.push(builder.build().await?);
-                    }
-                    clients
-                };
-                Self::fetch_nonce(&mut ws_clients, address, cached)
-                    .await
-                    .map(|nonce| (i, nonce))
+                let mut results = Vec::with_capacity(addresses.len());
+                for (i, address, cached) in addresses {
+                    let nonce = Self::fetch_nonce(&mut clients, address, cached).await?;
+                    results.push((i, nonce));
+                }
+                Ok::<Vec<(usize, u64)>, eyre::Error>(results)
             }));
         }
-        for handle in handles {
-            let (i, nonce) = handle.await??;
-            self.next_nonces[i] = Some(nonce);
+
+        for h in handles {
+            for (i, nonce) in h.await?? {
+                self.next_nonces[i] = Some(nonce);
+            }
         }
 
         info!("TxGenerator {}: nonce resync complete", self.id);
@@ -646,7 +753,19 @@ impl TxGenerator {
     }
 
     /// Generate transactions and send them to the load scheduler (fire-and-forget mode).
-    pub async fn run(&mut self) -> Result<()> {
+    ///
+    /// Nonces are still advanced optimistically right after the channel push:
+    /// without that, the generator's tight loop would build several txs at
+    /// the same nonce before the sender's first response came back, and the
+    /// chain would reject every duplicate as `"nonce too low"`. The
+    /// `ack_rx` channel from the paired `TxSender` is used purely as a
+    /// *correction* signal — `AckOutcome::Rejected` triggers a chain-side
+    /// `refresh_nonce` for the affected account, which catches the cases the
+    /// optimistic ack overshoots (response-stream errors like
+    /// `"nonce too low"`, `"txpool is full"`, validation failures, etc.).
+    /// `AckOutcome::Accepted` is therefore a no-op — the cache was already
+    /// advanced at submit time.
+    pub async fn run(&mut self, mut ack_rx: Receiver<AckOutcome>) -> Result<()> {
         debug!("TxGenerator {}: running...", self.id);
 
         let tx_sender = self
@@ -656,19 +775,68 @@ impl TxGenerator {
             .clone();
 
         loop {
+            // Drain any pending acks (just refreshes — accepts are no-ops)
+            // before generating the next tx. Done synchronously via
+            // `try_recv` to keep the borrow checker happy — `next_tx().await`
+            // borrows `&mut self` mutably, and we need the same borrow
+            // inside the refresh handler, so the two cannot overlap in a
+            // `select!` arm.
+            self.process_pending_acks(&mut ack_rx).await;
+
             match self.next_tx().await? {
                 Some((signed_tx, account_index)) => {
-                    if tx_sender.send(signed_tx).await.is_err() {
+                    if tx_sender.send((signed_tx, account_index)).await.is_err() {
                         // Channel closed, abort
                         return Ok(());
                     }
-                    // Fire-and-forget: optimistically ack nonce after channel push
+                    // Optimistic ack: advance cache so the next iteration's
+                    // `next_tx` uses nonce+1. Sender-driven refresh on
+                    // rejection corrects the overshoot if the tx is rejected.
                     self.ack_nonce(account_index);
                 }
                 None => {
-                    // All accounts exhausted
+                    // All accounts exhausted — drain any remaining acks so
+                    // late-arriving rejections still trigger refresh.
+                    self.process_pending_acks(&mut ack_rx).await;
                     return Ok(());
                 }
+            }
+        }
+    }
+
+    /// Drain whatever `AckOutcome` messages are immediately available.
+    /// `Accepted` is a no-op (the generator already advanced the cache
+    /// optimistically at submit time). `Rejected` flags the account as
+    /// dirty so any overshoot is corrected before the next tx for that
+    /// account is built. Refreshes happen after the drain completes,
+    /// deduplicated per account — a burst of inflight rejections for the
+    /// same account (e.g. several stale-nonce txs queued behind a real
+    /// rejection) costs one chain query, not N.
+    /// Non-blocking: returns as soon as `try_recv` yields `Empty`. A
+    /// `Disconnected` channel is treated as terminal — the sender side
+    /// has exited and there's nothing more to ack.
+    async fn process_pending_acks(&mut self, ack_rx: &mut Receiver<AckOutcome>) {
+        let mut dirty: HashSet<usize> = HashSet::new();
+        loop {
+            match ack_rx.try_recv() {
+                Ok(AckOutcome::Accepted) => {}
+                Ok(AckOutcome::Rejected(idx)) => {
+                    dirty.insert(idx);
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        for idx in dirty {
+            // If the chain query fails, leave the cached (advanced) nonce in
+            // place and log. The account will keep emitting txs with the
+            // stale optimistic nonce until the next rejection drives another
+            // refresh attempt. Worst case it converges at the next phase-end
+            // resync, which re-queries every account from chain.
+            if let Err(e) = self.refresh_nonce(idx).await {
+                debug!(
+                    "TxGenerator {}: refresh_nonce failed for account {idx}: {e}",
+                    self.id
+                );
             }
         }
     }
@@ -912,7 +1080,7 @@ mod tests {
     fn make_generator(
         start: usize,
         end: usize,
-        tx_sender: Option<Sender<TxEnvelope>>,
+        tx_sender: Option<Sender<(TxEnvelope, usize)>>,
         max_txs_per_account: u64,
     ) -> TxGenerator {
         let account_builder = AccountBuilder::new(TEST_MNEMONIC.to_string());
@@ -937,6 +1105,51 @@ mod tests {
         )
     }
 
+    #[test]
+    fn tx_generator_round_trips_through_json() {
+        // Build a generator, populate the persistable state, serialise,
+        // deserialise, and verify it round-trips. `signers` is `#[serde(skip)]`
+        // — keys are re-derived lazily via `next_tx`, with capacity restored
+        // by `ensure_signers_capacity` (exercised below).
+        let mut tg = make_generator(5, 10, None, 0);
+        for i in 0..5 {
+            tg.next_nonces[i] = Some(i as u64 + 42);
+            tg.tx_counts[i] = (i as u64 + 1) * 7;
+        }
+        tg.next_account_index = 3;
+        tg.skipped_accounts.insert(2);
+        tg.guzzler_verified = true;
+        tg.test_token_verified = true;
+        tg.erc20_gas_cache.insert(Erc20Function::Transfer, 21_000);
+        tg.guzzler_gas_cache
+            .insert(GuzzlerFunction::HashLoop, 100_000);
+
+        let json = serde_json::to_string(&tg).expect("serialise");
+        let mut restored: TxGenerator = serde_json::from_str(&json).expect("deserialise");
+
+        assert_eq!(restored.id, tg.id);
+        assert_eq!(restored.signers_range, tg.signers_range);
+        assert_eq!(restored.next_nonces, tg.next_nonces);
+        assert_eq!(restored.tx_counts, tg.tx_counts);
+        assert_eq!(restored.next_account_index, tg.next_account_index);
+        assert_eq!(restored.skipped_accounts, tg.skipped_accounts);
+        assert_eq!(restored.guzzler_verified, tg.guzzler_verified);
+        assert_eq!(restored.test_token_verified, tg.test_token_verified);
+        assert_eq!(restored.erc20_gas_cache, tg.erc20_gas_cache);
+        assert_eq!(restored.guzzler_gas_cache, tg.guzzler_gas_cache);
+        // Skipped fields default on deserialise — signers, channels, WS clients.
+        assert!(restored.signers.is_empty());
+        assert!(restored.tx_sender.is_none());
+        assert!(restored.ws_client_builders.is_empty());
+        assert!(restored.ws_clients.is_none());
+
+        // ensure_signers_capacity resizes to one slot per account in range,
+        // each holding None until next_tx lazily derives the BIP32 key.
+        restored.ensure_signers_capacity();
+        assert_eq!(restored.signers.len(), restored.signers_range.len());
+        assert!(restored.signers.iter().all(Option::is_none));
+    }
+
     #[tokio::test]
     async fn tx_generator_distributes_across_signers() -> Result<()> {
         let account_builder = AccountBuilder::new(TEST_MNEMONIC.to_string());
@@ -951,11 +1164,16 @@ mod tests {
             (900, 1000, 1000),
         ];
         for (start, end, channel_capacity) in test_cases {
-            let (tx_sender, mut tx_receiver) = mpsc::channel::<TxEnvelope>(channel_capacity);
+            let (tx_sender, mut tx_receiver) =
+                mpsc::channel::<(TxEnvelope, usize)>(channel_capacity);
+            // The generator no longer acks optimistically — the sender drives
+            // ack/refresh via a back-channel. The test only exercises tx
+            // distribution, so wire up an ack receiver that's never written to.
+            let (_ack_tx, ack_rx) = mpsc::channel::<AckOutcome>(channel_capacity);
             let mut generator = make_generator(start, end, Some(tx_sender), 0);
 
             // When we run the generator briefly to fill up the channel
-            let handle = tokio::spawn(async move { generator.run().await });
+            let handle = tokio::spawn(async move { generator.run(ack_rx).await });
             tokio::time::sleep(Duration::from_millis(channel_capacity as u64)).await;
             handle.abort(); // to stop producing more txs
             let _ = handle.await; // ignore join errors from abort
@@ -963,7 +1181,7 @@ mod tests {
             // Drain generated txs from channel and count txs per signer (by recovered sender address)
             let mut per_sender_counts: HashMap<Address, usize> = HashMap::new();
             let mut counter = 0usize;
-            while let Ok(envelope) = tx_receiver.try_recv() {
+            while let Ok((envelope, _account_index)) = tx_receiver.try_recv() {
                 let sender = envelope.recover_signer().expect("recover signer");
                 *per_sender_counts.entry(sender).or_default() += 1;
                 counter += 1;

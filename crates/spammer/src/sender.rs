@@ -46,13 +46,13 @@ use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Encodable2718;
 use color_eyre::eyre::{self, Result, WrapErr};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-use crate::generator::TxGenerator;
+use crate::generator::{AckOutcome, TxGenerator};
 use crate::latency::{compute_tx_hash, timestamp_now, TxSubmitted};
 use crate::rate_limiter::RateLimiter;
 use crate::ws::{is_connection_error, WsClient, WsClientBuilder};
@@ -77,9 +77,12 @@ pub(crate) struct TxSenderConfig {
 
 /// The transaction source determines the sender's operating mode.
 pub(crate) enum TxSource {
-    /// Fire-and-forget: receives txs from a separate generator task via channel.
+    /// Fire-and-forget: receives `(tx, account_index)` from a separate
+    /// generator task via channel. `account_index` is required so the
+    /// sender can pair each tx with the eventual `AckOutcome` it sends
+    /// back through `ack_sender`.
     Channel {
-        rx: Receiver<TxEnvelope>,
+        rx: Receiver<(TxEnvelope, usize)>,
         wait_response: bool,
     },
     /// Backpressure: owns the generator directly, waits for each response.
@@ -105,6 +108,11 @@ pub(crate) struct TxSender {
     ws_clients: Vec<WsClient>,
     tx_source: TxSource,
     result_sender: Sender<Result<u64>>,
+    /// Channel for relaying per-tx outcomes back to the paired generator so
+    /// it can ack the nonce on acceptance or refresh on rejection. Only
+    /// populated in fire-and-forget mode (`TxSource::Channel`) — backpressure
+    /// mode owns the generator directly and acks inline.
+    ack_sender: Option<Sender<AckOutcome>>,
     /// Optional channel for emitting tx submission timestamps.
     latency_sender: Option<Sender<TxSubmitted>>,
     rate_limiter: Arc<RateLimiter>,
@@ -124,13 +132,38 @@ enum SendOutcome {
     Transient(String),
 }
 
+/// Outcome of a single fire-and-forget `send()` call (named after the
+/// `TxSource::Channel` variant that drives this code path).
+///
+/// In fire-and-forget mode the sender needs the caller to know whether the
+/// tx was already fully observed (`WaitedAccepted` / `WaitedRejected` —
+/// `wait_response=true`), is in flight awaiting an async response (`Fired` —
+/// `wait_response=false`), or never made it to the wire (`DispatchFailed`).
+/// Only the `Fired` variant adds an entry to the per-client inflight deque;
+/// the other three are handled inline. Each variant determines whether/when
+/// the caller emits an `AckOutcome` to the generator.
+enum ChannelSendOutcome {
+    /// Response already received in-band and was successful.
+    WaitedAccepted,
+    /// Response already received in-band and was an error.
+    WaitedRejected,
+    /// Tx is on the wire; response will arrive later on the WS stream and
+    /// must be paired back via the per-client inflight deque.
+    Fired { request_id: u64, node_idx: usize },
+    /// Dispatch reported the error to the tracker without producing a wire
+    /// frame (already-tracked failure). Caller should treat as a rejection.
+    DispatchFailed,
+}
+
 impl TxSender {
     /// Create a sender in channel (fire-and-forget mode).
+    #[allow(clippy::too_many_arguments)]
     pub async fn new_channel(
         id: usize,
         ws_client_builders: Vec<WsClientBuilder>,
-        tx_receiver: Receiver<TxEnvelope>,
+        tx_receiver: Receiver<(TxEnvelope, usize)>,
         result_sender: Sender<Result<u64>>,
+        ack_sender: Sender<AckOutcome>,
         rate_limiter: Arc<RateLimiter>,
         config: TxSenderConfig,
     ) -> Result<Self> {
@@ -143,6 +176,7 @@ impl TxSender {
                 wait_response: config.wait_response,
             },
             result_sender,
+            ack_sender: Some(ack_sender),
             latency_sender: config.latency_sender,
             rate_limiter,
             node_index: 0,
@@ -167,6 +201,7 @@ impl TxSender {
             ws_clients,
             tx_source: TxSource::Backpressure(Box::new(generator)),
             result_sender,
+            ack_sender: None,
             latency_sender: config.latency_sender,
             rate_limiter,
             node_index: 0,
@@ -191,33 +226,155 @@ impl TxSender {
         }
     }
 
-    /// Fire-and-forget mode: read from channel, send, optionally wait for response.
+    /// Fire-and-forget mode: read from channel, send, optionally wait for
+    /// response. Tracks every in-flight tx as `(request_id → account_index)`
+    /// per WS client so when the response eventually drains we can pair it
+    /// back to the originating account and tell the generator to ack or
+    /// refresh the nonce.
+    ///
+    /// Without this correlation, fire-and-forget mode silently drifted the
+    /// generator's cached nonce whenever a tx was lost between channel and
+    /// node (WS reconnect, RPC timeout, ...) — the cache had already been
+    /// optimistically advanced but no tx with that nonce ever reached chain,
+    /// so subsequent submissions for the account piled into the queued
+    /// sub-pool. Pairing drained responses with account_indices closes that
+    /// loop in real time at the cost of two `usize`s of bookkeeping per
+    /// in-flight tx.
     async fn run_channel(&mut self) -> Result<()> {
-        debug!("TxSender {}: running (channel mode)...", self.id);
+        debug!("TxSender {}: running (fire-and-forget mode)...", self.id);
         let wait_response = match &self.tx_source {
             TxSource::Channel { wait_response, .. } => *wait_response,
             TxSource::Backpressure(_) => unreachable!("run_channel called in backpressure mode"),
         };
+        // Per-client FIFO of in-flight `(request_id, account_index)` waiting
+        // for a response. JSON-RPC over WebSocket preserves request order per
+        // connection, so popping the front on each drained response correctly
+        // pairs it with the corresponding tx.
+        let mut inflight: Vec<VecDeque<(u64, usize)>> = (0..self.ws_clients.len())
+            .map(|_| VecDeque::new())
+            .collect();
         let start_time = Instant::now();
         loop {
             if !self.rate_limiter.wait().await {
                 break;
             }
-            let tx = match &mut self.tx_source {
+            let next = match &mut self.tx_source {
                 TxSource::Channel { rx, .. } => rx.recv().await,
                 _ => unreachable!(),
             };
-            if let Some(tx) = tx {
-                self.send(tx, wait_response).await?;
-                if !wait_response {
-                    for client in &mut self.ws_clients {
-                        if let Some(result) = client.drain_one_result().await {
-                            let _ = self.result_sender.send(result).await;
+            let Some((tx, account_index)) = next else {
+                break;
+            };
+
+            let outcome = self.send(tx, wait_response).await?;
+
+            // Buffer ack-outcome work and per-client error-forwarding here
+            // so we can run the drain loop with `&mut self.ws_clients` and
+            // emit on `self.ack_sender` / `self.result_sender` once it ends,
+            // sidestepping the overlapping-borrow lint.
+            let mut pending_acks: Vec<AckOutcome> = Vec::new();
+            let mut pending_errors: Vec<eyre::Report> = Vec::new();
+
+            match outcome {
+                ChannelSendOutcome::WaitedAccepted => {
+                    pending_acks.push(AckOutcome::Accepted);
+                }
+                ChannelSendOutcome::WaitedRejected => {
+                    pending_acks.push(AckOutcome::Rejected(account_index));
+                }
+                ChannelSendOutcome::Fired {
+                    request_id,
+                    node_idx,
+                } => {
+                    inflight[node_idx].push_back((request_id, account_index));
+                }
+                ChannelSendOutcome::DispatchFailed => {
+                    // dispatch_raw_tx already reported the error to the
+                    // tracker; treat as a rejection so the next tx for this
+                    // account refreshes its nonce.
+                    pending_acks.push(AckOutcome::Rejected(account_index));
+                }
+            }
+
+            // Drain whatever asynchronous responses are available right now.
+            // Per-client FIFO assumption: responses arrive in the same order
+            // the requests were issued, so popping the deque front gives us
+            // the originating account.
+            for (client_idx, client) in self.ws_clients.iter_mut().enumerate() {
+                while let Some((resp_id, result)) = client.drain_one_result().await {
+                    // resp_id == 0 marks a connection-level event (e.g. close
+                    // frame) with no originating request. The connection is
+                    // gone and `reconnect()` resets `next_id` to 1, so every
+                    // entry currently in this client's inflight deque has a
+                    // stale id that can never match a future response and
+                    // would corrupt id-pairing if left behind. Drain the deque
+                    // and Reject each pending account so the generator
+                    // refreshes their nonces from chain.
+                    if resp_id == 0 {
+                        if let Err(e) = result {
+                            pending_errors.push(e);
                         }
+                        for (_stale_id, acct) in inflight[client_idx].drain(..) {
+                            pending_acks.push(AckOutcome::Rejected(acct));
+                        }
+                        continue;
+                    }
+                    let acct = match inflight[client_idx].pop_front() {
+                        Some((expected_id, acct)) if expected_id == resp_id => Some(acct),
+                        Some((expected_id, acct)) => {
+                            // Per-client JSON-RPC over WS is FIFO so a
+                            // mismatch implies a request was silently dropped
+                            // upstream (or a stale entry slipped past a
+                            // reconnect drain). Don't attribute this response
+                            // to the front account — that would emit an
+                            // Ack/Reject against the wrong account index.
+                            // Drop the mismatched front entry too so the deque
+                            // doesn't keep poisoning subsequent matches; the
+                            // affected accounts catch up at the next phase
+                            // resync.
+                            debug!(
+                                "TxSender {}: response id {resp_id} did not match expected {expected_id} on client {client_idx} (dropped front entry for account {acct})",
+                                self.id
+                            );
+                            None
+                        }
+                        None => {
+                            // Response with no matching inflight entry.
+                            // Close-frame sentinels are handled above; this
+                            // arm only fires if the deque has been drained
+                            // out from under us (shouldn't happen given the
+                            // single-producer-per-client invariant). Skip.
+                            None
+                        }
+                    };
+                    // Emit an AckOutcome only when we have a confident
+                    // account match. Forward errors to result_tracker
+                    // unconditionally so phase-level `rpc_errors` still picks
+                    // them up — these are two separate sinks (generator vs
+                    // tracker). Successful responses were already counted at
+                    // submit time by `send()`, so we only emit Accepted to
+                    // the generator (cache ack) and skip forwarding to the
+                    // tracker to avoid double-counting.
+                    match (acct, &result) {
+                        (Some(_acct), Ok(())) => {
+                            pending_acks.push(AckOutcome::Accepted);
+                        }
+                        (Some(acct), Err(_)) => {
+                            pending_acks.push(AckOutcome::Rejected(acct));
+                        }
+                        (None, _) => {}
+                    }
+                    if let Err(e) = result {
+                        pending_errors.push(e);
                     }
                 }
-            } else {
-                break;
+            }
+
+            for ack in pending_acks {
+                self.emit_ack(ack).await;
+            }
+            for err in pending_errors {
+                let _ = self.result_sender.send(Err(err)).await;
             }
 
             if self.max_time > 0 && start_time.elapsed().as_secs() >= self.max_time {
@@ -228,6 +385,14 @@ impl TxSender {
             rx.close();
         }
         Ok(())
+    }
+
+    /// Best-effort emit on the ack channel. A dropped receiver (generator
+    /// has exited) silently no-ops rather than aborting the sender.
+    async fn emit_ack(&self, outcome: AckOutcome) {
+        if let Some(ack) = &self.ack_sender {
+            let _ = ack.send(outcome).await;
+        }
     }
 
     /// Backpressure mode: generate tx, send, wait for response, ack nonce on success.
@@ -339,30 +504,56 @@ impl TxSender {
 
     /// Fire-and-forget send: dispatch and optionally wait for the response.
     ///
+    /// Returns a [`ChannelSendOutcome`] so the caller knows whether the
+    /// response has already been seen (and thus an `AckOutcome` can be
+    /// emitted inline) or is still in flight (and thus the request_id
+    /// should be parked in the per-client inflight deque until the async
+    /// drain pairs it with a response).
+    ///
     /// If latency tracking is enabled, records the submission only when the
     /// result is successful. With `wait_response` enabled, this means only
     /// transactions accepted by the node are tracked. Without it, the node's
-    /// response is not checked, so rejected transactions may still be tracked.
-    async fn send(&mut self, tx: TxEnvelope, wait_response: bool) -> Result<()> {
+    /// response is not checked synchronously here, so all dispatched txs are
+    /// tracked optimistically at submit time and the async drain may later
+    /// surface errors against the same tx.
+    async fn send(&mut self, tx: TxEnvelope, wait_response: bool) -> Result<ChannelSendOutcome> {
         // Capture timestamp before sending for accurate latency measurement
         let submitted_time = timestamp_now();
         let (request_id, node_idx, tx_len, tx_hash) = self.dispatch_raw_tx(tx).await?;
 
         if request_id == 0 {
-            return Ok(());
+            return Ok(ChannelSendOutcome::DispatchFailed);
         }
 
-        let result = if wait_response {
-            self.ws_clients[node_idx]
+        if wait_response {
+            let result = self.ws_clients[node_idx]
                 .wait_for_response(request_id)
                 .await
-                .map(|_: String| tx_len)
+                .map(|_: String| tx_len);
+            let outcome = if result.is_ok() {
+                if let Some(latency_sender) = self.latency_sender.as_ref() {
+                    latency_sender
+                        .send(TxSubmitted {
+                            tx_hash,
+                            submitted_time,
+                        })
+                        .await
+                        .wrap_err_with(|| {
+                            format!(
+                                "Failed to send tx submission event for tx hash: {}",
+                                tx_hash
+                            )
+                        })?;
+                }
+                ChannelSendOutcome::WaitedAccepted
+            } else {
+                ChannelSendOutcome::WaitedRejected
+            };
+            self.result_sender.send(result).await?;
+            Ok(outcome)
         } else {
-            Ok(tx_len)
-        };
-
-        // Only record submission if the node accepted the tx (or we didn't wait)
-        if result.is_ok() {
+            // Fire-and-forget: record submission optimistically (the drain
+            // path will surface real errors against the same request_id).
             if let Some(latency_sender) = self.latency_sender.as_ref() {
                 latency_sender
                     .send(TxSubmitted {
@@ -377,11 +568,12 @@ impl TxSender {
                         )
                     })?;
             }
+            self.result_sender.send(Ok(tx_len)).await?;
+            Ok(ChannelSendOutcome::Fired {
+                request_id,
+                node_idx,
+            })
         }
-
-        self.result_sender.send(result).await?;
-
-        Ok(())
     }
 
     /// Send a transaction and always wait for the JSON-RPC response.

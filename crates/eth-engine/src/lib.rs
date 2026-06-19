@@ -15,6 +15,7 @@
 // limitations under the License.
 
 pub mod capabilities;
+pub mod deadline;
 pub mod engine;
 pub mod ipc;
 pub mod json_structures;
@@ -25,7 +26,10 @@ pub mod rpc;
 mod abi_utils;
 
 mod constants;
-pub use constants::INITIAL_RETRY_DELAY;
+pub use constants::{
+    ENGINE_FORKCHOICE_UPDATED_TIMEOUT, ENGINE_GET_PAYLOAD_TIMEOUT, ENGINE_NEW_PAYLOAD_TIMEOUT,
+    INITIAL_RETRY_DELAY,
+};
 
 #[cfg(any(test, feature = "mocks"))]
 pub mod mocks {

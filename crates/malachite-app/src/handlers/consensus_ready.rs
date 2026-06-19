@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use alloy_rpc_types_eth::BlockNumberOrTag;
 use eyre::{eyre, Context};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -140,11 +141,11 @@ async fn on_consensus_ready(
     )
     .await?;
 
-    // The validator set for the next height is the one at the latest committed height
+    // The validator set for the next height is the one committed at latest_height.
     let validator_set = ethereum_api
-        .get_active_validator_set(latest_height.as_u64())
+        .get_signing_validator_set(next_height.as_u64())
         .await
-        .wrap_err("Failed to get the validator set at ConsensusReady")?;
+        .wrap_err("Failed to get the signing validator set at ConsensusReady")?;
 
     // The consensus params for the next height are the same as the latest committed height
     let consensus_params = ethereum_api
@@ -253,7 +254,11 @@ async fn checkpoint_sync(
     info!(block_hash = %target_block_hash, height = %target_block_height, timeout = ?timeout, "🔄 Checkpoint sync: targeting block hash");
 
     let fcu_result = engine_api
-        .forkchoice_updated(target_block_hash, None)
+        .forkchoice_updated(
+            target_block_hash,
+            None,
+            arc_eth_engine::ENGINE_FORKCHOICE_UPDATED_TIMEOUT,
+        )
         .await
         .wrap_err("Checkpoint sync: forkchoice_updated failed")?;
 
@@ -263,9 +268,8 @@ async fn checkpoint_sync(
         }
         PayloadStatusEnum::Valid => {
             info!(block_hash = %target_block_hash, height = %target_block_height, "🔄 Checkpoint sync: EL already has the target block");
-            let height_str = format!("0x{:x}", target_block_height.as_u64());
             return ethereum_api
-                .get_block_by_number(&height_str)
+                .get_block_by_number(BlockNumberOrTag::Number(target_block_height.as_u64()))
                 .await?
                 .ok_or_else(|| {
                     eyre!(
@@ -280,7 +284,7 @@ async fn checkpoint_sync(
 
     const POLL_INTERVAL: Duration = Duration::from_secs(2);
     let start = tokio::time::Instant::now();
-    let height_str = format!("0x{:x}", target_block_height.as_u64());
+    let block_number = BlockNumberOrTag::Number(target_block_height.as_u64());
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -289,7 +293,7 @@ async fn checkpoint_sync(
             return Err(eyre!("Checkpoint sync: timed out after {timeout:?}"));
         }
 
-        let block = ethereum_api.get_block_by_number(&height_str).await?;
+        let block = ethereum_api.get_block_by_number(block_number).await?;
         if let Some(b) = block {
             if b.block_hash == target_block_hash {
                 info!(
@@ -350,7 +354,7 @@ async fn handshake_and_replay(
         let _guard = metrics.start_engine_api_timer("get_block_by_number");
 
         ethereum_api
-            .get_block_by_number("latest")
+            .get_block_by_number(BlockNumberOrTag::Latest)
             .await?
             .ok_or_else(|| {
                 eyre::eyre!("Handshake: Could not get latest block from execution client")
@@ -592,20 +596,20 @@ mod tests {
 
     fn setup_mock_ethereum_api_with_block(
         block: ExecutionBlock,
-        validator_set_height: u64,
+        latest_height: u64,
     ) -> MockEthereumAPI {
         let mut ethereum_api = MockEthereumAPI::new();
         ethereum_api
             .expect_get_block_by_number()
-            .with(eq("latest"))
+            .with(eq(BlockNumberOrTag::Latest))
             .returning(move |_| Ok(Some(block)));
         ethereum_api
-            .expect_get_active_validator_set()
-            .with(eq(validator_set_height))
+            .expect_get_signing_validator_set()
+            .with(eq(latest_height + 1))
             .returning(|_| Ok(test_validator_set()));
         ethereum_api
             .expect_get_consensus_params()
-            .with(eq(validator_set_height))
+            .with(eq(latest_height))
             .returning(|_| Ok(test_consensus_params()));
         ethereum_api
     }
@@ -614,7 +618,7 @@ mod tests {
         let mut ethereum_api = MockEthereumAPI::new();
         ethereum_api
             .expect_get_block_by_number()
-            .with(eq("latest"))
+            .with(eq(BlockNumberOrTag::Latest))
             .returning(|_| Ok(None));
         ethereum_api
     }
@@ -1559,11 +1563,11 @@ mod tests {
         let mut ethereum_api = MockEthereumAPI::new();
         ethereum_api
             .expect_get_block_by_number()
-            .with(eq("latest"))
+            .with(eq(BlockNumberOrTag::Latest))
             .returning(move |_| Ok(Some(latest_block)));
         ethereum_api
-            .expect_get_active_validator_set()
-            .with(eq(latest_height.as_u64()))
+            .expect_get_signing_validator_set()
+            .with(eq(latest_height.increment().as_u64()))
             .returning(|_| Ok(test_validator_set()));
         ethereum_api
             .expect_get_consensus_params()
@@ -1635,7 +1639,7 @@ mod tests {
         let mut engine_api = setup_mock_engine_api_success();
         engine_api
             .expect_forkchoice_updated()
-            .return_once(move |_, _| {
+            .return_once(move |_, _, _| {
                 Ok(ForkchoiceUpdated::new(PayloadStatus::new(
                     PayloadStatusEnum::Syncing,
                     None,
@@ -1646,16 +1650,16 @@ mod tests {
         // Handshake fetches "latest" for the initial EL height
         ethereum_api
             .expect_get_block_by_number()
-            .with(eq("latest"))
+            .with(eq(BlockNumberOrTag::Latest))
             .returning(move |_| Ok(Some(latest_block_el)));
         // Checkpoint sync polls by target height
         ethereum_api
             .expect_get_block_by_number()
-            .with(eq("0xa"))
+            .with(eq(BlockNumberOrTag::Number(10)))
             .returning(move |_| Ok(Some(check_point_block)));
         ethereum_api
-            .expect_get_active_validator_set()
-            .with(eq(cl_height.as_u64()))
+            .expect_get_signing_validator_set()
+            .with(eq(cl_height.increment().as_u64()))
             .returning(|_| Ok(test_validator_set()));
         ethereum_api
             .expect_get_consensus_params()
@@ -1736,7 +1740,7 @@ mod tests {
         let mut engine_api = MockEngineAPI::new();
         engine_api
             .expect_forkchoice_updated()
-            .return_once(move |_, _| {
+            .return_once(move |_, _, _| {
                 Ok(ForkchoiceUpdated::new(PayloadStatus::new(
                     PayloadStatusEnum::Syncing,
                     None,
@@ -1747,7 +1751,7 @@ mod tests {
         let mut poll_count = 0u32;
         ethereum_api
             .expect_get_block_by_number()
-            .with(eq("0x32"))
+            .with(eq(BlockNumberOrTag::Number(50)))
             .returning(move |_| {
                 poll_count += 1;
                 if poll_count < 3 {
@@ -1780,18 +1784,20 @@ mod tests {
 
         let target_hash = B256::repeat_byte(0xCC);
         let mut engine_api = MockEngineAPI::new();
-        engine_api.expect_forkchoice_updated().return_once(|_, _| {
-            Ok(ForkchoiceUpdated::new(PayloadStatus::new(
-                PayloadStatusEnum::Syncing,
-                None,
-            )))
-        });
+        engine_api
+            .expect_forkchoice_updated()
+            .return_once(|_, _, _| {
+                Ok(ForkchoiceUpdated::new(PayloadStatus::new(
+                    PayloadStatusEnum::Syncing,
+                    None,
+                )))
+            });
 
         let mut ethereum_api = MockEthereumAPI::new();
         // Block at target height is never available, forcing a timeout
         ethereum_api
             .expect_get_block_by_number()
-            .with(eq("0x32"))
+            .with(eq(BlockNumberOrTag::Number(50)))
             .returning(|_| Ok(None));
 
         let timeout = Some(Duration::from_secs(10));
@@ -1816,14 +1822,16 @@ mod tests {
 
         let target_hash = B256::repeat_byte(0xDD);
         let mut engine_api = MockEngineAPI::new();
-        engine_api.expect_forkchoice_updated().return_once(|_, _| {
-            Ok(ForkchoiceUpdated::new(PayloadStatus::new(
-                PayloadStatusEnum::Invalid {
-                    validation_error: "block not found".to_string(),
-                },
-                None,
-            )))
-        });
+        engine_api
+            .expect_forkchoice_updated()
+            .return_once(|_, _, _| {
+                Ok(ForkchoiceUpdated::new(PayloadStatus::new(
+                    PayloadStatusEnum::Invalid {
+                        validation_error: "block not found".to_string(),
+                    },
+                    None,
+                )))
+            });
 
         let ethereum_api = MockEthereumAPI::new();
 
@@ -1851,18 +1859,19 @@ mod tests {
         let target_height = Height::new(50);
 
         let mut engine_api = MockEngineAPI::new();
-        engine_api.expect_forkchoice_updated().return_once(|_, _| {
-            Ok(ForkchoiceUpdated::new(PayloadStatus::new(
-                PayloadStatusEnum::Syncing,
-                None,
-            )))
-        });
+        engine_api
+            .expect_forkchoice_updated()
+            .return_once(|_, _, _| {
+                Ok(ForkchoiceUpdated::new(PayloadStatus::new(
+                    PayloadStatusEnum::Syncing,
+                    None,
+                )))
+            });
 
         let mut ethereum_api = MockEthereumAPI::new();
-        let height_str = format!("0x{:x}", target_height.as_u64());
         ethereum_api
             .expect_get_block_by_number()
-            .with(eq(height_str))
+            .with(eq(BlockNumberOrTag::Number(target_height.as_u64())))
             .returning(move |_| {
                 Ok(Some(ExecutionBlock {
                     block_hash: wrong_hash,
@@ -1897,7 +1906,7 @@ mod tests {
         let mut engine_api = MockEngineAPI::new();
         engine_api
             .expect_forkchoice_updated()
-            .return_once(move |_, _| {
+            .return_once(move |_, _, _| {
                 Ok(ForkchoiceUpdated::new(PayloadStatus::new(
                     PayloadStatusEnum::Valid,
                     None,
@@ -1907,7 +1916,7 @@ mod tests {
         let mut ethereum_api = MockEthereumAPI::new();
         ethereum_api
             .expect_get_block_by_number()
-            .with(eq("0x32"))
+            .with(eq(BlockNumberOrTag::Number(50)))
             .return_once(move |_| Ok(Some(target_block)));
 
         let result =

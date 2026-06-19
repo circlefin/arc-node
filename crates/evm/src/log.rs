@@ -16,24 +16,8 @@
 
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::{sol, SolEvent};
-use arc_precompiles::NATIVE_COIN_AUTHORITY_ADDRESS;
 use reth_ethereum::primitives::Log;
 use revm::handler::SYSTEM_ADDRESS;
-
-sol! {
-    #[derive(Debug, PartialEq, Eq)]
-    event NativeCoinTransferred(address indexed from, address indexed to, uint256 amount);
-}
-
-// Creates a log for native coin transfers
-pub(crate) fn create_native_transfer_log(from: Address, to: Address, amount: U256) -> Log {
-    let log_data = NativeCoinTransferred { from, to, amount }.encode_log_data();
-
-    Log {
-        address: NATIVE_COIN_AUTHORITY_ADDRESS,
-        data: log_data,
-    }
-}
 
 sol! {
     #[derive(Debug, PartialEq, Eq)]

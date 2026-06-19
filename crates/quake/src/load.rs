@@ -30,7 +30,8 @@ use spammer::{self, Spammer, SpammerArgs};
 ///
 /// `fire_and_forget` controls whether the generated transactions wait for
 /// receipts (`false` for `load`, `true` for `spam`). `silent` propagates the
-/// top-level verbosity flag to the local spammer's config.
+/// top-level verbosity flag to the spammer — to the local config directly, and
+/// to the remote spammer as a `--silent` flag.
 pub(crate) async fn run(
     testnet: &Testnet,
     target_nodes: Vec<NodeName>,
@@ -44,7 +45,7 @@ pub(crate) async fn run(
             config.validate()?;
             load(testnet, target_nodes, &config).await
         }
-        InfraType::Remote => load_remote(testnet, target_nodes, args, fire_and_forget),
+        InfraType::Remote => load_remote(testnet, target_nodes, args, fire_and_forget, silent),
     }
 }
 
@@ -93,6 +94,7 @@ pub(crate) fn load_remote(
     target_nodes: Vec<NodeName>,
     args: &SpammerArgs,
     fire_and_forget: bool,
+    silent: bool,
 ) -> Result<()> {
     let infra = testnet.remote_infra()?;
     if args.csv_dir.is_some() {
@@ -101,7 +103,9 @@ pub(crate) fn load_remote(
              latency CSV would land on the inaccessible Control Center."
         );
     }
-    let mut cli_args = args.to_cli_args();
+    let mut spammer_args = args.clone();
+    spammer_args.silent = spammer_args.silent || silent;
+    let mut cli_args = spammer_args.to_cli_args();
     if !target_nodes.is_empty() {
         cli_args.push("--targets".to_string());
         cli_args.push(target_nodes.join(","));

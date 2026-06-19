@@ -14,8 +14,7 @@ Create a temporary manifest file with three validators:
 ```sh {empty_output}
 $ export MANIFEST=/tmp/quake-test-upgrade.toml
 $ cat > $MANIFEST << 'EOF'
-engine_api_connection = "rpc"
-el_init_hardfork="zero4"
+el_init_hardfork="zero6"
 
 # IMAGE_REGISTRY_URL should be defined as an environment variable or in the .env file.
 image_cl="${IMAGE_REGISTRY_URL}/arc-consensus:latest"

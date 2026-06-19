@@ -191,6 +191,9 @@ fn build_config_from_cli(cmd: &StartCmd, logging: config::LoggingConfig) -> Resu
         persistence_backpressure_threshold: cmd.execution_persistence_backpressure_threshold,
     };
 
+    #[cfg(feature = "byzantine")]
+    let byzantine = cmd.byzantine.clone();
+
     Ok(Config {
         moniker: cmd.get_moniker(),
         logging,
@@ -202,6 +205,8 @@ fn build_config_from_cli(cmd: &StartCmd, logging: config::LoggingConfig) -> Resu
         rpc,
         execution,
         signing: build_signing_config(cmd)?,
+        #[cfg(feature = "byzantine")]
+        byzantine,
     })
 }
 
@@ -212,6 +217,14 @@ fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<
 
     // Build configuration from CLI arguments
     let config = build_config_from_cli(cmd, logging)?;
+
+    // Validate the assembled config. `StartCmd::validate` only checks CLI-arg
+    // shape; `Config::validate` is where `ByzantineConfig::validate` is reached,
+    // so without this call an ad-hoc `--byzantine=<JSON>` would bypass
+    // semantic checks (mutually-exclusive triggers, malformed ranges).
+    config
+        .validate()
+        .map_err(|error| eyre!("Invalid configuration: {error}"))?;
 
     let rt = runtime::build_runtime(config.runtime)?;
 

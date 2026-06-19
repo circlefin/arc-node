@@ -16,16 +16,19 @@
 
 use crate::cli::Command;
 
+mod build_payload;
 mod context;
 mod fixture;
 mod helpers;
 pub mod new_payload_fcu;
 mod output;
 mod prepare_payload;
+mod tx_submit;
 
 pub async fn run(command: Command) -> eyre::Result<()> {
     match command {
         Command::PreparePayload(args) => prepare_payload::run(args).await,
         Command::NewPayloadFcu(args) => new_payload_fcu::run(args).await,
+        Command::BuildPayload(args) => build_payload::run(args).await,
     }
 }

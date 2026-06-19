@@ -43,9 +43,21 @@ pub const ENGINE_GET_CLIENT_VERSION_V1: &str = "engine_getClientVersionV1";
 
 pub const ENGINE_GET_BLOBS_V1: &str = "engine_getBlobsV1";
 
-// Engine API timeouts
+// Engine API timeouts.
+//
+// newPayload, getPayload and forkchoiceUpdated share the proposer's critical
+// path (forkchoiceUpdated starts the build, getPayload retrieves the payload,
+// newPayload self-validates it), which consensus already bounds with the
+// round's propose budget (GetValue timeout, 3s at round 0). These values are
+// deliberately equal: they are a sanity backstop against a hung EL, not a
+// tuned per-call latency bound — a value below the others (getPayload was 2s)
+// makes that call fail spuriously under EL load even though the round budget
+// would have allowed more time. `Engine` resolves them as floors: used as-is
+// on unbudgeted paths, and extended by the remaining consensus budget on
+// budgeted ones (see `EngineDeadline::call_timeout` for why the budget never
+// shrinks them).
 pub const ENGINE_NEW_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(8);
-pub const ENGINE_GET_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(2);
+pub const ENGINE_GET_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(8);
 pub const ENGINE_FORKCHOICE_UPDATED_TIMEOUT: Duration = Duration::from_secs(8);
 // pub const ENGINE_GET_PAYLOAD_BODIES_TIMEOUT: Duration = Duration::from_secs(10);
 pub const ENGINE_EXCHANGE_CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(1);
@@ -74,8 +86,8 @@ pub const ENGINE_EXCHANGE_CAPABILITIES_RETRY_IPC: backon::FibonacciBuilder =
         .with_max_delay(Duration::from_secs(1))
         .with_max_times(30);
 
-// Retry policy for IPC Engine API calls (newPayload, forkchoiceUpdated, getPayload).
-// All three are idempotent per the Engine API spec.
+// Retry policy for IPC Engine API calls (newPayload, forkchoiceUpdated).
+// Both are idempotent per the Engine API spec.
 pub const ENGINE_API_RETRY_IPC: backon::FibonacciBuilder = backon::FibonacciBuilder::new()
     .with_min_delay(Duration::from_millis(200))
     .with_max_delay(Duration::from_secs(2))

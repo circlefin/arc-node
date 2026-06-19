@@ -34,5 +34,5 @@ mod ws;
 
 pub use accounts::PartitionMode;
 pub use cli::SpammerArgs;
-pub use config::{Config, ResumeConfig};
-pub use spammer::{Spammer, SpammerRunResult, SpammerState};
+pub use config::{Config, Erc20FnWeights, GuzzlerFnWeights, ResumeConfig, TxTypeMix};
+pub use spammer::{Spammer, SpammerRunResult, SpammerState, SpammerSummary};

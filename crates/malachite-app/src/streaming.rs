@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use schnellru::{ByLength, LruMap};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use arc_consensus_types::{Height, ProposalPart, ProposalParts, ProposalPartsError, Round};
 use malachitebft_app_channel::app::streaming::{Sequence, StreamId, StreamMessage};
@@ -50,8 +50,18 @@ pub(crate) const CHUNK_SIZE: usize = 128 * 1024;
 /// Maximum age for a stream before it's evicted
 const MAX_STREAM_AGE: Duration = Duration::from_secs(60);
 
-/// Maximum number of evicted streams tracked in the LRU cache.
-const MAX_EVICTED_STREAMS: usize = 10_000;
+/// Maximum number of closed stream keys tracked in the LRU cache.
+///
+/// A key is closed either because its stream was evicted (stale height,
+/// oversized chunk, message-limit breach, age/global eviction) or because it
+/// completed and the assembled proposal reached a terminal disposition (stored,
+/// ignored as past-height, or rejected). Closed keys are dropped at the front
+/// of [`PartStreamsMap::insert`] so resurfaced duplicates cannot reopen a slot.
+///
+/// At sub-second finality this bound covers a wide recent window; anything
+/// resurfacing older than that is almost certainly from a past height and is
+/// caught by the staleness check (if it carries an `Init`) or the age timer.
+const MAX_CLOSED_STREAMS: usize = 10_000;
 
 /// Stream IDs are exactly 16 bytes: u64 height + u32 round + u32 nonce.
 pub(crate) const STREAM_ID_LEN: usize = size_of::<u64>() + size_of::<u32>() + size_of::<u32>();
@@ -68,6 +78,12 @@ fn max_total_streams(num_validators: usize) -> usize {
         .max(MAX_STREAMS_PER_PEER)
 }
 
+/// Returns `true` when `sequence` is a valid Fin sequence, i.e. it can be
+/// safely cast to `usize` and `sequence + 1 <= MAX_MESSAGES_PER_STREAM`.
+fn is_valid_fin_sequence(sequence: Sequence) -> bool {
+    usize::try_from(sequence).is_ok_and(|s| s < MAX_MESSAGES_PER_STREAM)
+}
+
 /// Outcome of [`PartStreamsMap::insert`].
 #[derive(Debug)]
 pub enum InsertResult {
@@ -75,13 +91,6 @@ pub enum InsertResult {
     Complete(ProposalParts),
     /// The message was accepted (or silently dropped) but the stream is not yet complete.
     Pending,
-    /// The message belongs to a height below the current one and was dropped.
-    ///
-    /// Distinct from [`Pending`](InsertResult::Pending) so callers can treat
-    /// stale gossip (old proposal parts re-circulating on the network) as
-    /// benign, expected noise rather than an in-progress stream, and never as
-    /// peer misbehaviour.
-    Stale,
     /// The message was rejected due to peer misbehaviour.
     Invalid(InsertError),
 }
@@ -91,11 +100,6 @@ pub enum InsertResult {
 pub enum InsertError {
     /// The stream_id is not exactly [`STREAM_ID_LEN`] bytes.
     InvalidStreamIdLength { actual: usize, expected: usize },
-    /// The stream_id height disagrees with the proposal Init payload height.
-    StreamIdHeightMismatch {
-        stream_height: Height,
-        init_height: Height,
-    },
     /// A completed stream failed final assembly into [`ProposalParts`].
     AssemblyFailed(ProposalPartsError),
 }
@@ -107,15 +111,6 @@ impl std::fmt::Display for InsertError {
                 write!(
                     f,
                     "invalid stream_id length: {actual} bytes (expected {expected})"
-                )
-            }
-            InsertError::StreamIdHeightMismatch {
-                stream_height,
-                init_height,
-            } => {
-                write!(
-                    f,
-                    "stream_id height {stream_height} does not match Init height {init_height}"
                 )
             }
             InsertError::AssemblyFailed(err) => {
@@ -137,21 +132,6 @@ pub(crate) fn new_stream_id(height: Height, round: Round, nonce: u32) -> StreamI
     );
     bytes[12..16].copy_from_slice(&nonce.to_be_bytes());
     StreamId::new(Bytes::copy_from_slice(&bytes))
-}
-
-/// Extension trait for reading the structured fields encoded in a proposal-part
-/// [`StreamId`] by [`new_stream_id`].
-trait StreamIdExt {
-    /// The height encoded in the leading 8 bytes, or `None` if the id is shorter.
-    fn height(&self) -> Option<Height>;
-}
-
-impl StreamIdExt for StreamId {
-    fn height(&self) -> Option<Height> {
-        let bytes = self.to_bytes();
-        let raw: [u8; size_of::<u64>()] = bytes.get(..size_of::<u64>())?.try_into().ok()?;
-        Some(Height::new(u64::from_be_bytes(raw)))
-    }
 }
 
 struct MinSeq<T>(StreamMessage<T>);
@@ -225,6 +205,7 @@ enum StreamInsertResult {
     Duplicate,
     Incomplete(Option<Height>),
     ExceededMaxMessages,
+    InvalidFinSequence(u64),
     ExceededMaxChunkSize(usize),
     Complete(Vec<ProposalPart>),
 }
@@ -249,6 +230,10 @@ impl StreamState {
             if data.bytes.len() > CHUNK_SIZE {
                 return StreamInsertResult::ExceededMaxChunkSize(data.bytes.len());
             }
+        }
+
+        if msg.is_fin() && !is_valid_fin_sequence(msg.sequence) {
+            return StreamInsertResult::InvalidFinSequence(msg.sequence);
         }
 
         if !self.seen_sequences.insert(msg.sequence) {
@@ -280,8 +265,8 @@ impl StreamState {
             // If we have received the fin message, we can determine when we will be done.
             // We are done if we have already received all messages from 0 to fin.sequence,
             // included. That is to say, if we have received `fin.sequence + 1` messages.
-            // Sequence is a u64 protocol field; on 64-bit targets usize == u64.
-            // The +1 cannot overflow because MAX_MESSAGES_PER_STREAM << u64::MAX.
+            // `is_valid_fin_sequence` rejected sequences >= MAX_MESSAGES_PER_STREAM,
+            // so the cast and +1 cannot truncate or overflow.
             #[allow(clippy::cast_possible_truncation, clippy::arithmetic_side_effects)]
             {
                 self.expected_messages = msg.sequence as usize + 1;
@@ -319,6 +304,8 @@ impl StreamState {
 /// - Evict streams older than [`MAX_STREAM_AGE`]
 /// - Immediately evict streams that exceed message or size limits
 /// - Immediately evict streams from previous heights
+/// - Drop messages for closed keys (evicted streams, or completed streams whose
+///   proposal reached a terminal disposition) so duplicates cannot reopen a slot
 ///
 /// Worst-case memory at full saturation:
 /// = max_total_streams * MAX_MESSAGES_PER_STREAM * CHUNK_SIZE
@@ -330,7 +317,10 @@ pub struct PartStreamsMap {
     /// [`MAX_STREAMS_PER_PEER`] during the pre-validator-set startup window.
     max_total_streams: usize,
     streams: BTreeMap<(PeerId, StreamId), StreamState>,
-    evicted: LruMap<(PeerId, StreamId), ()>,
+    /// Keys that are terminal — evicted streams, or completed streams whose
+    /// proposal was stored, ignored, or rejected. Bounded by
+    /// [`MAX_CLOSED_STREAMS`]; the oldest entry is dropped when full.
+    closed_keys: LruMap<(PeerId, StreamId), ()>,
     last_eviction: Instant,
 }
 
@@ -343,32 +333,17 @@ impl PartStreamsMap {
         Self {
             streams: BTreeMap::new(),
             last_eviction: Instant::now(),
-            // MAX_EVICTED_STREAMS (10_000) fits in u32
+            // MAX_CLOSED_STREAMS (10_000) fits in u32
             #[allow(clippy::cast_possible_truncation)]
-            evicted: LruMap::new(ByLength::new(MAX_EVICTED_STREAMS as u32)),
+            closed_keys: LruMap::new(ByLength::new(MAX_CLOSED_STREAMS as u32)),
             current_height,
             max_total_streams: max_total_streams(num_validators),
         }
     }
 
-    /// Update the current height, purging any tracked streams that are now
-    /// stale so they stop consuming per-peer budget before the age sweep would
-    /// reach them.
-    ///
-    /// Height comes from the stream_id (see [`new_stream_id`]); lone non-Init
-    /// streams carry no payload height. Purged streams are not added to
-    /// `evicted`: the up-front height check in [`insert`](Self::insert) is
-    /// idempotent and prevents re-creation.
+    /// Update the current height.
     pub fn set_current_height(&mut self, height: Height) {
         self.current_height = height;
-        self.remove_stale_streams(height);
-    }
-
-    /// Remove streams whose height is below the given height.
-    /// Called by `set_current_height` to purge stale streams after a height increase.
-    fn remove_stale_streams(&mut self, height: Height) {
-        self.streams
-            .retain(|(_, stream_id), _| stream_id.height().is_some_and(|h| h >= height));
     }
 
     /// Update the global stream cap after a validator set change.
@@ -395,54 +370,24 @@ impl PartStreamsMap {
     ///   yet complete, or was silently rejected (duplicate, evicted, limit exceeded)
     /// - [`InsertResult::Invalid`] if the message was rejected due to misbehaviour
     pub fn insert(&mut self, peer_id: PeerId, msg: StreamMessage<ProposalPart>) -> InsertResult {
-        let stream_id = msg.stream_id.clone();
-        let key = (peer_id, stream_id.clone());
-        let actual = stream_id.to_bytes().len();
+        let actual = msg.stream_id.to_bytes().len();
         if actual != STREAM_ID_LEN {
-            self.streams.remove(&key);
             return InsertResult::Invalid(InsertError::InvalidStreamIdLength {
                 actual,
                 expected: STREAM_ID_LEN,
             });
-        }
-
-        // Reject parts for already-decided heights up front, before any per-peer
-        // accounting. The stream_id encodes the height (see `new_stream_id`), so
-        // this catches stale parts re-circulating on the network even when only
-        // non-Init parts arrive — those never carry the height in their payload,
-        // so without this they would linger and consume the proposer's per-peer
-        // stream budget until the age sweep.
-        let Some(stream_height) = stream_id.height() else {
-            self.streams.remove(&key);
-            return InsertResult::Invalid(InsertError::InvalidStreamIdLength {
-                actual,
-                expected: STREAM_ID_LEN,
-            });
-        };
-
-        if stream_height < self.current_height {
-            debug!(
-                %peer_id,
-                %stream_id,
-                %stream_height,
-                current_height = %self.current_height,
-                "Dropping stale proposal-part stream"
-            );
-
-            // A stream created while it was still current can become stale
-            // as the node advances; drop any tracked entry now so it stops
-            // consuming the peer's budget instead of lingering until the age
-            // sweep. The height check above is idempotent and prevents
-            // re-creation, so there is no need to mark it in `evicted`.
-            self.streams.remove(&key);
-
-            return InsertResult::Stale;
         }
 
         // First, evict any streams that have exceeded MAX_STREAM_AGE
         self.evict_old_streams();
 
-        if self.evicted.peek(&key).is_some() {
+        let stream_id = msg.stream_id.clone();
+        let key = (peer_id, stream_id.clone());
+        if self
+            .closed_keys
+            .peek(&(peer_id, stream_id.clone()))
+            .is_some()
+        {
             return InsertResult::Pending;
         }
 
@@ -479,13 +424,9 @@ impl PartStreamsMap {
 
             StreamInsertResult::Incomplete(None) => return InsertResult::Pending,
 
-            StreamInsertResult::Incomplete(Some(init_height)) => {
-                if init_height != stream_height {
+            StreamInsertResult::Incomplete(Some(height)) => {
+                if height < self.current_height {
                     self.evict(&key);
-                    return InsertResult::Invalid(InsertError::StreamIdHeightMismatch {
-                        stream_height,
-                        init_height,
-                    });
                 }
                 return InsertResult::Pending;
             }
@@ -497,6 +438,19 @@ impl PartStreamsMap {
                     message_count = state.message_count,
                     max = MAX_MESSAGES_PER_STREAM,
                     "Stream exceeded maximum message count, message rejected"
+                );
+
+                self.evict(&key);
+                return InsertResult::Pending;
+            }
+
+            StreamInsertResult::InvalidFinSequence(sequence) => {
+                warn!(
+                    %peer_id,
+                    %stream_id,
+                    sequence,
+                    max = MAX_MESSAGES_PER_STREAM,
+                    "Fin sequence out of range, evicting stream"
                 );
 
                 self.evict(&key);
@@ -531,27 +485,41 @@ impl PartStreamsMap {
         // Surface the failure as `Invalid` so the caller can act on the
         // misbehaviour rather than silently dropping the stream.
         match ProposalParts::new(parts) {
-            Ok(proposal_parts) => {
-                let init_height = proposal_parts.height();
-                if init_height != stream_height {
-                    self.evict(&key);
-                    return InsertResult::Invalid(InsertError::StreamIdHeightMismatch {
-                        stream_height,
-                        init_height,
-                    });
-                }
-                InsertResult::Complete(proposal_parts)
-            }
+            Ok(proposal_parts) => InsertResult::Complete(proposal_parts),
             Err(e) => InsertResult::Invalid(InsertError::AssemblyFailed(e)),
         }
     }
 
-    /// Evict a stream from the map and mark it as evicted.
-    /// The evicted LRU map is bounded by [`MAX_EVICTED_STREAMS`]; the oldest
+    /// Evict a stream from the map and record its key as closed.
+    /// The closed-keys LRU map is bounded by [`MAX_CLOSED_STREAMS`]; the oldest
     /// entry is automatically dropped when capacity is exceeded.
     fn evict(&mut self, key: &(PeerId, StreamId)) {
         self.streams.remove(key);
-        self.evicted.insert((key.0, key.1.clone()), ());
+        self.closed_keys.insert((key.0, key.1.clone()), ());
+    }
+
+    /// Record a key as closed after its stream completed and the assembled
+    /// proposal reached a terminal disposition (stored, ignored as past-height,
+    /// or rejected).
+    ///
+    /// Subsequent messages for this key — including resurfaced duplicates of the
+    /// already-completed stream — are dropped at the front of [`Self::insert`]
+    /// instead of reopening a slot. Callers must NOT close a key whose proposal
+    /// was only transiently declined (too far in the future, or the pending
+    /// table was full), because a later copy could still become storable.
+    ///
+    /// Shares the bounded [`MAX_CLOSED_STREAMS`] LRU with evicted streams.
+    pub fn mark_closed(&mut self, peer_id: PeerId, stream_id: StreamId) {
+        self.closed_keys.insert((peer_id, stream_id), ());
+    }
+
+    /// Test-only: whether a key has been recorded as closed (evicted or
+    /// terminally completed). Lets sibling-module tests observe `mark_closed`.
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self, peer_id: PeerId, stream_id: &StreamId) -> bool {
+        self.closed_keys
+            .peek(&(peer_id, stream_id.clone()))
+            .is_some()
     }
 
     /// Evict streams that have exceeded MAX_STREAM_AGE
@@ -649,11 +617,6 @@ mod tests {
     /// per-peer or per-stream limit tests.
     const NUM_VALIDATORS: usize = 100;
 
-    /// Height encoded into helper-built stream IDs. Matches the `current_height`
-    /// the helper-based tests construct their maps with, so those streams are
-    /// not dropped as stale by the height check in `PartStreamsMap::insert`.
-    const HELPER_STREAM_HEIGHT: u64 = 1;
-
     impl PartStreamsMap {
         /// Test-only wrapper that panics on [`InsertResult::Invalid`].
         /// Returns `Some(parts)` on [`InsertResult::Complete`], `None` on [`InsertResult::Pending`].
@@ -664,7 +627,7 @@ mod tests {
         ) -> Option<ProposalParts> {
             match self.insert(peer_id, msg) {
                 InsertResult::Complete(parts) => Some(parts),
-                InsertResult::Pending | InsertResult::Stale => None,
+                InsertResult::Pending => None,
                 InsertResult::Invalid(e) => panic!("unexpected InsertError: {e}"),
             }
         }
@@ -714,15 +677,19 @@ mod tests {
 
     fn make_stream_id(id: u8) -> StreamId {
         let mut bytes = vec![0u8; STREAM_ID_LEN];
-        bytes[..8].copy_from_slice(&HELPER_STREAM_HEIGHT.to_be_bytes());
         bytes[STREAM_ID_LEN - 1] = id;
         StreamId::new(bytes.into())
     }
 
     fn make_stream_id_u16(id: u16) -> StreamId {
         let mut bytes = vec![0u8; STREAM_ID_LEN];
-        bytes[..8].copy_from_slice(&HELPER_STREAM_HEIGHT.to_be_bytes());
         bytes[STREAM_ID_LEN - 2..].copy_from_slice(&id.to_be_bytes());
+        StreamId::new(bytes.into())
+    }
+
+    fn make_stream_id_u64(id: u64) -> StreamId {
+        let mut bytes = vec![0u8; STREAM_ID_LEN];
+        bytes[8..16].copy_from_slice(&id.to_be_bytes());
         StreamId::new(bytes.into())
     }
 
@@ -1099,6 +1066,98 @@ mod tests {
         );
 
         assert_eq!(map.streams.len(), 0, "Stream has been evicted");
+    }
+
+    #[test]
+    fn test_fin_sequence_max_allowed_completes() {
+        let peer = PeerId::random();
+        let stream = make_stream_id(101);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        assert!(map
+            .must_insert(peer, make_message(&stream, 0, make_init_part()))
+            .is_none());
+
+        for i in 1..(MAX_MESSAGES_PER_STREAM - 2) {
+            assert!(map
+                .must_insert(
+                    peer,
+                    make_message(&stream, i as u64, make_data_part(i as u8))
+                )
+                .is_none());
+        }
+
+        let proposal_fin_sequence = (MAX_MESSAGES_PER_STREAM - 2) as u64;
+        assert!(map
+            .must_insert(
+                peer,
+                make_message(&stream, proposal_fin_sequence, make_fin_part()),
+            )
+            .is_none());
+
+        let stream_fin_sequence = (MAX_MESSAGES_PER_STREAM - 1) as u64;
+        let result = map.must_insert(peer, make_fin_message(&stream, stream_fin_sequence));
+
+        assert!(
+            result.is_some(),
+            "Fin at the maximum allowed sequence should complete"
+        );
+        assert!(map.streams.is_empty(), "Completed stream should be removed");
+    }
+
+    #[test]
+    fn test_fin_sequence_at_max_messages_per_stream_evicts() {
+        let peer = PeerId::random();
+        let stream = make_stream_id(101);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        assert!(map
+            .must_insert(peer, make_message(&stream, 0, make_init_part()))
+            .is_none());
+
+        let result = map.must_insert(
+            peer,
+            make_fin_message(&stream, MAX_MESSAGES_PER_STREAM as u64),
+        );
+
+        assert!(result.is_none(), "Out-of-range Fin should be pending");
+        assert!(
+            map.streams.is_empty(),
+            "Stream should be evicted after out-of-range Fin"
+        );
+        assert!(
+            map.closed_keys.peek(&(peer, stream)).is_some(),
+            "Stream should be marked as evicted"
+        );
+    }
+
+    #[test]
+    fn test_fin_sequence_u64_max_evicts_without_panicking() {
+        let peer = PeerId::random();
+        let stream = make_stream_id(101);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        assert!(map
+            .must_insert(peer, make_message(&stream, 0, make_init_part()))
+            .is_none());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.insert(peer, make_fin_message(&stream, u64::MAX))
+        }));
+
+        let result = result.expect("Out-of-range Fin should not panic");
+        assert!(
+            matches!(result, InsertResult::Pending),
+            "Out-of-range Fin should be rejected as pending"
+        );
+        assert!(
+            map.streams.is_empty(),
+            "Stream should be evicted after out-of-range Fin"
+        );
+        assert!(
+            map.closed_keys.peek(&(peer, stream)).is_some(),
+            "Stream should be marked as evicted"
+        );
     }
 
     #[test]
@@ -1544,158 +1603,28 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_id_init_height_mismatch_rejected() {
+    fn test_stale_height_streams_evicted() {
         let peer_1 = PeerId::random();
-        let stream_1 = new_stream_id(Height::new(5), Round::new(0), 101);
+        let stream_1 = make_stream_id(101);
         let mut map = PartStreamsMap::new(Height::new(5), NUM_VALIDATORS);
 
-        // Send Init message whose payload height disagrees with stream_id.
+        // Send Init message for old height (height 3)
         let mut init_part = make_init_part();
         if let ProposalPart::Init(ref mut init) = init_part {
             init.height = Height::new(3);
         }
         let init_msg = make_message(&stream_1, 0, init_part);
-        let result = map.insert(peer_1, init_msg);
+        map.must_insert(peer_1, init_msg);
 
-        assert!(matches!(
-            result,
-            InsertResult::Invalid(InsertError::StreamIdHeightMismatch {
-                stream_height,
-                init_height,
-            }) if stream_height == Height::new(5) && init_height == Height::new(3)
-        ));
-        assert_eq!(map.streams.len(), 0, "Mismatched stream should be evicted");
+        // Send a data message
+        let data_msg = make_message(&stream_1, 1, make_data_part(42));
+        map.must_insert(peer_1, data_msg);
+
+        // Verify stream was evicted
+        assert_eq!(map.streams.len(), 0, "Stale stream should be evicted");
         assert!(
-            map.evicted.peek(&(peer_1, stream_1)).is_some(),
-            "Mismatched stream should be marked as evicted"
-        );
-    }
-
-    #[test]
-    fn test_stale_lone_data_parts_do_not_starve_current_proposal() {
-        // Regression guard: stale lone non-Init parts (e.g. old proposal parts
-        // re-circulating on gossipsub) must not consume a peer's per-peer stream
-        // budget, so a proposer's current-height proposal is always admitted.
-        // `insert` rejects parts whose stream_id-encoded height is below
-        // `current_height` up front, before they can occupy a slot.
-        let peer = PeerId::random();
-        let mut map = PartStreamsMap::new(Height::new(100), NUM_VALIDATORS);
-
-        // Each stale stream carries only a lone data part (no Init at sequence 0);
-        // the stream_id still encodes the old height, so it must be rejected.
-        for nonce in 0..MAX_STREAMS_PER_PEER as u32 {
-            let stream_id = new_stream_id(Height::new(90 + nonce as u64), Round::new(0), nonce);
-            let data_msg = make_message(&stream_id, 1, make_data_part(nonce as u8));
-            assert!(matches!(map.insert(peer, data_msg), InsertResult::Stale));
-        }
-
-        assert_eq!(
-            map.streams.len(),
-            0,
-            "Stale lone-data streams must be rejected up front, not lingering"
-        );
-        assert_eq!(map.peer_streams_count(peer), 0);
-
-        // The legitimate current-height proposal (carrying a real Init) must be
-        // admitted because no stale stream is occupying the per-peer budget.
-        let mut init_part = make_init_part();
-        if let ProposalPart::Init(ref mut init) = init_part {
-            init.height = Height::new(100);
-        }
-        let current_id =
-            new_stream_id(Height::new(100), Round::new(0), MAX_STREAMS_PER_PEER as u32);
-        let init_msg = make_message(&current_id, 0, init_part);
-
-        assert!(
-            map.must_insert(peer, init_msg).is_none(),
-            "Current proposal Init is incomplete on its own"
-        );
-        assert_eq!(
-            map.streams.len(),
-            1,
-            "Current-height Init stream must be admitted"
-        );
-        assert_eq!(map.peer_streams_count(peer), 1);
-    }
-
-    #[test]
-    fn test_height_advance_purges_tracked_stale_streams() {
-        // A stream created while its height was current becomes stale once the
-        // node advances. Such streams must be purged on the height advance so
-        // they stop consuming the proposer's per-peer budget, instead of
-        // lingering (and potentially starving the current proposal) until the
-        // age sweep.
-        let peer = PeerId::random();
-        let mut map = PartStreamsMap::new(Height::new(10), NUM_VALIDATORS);
-
-        // Fill the peer's budget with incomplete lone-data streams at the
-        // current height — each lingers because it carries no Init yet.
-        for nonce in 0..MAX_STREAMS_PER_PEER as u32 {
-            let stream_id = new_stream_id(Height::new(10), Round::new(0), nonce);
-            let data = make_message(&stream_id, 1, make_data_part(nonce as u8));
-            assert!(map.must_insert(peer, data).is_none());
-        }
-        assert_eq!(map.peer_streams_count(peer), MAX_STREAMS_PER_PEER);
-
-        // Advancing past those heights must purge them.
-        map.set_current_height(Height::new(11));
-        assert_eq!(
-            map.streams.len(),
-            0,
-            "stale tracked streams must be purged on height advance"
-        );
-
-        // The peer's current-height proposal is now admitted.
-        let mut init_part = make_init_part();
-        if let ProposalPart::Init(ref mut init) = init_part {
-            init.height = Height::new(11);
-        }
-        let current = new_stream_id(Height::new(11), Round::new(0), 0);
-        let init_msg = make_message(&current, 0, init_part);
-        assert!(map.must_insert(peer, init_msg).is_none());
-        assert_eq!(
-            map.streams.len(),
-            1,
-            "current-height proposal must be admitted"
-        );
-        assert_eq!(map.peer_streams_count(peer), 1);
-    }
-
-    #[test]
-    fn test_complete_on_stream_id_init_height_mismatch_returns_invalid() {
-        // A stream can complete on the Init insert if Init arrives last. Even
-        // then, a stream_id/Init height disagreement is peer misbehaviour.
-        let peer = PeerId::random();
-        let mut map = PartStreamsMap::new(Height::new(10), NUM_VALIDATORS);
-        let stream = new_stream_id(Height::new(10), Round::new(0), 0);
-
-        // Fin parts arrive first; height stays unknown so the stream is kept.
-        assert!(matches!(
-            map.insert(peer, make_message(&stream, 1, make_fin_part())),
-            InsertResult::Pending
-        ));
-        assert!(matches!(
-            map.insert(peer, make_fin_message(&stream, 2)),
-            InsertResult::Pending
-        ));
-
-        // Init arrives last with a mismatched payload height, completing the stream.
-        let mut init_part = make_init_part();
-        if let ProposalPart::Init(ref mut init) = init_part {
-            init.height = Height::new(3);
-        }
-        let result = map.insert(peer, make_message(&stream, 0, init_part));
-        assert!(matches!(
-            result,
-            InsertResult::Invalid(InsertError::StreamIdHeightMismatch {
-                stream_height,
-                init_height,
-            }) if stream_height == Height::new(10) && init_height == Height::new(3)
-        ));
-        assert_eq!(map.streams.len(), 0, "completed stream must be removed");
-        assert!(
-            map.evicted.peek(&(peer, stream)).is_some(),
-            "Mismatched stream should be marked as evicted"
+            map.closed_keys.peek(&(peer_1, stream_1)).is_some(),
+            "Stream should be marked as evicted"
         );
     }
 
@@ -1712,7 +1641,7 @@ mod tests {
         }
 
         assert!(
-            !map.evicted.is_empty(),
+            !map.closed_keys.is_empty(),
             "Evicted set should contain entries"
         );
 
@@ -1722,7 +1651,7 @@ mod tests {
 
         // Evicted entries should be retained — the LRU is self-bounding
         assert!(
-            !map.evicted.is_empty(),
+            !map.closed_keys.is_empty(),
             "Evicted set should be retained across eviction cycles"
         );
     }
@@ -1750,7 +1679,7 @@ mod tests {
             "Stream should be evicted after oversized chunk"
         );
         assert!(
-            map.evicted.peek(&(peer, stream)).is_some(),
+            map.closed_keys.peek(&(peer, stream)).is_some(),
             "Stream should be marked as evicted"
         );
     }
@@ -1848,7 +1777,7 @@ mod tests {
         assert!(map.streams.is_empty(), "empty stream_id should be rejected");
 
         // Exactly 16 bytes — accepted
-        let valid = new_stream_id(Height::new(1), Round::new(0), 0x01);
+        let valid = StreamId::new(vec![0x01; STREAM_ID_LEN].into());
         let msg = make_message(&valid, 0, make_init_part());
         assert!(map.must_insert(peer, msg).is_none()); // not complete, but accepted
         assert_eq!(map.streams.len(), 1, "valid stream_id should be accepted");
@@ -1859,41 +1788,37 @@ mod tests {
         let peer = PeerId::random();
         let mut map = PartStreamsMap::new(Height::new(100), NUM_VALIDATORS);
 
-        // Send many Init messages whose payload height disagrees with the
-        // current-height stream ID. Each mismatch is rejected, evicted, and
-        // recorded in the evicted set.
-        let count = MAX_EVICTED_STREAMS + 500;
-        for i in 0..count {
+        // Send many Init messages for stale height with distinct stream IDs.
+        // Each gets immediately evicted because height 1 < current height 100.
+        let count = MAX_CLOSED_STREAMS + 500;
+        for i in 0..count as u64 {
             let mut init = make_init_part();
             if let ProposalPart::Init(ref mut part) = init {
                 part.height = Height::new(1);
             }
 
-            let stream = new_stream_id(Height::new(100), Round::new(0), i as u32);
+            let stream = make_stream_id_u64(i);
             let msg = make_message(&stream, 0, init);
-            assert!(matches!(
-                map.insert(peer, msg),
-                InsertResult::Invalid(InsertError::StreamIdHeightMismatch { .. })
-            ));
+            map.must_insert(peer, msg);
 
             assert!(
-                map.evicted.len() <= MAX_EVICTED_STREAMS,
-                "Evicted set should never exceed MAX_EVICTED_STREAMS, got {}",
-                map.evicted.len()
+                map.closed_keys.len() <= MAX_CLOSED_STREAMS,
+                "Evicted set should never exceed MAX_CLOSED_STREAMS, got {}",
+                map.closed_keys.len()
             );
         }
 
         // After the loop, evicted should have been cleared at least once
         assert!(
-            map.evicted.len() <= MAX_EVICTED_STREAMS,
+            map.closed_keys.len() <= MAX_CLOSED_STREAMS,
             "Evicted set should be bounded, got {}",
-            map.evicted.len()
+            map.closed_keys.len()
         );
 
         // Map should still function correctly after clearing.
-        // Use a new peer and a current-height stream so it isn't stale-evicted.
+        // Use a new peer and a current-height init so the stream isn't stale-evicted.
         let peer2 = PeerId::random();
-        let stream = new_stream_id(Height::new(100), Round::new(0), 0xFF);
+        let stream = make_stream_id(0xFF);
         let mut init_part = make_init_part();
         if let ProposalPart::Init(ref mut part) = init_part {
             part.height = Height::new(100);
@@ -1991,6 +1916,83 @@ mod tests {
             map.must_insert(low_volume_peer, msg_part).is_none(),
             "Follow up message on the low-volume stream should be accepted"
         );
+    }
+
+    #[test]
+    fn test_resurfaced_part_reopens_completed_stream_without_mark_closed() {
+        // Documents the gap that `mark_closed` closes: after a stream completes
+        // and is removed, a resurfaced non-`Init` straggler creates a fresh
+        // `height = None` stream that escapes the staleness check and lingers,
+        // holding a slot until the age timer reaps it.
+        let peer = PeerId::random();
+        let stream = make_stream_id(1);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        map.must_insert(peer, make_message(&stream, 0, make_init_part()));
+        map.must_insert(peer, make_message(&stream, 1, make_fin_part()));
+        assert!(map
+            .must_insert(peer, make_fin_message(&stream, 2))
+            .is_some());
+        assert_eq!(map.streams.len(), 0, "completed stream is removed");
+
+        // A resurfaced straggler (the original fin part) carries no height.
+        let resurfaced = make_message(&stream, 1, make_fin_part());
+        assert!(map.must_insert(peer, resurfaced).is_none());
+        assert_eq!(
+            map.streams.len(),
+            1,
+            "without mark_closed, a resurfaced straggler reopens a lingering stream"
+        );
+    }
+
+    #[test]
+    fn test_mark_closed_drops_resurfaced_part() {
+        // With the completed key marked closed, the same resurfaced straggler is
+        // dropped at the front of `insert` and never reopens a slot.
+        let peer = PeerId::random();
+        let stream = make_stream_id(1);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        map.must_insert(peer, make_message(&stream, 0, make_init_part()));
+        map.must_insert(peer, make_message(&stream, 1, make_fin_part()));
+        assert!(map
+            .must_insert(peer, make_fin_message(&stream, 2))
+            .is_some());
+        assert_eq!(map.streams.len(), 0, "completed stream is removed");
+
+        map.mark_closed(peer, stream.clone());
+
+        let resurfaced = make_message(&stream, 1, make_fin_part());
+        assert!(map.must_insert(peer, resurfaced).is_none());
+        assert_eq!(
+            map.streams.len(),
+            0,
+            "a closed key must not reopen a stream"
+        );
+        assert!(
+            map.closed_keys.peek(&(peer, stream)).is_some(),
+            "key should be recorded as closed"
+        );
+    }
+
+    #[test]
+    fn test_mark_closed_does_not_count_toward_per_peer_limit() {
+        // Closed keys live in the LRU, not in `streams`, so they never consume a
+        // per-peer slot.
+        let peer = PeerId::random();
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        for i in 0..MAX_STREAMS_PER_PEER as u8 {
+            map.mark_closed(peer, make_stream_id(i));
+        }
+        assert_eq!(map.peer_streams_count(peer), 0);
+
+        // A brand-new stream is still accepted despite the closed keys.
+        let fresh = make_stream_id(200);
+        assert!(map
+            .must_insert(peer, make_message(&fresh, 0, make_init_part()))
+            .is_none());
+        assert_eq!(map.streams.len(), 1);
     }
 
     // --- Property-Based Tests ---

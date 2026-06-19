@@ -208,6 +208,7 @@ mod tests {
             suggested_fee_recipient: Address::ZERO,
             withdrawals: None,
             parent_beacon_block_root: None,
+            slot_number: None,
         };
 
         assert!(<ArcEngineValidator<_> as PayloadValidator<EthEngineTypes>>::validate_payload_attributes_against_header(
@@ -223,6 +224,7 @@ mod tests {
             suggested_fee_recipient: Address::ZERO,
             withdrawals: None,
             parent_beacon_block_root: None,
+            slot_number: None,
         };
 
         assert!(<ArcEngineValidator<_> as PayloadValidator<EthEngineTypes>>::validate_payload_attributes_against_header(
@@ -247,6 +249,7 @@ mod tests {
             suggested_fee_recipient: Address::ZERO,
             withdrawals: None,
             parent_beacon_block_root: None,
+            slot_number: None,
         };
 
         assert!(matches!(<ArcEngineValidator<_> as PayloadValidator<EthEngineTypes>>::validate_payload_attributes_against_header(

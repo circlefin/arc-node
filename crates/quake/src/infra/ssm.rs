@@ -34,6 +34,10 @@ use crate::util::in_parallel;
 /// Local file that stores the SSM owner ID for one imported remote testnet.
 pub(crate) const OWNER_ID_FILENAME: &str = ".ssm-owner-id";
 
+/// AWS closes idle SSM sessions after 20 minutes. Pinging every 5 minutes
+/// gives generous headroom for transient network blips.
+const KEEP_ALIVE_PING_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 /// Each developer needs a stable local owner ID so Quake only matches
 /// and terminates the SSM tunnels created by this machine.
 pub(crate) fn ensure_owner_id(testnet_dir: &Path) -> Result<String> {
@@ -173,6 +177,67 @@ impl Ssm {
 
         info!("✅ SSM sessions ready");
         Ok(())
+    }
+
+    /// Opens a short-lived TCP connection through each tunnel periodically
+    /// so AWS doesn't close the underlying SSM sessions after 20 minutes of
+    /// inactivity. The TCP handshake traverses the SSM channel and resets
+    /// the idle timer; no real data is exchanged.
+    pub async fn keep_alive(&self, total_duration: Duration) -> Result<()> {
+        if self.sessions.is_empty() {
+            info!("No SSM tunnels configured; nothing to keep alive");
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + total_duration;
+        info!(
+            duration = %humantime::format_duration(total_duration),
+            ping_interval = %humantime::format_duration(KEEP_ALIVE_PING_INTERVAL),
+            tunnels = self.sessions.len(),
+            "Keeping SSM tunnels alive (Ctrl-C to stop)"
+        );
+
+        loop {
+            self.ping_sessions();
+
+            let now = Instant::now();
+            if now >= deadline {
+                info!("✅ Keep-alive period elapsed");
+                return Ok(());
+            }
+            let sleep_for = (deadline - now).min(KEEP_ALIVE_PING_INTERVAL);
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_for) => {}
+                _ = tokio::signal::ctrl_c() => {
+                    info!("✅ Keep-alive interrupted (Ctrl-C); SSM tunnels still up");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Touches every tunnel's local port to push activity through the SSM
+    /// channel. Warns on tunnels that no longer have a local listener — they
+    /// should be repaired with `quake remote ssm start`.
+    fn ping_sessions(&self) {
+        let mut alive = 0;
+        let mut dead = Vec::new();
+        for session in &self.sessions {
+            if self.backend.is_local_port_listening(session.local_port) {
+                alive += 1;
+            } else {
+                dead.push(session.label());
+            }
+        }
+        if dead.is_empty() {
+            debug!(alive, "Pinged SSM tunnels");
+        } else {
+            warn!(
+                alive,
+                dead = %dead.join(", "),
+                "Some SSM tunnels have no local listener; run `quake remote ssm start` to repair",
+            );
+        }
     }
 
     /// Without cleanup, AWS can still show this machine's old sessions for
@@ -635,6 +700,9 @@ mod tests {
         terminated_sessions: Mutex<Vec<String>>,
         /// `next_id` keeps the counter used to mint fake AWS session IDs.
         next_id: Mutex<usize>,
+        /// Counts how many times each local port was probed by
+        /// `is_local_port_listening`. Used to verify keep-alive activity.
+        port_probes: Mutex<Vec<u16>>,
     }
 
     impl MockSsmBackend {
@@ -677,6 +745,14 @@ mod tests {
                 .expect("terminated_sessions mutex poisoned")
                 .clone()
         }
+
+        /// Ports probed by `is_local_port_listening`, in call order.
+        fn port_probes(&self) -> Vec<u16> {
+            self.port_probes
+                .lock()
+                .expect("port_probes mutex poisoned")
+                .clone()
+        }
     }
 
     impl SsmBackend for MockSsmBackend {
@@ -689,6 +765,10 @@ mod tests {
         }
 
         fn is_local_port_listening(&self, local_port: u16) -> bool {
+            self.port_probes
+                .lock()
+                .expect("port_probes mutex poisoned")
+                .push(local_port);
             self.listening_ports
                 .lock()
                 .expect("listening_ports mutex poisoned")
@@ -1006,5 +1086,77 @@ session-3 Failed quake-cc-i-123-8000-80
         assert!(rendered.contains("listener: down aws_sessions: 0"));
         assert!(rendered.contains("aws: []"));
         assert!(!rendered.contains("foreign-1"));
+    }
+
+    #[tokio::test]
+    async fn keep_alive_probes_every_tunnel_then_returns() {
+        let session_a = test_session(13000, 3000);
+        let session_b = test_session(19090, 9090);
+        let backend = Arc::new(MockSsmBackend::default());
+        backend.listen_on(session_a.local_port);
+        backend.listen_on(session_b.local_port);
+        let ssm = Ssm::with_backend(vec![session_a.clone(), session_b.clone()], backend.clone());
+
+        // Zero duration: one ping pass, then the deadline check exits.
+        ssm.keep_alive(Duration::ZERO)
+            .await
+            .expect("keep_alive succeeds");
+
+        assert_eq!(
+            backend.port_probes(),
+            vec![session_a.local_port, session_b.local_port],
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_alive_with_no_sessions_is_noop() {
+        let backend = Arc::new(MockSsmBackend::default());
+        let ssm = Ssm::with_backend(vec![], backend.clone());
+
+        ssm.keep_alive(Duration::from_secs(60))
+            .await
+            .expect("keep_alive succeeds");
+
+        assert!(backend.port_probes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn keep_alive_pings_multiple_times_within_window() {
+        let session = test_session(13000, 3000);
+        let backend = Arc::new(MockSsmBackend::default());
+        backend.listen_on(session.local_port);
+        let ssm = Ssm::with_backend(vec![session.clone()], backend.clone());
+
+        // Non-zero duration: the loop pings, sleeps, then pings again before
+        // the deadline check exits. Exercises the tokio::select! sleep arm
+        // that Duration::ZERO skips.
+        ssm.keep_alive(Duration::from_millis(50))
+            .await
+            .expect("keep_alive succeeds");
+
+        let probes = backend.port_probes();
+        assert!(
+            probes.len() >= 2,
+            "expected at least 2 ping passes within 50ms; got {}",
+            probes.len()
+        );
+        assert!(
+            probes.iter().all(|p| *p == session.local_port),
+            "every probe should target {} but got {probes:?}",
+            session.local_port,
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_alive_tolerates_tunnels_with_no_local_listener() {
+        let session = test_session(13000, 3000);
+        let backend = Arc::new(MockSsmBackend::default());
+        let ssm = Ssm::with_backend(vec![session.clone()], backend.clone());
+
+        ssm.keep_alive(Duration::ZERO)
+            .await
+            .expect("keep_alive succeeds even when tunnel is down");
+
+        assert_eq!(backend.port_probes(), vec![session.local_port]);
     }
 }

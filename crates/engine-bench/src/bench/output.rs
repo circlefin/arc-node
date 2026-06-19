@@ -65,6 +65,48 @@ pub(crate) struct SummaryRow {
     pub p99_total_ms: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CombinedBuildLatencyRow {
+    pub block_number: u64,
+    pub parent_hash: String,
+    pub recorded_gas: u64,
+    pub recorded_tx_count: u64,
+    pub built_block_hash: String,
+    pub built_gas: u64,
+    pub built_tx_count: u64,
+    pub txs_submitted: u64,
+    pub txs_rejected: u64,
+    pub fcu_attrs_ms: f64,
+    pub get_payload_ms: f64,
+    pub build_window_ms: f64,
+    pub elapsed_ms: f64,
+    pub built_mgas_per_s: f64,
+    pub gas_fill_ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BuildSummaryRow {
+    pub mode: String,
+    pub samples: u64,
+    pub build_window_ms: f64,
+    pub total_built_gas: u64,
+    pub total_built_txs: u64,
+    pub total_recorded_gas: u64,
+    pub wall_clock_ms: f64,
+    pub avg_fcu_attrs_ms: f64,
+    pub avg_get_payload_ms: f64,
+    pub p50_get_payload_ms: f64,
+    pub p95_get_payload_ms: f64,
+    pub p99_get_payload_ms: f64,
+    pub p50_fcu_attrs_ms: f64,
+    pub p95_fcu_attrs_ms: f64,
+    pub p99_fcu_attrs_ms: f64,
+    pub avg_built_gas: f64,
+    pub avg_built_txs: f64,
+    pub avg_gas_fill_ratio: f64,
+    pub avg_built_mgas_per_s: f64,
+}
+
 pub(crate) trait BenchmarkRow {
     fn gas_used(&self) -> u64;
     fn tx_count(&self) -> u64;
@@ -205,6 +247,46 @@ pub(crate) fn build_summary<T: BenchmarkRow>(
     })
 }
 
+pub(crate) fn build_build_summary(
+    rows: &[CombinedBuildLatencyRow],
+    wall_clock: Duration,
+    build_window_ms: f64,
+) -> BuildSummaryRow {
+    let samples = rows.len() as u64;
+    let mut gp: Vec<f64> = rows.iter().map(|r| r.get_payload_ms).collect();
+    let mut fa: Vec<f64> = rows.iter().map(|r| r.fcu_attrs_ms).collect();
+    sort_f64(&mut gp);
+    sort_f64(&mut fa);
+
+    let total_built_gas: u64 = rows.iter().map(|r| r.built_gas).sum();
+    let total_built_txs: u64 = rows.iter().map(|r| r.built_tx_count).sum();
+    let total_recorded_gas: u64 = rows.iter().map(|r| r.recorded_gas).sum();
+    let n = samples.max(1) as f64;
+    let wall_ms = duration_to_ms(wall_clock);
+
+    BuildSummaryRow {
+        mode: "build-payload".to_owned(),
+        samples,
+        build_window_ms,
+        total_built_gas,
+        total_built_txs,
+        total_recorded_gas,
+        wall_clock_ms: wall_ms,
+        avg_fcu_attrs_ms: fa.iter().sum::<f64>() / n,
+        avg_get_payload_ms: gp.iter().sum::<f64>() / n,
+        p50_get_payload_ms: percentile_sorted(&gp, 0.50),
+        p95_get_payload_ms: percentile_sorted(&gp, 0.95),
+        p99_get_payload_ms: percentile_sorted(&gp, 0.99),
+        p50_fcu_attrs_ms: percentile_sorted(&fa, 0.50),
+        p95_fcu_attrs_ms: percentile_sorted(&fa, 0.95),
+        p99_fcu_attrs_ms: percentile_sorted(&fa, 0.99),
+        avg_built_gas: total_built_gas as f64 / n,
+        avg_built_txs: total_built_txs as f64 / n,
+        avg_gas_fill_ratio: rows.iter().map(|r| r.gas_fill_ratio).sum::<f64>() / n,
+        avg_built_mgas_per_s: throughput_mgas_per_s(total_built_gas, wall_clock),
+    }
+}
+
 fn average(values: &[f64]) -> Option<f64> {
     (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
@@ -240,6 +322,35 @@ fn percentile(mut values: Vec<f64>, quantile: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_summary_computes_percentiles() {
+        let rows: Vec<CombinedBuildLatencyRow> = (1..=5)
+            .map(|i| CombinedBuildLatencyRow {
+                block_number: i,
+                parent_hash: "0x".into(),
+                recorded_gas: 100,
+                recorded_tx_count: 10,
+                built_block_hash: "0x".into(),
+                built_gas: 90,
+                built_tx_count: 9,
+                txs_submitted: 10,
+                txs_rejected: 1,
+                fcu_attrs_ms: i as f64,
+                get_payload_ms: (i * 2) as f64,
+                build_window_ms: 200.0,
+                elapsed_ms: 0.0,
+                built_mgas_per_s: 0.0,
+                gas_fill_ratio: 0.9,
+            })
+            .collect();
+
+        let s = build_build_summary(&rows, Duration::from_millis(50), 200.0);
+        assert_eq!(s.samples, 5);
+        assert_eq!(s.total_built_gas, 450);
+        assert_eq!(s.p50_get_payload_ms, 6.0); // median of 2,4,6,8,10
+        assert!((s.avg_gas_fill_ratio - 0.9).abs() < 1e-9);
+    }
 
     #[test]
     fn percentile_interpolates_between_samples() {

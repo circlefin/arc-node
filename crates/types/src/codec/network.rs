@@ -23,7 +23,6 @@ use malachitebft_core_types::ValidatorProof;
 use malachitebft_sync::{self as sync};
 
 use crate::codec::error::CodecError;
-use crate::codec::impl_versioned_codec;
 use crate::codec::proto::ProtobufCodec;
 use crate::codec::versions::{
     LivenessMsgVersion, ProposalPartVersion, SignedConsensusMsgVersion, StreamMessageVersion,
@@ -442,76 +441,6 @@ mod tests {
         }
     }
 
-    /// XXX: remove after all nodes are upgraded to use versioning
-    #[test]
-    fn test_previous_codec_compatibility() {
-        let codec = NetCodec;
-
-        let msg = create_test_vote();
-        // NOTE: ProtobufCodec is used here because it is the previous codec used for encoding and decoding messages.
-        let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
-        let decoded = codec.decode(encoded).expect("Failed to decode");
-        assert_eq!(msg, decoded);
-
-        // LivenessMsg (Vote)
-        let msg = create_test_liveness_msg();
-        let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
-        let decoded = codec.decode(encoded).expect("Failed to decode");
-        assert_eq!(msg, decoded);
-
-        // Proposal (SignedConsensusMsg::Proposal)
-        let msg = create_test_proposal();
-        let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
-        let decoded = codec.decode(encoded).expect("Failed to decode");
-        assert_eq!(msg, decoded);
-
-        // ProposalPart messages (Init, Data, Fin variants)
-        let msg = create_test_proposal_part_init();
-        let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
-        let decoded = codec.decode(encoded).expect("Failed to decode");
-        assert_eq!(msg, decoded);
-
-        let msg = create_test_proposal_part_data();
-        let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
-        let decoded = codec.decode(encoded).expect("Failed to decode");
-        assert_eq!(msg, decoded);
-
-        let msg = create_test_proposal_part_fin();
-        let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
-        let decoded = codec.decode(encoded).expect("Failed to decode");
-        assert_eq!(msg, decoded);
-
-        // StreamMessage (Data variant)
-        let msg = create_test_stream_message_data();
-        let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
-        let decoded = codec.decode(encoded).expect("Failed to decode");
-        assert_eq!(msg, decoded);
-
-        // StreamMessage (Fin variant)
-        let msg = create_test_stream_message_fin();
-        let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
-        let decoded = codec.decode(encoded).expect("Failed to decode");
-        assert_eq!(msg, decoded);
-
-        // sync::Status
-        let msg = create_test_sync_status();
-        let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
-        let decoded: sync::Status<ArcContext> = codec.decode(encoded).expect("Failed to decode");
-        assert_eq!(msg, decoded);
-
-        // sync::Request
-        let msg = create_test_sync_request();
-        let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
-        let decoded = codec.decode(encoded).expect("Failed to decode");
-        assert_eq!(msg, decoded);
-
-        // sync::Response
-        let msg = create_test_sync_response();
-        let encoded = ProtobufCodec.encode(&msg).expect("Failed to encode");
-        let decoded = codec.decode(encoded).expect("Failed to decode");
-        assert_eq!(msg, decoded);
-    }
-
     #[test]
     fn test_decode_corrupted_legacy_message() {
         let codec = NetCodec;
@@ -521,7 +450,6 @@ mod tests {
         let result: Result<SignedConsensusMsg<ArcContext>, _> = codec.decode(corrupted_bytes);
         assert!(result.is_err());
 
-        // The logic should fall back to versioned decoding and fail with an "UnsupportedVersion" error.
         let err = result.unwrap_err();
         assert!(
             matches!(err, CodecError::UnsupportedVersion(2)),
@@ -534,7 +462,6 @@ mod tests {
         let result_v1: Result<SignedConsensusMsg<ArcContext>, _> = codec.decode(corrupted_bytes_v1);
         assert!(result_v1.is_err());
 
-        // The logic should fall back, see the valid version byte, and then fail on protobuf decoding.
         let err_v1 = result_v1.unwrap_err();
         assert!(
             matches!(err_v1, CodecError::Protobuf(_)),

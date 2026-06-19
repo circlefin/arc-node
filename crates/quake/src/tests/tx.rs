@@ -19,10 +19,12 @@ use alloy_primitives::{TxKind, U256};
 use alloy_signer::Signer;
 use alloy_signer_local::{coins_bip39::English, MnemonicBuilder};
 use color_eyre::eyre::{self, Context};
-use rand::{seq::SliceRandom, thread_rng};
+use indexmap::IndexMap;
+use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use tracing::{debug, info};
 
 use super::{quake_test, CheckResult, RpcClientFactory, TestOutcome, TestParams, TestResult};
+use crate::manifest;
 use crate::testnet::Testnet;
 
 /// Test mnemonic matching genesis pre-funded accounts.
@@ -33,14 +35,20 @@ const TEST_ACCOUNT_INDEX: u32 = 0;
 
 const CHAIN_ID: u64 = 1337;
 const MAX_PRIORITY_FEE_PER_GAS: u128 = 1_000_000_000; // 1 gwei
-const MAX_FEE_PER_GAS: u128 = 2_000_000_000; // 2 gwei
+const MAX_FEE_PER_GAS: u128 = 40_000_000_000_000; // 40,000 gwei (2x headroom over the 20,000 gwei maxBaseFee ceiling)
 const GAS_LIMIT: u64 = 30_000; // sufficient for a simple value transfer on Arc (~26k with blocklist check)
 
 /// Default receipt polling timeout.
-const DEFAULT_RECEIPT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_RECEIPT_TIMEOUT_SECS: u64 = 20;
 
 /// Delay between receipt polling attempts.
 const RECEIPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Maximum time to wait for a late-joining target node to come online.
+const TARGET_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Delay between target-readiness polls.
+const TARGET_READINESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Submit a value transfer from a pre-funded genesis account to itself and
 /// verify that the transaction is committed in a block with a success status.
@@ -79,6 +87,10 @@ fn transfer_test<'a>(
 
         let target_client = factory.create(target_node_url);
         let receipt_client = factory.create(receipt_node_url);
+
+        if target_starts_late(&testnet.manifest.nodes, &target_node_name) {
+            wait_for_node_started(&target_client, &target_node_name).await?;
+        }
 
         // Derive signer from test mnemonic
         let mut signer = MnemonicBuilder::<English>::default()
@@ -232,10 +244,63 @@ fn target_node(testnet: &Testnet, params: &TestParams) -> eyre::Result<(String, 
         return Ok((node_name.to_string(), node_url));
     }
 
+    let seed = testnet
+        .seed
+        .ok_or_else(|| eyre::eyre!("testnet seed is not set"))?;
+
+    pick_random_node(&node_urls, seed)
+}
+
+/// Pick a node deterministically from `seed`.
+fn pick_random_node(
+    node_urls: &[(String, reqwest::Url)],
+    seed: u64,
+) -> eyre::Result<(String, reqwest::Url)> {
+    let mut rng = StdRng::seed_from_u64(seed);
     node_urls
-        .choose(&mut thread_rng())
-        .cloned()
+        .choose(&mut rng)
+        .map(|(name, url)| (name.clone(), url.clone()))
         .ok_or_else(|| eyre::eyre!("no nodes available"))
+}
+
+/// `true` if the manifest configures `name` to start after genesis. Callers
+/// gate RPC submission on the node coming online when this is set.
+fn target_starts_late(manifest_nodes: &IndexMap<String, manifest::Node>, name: &str) -> bool {
+    manifest_nodes
+        .get(name)
+        .and_then(|node| node.start_at)
+        .unwrap_or(0)
+        > 0
+}
+
+/// Poll `eth_blockNumber` on the target until it reports a non-zero height,
+/// or [`TARGET_READINESS_TIMEOUT`] elapses.
+async fn wait_for_node_started(
+    client: &crate::rpc::RpcClient,
+    node_name: &str,
+) -> eyre::Result<()> {
+    let deadline = tokio::time::Instant::now() + TARGET_READINESS_TIMEOUT;
+    let mut last_err: Option<String> = None;
+    let mut last_height: Option<u64> = None;
+    loop {
+        match client.get_latest_block_number_with_retries(0).await {
+            Ok(height) if height > 0 => {
+                debug!(node = %node_name, height, "Target node ready");
+                return Ok(());
+            }
+            Ok(height) => last_height = Some(height),
+            Err(e) => last_err = Some(e.to_string()),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(eyre::eyre!(
+                "target node {node_name} not serving after {:?} (last height: {:?}, last error: {:?})",
+                TARGET_READINESS_TIMEOUT,
+                last_height,
+                last_err,
+            ));
+        }
+        tokio::time::sleep(TARGET_READINESS_POLL_INTERVAL).await;
+    }
 }
 
 fn named_node_url(
@@ -357,5 +422,83 @@ mod tests {
         let err = named_node_url(&node_urls, "receipt_node", "missing").unwrap_err();
 
         assert!(err.to_string().contains("receipt_node 'missing' not found"));
+    }
+
+    fn urls(names: &[&str]) -> Vec<(String, reqwest::Url)> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let url = reqwest::Url::parse(&format!("http://127.0.0.1:{}/", 8545 + i)).unwrap();
+                ((*name).to_string(), url)
+            })
+            .collect()
+    }
+
+    fn manifest_nodes(entries: &[(&str, Option<u64>)]) -> IndexMap<String, manifest::Node> {
+        entries
+            .iter()
+            .map(|(name, start_at)| {
+                let node = manifest::Node {
+                    start_at: *start_at,
+                    ..manifest::Node::default()
+                };
+                ((*name).to_string(), node)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pick_random_node_is_deterministic_for_same_seed() {
+        let node_urls = urls(&["val-0", "val-1", "val-2", "val-3"]);
+
+        let first = pick_random_node(&node_urls, 42).unwrap();
+        let second = pick_random_node(&node_urls, 42).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn pick_random_node_selects_per_seed() {
+        let node_urls = urls(&["val-0", "val-1", "val-2", "val-3"]);
+
+        let picks: std::collections::HashSet<String> = (0..32)
+            .map(|seed| pick_random_node(&node_urls, seed).unwrap().0)
+            .collect();
+
+        assert!(
+            picks.len() > 1,
+            "expected different seeds to select different nodes, got {picks:?}",
+        );
+    }
+
+    #[test]
+    fn pick_random_node_errors_on_empty_set() {
+        let err = pick_random_node(&[], 0).unwrap_err();
+        assert!(err.to_string().contains("no nodes available"));
+    }
+
+    #[test]
+    fn target_starts_late_is_true_for_positive_start_at() {
+        let manifest = manifest_nodes(&[("val-0", Some(100))]);
+        assert!(target_starts_late(&manifest, "val-0"));
+    }
+
+    #[test]
+    fn target_starts_late_is_false_for_zero_start_at() {
+        let manifest = manifest_nodes(&[("val-0", Some(0))]);
+        assert!(!target_starts_late(&manifest, "val-0"));
+    }
+
+    #[test]
+    fn target_starts_late_is_false_for_unset_start_at() {
+        let manifest = manifest_nodes(&[("val-0", None)]);
+        assert!(!target_starts_late(&manifest, "val-0"));
+    }
+
+    #[test]
+    fn target_starts_late_is_false_for_unknown_node() {
+        let manifest = manifest_nodes(&[("val-0", Some(100))]);
+        assert!(!target_starts_late(&manifest, "val-1"));
     }
 }

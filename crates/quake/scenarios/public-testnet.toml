@@ -8,7 +8,7 @@ cl.config.discovery_num_inbound_peers = 50
 cl.config.discovery_num_outbound_peers = 50
 
 latency_emulation = true
-engine_api_connection = "rpc"
+engine_api_connection = "ipc"
 
 # Topology (testnet reproduction):
 # 10 validators in 4 AWS regions

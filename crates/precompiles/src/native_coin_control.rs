@@ -20,17 +20,14 @@
 //! blocklisting and unblocklisting addresses from receiving native coin transfers.
 
 use crate::helpers::{
-    abi_decode_raw_with_zero6_validation, check_delegatecall, check_gas_remaining,
-    check_staticcall, emit_event, new_reverted_with_early_penalty, read, write,
-    PrecompileErrorOrRevert, ERR_EXECUTION_REVERTED, LOG_BASE_COST, LOG_TOPIC_COST,
-    NATIVE_FIAT_TOKEN_ADDRESS, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, PRECOMPILE_SLOAD_GAS_COST,
-    PRECOMPILE_SSTORE_GAS_COST,
+    abi_decode_raw_validated, check_delegatecall, check_gas_remaining, check_staticcall,
+    emit_event, new_reverted_with_early_penalty, read, write, PrecompileErrorOrRevert,
+    ERR_EXECUTION_REVERTED, LOG_BASE_COST, LOG_TOPIC_COST, NATIVE_FIAT_TOKEN_ADDRESS,
+    PRECOMPILE_EARLY_REVERT_GAS_PENALTY, PRECOMPILE_SLOAD_GAS_COST, PRECOMPILE_SSTORE_GAS_COST,
 };
 use crate::precompile;
-use alloy_evm::EvmInternals;
 use alloy_primitives::{address, Address, StorageKey, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
-use arc_execution_config::hardforks::{ArcHardfork, ArcHardforkFlags};
 use arc_execution_config::native_coin_control as native_coin_control_config;
 use reth_ethereum::evm::revm::precompile::PrecompileOutput;
 use revm_interpreter::Gas;
@@ -45,21 +42,13 @@ const ALLOWED_CALLER_ADDRESS: Address = NATIVE_FIAT_TOKEN_ADDRESS;
 /// Exported error message / revert string
 pub const BLOCKLISTED_ERROR_MESSAGE: &str = "address is blocklisted";
 
-// Storage key for allowed caller (deprecated since Zero5)
-const ALLOWED_CALLER_STORAGE_KEY: StorageKey = StorageKey::new([
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-]);
-
 // Gas costs
 const BLOCKLISTED_EVENT_GAS_COST: u64 = LOG_BASE_COST + 2 * LOG_TOPIC_COST; // 2 topics
 const UNBLOCKLISTED_EVENT_GAS_COST: u64 = LOG_BASE_COST + 2 * LOG_TOPIC_COST; // 2 topics
 
-// Total gas costs for each operation
-
-// - Reading allowed caller (2100 gas)
-// - Writing blocklist storage (2900 gas)
-// - Emitting event (1125 gas)
-// Total: 6125 gas
+// Success-path gas floor for blocklist operations. The baseline path no longer
+// performs an auth SLOAD, so callers subtract PRECOMPILE_SLOAD_GAS_COST before
+// checking this floor.
 const BLOCKLIST_GAS_COST: u64 =
     PRECOMPILE_SLOAD_GAS_COST + PRECOMPILE_SSTORE_GAS_COST + BLOCKLISTED_EVENT_GAS_COST;
 
@@ -67,10 +56,7 @@ const BLOCKLIST_GAS_COST: u64 =
 // Total: 2100 gas
 pub const IS_BLOCKLISTED_GAS_COST: u64 = PRECOMPILE_SLOAD_GAS_COST;
 
-// - Reading allowed caller (2100 gas)
-// - Writing blocklist storage (2900 gas)
-// - Emitting event (1125 gas)
-// Total: 6125 gas
+// Success-path gas floor for unblocklist operations. See BLOCKLIST_GAS_COST.
 const UNBLOCKLIST_GAS_COST: u64 =
     PRECOMPILE_SLOAD_GAS_COST + PRECOMPILE_SSTORE_GAS_COST + UNBLOCKLISTED_EVENT_GAS_COST;
 
@@ -103,28 +89,6 @@ sol! {
     event UnBlocklisted(address indexed account);
 }
 
-/// Checks if the caller is authorized to call mutative native coin control functions
-fn is_authorized(
-    internals: &mut EvmInternals,
-    caller: Address,
-    gas_counter: &mut Gas,
-    hardfork_flags: ArcHardforkFlags,
-) -> Result<bool, PrecompileErrorOrRevert> {
-    // Get allowed caller
-    let allowed_caller_output = read(
-        internals,
-        NATIVE_COIN_CONTROL_ADDRESS,
-        ALLOWED_CALLER_STORAGE_KEY,
-        gas_counter,
-        hardfork_flags,
-    )?;
-
-    // Compare caller to allowed_caller_output
-    let caller_word = U256::from_be_slice(caller.as_ref());
-    let allowed_caller_word = U256::from_be_slice(&allowed_caller_output);
-    Ok(caller_word == allowed_caller_word)
-}
-
 /// Computes the storage slot for a mapping key of type address
 ///
 /// Delegates to the execution-config canonical implementation.
@@ -132,10 +96,11 @@ pub fn compute_is_blocklisted_storage_slot(key: Address) -> StorageKey {
     native_coin_control_config::compute_is_blocklisted_storage_slot(key)
 }
 
-precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
+precompile!(run_native_coin_control, precompile_input, _hardfork_flags; {
     INativeCoinControl::blocklistCall => |input| {
         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
             let mut gas_counter = Gas::new(precompile_input.gas);
+            let reservoir = precompile_input.reservoir;
             let mut precompile_input = precompile_input;
 
             // Check if static call is attempting to modify state
@@ -145,61 +110,28 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             )?;
 
             // Decode arguments passed to blocklist function
-            let args = abi_decode_raw_with_zero6_validation::<INativeCoinControl::blocklistCall>(
-                input,
-                hardfork_flags,
-            )
+            let args = abi_decode_raw_validated::<INativeCoinControl::blocklistCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
+                        gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
                     )
                 )?;
 
-            if hardfork_flags.is_active(ArcHardfork::Zero5) {
-                if hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    // Auth first so the Zero6 early-revert penalty is reachable
-                    // regardless of remaining gas; otherwise the success-path
-                    // floor below OOGs callers in the 200..4024 gas window.
-                    if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
-                        return Err(new_reverted_with_early_penalty(
-                            gas_counter,
-                            ERR_CANNOT_BLOCKLIST,
-                            hardfork_flags,
-                        ));
-                    }
-                    check_gas_remaining(
-                        &gas_counter,
-                        BLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST,
-                    )?;
-                } else {
-                    // Zero5-only: keep the original order to preserve consensus
-                    // on networks already past the Zero5 activation block.
-                    check_gas_remaining(
-                        &gas_counter,
-                        BLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST,
-                    )?;
-                    if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
-                        return Err(new_reverted_with_early_penalty(
-                            gas_counter,
-                            ERR_CANNOT_BLOCKLIST,
-                            hardfork_flags,
-                        ));
-                    }
-                }
-            } else {
-                // Early return if not enough gas
-                check_gas_remaining(&gas_counter, BLOCKLIST_GAS_COST)?;
-
-                // Check authorization
-                if !(is_authorized(
-                    &mut precompile_input.internals,
-                    precompile_input.caller,
-                    &mut gas_counter,
-                    hardfork_flags,
-                )?) {
-                    return Err(new_reverted_with_early_penalty(gas_counter, ERR_CANNOT_BLOCKLIST, hardfork_flags));
-                }
+            // Auth first so the early-revert penalty is reachable regardless of
+            // remaining gas; otherwise the success-path floor below OOGs callers
+            // in the 200..4024 gas window.
+            if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
+                return Err(new_reverted_with_early_penalty(
+                    gas_counter,
+                    reservoir,
+                    ERR_CANNOT_BLOCKLIST,
+                ));
             }
+            check_gas_remaining(
+                &gas_counter,
+                reservoir,
+                BLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST,
+            )?;
 
             // Check delegate call
             check_delegatecall(
@@ -216,7 +148,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                 storage_slot,
                 &BLOCKLISTED_STATUS.to_be_bytes_vec(),
                 &mut gas_counter,
-                hardfork_flags,
+                reservoir,
             )?;
 
             // Emit event
@@ -227,32 +159,31 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                     account: args.account,
                 },
                 &mut gas_counter,
+                reservoir,
             )?;
 
             let output = true.abi_encode();
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(gas_counter.used(), output.into(), reservoir))
         })()
     },
 
     INativeCoinControl::isBlocklistedCall => |input| {
         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
             let mut gas_counter = Gas::new(precompile_input.gas);
+            let reservoir = precompile_input.reservoir;
             let mut precompile_input = precompile_input;
 
             // Decode arguments passed to isBlocklisted function
             let args =
-                abi_decode_raw_with_zero6_validation::<INativeCoinControl::isBlocklistedCall>(
-                    input,
-                    hardfork_flags,
-                )
+                abi_decode_raw_validated::<INativeCoinControl::isBlocklistedCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
+                        gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
                     )
                 )?;
 
             // Early return if not enough gas
-            check_gas_remaining(&gas_counter, IS_BLOCKLISTED_GAS_COST)?;
+            check_gas_remaining(&gas_counter, reservoir, IS_BLOCKLISTED_GAS_COST)?;
 
             // Check if address is blocklisted
             let storage_slot = compute_is_blocklisted_storage_slot(args.account);
@@ -261,7 +192,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                 NATIVE_COIN_CONTROL_ADDRESS,
                 storage_slot,
                 &mut gas_counter,
-                hardfork_flags,
+                reservoir,
             )?;
 
             let status = U256::from_be_slice(&storage_output);
@@ -269,13 +200,14 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             let is_blocked = status != UNBLOCKLISTED_STATUS;
 
             let output = is_blocked.abi_encode();
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(gas_counter.used(), output.into(), reservoir))
         })()
     },
 
     INativeCoinControl::unBlocklistCall => |input| {
         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
             let mut gas_counter = Gas::new(precompile_input.gas);
+            let reservoir = precompile_input.reservoir;
             let mut precompile_input = precompile_input;
 
             // Check if static call is attempting to modify state
@@ -285,61 +217,28 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             )?;
 
             // Decode arguments passed to unBlocklist function
-            let args = abi_decode_raw_with_zero6_validation::<INativeCoinControl::unBlocklistCall>(
-                input,
-                hardfork_flags,
-            )
+            let args = abi_decode_raw_validated::<INativeCoinControl::unBlocklistCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
+                        gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
                     )
                 )?;
 
-            if hardfork_flags.is_active(ArcHardfork::Zero5) {
-                if hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    // Auth first so the Zero6 early-revert penalty is reachable
-                    // regardless of remaining gas; otherwise the success-path
-                    // floor below OOGs callers in the 200..4024 gas window.
-                    if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
-                        return Err(new_reverted_with_early_penalty(
-                            gas_counter,
-                            ERR_CANNOT_UNBLOCKLIST,
-                            hardfork_flags,
-                        ));
-                    }
-                    check_gas_remaining(
-                        &gas_counter,
-                        UNBLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST,
-                    )?;
-                } else {
-                    // Zero5-only: keep the original order to preserve consensus
-                    // on networks already past the Zero5 activation block.
-                    check_gas_remaining(
-                        &gas_counter,
-                        UNBLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST,
-                    )?;
-                    if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
-                        return Err(new_reverted_with_early_penalty(
-                            gas_counter,
-                            ERR_CANNOT_UNBLOCKLIST,
-                            hardfork_flags,
-                        ));
-                    }
-                }
-            } else {
-                // Early return if not enough gas
-                check_gas_remaining(&gas_counter, UNBLOCKLIST_GAS_COST)?;
-
-                // Check authorization
-                if !(is_authorized(
-                    &mut precompile_input.internals,
-                    precompile_input.caller,
-                    &mut gas_counter,
-                    hardfork_flags,
-                )?) {
-                    return Err(new_reverted_with_early_penalty(gas_counter, ERR_CANNOT_UNBLOCKLIST, hardfork_flags));
-                }
+            // Auth first so the early-revert penalty is reachable regardless of
+            // remaining gas; otherwise the success-path floor below OOGs callers
+            // in the 200..4024 gas window.
+            if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
+                return Err(new_reverted_with_early_penalty(
+                    gas_counter,
+                    reservoir,
+                    ERR_CANNOT_UNBLOCKLIST,
+                ));
             }
+            check_gas_remaining(
+                &gas_counter,
+                reservoir,
+                UNBLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST,
+            )?;
 
             // Check delegate call
             check_delegatecall(
@@ -356,7 +255,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                 storage_slot,
                 &UNBLOCKLISTED_STATUS.to_be_bytes_vec(),
                 &mut gas_counter,
-                hardfork_flags,
+                reservoir,
             )?;
 
             // Emit event
@@ -367,10 +266,11 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                     account: args.account,
                 },
                 &mut gas_counter,
+                reservoir,
             )?;
 
             let output = true.abi_encode();
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(gas_counter.used(), output.into(), reservoir))
         })()
     },
 });
@@ -378,10 +278,10 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
 #[cfg(test)]
 mod tests {
     use crate::helpers::ERR_DELEGATE_CALL_NOT_ALLOWED;
-    use arc_execution_config::hardforks::ArcHardforkFlags;
+    use arc_execution_config::hardforks::{ArcHardfork, ArcHardforkFlags};
 
     use super::*;
-    use alloy_primitives::Bytes;
+    use alloy_primitives::{Bytes, B256};
     use alloy_sol_types::SolEvent;
     use reth_ethereum::evm::revm::{
         context::{Context, ContextTr, JournalTr},
@@ -390,27 +290,18 @@ mod tests {
     };
     use reth_evm::precompiles::{DynPrecompile, PrecompilesMap};
     use revm::{
+        bytecode::Bytecode,
         handler::PrecompileProvider,
         interpreter::InterpreterResult,
         precompile::{PrecompileId, Precompiles},
     };
 
-    fn mock_context(hardfork_flags: ArcHardforkFlags) -> revm::Context {
+    fn mock_context(_hardfork_flags: ArcHardforkFlags) -> revm::Context {
         let mut ctx = Context::mainnet();
 
         ctx.journal_mut()
             .load_account(NATIVE_COIN_CONTROL_ADDRESS)
             .expect("Unable to load native coin control account");
-
-        if !hardfork_flags.is_active(ArcHardfork::Zero5) {
-            ctx.journal_mut()
-                .sstore(
-                    NATIVE_COIN_CONTROL_ADDRESS,
-                    ALLOWED_CALLER_STORAGE_KEY.into(),
-                    U256::from_be_slice(ALLOWED_CALLER_ADDRESS.as_ref()),
-                )
-                .expect("Unable to write allowed caller");
-        }
 
         ctx
     }
@@ -445,29 +336,27 @@ mod tests {
         expected_revert_str: Option<&'static str>,
         return_data: Option<Bytes>,
         gas_used: u64,
-        /// If set, overrides gas_used for pre-Zero5 hardforks (before EIP-2929/2200 storage costs)
-        pre_zero5_gas_used: Option<u64>,
-        /// If set, overrides gas_used when Zero6 is active (auth/validation reverts now
-        /// charge `PRECOMPILE_EARLY_REVERT_GAS_PENALTY`).
-        zero6_gas_used: Option<u64>,
         target_address: Address,
         bytecode_address: Address,
-        /// If true, skip this test case for hardfork combinations without Zero6.
-        /// Used for cases whose result shape differs under Zero6 (e.g. penalty
-        /// revert vs OOG for low-gas unauthorized calls).
-        zero6_only: bool,
-        /// If true, skip this test case for hardfork combinations with Zero6.
-        pre_zero6_only: bool,
     }
 
     // Test constants
     const ADDRESS_A: Address = address!("1000000000000000000000000000000000000001");
     const ADDRESS_B: Address = address!("2000000000000000000000000000000000000002");
 
+    fn baseline_flags() -> ArcHardforkFlags {
+        ArcHardforkFlags::with(&[
+            ArcHardfork::Zero3,
+            ArcHardfork::Zero4,
+            ArcHardfork::Zero5,
+            ArcHardfork::Zero6,
+        ])
+    }
+
     fn assert_precompile_result(
         precompile_res: Result<Option<InterpreterResult>, String>,
         tc: &NativeCoinControlTest,
-        hardfork_flags: ArcHardforkFlags,
+        _hardfork_flags: ArcHardforkFlags,
         tc_name: &str,
     ) {
         match precompile_res {
@@ -506,18 +395,16 @@ mod tests {
                     );
                 }
 
-                let expected_gas_used = if hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    tc.zero6_gas_used.unwrap_or(tc.gas_used)
-                } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
-                    tc.gas_used
-                } else {
-                    tc.pre_zero5_gas_used.unwrap_or(tc.gas_used)
-                };
-                assert_eq!(
-                    result.gas.used(),
-                    expected_gas_used,
-                    "{tc_name}: gas used to match"
-                );
+                // Skip the gas-used assertion on PrecompileOOG: under revm 38 the
+                // precompile-result converter always `spend_all()`s on Halt, so
+                // `result.gas.used()` is tautologically the gas_limit.
+                if tc.expected_result != InstructionResult::PrecompileOOG {
+                    assert_eq!(
+                        result.gas.used(),
+                        tc.gas_used,
+                        "{tc_name}: gas used to match"
+                    );
+                }
             }
             Err(e) => {
                 panic!("{tc_name}: unexpected error {:?}", e)
@@ -540,14 +427,10 @@ mod tests {
                 expected_revert_str: None,
                 return_data: Some(true.abi_encode().into()),
                 gas_used: 23225,
-                pre_zero5_gas_used: Some(BLOCKLIST_GAS_COST),
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
-            // Reverts before storage ops, 0 gas
+            // Reverts before storage ops
             NativeCoinControlTest {
                 name: "blocklist() unauthorized caller reverts",
                 caller: ADDRESS_A,
@@ -558,11 +441,7 @@ mod tests {
                 expected_result: InstructionResult::Revert,
                 expected_revert_str: Some(ERR_CANNOT_BLOCKLIST),
                 return_data: None,
-                gas_used: 0,
-                pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
-                zero6_gas_used: Some(PRECOMPILE_EARLY_REVERT_GAS_PENALTY),
-                zero6_only: false,
-                pre_zero6_only: false,
+                gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -577,10 +456,6 @@ mod tests {
                 expected_revert_str: None,
                 return_data: None,
                 gas_used: 0,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -593,14 +468,10 @@ mod tests {
                 expected_revert_str: Some(ERR_EXECUTION_REVERTED),
                 return_data: None,
                 gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
-            // Reverts before storage ops, 0 gas
+            // Reverts before storage ops
             NativeCoinControlTest {
                 name: "blocklist() with target address != precompile address reverts",
                 caller: ALLOWED_CALLER_ADDRESS,
@@ -612,14 +483,10 @@ mod tests {
                 expected_revert_str: Some(ERR_DELEGATE_CALL_NOT_ALLOWED),
                 return_data: None,
                 gas_used: 0,
-                pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: ADDRESS_B,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
-            // Reverts before storage ops, 0 gas
+            // Reverts before storage ops
             NativeCoinControlTest {
                 name: "blocklist() with bytecode address != precompile address reverts",
                 caller: ALLOWED_CALLER_ADDRESS,
@@ -631,14 +498,10 @@ mod tests {
                 expected_revert_str: Some(ERR_DELEGATE_CALL_NOT_ALLOWED),
                 return_data: None,
                 gas_used: 0,
-                pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: ADDRESS_B,
             },
-            // SLOAD cold = 2100 (same for Zero5 and pre-Zero5)
+            // SLOAD cold = 2100
             NativeCoinControlTest {
                 name: "isBlocklisted() returns false for non-blocklisted address",
                 caller: ADDRESS_A, // Authorization not required for view function
@@ -650,10 +513,6 @@ mod tests {
                 expected_revert_str: None,
                 return_data: Some(false.abi_encode().into()),
                 gas_used: PRECOMPILE_SLOAD_GAS_COST,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -668,10 +527,6 @@ mod tests {
                 expected_revert_str: None,
                 return_data: None,
                 gas_used: 0,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -684,10 +539,6 @@ mod tests {
                 expected_revert_str: Some(ERR_EXECUTION_REVERTED),
                 return_data: None,
                 gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -703,14 +554,10 @@ mod tests {
                 expected_revert_str: None,
                 return_data: Some(true.abi_encode().into()),
                 gas_used: 3325,
-                pre_zero5_gas_used: Some(UNBLOCKLIST_GAS_COST),
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
-            // Reverts before storage ops, 0 gas
+            // Reverts before storage ops
             NativeCoinControlTest {
                 name: "unBlocklist() with target != precompile address reverts",
                 caller: ALLOWED_CALLER_ADDRESS,
@@ -722,14 +569,10 @@ mod tests {
                 expected_revert_str: Some(ERR_DELEGATE_CALL_NOT_ALLOWED),
                 return_data: None,
                 gas_used: 0,
-                pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: ADDRESS_B,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
-            // Reverts before storage ops, 0 gas
+            // Reverts before storage ops
             NativeCoinControlTest {
                 name: "unBlocklist() with bytecode_address != precompile address reverts",
                 caller: ALLOWED_CALLER_ADDRESS,
@@ -741,14 +584,10 @@ mod tests {
                 expected_revert_str: Some(ERR_DELEGATE_CALL_NOT_ALLOWED),
                 return_data: None,
                 gas_used: 0,
-                pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: ADDRESS_B,
             },
-            // Reverts before storage ops, 0 gas
+            // Reverts before storage ops
             NativeCoinControlTest {
                 name: "unBlocklist() unauthorized caller reverts",
                 caller: ADDRESS_A,
@@ -759,11 +598,7 @@ mod tests {
                 expected_result: InstructionResult::Revert,
                 expected_revert_str: Some(ERR_CANNOT_UNBLOCKLIST),
                 return_data: None,
-                gas_used: 0,
-                pre_zero5_gas_used: Some(PRECOMPILE_SLOAD_GAS_COST),
-                zero6_gas_used: Some(PRECOMPILE_EARLY_REVERT_GAS_PENALTY),
-                zero6_only: false,
-                pre_zero6_only: false,
+                gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -778,10 +613,6 @@ mod tests {
                 expected_revert_str: None,
                 return_data: None,
                 gas_used: 0,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -794,18 +625,14 @@ mod tests {
                 expected_revert_str: Some(ERR_EXECUTION_REVERTED),
                 return_data: None,
                 gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
-            // Under Zero6, the auth check runs before the success-path gas
+            // Authorization reverts before the success-path gas
             // floor, so an unauthorized caller with gas >= 200 (the penalty)
             // gets a penalized revert — not an OOG.
             NativeCoinControlTest {
-                name: "blocklist() Zero6 low-gas unauthorized reverts with penalty",
+                name: "blocklist() low-gas unauthorized reverts with penalty",
                 caller: ADDRESS_A,
                 calldata: INativeCoinControl::blocklistCall { account: ADDRESS_B }
                     .abi_encode()
@@ -815,36 +642,11 @@ mod tests {
                 expected_revert_str: Some(ERR_CANNOT_BLOCKLIST),
                 return_data: None,
                 gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
-                zero6_only: true,
-                pre_zero6_only: false,
-                target_address: NATIVE_COIN_CONTROL_ADDRESS,
-                bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
-            },
-            // Pre-Zero6 (Zero3/Zero4/Zero5): gas floor runs before auth, so a
-            // low-gas unauthorized caller OOGs. Locks in the historical Zero5
-            // behavior on devnet.
-            NativeCoinControlTest {
-                name: "blocklist() pre-Zero6 low-gas unauthorized OOGs",
-                caller: ADDRESS_A,
-                calldata: INativeCoinControl::blocklistCall { account: ADDRESS_B }
-                    .abi_encode()
-                    .into(),
-                gas_limit: 500,
-                expected_result: InstructionResult::PrecompileOOG,
-                expected_revert_str: None,
-                return_data: None,
-                gas_used: 0,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: true,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
             NativeCoinControlTest {
-                name: "unBlocklist() Zero6 low-gas unauthorized reverts with penalty",
+                name: "unBlocklist() low-gas unauthorized reverts with penalty",
                 caller: ADDRESS_A,
                 calldata: INativeCoinControl::unBlocklistCall { account: ADDRESS_B }
                     .abi_encode()
@@ -854,49 +656,14 @@ mod tests {
                 expected_revert_str: Some(ERR_CANNOT_UNBLOCKLIST),
                 return_data: None,
                 gas_used: PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
-                zero6_only: true,
-                pre_zero6_only: false,
-                target_address: NATIVE_COIN_CONTROL_ADDRESS,
-                bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
-            },
-            NativeCoinControlTest {
-                name: "unBlocklist() pre-Zero6 low-gas unauthorized OOGs",
-                caller: ADDRESS_A,
-                calldata: INativeCoinControl::unBlocklistCall { account: ADDRESS_B }
-                    .abi_encode()
-                    .into(),
-                gas_limit: 500,
-                expected_result: InstructionResult::PrecompileOOG,
-                expected_revert_str: None,
-                return_data: None,
-                gas_used: 0,
-                pre_zero5_gas_used: None,
-                zero6_gas_used: None,
-                zero6_only: false,
-                pre_zero6_only: true,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
         ];
 
         for tc in cases {
-            for hardfork_flags in ArcHardforkFlags::all_combinations() {
-                // ZeroX hardforks are cumulative; Zero6 implies Zero5.
-                if hardfork_flags.is_active(ArcHardfork::Zero6)
-                    && !hardfork_flags.is_active(ArcHardfork::Zero5)
-                {
-                    continue;
-                }
-
-                if tc.zero6_only && !hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    continue;
-                }
-                if tc.pre_zero6_only && hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    continue;
-                }
-
+            {
+                let hardfork_flags = baseline_flags();
                 let tc_name =
                     tc.name.to_string() + &format!(" (hardfork_flags: {:?})", hardfork_flags);
 
@@ -918,13 +685,14 @@ mod tests {
                     scheme: CallScheme::Call,
                     target_address: tc.target_address,
                     bytecode_address: tc.bytecode_address,
-                    known_bytecode: None,
+                    known_bytecode: (B256::ZERO, Bytecode::default()),
                     caller: tc.caller,
                     value: CallValue::Transfer(U256::ZERO),
                     input: CallInput::Bytes(tc.calldata.clone()),
                     gas_limit: tc.gas_limit,
                     is_static: false,
                     return_memory_offset: 0..0,
+                    reservoir: 0,
                 };
 
                 let precompile_res = call_native_coin_control(&mut ctx, &inputs, hardfork_flags);
@@ -934,26 +702,44 @@ mod tests {
     }
 
     #[test]
-    fn blocklist_workflow_zero3() {
-        test_blocklist_workflow(ArcHardforkFlags::default());
+    fn blocklist_workflow() {
+        test_blocklist_workflow(baseline_flags());
     }
+
     #[test]
-    fn blocklist_workflow_zero4() {
-        test_blocklist_workflow(ArcHardforkFlags::with(&[ArcHardfork::Zero4]));
-    }
-    #[test]
-    fn blocklist_workflow_zero5() {
-        test_blocklist_workflow(ArcHardforkFlags::with(&[ArcHardfork::Zero5]));
-    }
-    fn test_blocklist_workflow(hardfork_flags: ArcHardforkFlags) {
+    fn blocklist_uses_constant_authority_regardless_of_flags() {
+        let hardfork_flags = ArcHardforkFlags::default();
         let mut ctx = mock_context(hardfork_flags);
 
-        // Test 1: Initially address should not be blocklisted
+        let blocklist_input = CallInputs {
+            scheme: CallScheme::Call,
+            target_address: NATIVE_COIN_CONTROL_ADDRESS,
+            bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
+            caller: ALLOWED_CALLER_ADDRESS,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(
+                INativeCoinControl::blocklistCall { account: ADDRESS_B }
+                    .abi_encode()
+                    .into(),
+            ),
+            gas_limit: 100_000,
+            is_static: false,
+            return_memory_offset: 0..0,
+            reservoir: 0,
+        };
+
+        let result = call_native_coin_control(&mut ctx, &blocklist_input, hardfork_flags)
+            .expect("call should not error")
+            .expect("result should be Some");
+        assert_eq!(result.result, InstructionResult::Return);
+        assert_eq!(result.output, Bytes::from(true.abi_encode()));
+
         let is_blocklisted_input = CallInputs {
             scheme: CallScheme::Call,
             target_address: NATIVE_COIN_CONTROL_ADDRESS,
             bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
-            known_bytecode: None,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
             caller: ADDRESS_A,
             value: CallValue::Transfer(U256::ZERO),
             input: CallInput::Bytes(
@@ -964,6 +750,36 @@ mod tests {
             gas_limit: 100_000,
             is_static: false,
             return_memory_offset: 0..0,
+            reservoir: 0,
+        };
+
+        let result = call_native_coin_control(&mut ctx, &is_blocklisted_input, hardfork_flags)
+            .expect("call should not error")
+            .expect("result should be Some");
+        assert_eq!(result.result, InstructionResult::Return);
+        assert_eq!(result.output, Bytes::from(true.abi_encode()));
+    }
+
+    fn test_blocklist_workflow(hardfork_flags: ArcHardforkFlags) {
+        let mut ctx = mock_context(hardfork_flags);
+
+        // Test 1: Initially address should not be blocklisted
+        let is_blocklisted_input = CallInputs {
+            scheme: CallScheme::Call,
+            target_address: NATIVE_COIN_CONTROL_ADDRESS,
+            bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
+            caller: ADDRESS_A,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(
+                INativeCoinControl::isBlocklistedCall { account: ADDRESS_B }
+                    .abi_encode()
+                    .into(),
+            ),
+            gas_limit: 100_000,
+            is_static: false,
+            return_memory_offset: 0..0,
+            reservoir: 0,
         };
 
         let result = call_native_coin_control(&mut ctx, &is_blocklisted_input, hardfork_flags)
@@ -977,7 +793,7 @@ mod tests {
             scheme: CallScheme::Call,
             target_address: NATIVE_COIN_CONTROL_ADDRESS,
             bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
-            known_bytecode: None,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
             caller: ALLOWED_CALLER_ADDRESS,
             value: CallValue::Transfer(U256::ZERO),
             input: CallInput::Bytes(
@@ -988,6 +804,7 @@ mod tests {
             gas_limit: 100_000,
             is_static: false,
             return_memory_offset: 0..0,
+            reservoir: 0,
         };
 
         let result = call_native_coin_control(&mut ctx, &blocklist_input, hardfork_flags)
@@ -1023,7 +840,7 @@ mod tests {
             scheme: CallScheme::Call,
             target_address: NATIVE_COIN_CONTROL_ADDRESS,
             bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
-            known_bytecode: None,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
             caller: ALLOWED_CALLER_ADDRESS,
             value: CallValue::Transfer(U256::ZERO),
             input: CallInput::Bytes(
@@ -1034,6 +851,7 @@ mod tests {
             gas_limit: 100_000,
             is_static: false,
             return_memory_offset: 0..0,
+            reservoir: 0,
         };
 
         let result = call_native_coin_control(&mut ctx, &unblocklist_input, hardfork_flags)
@@ -1103,7 +921,8 @@ mod tests {
             ),
         ];
 
-        for hardfork_flags in ArcHardforkFlags::all_combinations() {
+        {
+            let hardfork_flags = baseline_flags();
             // State-modifying functions must revert under static call
             for (fn_name, calldata) in state_modifying_calldatas {
                 let mut ctx = mock_context(hardfork_flags);
@@ -1111,13 +930,14 @@ mod tests {
                     scheme: CallScheme::Call,
                     target_address: NATIVE_COIN_CONTROL_ADDRESS,
                     bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
-                    known_bytecode: None,
+                    known_bytecode: (B256::ZERO, Bytecode::default()),
                     caller: ALLOWED_CALLER_ADDRESS,
                     value: CallValue::Transfer(U256::ZERO),
                     input: CallInput::Bytes(calldata.clone()),
                     gas_limit: 100_000,
                     is_static: true,
                     return_memory_offset: 0..0,
+                    reservoir: 0,
                 };
 
                 let result = call_native_coin_control(&mut ctx, &inputs, hardfork_flags)
@@ -1144,7 +964,7 @@ mod tests {
                     scheme: CallScheme::Call,
                     target_address: NATIVE_COIN_CONTROL_ADDRESS,
                     bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
-                    known_bytecode: None,
+                    known_bytecode: (B256::ZERO, Bytecode::default()),
                     caller: ADDRESS_A,
                     value: CallValue::Transfer(U256::ZERO),
                     input: CallInput::Bytes(
@@ -1155,6 +975,7 @@ mod tests {
                     gas_limit: 100_000,
                     is_static: true,
                     return_memory_offset: 0..0,
+                    reservoir: 0,
                 };
 
                 let result = call_native_coin_control(&mut ctx, &inputs, hardfork_flags)

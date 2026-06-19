@@ -286,14 +286,13 @@ async fn prepare_next_height(
 ) -> eyre::Result<NextHeightInfo> {
     let next_height = decided_height.increment();
 
-    // Fetch the validator set for the next height
-    // NOTE: Validator set is fetched at the decided height for the next height
+    // Fetch the signing validator set for the next consensus height.
     let validator_set = engine
         .eth
-        .get_active_validator_set(decided_height.as_u64())
+        .get_signing_validator_set(next_height.as_u64())
         .await
         .wrap_err_with(|| {
-            format!("Failed to fetch validator set at height {decided_height} for next height {next_height}")
+            format!("Failed to fetch signing validator set for next height {next_height}")
         })?;
 
     // Fetch the consensus params for the next height

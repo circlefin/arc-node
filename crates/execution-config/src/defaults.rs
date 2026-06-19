@@ -42,6 +42,8 @@ fn init_download_urls() {
         ],
         default_base_url: Cow::Borrowed(DEFAULT_DOWNLOAD_URL),
         default_chain_aware_base_url: None,
+        // Arc uses arc-snapshots, not reth's download command.
+        snapshot_api_url: Cow::Borrowed(""),
         long_help: None,
     };
     let _ = download_defaults.try_init();
@@ -127,5 +129,25 @@ mod tests {
             args.rpc_max_subscriptions_per_connection.get(),
             RPC_MAX_SUBSCRIPTIONS_PER_CONNECTION,
         );
+    }
+
+    #[test]
+    fn init_defaults_registers_arc_snapshot_urls() {
+        ensure_initialized();
+
+        let global = DownloadDefaults::get_global();
+        assert_eq!(global.default_base_url.as_ref(), DEFAULT_DOWNLOAD_URL);
+        assert!(global.default_chain_aware_base_url.is_none());
+        assert!(global.snapshot_api_url.is_empty());
+        assert!(global.long_help.is_none());
+        assert_eq!(global.available_snapshots.len(), 2);
+        assert!(global
+            .available_snapshots
+            .iter()
+            .any(|s| s.contains("5042002") && s.contains("testnet")));
+        assert!(global
+            .available_snapshots
+            .iter()
+            .any(|s| s.contains("5042001") && s.contains("devnet")));
     }
 }

@@ -20,12 +20,9 @@ use alloy_evm::eth::receipt_builder::ReceiptBuilder;
 use reth_chainspec::EthChainSpec;
 use reth_chainspec::Hardforks;
 use reth_ethereum::{
-    evm::{
-        primitives::{
-            execute::{BlockExecutionError, BlockExecutor},
-            Database, OnStateHook,
-        },
-        revm::db::State,
+    evm::primitives::{
+        execute::{BlockExecutionError, BlockExecutor},
+        Database, OnStateHook,
     },
     provider::BlockExecutionResult,
 };
@@ -52,7 +49,6 @@ use arc_execution_config::chainspec::{BaseFeeConfigProvider, BlockGasLimitProvid
 use arc_execution_config::gas_fee::{
     self, arc_calc_next_block_base_fee, decode_base_fee_from_bytes,
 };
-use arc_execution_config::hardforks::{is_arc_fork_active, ArcHardfork};
 use arc_execution_config::native_coin_control::{
     compute_is_blocklisted_storage_slot, is_blocklisted_status,
 };
@@ -64,7 +60,6 @@ use revm::DatabaseCommit;
 
 const ERR_BLOCKLIST_READ_FAILED: &str = "Failed to read beneficiary blocklist status";
 const ERR_BLOCK_NUMBER_CONVERSION_FAILED: &str = "Failed to convert block number to u64";
-const ERR_BLOCK_TIMESTAMP_CONVERSION_FAILED: &str = "Failed to convert block timestamp to u64";
 
 /// Result of executing an Arc transaction.
 #[derive(Debug)]
@@ -77,11 +72,19 @@ pub struct ArcTxResult<H, T> {
     pub tx_type: T,
 }
 
-impl<H, T> TxResult for ArcTxResult<H, T> {
+impl<H, T> TxResult for ArcTxResult<H, T>
+where
+    H: Send + 'static,
+    T: Send + 'static,
+{
     type HaltReason = H;
 
     fn result(&self) -> &ResultAndState<Self::HaltReason> {
         &self.result
+    }
+
+    fn into_result(self) -> ResultAndState<Self::HaltReason> {
+        self.result
     }
 }
 
@@ -140,24 +143,6 @@ where
             BlockExecutionError::msg(ERR_BLOCK_NUMBER_CONVERSION_FAILED)
         })
     }
-
-    /// Current block timestamp as `u64`.
-    ///
-    /// Needed alongside [`Self::block_number_u64`] because Arc hardforks may activate
-    /// either by block or by timestamp (e.g. testnet Zero5/Zero6, all networks' Zero7+);
-    /// runtime hardfork gating must consult both dimensions via
-    /// [`arc_execution_config::hardforks::is_arc_fork_active`].
-    fn block_timestamp_u64(&self) -> Result<u64, BlockExecutionError> {
-        let block_timestamp = self.evm.block().timestamp();
-        block_timestamp.try_into().map_err(|err| {
-            tracing::error!(
-                error = %err,
-                block_timestamp = %block_timestamp,
-                "Failed to convert block timestamp to u64"
-            );
-            BlockExecutionError::msg(ERR_BLOCK_TIMESTAMP_CONVERSION_FAILED)
-        })
-    }
 }
 
 fn validate_beneficiary_not_blocklisted<DB: Database>(
@@ -194,11 +179,10 @@ fn validate_beneficiary_not_blocklisted<DB: Database>(
     Ok(())
 }
 
-impl<'db, DB, E, Spec, R> ArcBlockExecutor<'_, E, Spec, R>
+impl<E, Spec, R> ArcBlockExecutor<'_, E, Spec, R>
 where
-    DB: Database + 'db,
     E: Evm<
-        DB = &'db mut State<DB>,
+        DB: alloy_evm::block::state::StateDB,
         Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>,
     >,
     Spec:
@@ -224,54 +208,7 @@ where
         Ok(())
     }
 
-    /// Computes `GasValues` using the pre-Zero5 path
-    fn compute_gas_values_legacy(
-        &mut self,
-        block_number: u64,
-        fee_params: Option<protocol_config::IProtocolConfig::FeeParams>,
-    ) -> Result<system_accounting::GasValues, BlockExecutionError> {
-        let Some(fee_params) = fee_params else {
-            return Ok(system_accounting::GasValues {
-                gasUsed: self.gas_used,
-                gasUsedSmoothed: self.gas_used,
-                nextBaseFee: 0,
-            });
-        };
-
-        let parent_block_number = block_number.saturating_sub(1);
-        let parent_gas_values =
-            system_accounting::retrieve_gas_values(parent_block_number, &mut self.evm).map_err(
-                |e| BlockExecutionError::Internal(InternalBlockExecutionError::Other(Box::new(e))),
-            )?;
-
-        let calculated_smoothed_gas_used = gas_fee::determine_ema_parent_gas_used(
-            parent_gas_values.gasUsedSmoothed,
-            self.gas_used,
-            fee_params.alpha,
-        );
-
-        let mut next_base_fee: u64 = 0;
-        if let Some(smoothed_gas_used) = calculated_smoothed_gas_used {
-            let raw = arc_calc_next_block_base_fee(
-                smoothed_gas_used,
-                self.evm.block().gas_limit(),
-                self.evm.block().basefee(),
-                fee_params.kRate,
-                fee_params.inverseElasticityMultiplier,
-            );
-            next_base_fee = protocol_config::determine_bounded_base_fee(&fee_params, raw);
-        }
-
-        let smoothed_gas_used = calculated_smoothed_gas_used.unwrap_or(self.gas_used);
-
-        Ok(system_accounting::GasValues {
-            gasUsed: self.gas_used,
-            gasUsedSmoothed: smoothed_gas_used,
-            nextBaseFee: next_base_fee,
-        })
-    }
-
-    /// Computes `GasValues` using the ADR-0004 spec (Zero5+).
+    /// Computes `GasValues` using the ADR-0004 spec.
     ///
     /// Validates the on-chain `FeeParams` against the chainspec `BaseFeeConfig` bounds,
     /// substituting per-field defaults for any out-of-range value. If ProtocolConfig is
@@ -286,7 +223,7 @@ where
         if fee_params.is_none() {
             tracing::warn!(
                 block_number,
-                "ProtocolConfig unavailable post-Zero5; computing next_base_fee with chainspec defaults"
+                "ProtocolConfig unavailable; computing next_base_fee with chainspec defaults"
             );
         }
 
@@ -339,16 +276,16 @@ where
     }
 }
 
-impl<'db, DB, E, Spec, R> BlockExecutor for ArcBlockExecutor<'_, E, Spec, R>
+impl<E, Spec, R> BlockExecutor for ArcBlockExecutor<'_, E, Spec, R>
 where
-    DB: Database + 'db,
     E: Evm<
-        DB = &'db mut State<DB>,
+        DB: alloy_evm::block::state::StateDB,
         Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>,
     >,
     Spec:
         EthExecutorSpec + Hardforks + EthChainSpec + BlockGasLimitProvider + BaseFeeConfigProvider,
     R: ReceiptBuilder<Transaction: Transaction + Encodable2718, Receipt: TxReceipt<Log = Log>>,
+    <R::Transaction as TransactionEnvelope>::TxType: Send + 'static,
 {
     type Transaction = R::Transaction;
     type Receipt = R::Receipt;
@@ -356,47 +293,38 @@ where
     type Result = ArcTxResult<E::HaltReason, <R::Transaction as TransactionEnvelope>::TxType>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
-        // Spurious Dragon hardfork is enabled
-        self.evm.db_mut().set_state_clear_flag(true);
+        // EIP-161 state clearing is handled by revm's Journal under reth 2.2; Spurious
+        // Dragon is always active on Arc, so no explicit set_state_clear_flag call.
 
-        // Zero5+ pre-execution checks: beneficiary blocklist, gas limit validation
+        // Arc pre-execution checks: beneficiary blocklist, gas limit validation.
         let block_number = self.block_number_u64()?;
-        let block_timestamp = self.block_timestamp_u64()?;
 
-        if is_arc_fork_active(
-            &self.chain_spec,
-            ArcHardfork::Zero5,
-            block_number,
-            block_timestamp,
-        ) {
-            // EIP-2935: persist parent block hash in history storage contract.
-            // Internally gates on Prague activation and is a no-op at block 0 (genesis).
-            self.system_caller
-                .apply_blockhashes_contract_call(self.ctx.parent_hash, &mut self.evm)?;
+        // EIP-2935: persist parent block hash in history storage contract.
+        // Internally gates on Prague activation and is a no-op at block 0 (genesis).
+        self.system_caller
+            .apply_blockhashes_contract_call(self.ctx.parent_hash, &mut self.evm)?;
 
-            let beneficiary = self.evm.block().beneficiary();
-            validate_beneficiary_not_blocklisted(self.evm.db_mut(), beneficiary, block_number)?;
+        let beneficiary = self.evm.block().beneficiary();
+        validate_beneficiary_not_blocklisted(self.evm.db_mut(), beneficiary, block_number)?;
 
-            // ADR-0003: Stateful gas limit validation against ProtocolConfig (Zero5+)
-            let block_gas_limit = self.evm.block().gas_limit();
-            let fee_params = protocol_config::retrieve_fee_params(&mut self.evm).inspect_err(|err| {
-                    tracing::warn!(error = ?err, block_number, "Failed to get fee params from ProtocolConfig for gas limit validation");
-                }).ok();
+        // ADR-0003: Stateful gas limit validation against ProtocolConfig.
+        let block_gas_limit = self.evm.block().gas_limit();
+        let fee_params = protocol_config::retrieve_fee_params(&mut self.evm)
+            .inspect_err(|err| {
+                tracing::warn!(error = ?err, block_number, "Failed to get fee params from ProtocolConfig for gas limit validation");
+            })
+            .ok();
 
-            let gas_limit_config = self.chain_spec.block_gas_limit_config(block_number);
-            let expected =
-                protocol_config::expected_gas_limit(fee_params.as_ref(), &gas_limit_config);
+        let gas_limit_config = self.chain_spec.block_gas_limit_config(block_number);
+        let expected = protocol_config::expected_gas_limit(fee_params.as_ref(), &gas_limit_config);
 
-            if block_gas_limit != expected {
-                return Err(BlockExecutionError::Validation(
-                    BlockValidationError::Other(
-                        format!(
-                            "block gas limit {block_gas_limit} does not match expected {expected}"
-                        )
+        if block_gas_limit != expected {
+            return Err(BlockExecutionError::Validation(
+                BlockValidationError::Other(
+                    format!("block gas limit {block_gas_limit} does not match expected {expected}")
                         .into(),
-                    ),
-                ));
-            }
+                ),
+            ));
         }
 
         Ok(())
@@ -440,7 +368,7 @@ where
         })
     }
 
-    fn commit_transaction(&mut self, output: Self::Result) -> Result<u64, BlockExecutionError> {
+    fn commit_transaction(&mut self, output: Self::Result) -> alloy_evm::block::GasOutput {
         let ArcTxResult {
             result: ResultAndState { result, state },
             blob_gas_used,
@@ -450,9 +378,8 @@ where
         self.system_caller
             .on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
 
-        let gas_used = result.gas_used();
+        let gas_used = result.tx_gas_used();
 
-        // append gas used
         self.gas_used = self
             .gas_used
             .checked_add(gas_used)
@@ -461,7 +388,6 @@ where
         // Cancun is always active for arc
         self.blob_gas_used = self.blob_gas_used.saturating_add(blob_gas_used);
 
-        // Push transaction changeset and calculate header bloom filter for receipt.
         self.receipts
             .push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
                 tx_type,
@@ -471,10 +397,9 @@ where
                 cumulative_gas_used: self.gas_used,
             }));
 
-        // Commit the state changes.
         self.evm.db_mut().commit(state);
 
-        Ok(gas_used)
+        alloy_evm::block::GasOutput::new(gas_used)
     }
 
     fn finish(
@@ -484,7 +409,6 @@ where
         let requests = Requests::default();
 
         let block_number = self.block_number_u64()?;
-        let block_timestamp = self.block_timestamp_u64()?;
 
         // At the end of the block, call a system contract (precompile) to persist gas accounting
         // state: raw gas used, smoothed gas used, and the next block's base fee.
@@ -497,23 +421,12 @@ where
                 );
             })
             .ok();
-        let is_zero5 = is_arc_fork_active(
-            &self.chain_spec,
-            ArcHardfork::Zero5,
-            block_number,
-            block_timestamp,
-        );
-        let gas_values = if is_zero5 {
-            // ADR-0004 implementation: compute gas values within local bounds
-            self.compute_gas_values(block_number, fee_params)?
-        } else {
-            self.compute_gas_values_legacy(block_number, fee_params)?
-        };
+        let gas_values = self.compute_gas_values(block_number, fee_params)?;
 
         // ADR-004: enforce extra_data matches what is computed, but only when executing an
         // existing payload (extra_data already set by consensus). During block building the
         // executor writes extra_data itself, so it is empty at this point — skip validation.
-        if is_zero5 && !self.ctx.extra_data.is_empty() {
+        if !self.ctx.extra_data.is_empty() {
             self.validate_extra_data_base_fee(block_number, gas_values.nextBaseFee)?;
         }
 
@@ -565,11 +478,14 @@ mod tests {
 
     use super::*;
 
+    use reth_ethereum::evm::revm::db::State;
+
     use alloy_genesis::Genesis;
     use alloy_primitives::address;
     use alloy_primitives::map::HashMap;
     use alloy_primitives::B256 as AlloyB256;
     use alloy_primitives::KECCAK256_EMPTY;
+    use arc_execution_config::hardforks::ArcHardfork;
     use reth_chainspec::{EthChainSpec, ForkCondition};
     use reth_evm::ConfigureEvm;
     use reth_evm::EvmEnv;
@@ -620,10 +536,11 @@ mod tests {
         }
     }
 
-    // Input values used only for pre-Zero5 patch_fee_params calls — not used as expected outputs.
-    const GENESIS_K_RATE: u64 = 200;
-    const GENESIS_INVERSE_ELASTICITY_MULTIPLIER: u64 = 5000;
     const GAS_USED: u64 = 100_000;
+    // Mirrors `minBaseFee` / `maxBaseFee` in `assets/localdev/genesis.config.ts`.
+    // Used to clamp expected `nextBaseFee` in tests where the ProtocolConfig storage is intact.
+    const GENESIS_MIN_BASE_FEE: u64 = 20_000_000_000;
+    const GENESIS_MAX_BASE_FEE: u64 = 20_000_000_000_000;
 
     fn get_mock_block_env() -> BlockEnv {
         BlockEnv {
@@ -642,6 +559,7 @@ mod tests {
             withdrawals: None,
             extra_data: Default::default(),
             tx_count_hint: None,
+            slot_number: None,
         }
     }
 
@@ -696,6 +614,7 @@ mod tests {
             withdrawals: None,
             extra_data: Default::default(),
             tx_count_hint: None,
+            slot_number: None,
         };
 
         let mut executor = ArcBlockExecutor::new(
@@ -738,7 +657,8 @@ mod tests {
             block_env.basefee,
             defaults.k_rate,
             defaults.inverse_elasticity_multiplier,
-        );
+        )
+        .clamp(GENESIS_MIN_BASE_FEE, GENESIS_MAX_BASE_FEE);
         assert_eq!(stored.nextBaseFee, expected_next_base_fee);
     }
 
@@ -832,27 +752,6 @@ mod tests {
     }
 
     #[test]
-    fn test_zero4_invalid_alpha_stores_zero_next_base_fee() {
-        let block_env = get_mock_block_env();
-        let chain_spec = localdev_with_hardforks(&[(ArcHardfork::Zero3, ForkCondition::Block(0))]);
-
-        let mut db = InMemoryDB::default();
-        insert_alloc_into_db(&mut db, chain_spec.genesis());
-        patch_fee_params(
-            &mut db,
-            255,
-            GENESIS_K_RATE,
-            GENESIS_INVERSE_ELASTICITY_MULTIPLIER,
-        );
-
-        let stored = run_executor_finish_and_query_gas_values(chain_spec, &block_env, &mut db);
-
-        assert_eq!(stored.gasUsed, GAS_USED);
-        assert_eq!(stored.gasUsedSmoothed, GAS_USED);
-        assert_eq!(stored.nextBaseFee, 0);
-    }
-
-    #[test]
     fn test_zero5_executor_out_of_range_alpha_uses_default() {
         // alpha=255 exceeds alpha.max for localdev; zero5 will substitute alpha.default
         let block_env = get_mock_block_env();
@@ -880,7 +779,8 @@ mod tests {
             block_env.basefee,
             defaults.k_rate,
             defaults.inverse_elasticity_multiplier,
-        );
+        )
+        .clamp(GENESIS_MIN_BASE_FEE, GENESIS_MAX_BASE_FEE);
         assert_eq!(stored.nextBaseFee, expected_next_base_fee);
     }
 
@@ -910,7 +810,8 @@ mod tests {
             block_env.basefee,
             defaults.k_rate,
             defaults.inverse_elasticity_multiplier,
-        );
+        )
+        .clamp(GENESIS_MIN_BASE_FEE, GENESIS_MAX_BASE_FEE);
         assert_eq!(stored.nextBaseFee, expected_next_base_fee);
     }
 
@@ -935,7 +836,8 @@ mod tests {
             block_env.basefee,
             defaults.k_rate,
             defaults.inverse_elasticity_multiplier,
-        );
+        )
+        .clamp(GENESIS_MIN_BASE_FEE, GENESIS_MAX_BASE_FEE);
         assert_eq!(stored.nextBaseFee, expected_next_base_fee);
     }
 
@@ -964,7 +866,8 @@ mod tests {
             block_env.basefee,
             CUSTOM_K_RATE,
             CUSTOM_ELASTICITY,
-        );
+        )
+        .clamp(GENESIS_MIN_BASE_FEE, GENESIS_MAX_BASE_FEE);
         assert_eq!(stored.nextBaseFee, expected_next_base_fee);
     }
 
@@ -1040,21 +943,20 @@ mod tests {
     }
 
     #[test]
-    fn test_beneficiary_validation_skipped_before_zero5() {
-        // Test that beneficiary validation is skipped for blocks before Zero5 hardfork
+    fn test_beneficiary_validation_enforced_before_zero5_activation() {
+        // Even when chain metadata does not activate Zero5, Arc execution uses the Zero6 baseline.
         let chain_spec = localdev_with_hardforks(&[(ArcHardfork::Zero4, ForkCondition::Block(0))]);
 
         let mut db = InMemoryDB::default();
         insert_alloc_into_db(&mut db, chain_spec.genesis());
+        let blocklisted_beneficiary = address!("0000000000000000000000000000000000000bad");
+        mark_address_as_blocklisted(&mut db, blocklisted_beneficiary);
 
         let evm_config = create_evm_config(chain_spec.clone());
 
-        // Use a wrong beneficiary - should still pass because we're before Zero5
-        let wrong_beneficiary = address!("0000000000000000000000000000000000000bad");
-
         let mut block_env = get_mock_block_env();
-        block_env.number = U256::from(0); // Before Zero5
-        block_env.beneficiary = wrong_beneficiary;
+        block_env.number = U256::from(0);
+        block_env.beneficiary = blocklisted_beneficiary;
 
         let cfg_env = CfgEnv::new()
             .with_chain_id(chain_spec.chain_id())
@@ -1073,11 +975,10 @@ mod tests {
             evm_config.inner.executor_factory.receipt_builder(),
         );
 
-        // This should succeed because validation is skipped before Zero5
         let result = executor.apply_pre_execution_changes();
         assert!(
-            result.is_ok(),
-            "Beneficiary validation should be skipped before Zero5 hardfork"
+            matches!(result, Err(BlockExecutionError::Validation(_))),
+            "beneficiary validation should be enforced regardless of Zero5 activation: {result:?}"
         );
     }
 

@@ -42,7 +42,12 @@ pub(crate) struct RpcClient {
 
 impl RpcClient {
     pub(crate) fn new(url: Url, timeout: Duration) -> Self {
-        let client = Client::new();
+        Self::with_client(Client::new(), url, timeout)
+    }
+
+    /// Reuse an externally built `reqwest::Client` (sharing its connection
+    /// pool / TLS context) across many `RpcClient` instances.
+    pub(crate) fn with_client(client: Client, url: Url, timeout: Duration) -> Self {
         Self {
             client,
             url,

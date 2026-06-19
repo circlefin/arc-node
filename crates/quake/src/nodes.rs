@@ -15,7 +15,7 @@
 // limitations under the License.
 
 use crate::infra::{InfraData, InfraType};
-use crate::manifest::{self, Subnets};
+use crate::manifest::{self, Manifest, Subnets};
 use crate::node::{Container, ContainerName, IpAddress, NodeMetadata, NodeName, EXECUTION_SUFFIX};
 use color_eyre::eyre::{bail, eyre, Context, Result};
 use indexmap::IndexMap;
@@ -272,6 +272,10 @@ impl NodesMetadata {
         peer_meta.execution.private_ip_address_for(subnet)
     }
 
+    pub fn consensus_rpc_url(&self, node: &str) -> Option<Url> {
+        self.nodes.get(node).map(|n| n.consensus.rpc_url.clone())
+    }
+
     pub fn execution_http_url(&self, node: &str) -> Option<Url> {
         self.nodes.get(node).map(|n| n.execution.http_url.clone())
     }
@@ -284,6 +288,13 @@ impl NodesMetadata {
         nodes
             .iter()
             .map(|name| (name.clone(), self.execution_http_url(name).unwrap()))
+            .collect()
+    }
+
+    pub fn to_consensus_rpc_urls(&self, nodes: &[NodeName]) -> Vec<(NodeName, Url)> {
+        nodes
+            .iter()
+            .map(|name| (name.clone(), self.consensus_rpc_url(name).unwrap()))
             .collect()
     }
 
@@ -314,16 +325,49 @@ impl NodesMetadata {
             .map(|(name, n)| (name.clone(), n.consensus.metrics_url.clone()))
             .collect()
     }
+
     /// The list of consensus layer RPC URLs for nodes with consensus enabled.
     /// Nodes with `consensus_enabled: false` (sync-only followers) are excluded.
     /// In local mode, ports are mapped to 127.0.0.1 with per-node offsets.
     /// In remote mode, URLs use the node's private IP.
-    pub fn all_consensus_rpc_urls(&self) -> Vec<(NodeName, Url)> {
+    pub fn all_consensus_enabled_rpc_urls(&self) -> Vec<(NodeName, Url)> {
         self.nodes
             .iter()
             .filter(|(_, n)| n.consensus_enabled)
             .map(|(name, n)| (name.clone(), n.consensus.rpc_url.clone()))
             .collect()
+    }
+
+    /// CL RPC URL of the first node in the manifest.
+    /// Useful for single-node CL reads (e.g. the endpoint catalog) where any consensus will do.
+    pub fn first_consensus_rpc_url(&self) -> (NodeName, Url) {
+        let (name, node) = self
+            .nodes
+            .first()
+            .expect("There should always be at least one node in a testnet");
+        (name.clone(), node.consensus.rpc_url.clone())
+    }
+
+    /// Resolve the selectors against the manifest and return each matching
+    /// node paired with its EL JSON-RPC URL.
+    pub fn resolve_el_targets(
+        &self,
+        manifest: &Manifest,
+        selectors: Option<&[String]>,
+    ) -> Result<Vec<(NodeName, Url)>> {
+        let node_names = manifest.resolve_optional_node_selectors(selectors)?;
+        Ok(self.to_execution_http_urls(&node_names))
+    }
+
+    /// Resolve target selectors against the manifest and return each matching
+    /// node paired with its CL RPC URL.
+    pub fn resolve_cl_targets(
+        &self,
+        manifest: &Manifest,
+        selectors: Option<&[String]>,
+    ) -> Result<Vec<(NodeName, Url)>> {
+        let node_names = manifest.resolve_optional_node_selectors(selectors)?;
+        Ok(self.to_consensus_rpc_urls(&node_names))
     }
 
     /// Serialize node metadata for use on the Control Center.

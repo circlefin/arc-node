@@ -20,8 +20,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "arc-evm-specs-tests",
-    version = arc_version::SHORT_VERSION,
-    long_version = arc_version::LONG_VERSION,
+    version,
     about = "ARC EVM specs state-test runner"
 )]
 struct Cli {
@@ -99,24 +98,16 @@ fn emit_compat_version_if_requested_from_args(mut args: impl Iterator<Item = Str
     }
 
     if matches!(first.as_str(), "-v" | "--version" | "version") {
-        println!("{}", detailed_version());
+        println!("evm version {}", env!("CARGO_PKG_VERSION"));
         return true;
     }
 
     false
 }
 
-fn detailed_version() -> String {
-    format!(
-        "arc-evm-specs-tests {}\n{}",
-        arc_version::SHORT_VERSION,
-        arc_version::LONG_VERSION
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{detailed_version, emit_compat_version_if_requested_from_args};
+    use super::emit_compat_version_if_requested_from_args;
 
     #[test]
     fn compat_version_accepts_single_version_flags() {
@@ -142,18 +133,5 @@ mod tests {
         assert!(!emit_compat_version_if_requested_from_args(
             ["--version".to_string(), "extra".to_string()].into_iter()
         ));
-    }
-
-    #[test]
-    fn detailed_version_uses_arc_build_metadata() {
-        let version = detailed_version();
-
-        assert!(version.starts_with("arc-evm-specs-tests "));
-        assert!(version.contains(arc_version::SHORT_VERSION));
-        assert!(version.contains("Version:"));
-        assert!(version.contains("Commit SHA:"));
-        assert!(version.contains("Build Timestamp:"));
-        assert!(version.contains("Build Profile:"));
-        assert!(version.contains("Platform:"));
     }
 }

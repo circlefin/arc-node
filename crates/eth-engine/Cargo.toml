@@ -36,7 +36,7 @@ jsonrpsee-types = { workspace = true }
 jsonwebtoken = { workspace = true }
 malachitebft-core-types = { workspace = true }
 mockall = { workspace = true, optional = true }
-reqwest = { workspace = true, features = ["blocking", "json", "stream", "rustls-tls", "native-tls-vendored"] }
+reqwest = { workspace = true, features = ["blocking", "json", "stream", "rustls", "native-tls-vendored"] }
 reth-chainspec = { workspace = true }
 reth-ipc = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -55,6 +55,7 @@ reth-node-builder = { workspace = true, features = ["test-utils"] }
 reth-tasks = { workspace = true }
 rstest = { workspace = true }
 tempfile = "3.8"
+tokio = { workspace = true, features = ["test-util"] }
 url = { workspace = true }
 wiremock = { workspace = true }
 

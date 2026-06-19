@@ -18,6 +18,7 @@
 //!
 //! Actions are composable building blocks for test scenarios.
 
+mod assert_account_absent;
 mod assert_named;
 mod assert_tx_logs;
 mod assert_tx_trace;
@@ -29,11 +30,12 @@ mod produce_invalid_block;
 mod send_transaction;
 mod store_deployed_address;
 
+pub use assert_account_absent::AssertAccountAbsent;
 pub use assert_named::{AssertNamedBalance, AssertTransferEvent};
 pub use assert_tx_logs::{
     AssertTxLogs, NATIVE_COIN_TRANSFERRED_SIGNATURE, TRANSFER_EVENT_SIGNATURE,
 };
-pub use assert_tx_trace::{AssertLastOpcodeGasCost, AssertTxTrace};
+pub use assert_tx_trace::AssertTxTrace;
 pub use assertions::{
     AssertBalance, AssertBlockNumber, AssertEthereumHardfork, AssertHardfork, AssertTxIncluded,
     AssertTxNotIncluded, TxStatus,

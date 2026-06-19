@@ -38,6 +38,7 @@ __Table of contents__
       - [Upgrade](#upgrade)
       - [Chaos testing](#chaos-testing)
     - [The `valset` command](#the-valset-command)
+    - [The `rpc` command](#the-rpc-command)
     - [The `web` command](#the-web-command)
     - [The `mcp` command](#the-mcp-command)
     - [The `generate` command](#the-generate-command)
@@ -621,6 +622,107 @@ Notes:
 do not use container names (`validator1_cl`, `validator2_cl`).
 - it does not accept `*` wildcards.
 
+### The `rpc` command
+
+The `rpc` command fans an RPC request out to one or more nodes in parallel and
+prints each node's result. It targets two different protocols:
+
+| Subcommand | Layer | Protocol | Server |
+|------------|-------|----------|--------|
+| `quake rpc el`   | Execution Layer | JSON-RPC over HTTP | Reth |
+| `quake rpc cl`   | Consensus Layer | REST over HTTP | Malachite |
+| `quake rpc list` | both | shows CL endpoint catalog + Reth docs link | — |
+
+Requests run concurrently against every selected node. The process exits 0 only
+when every node succeeded; per-node errors are reported in the output without
+aborting the fan-out.
+
+#### `quake rpc el` — Execution Layer JSON-RPC
+
+```
+quake rpc el <METHOD> [TARGET] [PARAMS...] [--raw '<JSON>']
+              [--timeout SECS] [--retries N] [--format json|table|raw]
+```
+
+- `<METHOD>` is the JSON-RPC method, e.g. `admin_clearTxpool`, `eth_blockNumber`.
+- `[TARGET]` is a comma-separated list of node names or manifest groups
+  (`ALL_NODES`, `ALL_VALIDATORS`, `ALL_NON_VALIDATORS`, or any custom group).
+  When omitted, defaults to **all manifest nodes**.
+- `[PARAMS...]` are positional JSON-RPC params. Each one is auto-promoted via
+  `serde_json::from_str`: `42` becomes a number, `true` a boolean,
+  `[1,2,3]` an array, `{"a":1}` an object; anything that doesn't parse stays a
+  JSON string (so `0xabc` and `latest` pass through unchanged).
+- `--raw '<JSON>'` lets you supply the params as a literal JSON array (mutually
+  exclusive with positional params, for cases where auto-promotion is awkward).
+
+> [!IMPORTANT]
+> When you want to pass params alongside the default `ALL_NODES` target, write
+> the target slot explicitly: `quake rpc el eth_getBalance ALL_NODES 0xabc latest`.
+> The first positional after the method is always the target.
+
+Examples:
+```bash
+# Wipe every node's mempool (the original use case)
+quake rpc el admin_clearTxpool
+
+# Read the latest block number from every validator
+quake rpc el eth_blockNumber ALL_VALIDATORS
+
+# Single-node read with raw output suitable for piping
+quake rpc el eth_blockNumber validator1 --format raw
+
+# Account balance lookup against all nodes
+quake rpc el eth_getBalance ALL_NODES 0xaaaa...bbbb latest
+
+# Complex params via --raw
+quake rpc el eth_call validator1 --raw '[{"to":"0x...","data":"0x..."},"latest"]'
+```
+
+Reth's full JSON-RPC reference is at <https://reth.rs/jsonrpc/intro>.
+
+#### `quake rpc cl` — Consensus Layer REST
+
+```
+quake rpc cl <PATH> [TARGET] [--method GET|POST|DELETE|PUT|PATCH]
+              [--body '<JSON>'] [--timeout SECS] [--retries N]
+              [--format json|table|raw]
+```
+
+- `<PATH>` is the REST path. The leading `/` is optional and prepended
+  automatically (so `consensus-state` and `/consensus-state` are equivalent).
+  May include a query string (e.g. `'/commit?height=42'`).
+- `[TARGET]` mirrors the EL form; defaults to all consensus-enabled nodes.
+- `--method` defaults to `GET`. `--body` supplies a JSON body for mutating
+  verbs.
+
+Examples:
+```bash
+# Catalog of every CL endpoint (live, fetched from a running node)
+quake rpc list
+
+# Application status on every validator (leading slash optional)
+quake rpc cl /status ALL_VALIDATORS
+quake rpc cl status ALL_VALIDATORS
+
+# Latest commit certificate from one validator
+quake rpc cl /commit validator1
+
+# Commit at a specific height
+quake rpc cl '/commit?height=42' validator1
+
+# Add a persistent peer
+quake rpc cl /persistent-peers validator1 \
+  --method POST --body '{"addr":"/ip4/.../tcp/26656/p2p/12D3KooW..."}'
+```
+
+#### Output formats
+
+| `--format` | When to use |
+|------------|-------------|
+| `json` (default) | Newline-delimited JSON: `{"node":"validator1","result":...}` per line. Pipe to `jq`. |
+| `table`          | Two-column `NODE | RESULT` table sorted by node name. Best for ad-hoc inspection. |
+| `raw`            | Prints the result value only (no `node`/`result` envelope). Requires a single target node. |
+
 ### The `web` command
 
 The `web` command starts a browser-based topology viewer that visualizes the testnet in real time and allows you to control the testnet.
@@ -823,7 +925,42 @@ Monitoring services (Prometheus, Grafana, cAdvisor, Blockscout) can be controlle
 
 # Stop monitoring services and remove monitoring data
 ./quake monitoring clean
+
+# Download a Prometheus metrics snapshot + a single-node database snapshot
+./quake download
+
+# Or download just one:
+./quake download metrics
+./quake download db
 ```
+
+The `download` subcommand group queries the running Prometheus directly over
+HTTP (local Docker port for local testnets, SSM-tunnelled port for remote) and
+bundles each metric's `query_range` response into one archive. The `db`
+subcommand archives node database files (remote) or logs their on-disk paths
+(local). Common options:
+
+```bash
+# Limit to a time range
+./quake download metrics --from 2024-01-15T10:30:00Z --to 2024-01-15T12:00:00Z
+
+# Download only specific metrics (names go after `--`)
+./quake download metrics -- reth_db_size_bytes go_goroutines
+
+# Save to a custom path
+./quake download metrics -o /tmp/my-metrics.tar.gz
+
+# Download db from a specific node (default: first node in manifest)
+./quake download db -- validator1
+```
+
+Without `--from`, the start defaults to Prometheus' `headStats.minTime` (the
+current head block start, typically the last ~2 h). Without `--to`, defaults
+to now. Without `--step`, the step is auto-sized to keep the response below
+Prometheus' 11 000-point limit. Archives land in
+`.quake/metrics/<testnet>/` and `.quake/db/<testnet>/` by default; pass `-o`
+to override. `quake remote download {metrics,db}` is deprecated but kept as a
+backward-compatible alias.
 
 ## Manifest File Format
 
@@ -866,6 +1003,13 @@ Optional top-level settings:
   ceiling above the volume type's baseline. Only valid with `gp3`, `io1`, `io2`; range
   100–256000. Default: AMI's baseline IOPS for the chosen type. Equivalent to
   `--node-volume-iops`. **Remote mode only**.
+- **node_data_on_instance_store**: When `true`, mounts the local instance-store NVMe at
+  the node data directory so the EL/CL databases live on local disk instead of the root
+  EBS volume. Requires an instance type with local NVMe (e.g. `i4i.*`, `i3.*`, `m6id.*`);
+  multiple instance-store volumes are striped RAID0 into one device. A no-op on instance
+  types without instance store, leaving the data directory on EBS. Independent of
+  `node_volume_type`/`node_volume_iops`, which keep configuring the root EBS volume.
+  Equivalent to `--node-data-on-instance-store`. **Remote mode only**.
 - **el_cpu_limit**: Hard CPU cap for each EL container; reproduces production CPU quotas
   on the testnet. Whole or fractional CPUs (e.g. `0.5`). Maps to Docker Compose
   [`cpus`][compose-cpus]. Default: no limit (container uses all host CPUs).
@@ -1462,6 +1606,30 @@ quake remote create --node-size t3.large --node-disk-gb 100 --cc-disk-gb 100
 quake start --remote --node-size t3.large --node-disk-gb 100
 ```
 
+#### Local NVMe vs EBS storage
+
+By default the node data directory lives on the root EBS volume. The
+`--node-data-on-instance-store` flag instead mounts the instance's local NVMe
+instance store at the data directory, so the EL/CL databases run on local disk.
+It requires an instance type that ships local NVMe (`i4i.*`, `i3.*`, `m6id.*`,
+`c6id.*`); on any other type it is a no-op and the data directory stays on EBS.
+Instance types with multiple instance-store volumes are striped RAID0 into a single
+device. The flag is independent of `--node-volume-type`/`--node-volume-iops`, which
+keep tuning the root EBS volume, so the two storage backends can be compared directly.
+
+```bash
+# Datadir on io2 EBS
+quake remote create --node-size i4i.xlarge \
+  --node-volume-type io2 --node-volume-iops 64000 --node-disk-gb 1000
+
+# Datadir on local NVMe (same instance type, only the storage backing differs)
+quake remote create --node-size i4i.xlarge --node-data-on-instance-store
+```
+
+The instance store is ephemeral: its contents are lost when the instance stops or
+terminates. That is fine for benchmarking and short-lived testnets, but never use
+it for state you need to keep.
+
 #### Node instances
 
 Each node runs an Execution Layer (EL) and a Consensus Layer (CL) container,
@@ -1644,7 +1812,7 @@ Initialize Terraform plugins and state. This step is required only once.
 
 Create EC2 instances for each node in the testnet, plus one extra for the Control Center (CC) server.
 ```bash
-./quake [-f <manifest>] remote create [--dry-run] [--yes] [--node-size <type>] [--cc-size <type>] [--node-disk-gb <GIB>] [--cc-disk-gb <GIB>]
+./quake [-f <manifest>] remote create [--dry-run] [--yes] [--node-size <type>] [--cc-size <type>] [--node-disk-gb <GIB>] [--cc-disk-gb <GIB>] [--node-data-on-instance-store]
 ```
 See [Instance sizing](#instance-sizing) for recommended instance types.
 
@@ -1656,7 +1824,11 @@ tunnels from local ports to remote ports.
 ```bash
 ./quake remote ssm start
 ```
-Note that tunnels are closed automatically after 20 minutes of inactivity.
+Note that tunnels are closed automatically after 20 minutes of inactivity. For
+long-running experiments, keep them alive in a separate terminal:
+```bash
+./quake remote ssm keep-alive 2h
+```
 
 Once the SSM session are established, we can log in via SSH to a node or CC, or
 run commands in the instances directly from the terminal:
@@ -1713,30 +1885,38 @@ run the spammer directly, remote testnets forward to the Control Center via SSH.
 All Spammer options are supported. `--targets` accepts comma-separated selectors
 including manifest node groups such as `ALL_VALIDATORS` or custom `[node_groups]`.
 
-Download diagnostic artifacts from the remote testnet:
+Download diagnostic artifacts from the testnet via the mode-agnostic
+`quake download` command group (`quake remote download
+{metrics,db}` is deprecated but kept as a backward-compatible alias):
 ```bash
-# Download all Prometheus metrics (covers the current head block, ~2h by default)
-./quake remote download metrics
+# Download both metrics and a single-node db snapshot
+./quake download
 
-# Download metrics for a specific time range
-./quake remote download metrics --from 2024-01-15T10:30:00Z --to 2024-01-15T12:00:00Z
+# Metrics only — covers the current head block (~2 h) by default
+./quake download metrics
 
-# Download specific metrics only (metric names go after --)
-./quake remote download metrics -- reth_db_size_bytes go_goroutines
+# Metrics for a specific time range
+./quake download metrics --from 2024-01-15T10:30:00Z --to 2024-01-15T12:00:00Z
 
-# Download node databases (both execution and consensus layers, all nodes)
-./quake remote download db
-
-# Download execution layer only, from specific nodes
-./quake remote download db --execution-only -- validator1 validator2
+# Specific metrics only (metric names go after --)
+./quake download metrics -- reth_db_size_bytes go_goroutines
 
 # Save to a custom output path
-./quake remote download metrics -o /tmp/my-metrics.tar.gz
-./quake remote download db -o /tmp/my-db.tar.gz
+./quake download metrics -o /tmp/my-metrics.tar.gz
+
+# Download node database (defaults to the first node in the manifest)
+./quake download db
+
+# Execution layer only, from specific nodes
+./quake download db --execution-only -- validator1 validator2
+
+# Save to a custom output path
+./quake download db -o /tmp/my-db.tar.gz
 ```
 
-Both `download` subcommands output a `.tar.gz` archive named `quake-metrics-<timestamp>.tar.gz` /
-`quake-db-<timestamp>.tar.gz` unless overridden with `-o`.
+Archives land in `.quake/metrics/<testnet>/quake-metrics-<timestamp>.tar.gz`
+and `.quake/db/<testnet>/quake-db-<timestamp>.tar.gz` by default; pass `-o`
+to override.
 
 Once finished with your tests, remember to destroy the remote infrastructure!
 ```bash
