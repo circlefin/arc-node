@@ -1211,6 +1211,7 @@ name = "arc-evm-node"
 version = "0.0.1"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-network",
  "alloy-primitives",
  "alloy-rpc-types-engine",
