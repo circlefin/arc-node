@@ -1,0 +1,134 @@
+name: Test Public Release Finalizer Action
+
+on:
+  push:
+    branches:
+      - test-main
+
+concurrency:
+  group: test-public-release-finalizer-action-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  test-public-release-finalizer-action:
+    name: Create public test release refs
+    if: ${{ contains(github.event.head_commit.message, '[test-public-finalizer-workflow]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout public test-main
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: test-main
+          fetch-depth: 0
+
+      - name: Prepare test release metadata
+        id: release
+        run: |
+          set -euo pipefail
+
+          tag="test/v0.8.0"
+          release_branch="test-release/0.8"
+          base_ref="test-main"
+          head_ref="sync/copybara-export-test-main-test-v0_8_0-public-workflow-${GITHUB_RUN_ID}"
+          body=$'Release tag: test/v0.8.0\nRelease branch: test-release/0.8\nRelease kind: minor'
+
+          [[ "${base_ref}" == "test-main" ]]
+          [[ "${release_branch}" == test-release/* ]]
+          [[ "${tag}" == test/v* ]]
+
+          {
+            echo "tag=${tag}"
+            echo "release_branch=${release_branch}"
+            echo "base_ref=${base_ref}"
+            echo "head_ref=${head_ref}"
+            echo "body<<PUBLIC_RELEASE_BODY"
+            printf '%s\n' "${body}"
+            echo "PUBLIC_RELEASE_BODY"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Snapshot production refs
+        run: |
+          set -euo pipefail
+          {
+            git ls-remote origin "refs/heads/main" || true
+            git ls-remote origin "refs/heads/release/*" || true
+            git ls-remote origin "refs/tags/v*" || true
+          } | sort > "${RUNNER_TEMP}/production-before.txt"
+
+      - name: Reset public test refs
+        env:
+          RELEASE_BRANCH: ${{ steps.release.outputs.release_branch }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          delete_ref() {
+            local ref="$1"
+            case "${ref}" in
+              refs/heads/test-release/*|refs/tags/test/v*) ;;
+              *) echo "::error::Ref is outside the public test namespace: ${ref}"; exit 1 ;;
+            esac
+
+            if git ls-remote --exit-code origin "${ref}" >/dev/null 2>&1; then
+              git push origin ":${ref}"
+              echo "Deleted ${ref}"
+            fi
+          }
+
+          delete_ref "refs/heads/${RELEASE_BRANCH}"
+          delete_ref "refs/tags/${RELEASE_TAG}"
+          git tag -d "${RELEASE_TAG}" >/dev/null 2>&1 || true
+
+      - name: Validate public release action
+        uses: ./.github/actions/finalize-release
+        with:
+          mode: validate
+          release-namespace: auto
+          pr-title: ${{ github.event.head_commit.message }}
+          pr-body: ${{ steps.release.outputs.body }}
+          pr-base-ref: ${{ steps.release.outputs.base_ref }}
+          pr-head-ref: ${{ steps.release.outputs.head_ref }}
+
+      - name: Finalize public release action
+        uses: ./.github/actions/finalize-release
+        with:
+          mode: finalize
+          release-namespace: auto
+          pr-title: ${{ github.event.head_commit.message }}
+          pr-body: ${{ steps.release.outputs.body }}
+          pr-base-ref: ${{ steps.release.outputs.base_ref }}
+          pr-head-ref: ${{ steps.release.outputs.head_ref }}
+          merge-commit-sha: ${{ github.sha }}
+
+      - name: Verify public test refs
+        env:
+          RELEASE_BRANCH: ${{ steps.release.outputs.release_branch }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          branch_sha="$(git ls-remote origin "refs/heads/${RELEASE_BRANCH}" | awk '{print $1}')"
+          tag_commit="$(git rev-list -n 1 "${RELEASE_TAG}")"
+
+          [[ "${branch_sha}" == "${EXPECTED_SHA}" ]] || {
+            echo "::error::${RELEASE_BRANCH} points at ${branch_sha}, expected ${EXPECTED_SHA}"
+            exit 1
+          }
+          [[ "${tag_commit}" == "${EXPECTED_SHA}" ]] || {
+            echo "::error::${RELEASE_TAG} points at ${tag_commit}, expected ${EXPECTED_SHA}"
+            exit 1
+          }
+
+          {
+            git ls-remote origin "refs/heads/main" || true
+            git ls-remote origin "refs/heads/release/*" || true
+            git ls-remote origin "refs/tags/v*" || true
+          } | sort > "${RUNNER_TEMP}/production-after.txt"
+          diff -u "${RUNNER_TEMP}/production-before.txt" "${RUNNER_TEMP}/production-after.txt"
+
+          echo "${RELEASE_BRANCH} and ${RELEASE_TAG} point at ${EXPECTED_SHA}"
