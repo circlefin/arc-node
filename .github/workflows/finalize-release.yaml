@@ -2,7 +2,7 @@ name: Finalize Public Release
 
 on:
   pull_request_target:
-    types: [opened, edited, synchronize, reopened, closed]
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled, closed]
     branches:
       - main
       - test-main
@@ -22,6 +22,7 @@ jobs:
     name: Validate release metadata
     if: >-
       github.event.action != 'closed' &&
+      contains(github.event.pull_request.labels.*.name, 'release') &&
       startsWith(github.event.pull_request.head.ref, 'sync/copybara-export-')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -45,6 +46,7 @@ jobs:
     name: Create release branch and tag
     if: >-
       github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'release') &&
       startsWith(github.event.pull_request.head.ref, 'sync/copybara-export-')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
