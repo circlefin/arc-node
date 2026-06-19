@@ -215,6 +215,8 @@ ensure_release_tag() {
     return
   fi
 
+  git config user.name "${GIT_COMMITTER_NAME:-github-actions[bot]}"
+  git config user.email "${GIT_COMMITTER_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}"
   git tag -a "${TAG}" "${TARGET_SHA}" -m "Release ${TAG}"
   git push origin "refs/tags/${TAG}:refs/tags/${TAG}"
   note "Created release tag ${TAG} at ${TARGET_SHA}"
