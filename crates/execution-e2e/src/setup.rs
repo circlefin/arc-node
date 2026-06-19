@@ -39,6 +39,7 @@ pub struct ArcSetup {
     chain_spec: Arc<ArcChainSpec>,
     addresses_denylist_config: Option<AddressesDenylistConfig>,
     invalid_tx_list_config: Option<InvalidTxListConfig>,
+    rpc_gas_cap: Option<u64>,
 }
 
 impl Default for ArcSetup {
@@ -56,6 +57,7 @@ impl ArcSetup {
             chain_spec: LOCAL_DEV.clone(),
             addresses_denylist_config: None,
             invalid_tx_list_config: None,
+            rpc_gas_cap: None,
         }
     }
 
@@ -83,6 +85,14 @@ impl ArcSetup {
         self
     }
 
+    /// Overrides Reth's `--rpc.gascap` (per-request gas budget on `eth_call`,
+    /// `eth_estimateGas`, and the trace/debug call variants). When unset the
+    /// node uses Reth's stock default.
+    pub fn with_rpc_gas_cap(mut self, rpc_gas_cap: u64) -> Self {
+        self.rpc_gas_cap = Some(rpc_gas_cap);
+        self
+    }
+
     /// Applies the setup to create the test environment.
     ///
     /// This creates a single Arc node and initializes the environment with
@@ -96,7 +106,8 @@ impl ArcSetup {
             arc_node.invalid_tx_list_cfg = cfg;
         }
 
-        let (node, wallet, genesis_block) = Self::launch_node(self.chain_spec, arc_node).await?;
+        let (node, wallet, genesis_block) =
+            Self::launch_node(self.chain_spec, arc_node, self.rpc_gas_cap).await?;
 
         env.set_node(node);
         env.set_wallet(wallet);
@@ -108,6 +119,7 @@ impl ArcSetup {
     async fn launch_node(
         chain_spec: Arc<ArcChainSpec>,
         arc_node: ArcNode,
+        rpc_gas_cap: Option<u64>,
     ) -> eyre::Result<(
         NodeHelperType<ArcNode>,
         reth_e2e_test_utils::wallet::Wallet,
@@ -127,15 +139,17 @@ impl ArcSetup {
         };
         let tree_config =
             reth_node_api::TreeConfig::default().with_cross_block_cache_size(1024 * 1024);
+        let mut rpc_args = RpcServerArgs::default()
+            .with_unused_ports()
+            .with_http()
+            .with_http_api(RpcModuleSelection::All);
+        if let Some(cap) = rpc_gas_cap {
+            rpc_args.rpc_gas_cap = cap;
+        }
         let node_config = NodeConfig::new(chain_spec.clone())
             .with_network(network_config)
             .with_unused_ports()
-            .with_rpc(
-                RpcServerArgs::default()
-                    .with_unused_ports()
-                    .with_http()
-                    .with_http_api(RpcModuleSelection::All),
-            );
+            .with_rpc(rpc_args);
 
         let NodeHandle {
             node,

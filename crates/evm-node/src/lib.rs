@@ -28,4 +28,4 @@ pub mod rpc_middleware;
 
 // Re-export commonly used types
 pub use engine::ArcEngineValidator;
-pub use rpc_middleware::ArcRpcLayer;
+pub use rpc_middleware::{ArcRpcLayer, ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT};

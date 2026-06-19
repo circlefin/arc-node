@@ -76,7 +76,7 @@ use revm::{
         result::{ExecResultAndState, ExecutionResult, InvalidTransaction},
         ContextSetters, Evm as RevmEvm,
     },
-    handler::{instructions::EthInstructions, EthFrame, PrecompileProvider},
+    handler::{instructions::EthInstructions, EthFrame, PrecompileProvider, SystemCallTx},
     interpreter::{CallOutcome, Gas, InstructionResult, InterpreterResult},
     state::EvmState,
     InspectEvm, SystemCallEvm,
@@ -89,7 +89,9 @@ use revm_primitives::{Address, Bytes};
 use std::collections::{HashMap, HashSet};
 
 use crate::handler::ArcEvmHandler;
-use crate::opcode::{arc_network_selfdestruct, arc_network_selfdestruct_zero4};
+use crate::opcode::{
+    arc_network_selfdestruct_zero4, arc_network_selfdestruct_zero5, arc_network_selfdestruct_zero7,
+};
 use crate::subcall::{SubcallContinuation, SubcallRegistry};
 use arc_execution_config::chainspec::{ArcChainSpec, BlockGasLimitProvider};
 use arc_execution_config::protocol_config::{expected_gas_limit, retrieve_fee_params};
@@ -522,11 +524,25 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
             ));
         }
         if self.hardfork_flags.is_active(ArcHardfork::Zero5) {
-            // Note: this selfdestructed-target check uses an unmetered `load_account(to)`.
-            // In the common value-transfer path REVM will touch the same target again during
-            // execution, so this usually has no practical gas impact even if the first load is cold.
-            let target_account = self.inner.journal_mut().load_account(to)?;
-            if target_account.is_selfdestructed() {
+            // Probe inside a checkpoint so this unmetered selfdestructed-target check does not
+            // leave a previously-cold account warm for the later path.
+            let target_is_selfdestructed = {
+                let journal = self.inner.journal_mut();
+                if self.hardfork_flags.is_active(ArcHardfork::Zero7) {
+                    let checkpoint = journal.checkpoint();
+                    let result = journal
+                        .load_account(to)
+                        .map(|target_account| target_account.is_selfdestructed());
+                    journal.checkpoint_revert(checkpoint);
+                    result?
+                } else {
+                    journal
+                        .load_account(to)
+                        .map(|target_account| target_account.is_selfdestructed())?
+                }
+            };
+
+            if target_is_selfdestructed {
                 return Ok(metered_revert(
                     frame_input,
                     meter_sloads,
@@ -1518,21 +1534,37 @@ where
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
         debug_assert!(
             self.subcall_continuations.is_empty(),
-            "system calls bypass ArcEvm::frame_init and must not start with active Arc subcall continuations"
+            "system calls must not start with active Arc subcall continuations"
         );
         debug_assert!(
             self.subcall_registry.get(&contract).is_none(),
-            "system-call target {contract:?} is an Arc subcall precompile; explicitly decide whether bypassing ArcEvm::frame_init is correct"
+            "system-call target {contract:?} is an Arc subcall precompile; explicitly decide whether this target is allowed"
         );
 
-        // Intentionally delegate to revm's system-call path. Current Arc system calls are
-        // zero-value calls, and upstream EIP system calls are expected to follow revm's
-        // semantics. Arc frame_init hooks (blocklist checks, transfer logs, SLOAD gas
-        // deduction, subcall interception) are therefore intentionally not applied here.
-        // If a future Arc system call depends on those hooks, treat that as an explicit
-        // execution-semantics design change instead of silently routing through
-        // ArcEvmHandler.
-        self.inner.system_call_with_caller(caller, contract, data)
+        if !self.hardfork_flags.is_active(ArcHardfork::Zero7) {
+            return self.inner.system_call_with_caller(caller, contract, data);
+        }
+
+        self.inner
+            .ctx
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)?;
+
+        self.inner
+            .ctx
+            .set_tx(TxEnv::new_system_tx_with_caller(caller, contract, data));
+
+        let result =
+            ArcEvmHandler::<_, Self::Error>::new(self.hardfork_flags).run_system_call(self);
+        debug_assert!(
+            self.subcall_continuations.is_empty(),
+            "stale subcall continuations after system call"
+        );
+        self.subcall_continuations.clear();
+
+        let result = result?;
+        let state = self.inner.journal_mut().finalize();
+        Ok(ResultAndState::new(result, state))
     }
 
     fn finish(self) -> (Self::DB, EvmEnv<Self::Spec>) {
@@ -1645,10 +1677,15 @@ impl EvmFactory for ArcEvmFactory {
         let inspector = NoOpInspector {};
         let subcall_registry = self.build_subcall_registry(hardfork_flags);
 
-        if hardfork_flags.is_active(ArcHardfork::Zero5) {
+        if hardfork_flags.is_active(ArcHardfork::Zero7) {
             instruction.insert_instruction(
                 SELFDESTRUCT,
-                Instruction::new(arc_network_selfdestruct, 5000),
+                Instruction::new(arc_network_selfdestruct_zero7, 5000),
+            );
+        } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
+            instruction.insert_instruction(
+                SELFDESTRUCT,
+                Instruction::new(arc_network_selfdestruct_zero5, 5000),
             );
         } else {
             instruction.insert_instruction(
@@ -1684,10 +1721,15 @@ impl EvmFactory for ArcEvmFactory {
         let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
         let subcall_registry = self.build_subcall_registry(hardfork_flags);
 
-        if hardfork_flags.is_active(ArcHardfork::Zero5) {
+        if hardfork_flags.is_active(ArcHardfork::Zero7) {
             instruction.insert_instruction(
                 SELFDESTRUCT,
-                Instruction::new(arc_network_selfdestruct, 5000),
+                Instruction::new(arc_network_selfdestruct_zero7, 5000),
+            );
+        } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
+            instruction.insert_instruction(
+                SELFDESTRUCT,
+                Instruction::new(arc_network_selfdestruct_zero5, 5000),
             );
         } else {
             instruction.insert_instruction(
@@ -1873,6 +1915,7 @@ mod tests {
     use crate::frame_result::BeforeFrameInitResult;
 
     use crate::log::NativeCoinTransferred;
+    use crate::log::Transfer;
     use alloy_consensus::Block;
     use alloy_primitives::{address, Bytes, B256, U256};
     use alloy_rpc_types_engine::ExecutionData;
@@ -1910,6 +1953,7 @@ mod tests {
     use revm_interpreter::interpreter::EthInterpreter;
     use revm_interpreter::CreateScheme;
     use revm_primitives::hardfork::SpecId;
+    use rstest::rstest;
 
     struct TestCase {
         name: &'static str,
@@ -1920,15 +1964,26 @@ mod tests {
     const ADDRESS_A: Address = address!("1000000000000000000000000000000000000001");
     const ADDRESS_B: Address = address!("2000000000000000000000000000000000000002");
 
-    fn create_arc_evm(
-        chain_spec: Arc<ArcChainSpec>,
-        db: InMemoryDB,
-    ) -> ArcEvm<
+    type TestEvm = ArcEvm<
         EthEvmContext<InMemoryDB>,
         NoOpInspector,
         EthInstructions<EthInterpreter, EthEvmContext<InMemoryDB>>,
         PrecompilesMap,
-    > {
+    >;
+
+    fn is_account_cold(evm: &TestEvm, address: Address) -> bool {
+        let journal = evm.inner.ctx.journal();
+        let transaction_id = journal.inner.transaction_id;
+        let account_is_cold = journal
+            .inner
+            .state
+            .get(&address)
+            .is_none_or(|account| account.is_cold_transaction_id(transaction_id));
+
+        account_is_cold && journal.inner.warm_addresses.is_cold(&address)
+    }
+
+    fn create_arc_evm(chain_spec: Arc<ArcChainSpec>, db: InMemoryDB) -> TestEvm {
         let spec = revm_spec_by_timestamp_and_block_number(&chain_spec, 0, 0);
         let hardfork_flags = chain_spec.get_hardfork_flags(0, 0);
         let cfg_env = CfgEnv::new()
@@ -1943,10 +1998,15 @@ mod tests {
         let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
         let inspector = NoOpInspector {};
 
-        if hardfork_flags.is_active(ArcHardfork::Zero5) {
+        if hardfork_flags.is_active(ArcHardfork::Zero7) {
             instruction.insert_instruction(
                 SELFDESTRUCT,
-                revm_interpreter::Instruction::new(arc_network_selfdestruct, 5000),
+                revm_interpreter::Instruction::new(arc_network_selfdestruct_zero7, 5000),
+            );
+        } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
+            instruction.insert_instruction(
+                SELFDESTRUCT,
+                revm_interpreter::Instruction::new(arc_network_selfdestruct_zero5, 5000),
             );
         } else {
             instruction.insert_instruction(
@@ -2226,7 +2286,7 @@ mod tests {
     }
 
     #[test]
-    fn test_system_call_delegates_to_revm_system_call_path() {
+    fn test_system_call_preserves_system_call_semantics() {
         let chain_spec = LOCAL_DEV.clone();
         let system_contract = Address::repeat_byte(0x21);
         let return_value = U256::from(42);
@@ -2270,6 +2330,211 @@ mod tests {
                 .expect("successful system call should return output")
                 .as_ref(),
             &return_value.to_be_bytes::<32>()
+        );
+    }
+
+    #[test]
+    fn test_zero7_system_call_uses_arc_frame_init_for_nested_blocklist_checks() {
+        let chain_spec = LOCAL_DEV.clone();
+        let system_contract = Address::repeat_byte(0x21);
+        let blocklisted_target = Address::repeat_byte(0x22);
+        let transfer_amount = U256::from(1);
+        let runtime = call_with_value_bytecode(blocklisted_target, transfer_amount);
+
+        let mut db = create_db(&[]);
+        db.insert_account_info(
+            system_contract,
+            revm::state::AccountInfo {
+                balance: U256::from(10),
+                nonce: 1,
+                code_hash: keccak256(runtime.bytecode()),
+                code: Some(runtime),
+                account_id: None,
+            },
+        );
+        let slot = native_coin_control::compute_is_blocklisted_storage_slot(blocklisted_target);
+        db.insert_account_storage(NATIVE_COIN_CONTROL_ADDRESS, slot.into(), U256::from(1))
+            .expect("insert blocklist storage");
+        let mut evm = create_arc_evm(chain_spec, db);
+
+        let result = alloy_evm::Evm::transact_system_call(
+            &mut evm,
+            Address::ZERO,
+            system_contract,
+            Bytes::new(),
+        )
+        .expect("system call should execute");
+
+        assert!(
+            result.result.is_success(),
+            "parent system call should succeed after catching failed child CALL"
+        );
+        assert_eq!(
+            result.result.logs().len(),
+            0,
+            "blocked child value transfer should not emit an EIP-7708 log"
+        );
+
+        let target_balance = result
+            .state
+            .get(&blocklisted_target)
+            .map(|account| account.info.balance)
+            .unwrap_or(U256::ZERO);
+        assert_eq!(
+            target_balance,
+            U256::ZERO,
+            "nested CALL to blocklisted target should be rejected before value transfer"
+        );
+    }
+
+    #[test]
+    fn test_pre_zero7_system_call_preserves_nested_call_blocklist_bypass() {
+        use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
+        use reth_chainspec::ForkCondition;
+
+        let chain_spec = localdev_with_hardforks(&[
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(0)),
+            (ArcHardfork::Zero5, ForkCondition::Block(0)),
+            (ArcHardfork::Zero6, ForkCondition::Block(0)),
+        ]);
+        let system_contract = Address::repeat_byte(0x21);
+        let blocklisted_target = Address::repeat_byte(0x22);
+        let transfer_amount = U256::from(1);
+        let runtime = call_with_value_bytecode(blocklisted_target, transfer_amount);
+
+        let mut db = create_db(&[]);
+        db.insert_account_info(
+            system_contract,
+            revm::state::AccountInfo {
+                balance: U256::from(10),
+                nonce: 1,
+                code_hash: keccak256(runtime.bytecode()),
+                code: Some(runtime),
+                account_id: None,
+            },
+        );
+        let slot = native_coin_control::compute_is_blocklisted_storage_slot(blocklisted_target);
+        db.insert_account_storage(NATIVE_COIN_CONTROL_ADDRESS, slot.into(), U256::from(1))
+            .expect("insert blocklist storage");
+        let mut evm = create_arc_evm(chain_spec, db);
+
+        let result = alloy_evm::Evm::transact_system_call(
+            &mut evm,
+            Address::ZERO,
+            system_contract,
+            Bytes::new(),
+        )
+        .expect("system call should execute");
+
+        assert!(
+            result.result.is_success(),
+            "pre-Zero7 parent system call should succeed"
+        );
+
+        let target_balance = result
+            .state
+            .get(&blocklisted_target)
+            .map(|account| account.info.balance)
+            .unwrap_or(U256::ZERO);
+        assert_eq!(
+            target_balance, transfer_amount,
+            "pre-Zero7 nested CALL to blocklisted target should preserve old blocklist bypass"
+        );
+    }
+
+    #[test]
+    fn test_system_call_preloads_native_coin_control_for_selfdestruct_blocklist() {
+        let chain_spec = LOCAL_DEV.clone();
+        let system_contract = Address::repeat_byte(0x21);
+        let blocklisted_target = Address::repeat_byte(0x22);
+
+        // PUSH20 <blocklisted_target> SELFDESTRUCT
+        let mut runtime = vec![opcode::PUSH20];
+        runtime.extend_from_slice(blocklisted_target.as_slice());
+        runtime.push(SELFDESTRUCT);
+        let runtime = Bytecode::new_raw(Bytes::from(runtime));
+
+        let mut db = create_db(&[]);
+        db.insert_account_info(
+            system_contract,
+            revm::state::AccountInfo {
+                balance: U256::from(1),
+                nonce: 1,
+                code_hash: keccak256(runtime.bytecode()),
+                code: Some(runtime),
+                account_id: None,
+            },
+        );
+        let slot = native_coin_control::compute_is_blocklisted_storage_slot(blocklisted_target);
+        db.insert_account_storage(NATIVE_COIN_CONTROL_ADDRESS, slot.into(), U256::from(1))
+            .expect("insert blocklist storage");
+        let mut evm = create_arc_evm(chain_spec, db);
+
+        let result = alloy_evm::Evm::transact_system_call(
+            &mut evm,
+            Address::ZERO,
+            system_contract,
+            Bytes::new(),
+        )
+        .expect("system call should execute");
+
+        let ExecutionResult::Revert { output, .. } = result.result else {
+            panic!("system call selfdestruct to blocklisted target should revert");
+        };
+        assert_eq!(
+            output,
+            arc_precompiles::helpers::revert_message_to_bytes(ERR_BLOCKED_ADDRESS),
+        );
+    }
+
+    #[test]
+    fn test_pre_zero7_system_call_preserves_selfdestruct_blocklist_fail_open() {
+        use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
+        use reth_chainspec::ForkCondition;
+
+        let chain_spec = localdev_with_hardforks(&[
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(0)),
+            (ArcHardfork::Zero5, ForkCondition::Block(0)),
+            (ArcHardfork::Zero6, ForkCondition::Block(0)),
+        ]);
+        let system_contract = Address::repeat_byte(0x21);
+        let blocklisted_target = Address::repeat_byte(0x22);
+
+        // PUSH20 <blocklisted_target> SELFDESTRUCT
+        let mut runtime = vec![opcode::PUSH20];
+        runtime.extend_from_slice(blocklisted_target.as_slice());
+        runtime.push(SELFDESTRUCT);
+        let runtime = Bytecode::new_raw(Bytes::from(runtime));
+
+        let mut db = create_db(&[]);
+        db.insert_account_info(
+            system_contract,
+            revm::state::AccountInfo {
+                balance: U256::from(1),
+                nonce: 1,
+                code_hash: keccak256(runtime.bytecode()),
+                code: Some(runtime),
+                account_id: None,
+            },
+        );
+        let slot = native_coin_control::compute_is_blocklisted_storage_slot(blocklisted_target);
+        db.insert_account_storage(NATIVE_COIN_CONTROL_ADDRESS, slot.into(), U256::from(1))
+            .expect("insert blocklist storage");
+        let mut evm = create_arc_evm(chain_spec, db);
+
+        let result = alloy_evm::Evm::transact_system_call(
+            &mut evm,
+            Address::ZERO,
+            system_contract,
+            Bytes::new(),
+        )
+        .expect("system call should execute");
+
+        assert!(
+            result.result.is_success(),
+            "pre-Zero7 system call should preserve old fail-open behavior"
         );
     }
 
@@ -3191,11 +3456,130 @@ mod tests {
             depth: 0,
         };
 
+        assert!(
+            !is_account_cold(&evm, ADDRESS_B),
+            "selfdestructed target should be warm after setup"
+        );
+
         // 3. Should revert on transferring to destructed account
         let result = evm.before_frame_init(&mut frame);
         assert!(
             matches!(result, Ok(BeforeFrameInitResult::Reverted(_))),
             "expect revert on transferring to destructed account"
+        );
+
+        assert!(
+            !is_account_cold(&evm, ADDRESS_B),
+            "checkpointed selfdestruct probe should not make an already-warm target cold"
+        );
+    }
+
+    #[rstest]
+    #[case::zero7_enabled(
+        &[ArcHardfork::Zero4, ArcHardfork::Zero5, ArcHardfork::Zero6, ArcHardfork::Zero7],
+        true
+    )]
+    #[case::zero6_enabled(
+        &[ArcHardfork::Zero4, ArcHardfork::Zero5, ArcHardfork::Zero6],
+        false
+    )]
+    fn transfer_to_cold_target_preserves_cold_status(
+        #[case] hardforks: &[ArcHardfork],
+        #[case] expected_target_is_cold: bool,
+    ) {
+        let db = create_db(&[(ADDRESS_A, 1000), (ADDRESS_B, 0)]);
+        let mut evm = create_test_evm(db, ArcHardforkFlags::with(hardforks));
+
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+            .unwrap();
+
+        assert!(
+            is_account_cold(&evm, ADDRESS_B),
+            "target should start cold before frame init"
+        );
+
+        let mut frame = FrameInit {
+            frame_input: FrameInput::Call(call_input(
+                CallScheme::Call,
+                U256::from(100),
+                ADDRESS_A,
+                ADDRESS_B,
+            )),
+            memory: SharedMemory::default(),
+            depth: 0,
+        };
+
+        let result = evm.before_frame_init(&mut frame).unwrap();
+        assert!(
+            matches!(result, BeforeFrameInitResult::Log(_, _)),
+            "normal value transfer should still produce a transfer log, got {result:?}"
+        );
+
+        assert_eq!(
+            is_account_cold(&evm, ADDRESS_B),
+            expected_target_is_cold,
+            "unexpected target warmth after selfdestruct probe for hardforks {hardforks:?}"
+        );
+    }
+
+    #[rstest]
+    #[case::zero7_enabled(
+        &[ArcHardfork::Zero4, ArcHardfork::Zero5, ArcHardfork::Zero6, ArcHardfork::Zero7],
+        true
+    )]
+    #[case::zero6_enabled(
+        &[ArcHardfork::Zero4, ArcHardfork::Zero5, ArcHardfork::Zero6],
+        false
+    )]
+    fn create_to_cold_target_preserves_cold_status(
+        #[case] hardforks: &[ArcHardfork],
+        #[case] expected_target_is_cold: bool,
+    ) {
+        let db = create_db(&[(ADDRESS_A, 1000)]);
+        let mut evm = create_test_evm(db, ArcHardforkFlags::with(hardforks));
+
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+            .unwrap();
+
+        let amount = U256::from(1);
+        let target_address = ADDRESS_A.create(0);
+
+        assert!(
+            is_account_cold(&evm, target_address),
+            "target should start cold before frame init"
+        );
+
+        let mut frame = FrameInit {
+            frame_input: FrameInput::Create(Box::new(CreateInputs::new(
+                ADDRESS_A,
+                CreateScheme::Create,
+                amount,
+                Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xF3]), // dummy contract byte code
+                100_000,
+            ))),
+            memory: SharedMemory::default(),
+            depth: 0,
+        };
+
+        let result = evm.before_frame_init(&mut frame).unwrap();
+        assert!(
+            matches!(result, BeforeFrameInitResult::Log(_, _)),
+            "normal value transfer should still produce a transfer log, got {result:?}"
+        );
+        if let BeforeFrameInitResult::Log(log, _gas) = result {
+            let t = Transfer::decode_log(&log).expect("decode EIP-7708 Transfer log");
+            assert_eq!(t.data.to, target_address);
+            assert_eq!(t.data.amount, amount)
+        }
+
+        assert_eq!(
+            is_account_cold(&evm, target_address),
+            expected_target_is_cold,
+            "unexpected target warmth after selfdestruct probe for hardforks {hardforks:?}"
         );
     }
 
@@ -3622,10 +4006,15 @@ mod tests {
                 .with_block(BlockEnv::default());
             let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
             let mut instruction = EthInstructions::new_mainnet_with_spec(spec);
-            if hardfork_flags.is_active(ArcHardfork::Zero5) {
+            if hardfork_flags.is_active(ArcHardfork::Zero7) {
                 instruction.insert_instruction(
                     SELFDESTRUCT,
-                    revm_interpreter::Instruction::new(arc_network_selfdestruct, 5000),
+                    revm_interpreter::Instruction::new(arc_network_selfdestruct_zero7, 5000),
+                );
+            } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
+                instruction.insert_instruction(
+                    SELFDESTRUCT,
+                    revm_interpreter::Instruction::new(arc_network_selfdestruct_zero5, 5000),
                 );
             }
 
@@ -3978,10 +4367,15 @@ mod tests {
                 .with_block(BlockEnv::default());
             let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
             let mut instruction = EthInstructions::new_mainnet_with_spec(spec);
-            if hardfork_flags.is_active(ArcHardfork::Zero5) {
+            if hardfork_flags.is_active(ArcHardfork::Zero7) {
                 instruction.insert_instruction(
                     SELFDESTRUCT,
-                    revm_interpreter::Instruction::new(arc_network_selfdestruct, 5000),
+                    revm_interpreter::Instruction::new(arc_network_selfdestruct_zero7, 5000),
+                );
+            } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
+                instruction.insert_instruction(
+                    SELFDESTRUCT,
+                    revm_interpreter::Instruction::new(arc_network_selfdestruct_zero5, 5000),
                 );
             }
 
@@ -5203,10 +5597,15 @@ mod tests {
                 .with_block(BlockEnv::default());
             let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
             let mut instruction = EthInstructions::new_mainnet_with_spec(spec);
-            if hardfork_flags.is_active(ArcHardfork::Zero5) {
+            if hardfork_flags.is_active(ArcHardfork::Zero7) {
                 instruction.insert_instruction(
                     SELFDESTRUCT,
-                    revm_interpreter::Instruction::new(arc_network_selfdestruct, 5000),
+                    revm_interpreter::Instruction::new(arc_network_selfdestruct_zero7, 5000),
+                );
+            } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
+                instruction.insert_instruction(
+                    SELFDESTRUCT,
+                    revm_interpreter::Instruction::new(arc_network_selfdestruct_zero5, 5000),
                 );
             }
 

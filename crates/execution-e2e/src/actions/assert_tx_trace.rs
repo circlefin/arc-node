@@ -18,7 +18,8 @@
 
 use crate::{action::Action, ArcEnvironment};
 use alloy_rpc_types_trace::geth::{
-    GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType, GethDebugTracingOptions,
+    GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
+    GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
 };
 use futures_util::future::BoxFuture;
 use reth_rpc_api::DebugApiClient;
@@ -90,6 +91,108 @@ impl Action for AssertTxTrace {
                 tx_hash = %tx_hash,
                 trace_variant = ?std::mem::discriminant(&trace),
                 "debug_traceTransaction succeeded"
+            );
+
+            Ok(())
+        })
+    }
+}
+
+/// Calls `debug_traceTransaction` with the default struct logger and asserts the
+/// gas cost of the last occurrence of an opcode.
+pub struct AssertLastOpcodeGasCost {
+    tx_name: String,
+    opcode: String,
+    expected_gas_cost: u64,
+}
+
+impl AssertLastOpcodeGasCost {
+    /// Creates a new opcode gas-cost assertion for the named transaction.
+    pub fn new(tx_name: impl Into<String>, opcode: impl Into<String>, gas_cost: u64) -> Self {
+        Self {
+            tx_name: tx_name.into(),
+            opcode: opcode.into(),
+            expected_gas_cost: gas_cost,
+        }
+    }
+}
+
+impl Action for AssertLastOpcodeGasCost {
+    fn execute<'a>(&'a mut self, env: &'a mut ArcEnvironment) -> BoxFuture<'a, eyre::Result<()>> {
+        Box::pin(async move {
+            let tx_hash = *env.get_tx_hash(&self.tx_name).ok_or_else(|| {
+                eyre::eyre!("Transaction '{}' not found in environment", self.tx_name)
+            })?;
+
+            info!(
+                name = %self.tx_name,
+                tx_hash = %tx_hash,
+                opcode = %self.opcode,
+                expected_gas_cost = self.expected_gas_cost,
+                "Calling debug_traceTransaction with struct logger"
+            );
+
+            let client = env
+                .node()
+                .rpc_client()
+                .ok_or_else(|| eyre::eyre!("RPC client not available"))?;
+
+            let opts = GethDebugTracingOptions {
+                config: GethDefaultTracingOptions::default()
+                    .with_enable_memory(false)
+                    .disable_stack()
+                    .disable_storage(),
+                ..Default::default()
+            };
+
+            let trace = <jsonrpsee::http_client::HttpClient as DebugApiClient<
+                alloy_rpc_types_eth::TransactionRequest,
+            >>::debug_trace_transaction(&client, tx_hash, Some(opts))
+            .await
+            .map_err(|e| {
+                eyre::eyre!(
+                    "debug_traceTransaction failed for tx '{}' ({}): {}",
+                    self.tx_name,
+                    tx_hash,
+                    e
+                )
+            })?;
+
+            let GethTrace::Default(frame) = trace else {
+                return Err(eyre::eyre!(
+                    "Expected default struct-log trace for tx '{}'",
+                    self.tx_name
+                ));
+            };
+
+            let Some(log) = frame
+                .struct_logs
+                .iter()
+                .rev()
+                .find(|log| log.opcode() == self.opcode)
+            else {
+                return Err(eyre::eyre!(
+                    "Tx '{}': opcode '{}' not found in trace",
+                    self.tx_name,
+                    self.opcode
+                ));
+            };
+
+            if log.gas_cost != self.expected_gas_cost {
+                return Err(eyre::eyre!(
+                    "Tx '{}': last '{}' gas cost mismatch. Expected {}, got {}",
+                    self.tx_name,
+                    self.opcode,
+                    self.expected_gas_cost,
+                    log.gas_cost
+                ));
+            }
+
+            info!(
+                name = %self.tx_name,
+                opcode = %self.opcode,
+                gas_cost = log.gas_cost,
+                "Opcode gas-cost assertion passed"
             );
 
             Ok(())

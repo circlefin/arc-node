@@ -158,6 +158,24 @@ impl TryFrom<u8> for ProposedValueVersion {
     }
 }
 
+/// Polka certificate version
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolkaCertificateVersion {
+    V1 = 0x01,
+}
+
+impl TryFrom<u8> for PolkaCertificateVersion {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(Self::V1),
+            _ => Err(value),
+        }
+    }
+}
+
 /// Validator proof version
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,6 +306,20 @@ mod tests {
     #[test]
     fn test_proposed_value_version_try_from_unknown() {
         let result = ProposedValueVersion::try_from(0x02);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), 0x02);
+    }
+
+    #[test]
+    fn test_polka_certificate_version_try_from_v1() {
+        let result = PolkaCertificateVersion::try_from(0x01);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PolkaCertificateVersion::V1);
+    }
+
+    #[test]
+    fn test_polka_certificate_version_try_from_unknown() {
+        let result = PolkaCertificateVersion::try_from(0x02);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), 0x02);
     }

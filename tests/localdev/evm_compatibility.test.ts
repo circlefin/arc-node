@@ -869,7 +869,9 @@ describe('EVM compatibility', () => {
       )
       expectAddressEq(res.from, sender)
       expectAddressEq(res.to, A)
-      expect(res.gas).to.be.eq(toHex(50_000_000))
+      // `debug_traceCall` hands the simulation `--rpc.gascap` when no explicit
+      // `gas` is supplied. Arc's default is 30M (see ARC_DEFAULT_NODE_FLAGS).
+      expect(res.gas).to.be.eq(toHex(30_000_000))
       expect(res.input).to.be.eq(CallHelper.encodeNested({ fn: 'getBlockInfo' }))
       expect(res.type).to.be.eq('CALL')
       expect(res.value).to.be.eq(toHex(0n))

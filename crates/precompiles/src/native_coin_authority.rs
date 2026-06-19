@@ -2690,6 +2690,117 @@ mod tests {
         }
     }
 
+    /// Under Zero6, account helpers (`transfer`, `balance_incr`, `balance_decr`)
+    /// charge `WARM_STORAGE_READ_COST` (100) for warm accounts and
+    /// `COLD_ACCOUNT_ACCESS_COST` (2600) for cold accounts after the load.
+    ///
+    /// The target is pre-funded (non-empty) so the Zero6 empty-account
+    /// creation surcharge does not apply — the OOG is isolated to the
+    /// cold-account access charge.
+    ///
+    /// This test mints to both a cold and a pre-warmed address at the same
+    /// gas budget (`full_cold_gas - cold_delta`). The warm mint succeeds
+    /// (account load costs only 100); the cold mint OOGs at the cold-account
+    /// charge after the load. Together they prove the OOG is caused
+    /// specifically by the cold-account surcharge.
+    #[test]
+    fn account_load_cold_oog() {
+        use revm_interpreter::gas::{COLD_ACCOUNT_ACCESS_COST, WARM_STORAGE_READ_COST};
+
+        let zero6_flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+        let mock_initial_supply = U256::from(1_000_000_000);
+
+        let cold_target: Address = address!("9999999999999999999999999999999999999999");
+
+        let make_inputs = |target: Address, gas_limit: u64| CallInputs {
+            scheme: CallScheme::Call,
+            target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+            bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+            known_bytecode: None,
+            caller: ALLOWED_CALLER_ADDRESS,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(
+                INativeCoinAuthority::mintCall {
+                    to: target,
+                    amount: U256::from(1),
+                }
+                .abi_encode()
+                .into(),
+            ),
+            gas_limit,
+            is_static: false,
+            return_memory_offset: 0..0,
+        };
+
+        /// Pre-fund cold_target so it is non-empty (avoids Zero6 empty-account
+        /// creation surcharge), then commit the tx to clear warm addresses.
+        fn prefund_cold_target(ctx: &mut revm::Context, target: Address) {
+            ctx.journal_mut().load_account(target).expect("load target");
+            ctx.journal_mut()
+                .balance_incr(target, U256::from(1))
+                .expect("fund target");
+            ctx.journal_mut().commit_tx();
+        }
+
+        // Observe full gas for a cold, non-empty target mint.
+        let mut ctx = mock_context(zero6_flags);
+        setup_initial_state(&mut ctx, mock_initial_supply);
+        prefund_cold_target(&mut ctx, cold_target);
+        let baseline =
+            call_native_coin_authority(&mut ctx, &make_inputs(cold_target, 1_000_000), zero6_flags)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            baseline.result,
+            InstructionResult::Return,
+            "baseline must succeed"
+        );
+        let full_cold_gas = baseline.gas.used();
+
+        // Budget that covers warm (100) but not cold (2600) at the account load.
+        #[allow(clippy::arithmetic_side_effects)]
+        let boundary_gas = full_cold_gas - COLD_ACCOUNT_ACCESS_COST + WARM_STORAGE_READ_COST;
+
+        // Cold target at boundary: OOG at the cold delta charge.
+        let mut ctx = mock_context(zero6_flags);
+        setup_initial_state(&mut ctx, mock_initial_supply);
+        prefund_cold_target(&mut ctx, cold_target);
+        let res = call_native_coin_authority(
+            &mut ctx,
+            &make_inputs(cold_target, boundary_gas),
+            zero6_flags,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            res.result,
+            InstructionResult::PrecompileOOG,
+            "cold account at boundary_gas must OOG"
+        );
+
+        // Warm target at the same boundary: succeeds, proving the OOG above is
+        // caused specifically by the cold delta.
+        let mut ctx = mock_context(zero6_flags);
+        setup_initial_state(&mut ctx, mock_initial_supply);
+        prefund_cold_target(&mut ctx, cold_target);
+        // Pre-warm cold_target by loading it before the precompile call.
+        ctx.journal_mut()
+            .load_account(cold_target)
+            .expect("pre-warm target");
+        let res = call_native_coin_authority(
+            &mut ctx,
+            &make_inputs(cold_target, boundary_gas),
+            zero6_flags,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            res.result,
+            InstructionResult::Return,
+            "warm account at boundary_gas must succeed"
+        );
+    }
+
     #[test]
     fn total_supply_accepts_extra_input_with_zero6() {
         let mock_initial_supply = U256::from(1_000_000_000);

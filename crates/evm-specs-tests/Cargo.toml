@@ -17,6 +17,7 @@ alloy-trie = { workspace = true, features = ["ethereum"] }
 
 arc-evm = { workspace = true }
 arc-execution-config = { workspace = true, features = ["test-utils"] }
+arc-version = { workspace = true }
 
 clap = { workspace = true, features = ["derive"] }
 

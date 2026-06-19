@@ -30,6 +30,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
 
 use arc_evm_node::node::{ArcNode, ArcRpcConfig};
+use arc_evm_node::ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT;
 use arc_execution_config::addresses_denylist::{
     AddressesDenylistConfig, AddressesDenylistConfigError, DEFAULT_DENYLIST_ADDRESS,
     DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
@@ -178,10 +179,14 @@ struct ArcExtraCli {
     /// Enable the invalid transaction list.
     ///
     /// When enabled, problematic transactions that cause builder panics or errors
-    /// are cached and rejected on subsequent submissions.
+    /// are cached and rejected on subsequent submissions. A builder panic flushes
+    /// all currently-pending transactions into the list; resubmit them after
+    /// investigating the panic.
     #[arg(
         long = "invalid-tx-list-enable",
-        default_value_t = false,
+        default_value_t = true,
+        // Flag is true by default; `Set` action lets `--invalid-tx-list-enable=false` opt out.
+        action = clap::ArgAction::Set,
         help_heading = "Invalid tx list"
     )]
     invalid_tx_list_enable: bool,
@@ -197,6 +202,19 @@ struct ArcExtraCli {
         help_heading = "Invalid tx list"
     )]
     invalid_tx_list_cap: u32,
+
+    /// Maximum number of entries permitted in a JSON-RPC batch request.
+    ///
+    /// Batches with more entries are rejected before any per-entry handler runs.
+    /// Must be >= 1.
+    #[arg(
+        long = "arc.rpc.max-batch-entries",
+        default_value_t = ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
+        value_parser = parse_max_batch_entries,
+        value_name = "COUNT",
+        help_heading = "Arc RPC limits"
+    )]
+    arc_rpc_max_batch_entries: usize,
 
     /// Maximum duration for the custom payload builder's transaction selection loop, in milliseconds.
     ///
@@ -281,6 +299,24 @@ struct ArcExtraCli {
         help_heading = "Arc RPC"
     )]
     public_api: bool,
+
+    /// Accept pre-EIP-155 (replay-unprotected) transactions over JSON-RPC.
+    ///
+    /// Defaults to false, matching Geth: raw transaction submission RPCs reject
+    /// transactions whose signature does not encode a chain ID, returning the
+    /// standard error "only replay-protected (EIP-155) transactions allowed over RPC".
+    /// Affects the RPC submission path only — transactions received from
+    /// peers or included in blocks by other validators are still accepted
+    /// by the txpool and execution layers.
+    ///
+    /// Enable on nodes that need to relay legacy deployer transactions
+    /// (Nick's-method singletons such as CreateX, ERC-2470, ERC-1820).
+    #[arg(
+        long = "arc.rpc.allow-unprotected-txs",
+        default_value_t = false,
+        help_heading = "Arc RPC"
+    )]
+    arc_rpc_allow_unprotected_txs: bool,
 
     /// Interval in seconds between transaction rebroadcast rounds.
     ///
@@ -403,6 +439,15 @@ fn warn_if_public_api_unsafe(selection: Option<&RpcModuleSelection>, socket_flag
 /// `--public-api` wins; clap enforces it can't coexist with `--arc.expose-pending-txs`.
 fn compute_filter_pending_txs(ext: &ArcExtraCli) -> bool {
     ext.public_api || !ext.arc_expose_pending_txs
+}
+
+/// Parses `--arc.rpc.max-batch-entries`, rejecting `0` so the cap is never silently disabled.
+fn parse_max_batch_entries(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|_| format!("invalid number: {s}"))?;
+    if n == 0 {
+        return Err("must be >= 1".to_string());
+    }
+    Ok(n)
 }
 
 /// Number of bodies, receipts, etc. to retain after pruning.
@@ -553,7 +598,9 @@ fn main() {
 
             let wait_for_payload = ext.wait_for_payload;
             let filter_pending_txs = compute_filter_pending_txs(&ext);
+            let allow_unprotected_txs = ext.arc_rpc_allow_unprotected_txs;
             let max_response_body_size = builder.config().rpc.rpc_max_response_size_bytes();
+            let max_batch_entries = ext.arc_rpc_max_batch_entries;
             let rebroadcast_interval =
                 std::time::Duration::from_secs(ext.txpool_rebroadcast_interval);
             let handle = builder
@@ -564,7 +611,9 @@ fn main() {
                     payload_builder_deadline_ms,
                     wait_for_payload,
                     filter_pending_txs,
+                    allow_unprotected_txs,
                     max_response_body_size,
+                    max_batch_entries,
                     rebroadcast_interval,
                 ))
                 .launch_with_debug_capabilities()
@@ -767,8 +816,23 @@ mod tests {
     fn test_invalid_tx_list_flags_default_values() {
         let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
         if let Commands::Node(node_cmd) = cli.inner.command {
-            assert!(!node_cmd.ext.invalid_tx_list_enable);
+            assert!(node_cmd.ext.invalid_tx_list_enable);
             assert_eq!(node_cmd.ext.invalid_tx_list_cap, 100_000);
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_invalid_tx_list_flag_explicit_disable() {
+        let cli = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--invalid-tx-list-enable=false",
+        ])
+        .unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert!(!node_cmd.ext.invalid_tx_list_enable);
         } else {
             panic!("Expected Node command");
         }
@@ -779,13 +843,13 @@ mod tests {
         let cli = ArcCli::try_parse_from([
             "arc-node-execution",
             "node",
-            "--invalid-tx-list-enable",
+            "--invalid-tx-list-enable=false",
             "--invalid-tx-list-cap",
             "50000",
         ])
         .unwrap();
         if let Commands::Node(node_cmd) = cli.inner.command {
-            assert!(node_cmd.ext.invalid_tx_list_enable);
+            assert!(!node_cmd.ext.invalid_tx_list_enable);
             assert_eq!(node_cmd.ext.invalid_tx_list_cap, 50000);
         } else {
             panic!("Expected Node command");
@@ -812,6 +876,49 @@ mod tests {
             &u128::MAX.to_string(),
         ]);
         assert!(result.is_err_and(|err| err.to_string().contains("invalid value")));
+    }
+
+    #[test]
+    fn test_arc_rpc_max_batch_entries_default() {
+        let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert_eq!(
+                node_cmd.ext.arc_rpc_max_batch_entries,
+                ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT
+            );
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_arc_rpc_max_batch_entries_custom() {
+        let cli = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.max-batch-entries",
+            "250",
+        ])
+        .unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert_eq!(node_cmd.ext.arc_rpc_max_batch_entries, 250);
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_arc_rpc_max_batch_entries_zero_rejected() {
+        let result = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.max-batch-entries",
+            "0",
+        ]);
+        assert!(
+            result.is_err_and(|err| err.to_string().contains("must be >= 1")),
+            "0 should be rejected with the must-be->=1 message"
+        );
     }
 
     #[test]
@@ -860,6 +967,34 @@ mod tests {
         .unwrap();
         if let Commands::Node(node_cmd) = cli.inner.command {
             assert!(!node_cmd.ext.wait_for_payload);
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_arc_rpc_allow_unprotected_txs_default_is_false() {
+        let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert!(
+                !node_cmd.ext.arc_rpc_allow_unprotected_txs,
+                "default must reject pre-EIP-155 txs over RPC"
+            );
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_arc_rpc_allow_unprotected_txs_explicit() {
+        let cli = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.allow-unprotected-txs",
+        ])
+        .unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert!(node_cmd.ext.arc_rpc_allow_unprotected_txs);
         } else {
             panic!("Expected Node command");
         }

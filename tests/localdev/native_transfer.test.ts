@@ -14,10 +14,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { balancesSnapshot, NativeCoinAuthority, ReceiptVerifier, NativeTransferHelper, getClients } from '../helpers'
-import { parseEther, keccak256, getCreate2Address, getCreateAddress } from 'viem'
+import {
+  balancesSnapshot,
+  NativeCoinAuthority,
+  ReceiptVerifier,
+  NativeTransferHelper,
+  getClients,
+  debugTraceFunctions,
+} from '../helpers'
+import {
+  parseEther,
+  keccak256,
+  getCreate2Address,
+  getCreateAddress,
+  toHex,
+  encodeFunctionData,
+  parseAbi,
+  concat,
+  multicall3Abi,
+} from 'viem'
 import { expect } from 'chai'
-import { callHelperArtifact } from '../helpers/CallHelper'
+import { CallHelper, callHelperArtifact } from '../helpers/CallHelper'
+import { multicall3Address } from '../../scripts/genesis'
+import { Hex } from 'viem'
 
 describe('native transfer', () => {
   let nativeTransferHelper: NativeTransferHelper
@@ -460,5 +479,156 @@ describe('native transfer', () => {
       // Balance unchanged
       expect(await client.getBalance({ address: helper.address })).to.equal(amount)
     })
+  })
+
+  it('create revert keep the target account cold', async () => {
+    const { client, sender } = await getClients()
+
+    // A simple create contract to call create with value=1 directly.
+    // prettier-ignore
+    const creatorRuntime = concat([
+        '0x7f', '0x0000000000000000000000000000000000000000000000000000000000000000', // push32 0
+        '0x60', '0x00',   //  PUSH1 0
+        '0x52',           // MSTORE(0, 0)
+        '0x60', '0x01',   //  PUSH1 0, len = 1
+        '0x60', '0x00',   //  PUSH1 0, offset = 0
+        '0x60', '0x01',   //  PUSH1 1, value = 1
+        '0xf0',           // CREATE(1, 0, 1)
+        '0x60', '0x00',   //  PUSH1 0
+        '0x55',           // SSTORE(0, created_addr)
+      ])
+    const contractDeployByteCode = (runtime: Hex) => {
+      const size = BigInt(runtime.length - 2) / 2n
+      if (size > 0xffn) throw new Error('runtime too big for PUSH1 deployer')
+      const sz = toHex(size, { size: 1 })
+
+      // Minimal deployer (12 bytes): CODECOPY runtime → RETURN
+      // prettier-ignore
+      const deployer = concat([
+          '0x60', sz,     //  PUSH1 sz = runtime_size
+          '0x60', '0x0c', //  PUSH1 12 = deployer_size
+          '0x60', '0x00', //  PUSH1 0
+          '0x39',         // CODECOPY(0, 12, size)
+          '0x60', sz,     //  PUSH1 size
+          '0x60', '0x00', //  PUSH1 0
+          '0xf3',         // RETURN(0, size)
+        ])
+
+      return concat([deployer, runtime])
+    }
+
+    const creatorAddr = await sender
+      .deployContract({
+        abi: parseAbi(['constructor()']),
+        bytecode: contractDeployByteCode(creatorRuntime),
+        args: [],
+      })
+      .then(ReceiptVerifier.waitSuccess)
+      .then((x) => x.contractAddress)
+    if (creatorAddr == null) throw new Error('Deployment failed, missing contract address')
+
+    const createdContractAddr = getCreateAddress({ from: creatorAddr, nonce: 1n })
+
+    const receipt = await sender
+      .sendTransaction({
+        to: multicall3Address,
+        value: 0n,
+        data: encodeFunctionData({
+          abi: multicall3Abi,
+          functionName: 'aggregate3',
+          args: [
+            [
+              {
+                target: creatorAddr,
+                allowFailure: true,
+                callData: '0x',
+              },
+              {
+                target: multicall3Address,
+                allowFailure: false,
+                callData: encodeFunctionData({
+                  abi: parseAbi(['function getEthBalance(address addr) view returns (uint256 balance)']),
+                  functionName: 'getEthBalance',
+                  args: [createdContractAddr],
+                }),
+              },
+            ],
+          ],
+        }),
+        gas: 100_000n,
+      })
+      .then(ReceiptVerifier.waitSuccess)
+
+    const trace = (await client.request({
+      method: 'debug_traceTransaction',
+      params: [receipt.transactionHash, { enableMemory: false, disableStack: true, disableStorage: true }],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any)) as unknown as { structLogs: Array<{ op: string; gasCost: number }> }
+
+    const oplogs = trace?.structLogs ?? []
+    const lastBalanceLog = oplogs.filter((log) => log.op === 'BALANCE').pop()
+    expect(lastBalanceLog?.gasCost).to.eq(2600)
+
+    const callTrace = await client
+      .extend(debugTraceFunctions)
+      .traceTransaction(receipt.transactionHash, { tracer: 'callTracer' })
+    // aggregate3 → creator call → CREATE
+    const revertedCreate = callTrace.calls?.[0]?.calls?.[0]
+    expect(revertedCreate).to.not.be.undefined
+    expect(revertedCreate?.type).to.eq('CREATE')
+    expect(revertedCreate?.error).to.eq('insufficient balance for transfer')
+  })
+
+  it('call revert make the target account warm', async () => {
+    const { client, sender } = await getClients()
+    const helper = await CallHelper.deploy(sender, client)
+
+    const receipt = await sender
+      .sendTransaction({
+        to: multicall3Address,
+        data: encodeFunctionData({
+          abi: multicall3Abi,
+          functionName: 'aggregate3',
+          args: [
+            [
+              {
+                target: helper.address,
+                allowFailure: true,
+                callData: CallHelper.encodeNested({ fn: 'revertWithError', message: 'Intentional revert after call' }),
+              },
+              {
+                target: multicall3Address,
+                allowFailure: false,
+                callData: encodeFunctionData({
+                  abi: parseAbi(['function getEthBalance(address addr) view returns (uint256 balance)']),
+                  functionName: 'getEthBalance',
+                  args: [helper.address],
+                }),
+              },
+            ],
+          ],
+        }),
+        gas: 300_000n,
+      })
+      .then(ReceiptVerifier.waitSuccess)
+
+    const trace = (await client.request({
+      method: 'debug_traceTransaction',
+      params: [receipt.transactionHash, { enableMemory: false, disableStack: true, disableStorage: true }],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any)) as unknown as { structLogs: Array<{ op: string; gasCost: number }> }
+
+    const oplogs = trace?.structLogs ?? []
+    const lastBalanceLog = oplogs.filter((log) => log.op === 'BALANCE').pop()
+    expect(lastBalanceLog?.gasCost).to.eq(100)
+
+    const callTrace = await client
+      .extend(debugTraceFunctions)
+      .traceTransaction(receipt.transactionHash, { tracer: 'callTracer' })
+    // aggregate3 → helper revertWithError
+    const revertedCall = callTrace.calls?.[0]
+    expect(revertedCall).to.not.be.undefined
+    expect(revertedCall?.type).to.eq('CALL')
+    expect(revertedCall?.error).to.eq('execution reverted')
   })
 })

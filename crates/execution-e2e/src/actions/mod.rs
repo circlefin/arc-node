@@ -33,7 +33,7 @@ pub use assert_named::{AssertNamedBalance, AssertTransferEvent};
 pub use assert_tx_logs::{
     AssertTxLogs, NATIVE_COIN_TRANSFERRED_SIGNATURE, TRANSFER_EVENT_SIGNATURE,
 };
-pub use assert_tx_trace::AssertTxTrace;
+pub use assert_tx_trace::{AssertLastOpcodeGasCost, AssertTxTrace};
 pub use assertions::{
     AssertBalance, AssertBlockNumber, AssertEthereumHardfork, AssertHardfork, AssertTxIncluded,
     AssertTxNotIncluded, TxStatus,

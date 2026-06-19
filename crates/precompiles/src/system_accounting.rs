@@ -376,8 +376,14 @@ mod tests {
     };
     use serde_with::NoneAsEmptyString;
 
-    fn call_system_accounting(
-        ctx: &mut Context,
+    fn call_system_accounting<DB: revm::database_interface::Database + std::fmt::Debug>(
+        ctx: &mut revm::context::Context<
+            revm::context::BlockEnv,
+            revm::context::TxEnv,
+            revm::context::CfgEnv,
+            DB,
+            revm::context::Journal<DB>,
+        >,
         inputs: &CallInputs,
         hardfork_flags: ArcHardforkFlags,
     ) -> Result<Option<InterpreterResult>, String> {
@@ -1016,6 +1022,181 @@ mod tests {
             .unwrap();
         assert_eq!(res.result, InstructionResult::Return);
         assert_eq!(res.gas.used(), happy_gas);
+    }
+
+    /// Under Zero6, `read()` probes slot warmth with `sload(key, true)`.
+    /// When the slot is cold the probe returns `ColdLoadSkipped` and the
+    /// helper must charge `COLD_SLOAD_COST` (2100) *before* retrying with
+    /// the real DB load.
+    ///
+    /// This test gives exactly `COLD_SLOAD_COST - 1` gas so the charge
+    /// fails before the retry I/O. A bug that deferred the charge would
+    /// succeed at this gas level (warm cost = 100 < 2099).
+    ///
+    /// Uses `TrackingDB` to prove zero storage reads occur before the OOG.
+    #[test]
+    fn read_cold_slot_oog_before_retry() {
+        use crate::helpers::test_utils::TrackingDB;
+        use revm_interpreter::gas::COLD_SLOAD_COST;
+
+        let zero6_flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+
+        let calldata: Bytes = ISystemAccounting::getGasValuesCall { blockNumber: 42 }
+            .abi_encode()
+            .into();
+        let make_inputs = |gas_limit: u64| CallInputs {
+            scheme: CallScheme::Call,
+            target_address: SYSTEM_ACCOUNTING_ADDRESS,
+            bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
+            known_bytecode: None,
+            caller: ARC_SYSTEM_CALLER,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(calldata.clone()),
+            gas_limit,
+            is_static: false,
+            return_memory_offset: 0..0,
+        };
+
+        // Gas = COLD_SLOAD_COST - 1: must OOG at the cold charge, zero DB reads.
+        let (mut ctx, storage_reads) = TrackingDB::context();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("load");
+        let res = call_system_accounting(&mut ctx, &make_inputs(COLD_SLOAD_COST - 1), zero6_flags)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            res.result,
+            InstructionResult::PrecompileOOG,
+            "cold read must OOG when gas < COLD_SLOAD_COST"
+        );
+        assert_eq!(
+            storage_reads.get(),
+            0,
+            "OOG must occur before any storage DB read"
+        );
+
+        // Gas = COLD_SLOAD_COST: must succeed (slot is cold, value is zero).
+        let (mut ctx, storage_reads) = TrackingDB::context();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("load");
+        let res = call_system_accounting(&mut ctx, &make_inputs(COLD_SLOAD_COST), zero6_flags)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            res.result,
+            InstructionResult::Return,
+            "cold read must succeed at exactly COLD_SLOAD_COST"
+        );
+        assert_eq!(res.gas.used(), COLD_SLOAD_COST);
+        assert!(
+            storage_reads.get() > 0,
+            "success path must hit the DB for the real sload"
+        );
+    }
+
+    /// Under Zero6, `write()` probes slot warmth with `sload(key, true)`.
+    /// When the slot is cold the probe returns `ColdLoadSkipped` and the
+    /// helper charges `COLD_SLOAD_COST` before retrying. This test verifies
+    /// that the cold charge + sstore base cost are both applied correctly
+    /// on a cold slot by testing at the exact boundary.
+    ///
+    /// For a 0→non-zero write: total = COLD_SLOAD_COST (2100) + SSTORE_SET
+    /// (20000) = 22100. Gas at 22099 must OOG; gas at 22100 must succeed.
+    /// The EIP-2200 sentry (CALL_STIPEND=2300) is below COLD_SLOAD_COST, so
+    /// it never gates the cold-load charge for 0→non-zero writes.
+    ///
+    /// Uses `TrackingDB` to prove zero storage reads occur before the OOG.
+    #[test]
+    fn write_cold_slot_oog_at_base_cost_boundary() {
+        use crate::helpers::test_utils::TrackingDB;
+        use revm_interpreter::gas::COLD_SLOAD_COST;
+
+        let zero6_flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+        // 0→non-zero base cost is SSTORE_SET (20000); total = COLD_SLOAD_COST + 20000
+        let exact_cost = COLD_SLOAD_COST + 20000;
+
+        let calldata: Bytes = ISystemAccounting::storeGasValuesCall {
+            blockNumber: 99,
+            gasValues: GasValues {
+                gasUsed: 1,
+                gasUsedSmoothed: 2,
+                nextBaseFee: 3,
+            },
+        }
+        .abi_encode()
+        .into();
+        let make_inputs = |gas_limit: u64| CallInputs {
+            scheme: CallScheme::Call,
+            target_address: SYSTEM_ACCOUNTING_ADDRESS,
+            bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
+            known_bytecode: None,
+            caller: ARC_SYSTEM_CALLER,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(calldata.clone()),
+            gas_limit,
+            is_static: false,
+            return_memory_offset: 0..0,
+        };
+
+        // Gas = COLD_SLOAD_COST - 1: OOG at the cold charge, before the sload DB read.
+        let (mut ctx, storage_reads) = TrackingDB::context();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("load");
+        let res = call_system_accounting(&mut ctx, &make_inputs(COLD_SLOAD_COST - 1), zero6_flags)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            res.result,
+            InstructionResult::PrecompileOOG,
+            "cold write must OOG when gas < COLD_SLOAD_COST"
+        );
+        assert_eq!(
+            storage_reads.get(),
+            0,
+            "OOG at cold charge must occur before any storage DB read"
+        );
+
+        // One gas short of full cost: OOG at sstore base cost, after the sload
+        // (whose gas was already charged).
+        let (mut ctx, storage_reads) = TrackingDB::context();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("load");
+        let res = call_system_accounting(&mut ctx, &make_inputs(exact_cost - 1), zero6_flags)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            res.result,
+            InstructionResult::PrecompileOOG,
+            "cold write one gas short of sstore must OOG"
+        );
+        assert_eq!(
+            storage_reads.get(),
+            1,
+            "sload DB read happens after cold charge was paid"
+        );
+
+        // Exact cost: must succeed.
+        let (mut ctx, storage_reads) = TrackingDB::context();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("load");
+        let res = call_system_accounting(&mut ctx, &make_inputs(exact_cost), zero6_flags)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            res.result,
+            InstructionResult::Return,
+            "cold write at exact cost must succeed"
+        );
+        assert_eq!(res.gas.used(), exact_cost);
+        assert!(
+            storage_reads.get() > 0,
+            "success path must hit the DB for the real sload"
+        );
     }
 
     #[test]

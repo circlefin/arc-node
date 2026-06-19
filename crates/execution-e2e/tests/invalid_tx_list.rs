@@ -182,3 +182,65 @@ async fn test_payload_builder_panic_populates_invalid_tx_list() -> Result<()> {
         )),
     }
 }
+
+/// Default-on regression: with no explicit `with_invalid_tx_list_config`, the
+/// `InvalidTxListConfig::default()` must still quarantine a tx that triggers
+/// `UnprocessableTransactionError` on resubmission.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn test_invalid_tx_list_default_on_quarantines_panicking_tx() -> Result<()> {
+    use alloy_primitives::U256;
+    use arc_execution_e2e::ArcEnvironment;
+    use arc_execution_txpool::ArcTransactionValidatorError;
+    use arc_precompiles::precompile_provider::PANIC_PRECOMPILE_ADDRESS;
+    use reth_transaction_pool::error::{PoolError, PoolErrorKind};
+    use reth_transaction_pool::{TransactionOrigin, TransactionPool};
+
+    reth_tracing::init_test_tracing();
+
+    let mut env = ArcEnvironment::new();
+    ArcSetup::new().apply(&mut env).await?;
+
+    SendTransaction::new("good_tx")
+        .execute_and_return(&mut env)
+        .await?;
+
+    let (panicking_tx_hash, panicking_tx) = SendTransaction::new("panic_tx")
+        .with_to(PANIC_PRECOMPILE_ADDRESS)
+        .with_value(U256::ZERO)
+        .with_gas_limit(100_000)
+        .execute_and_return(&mut env)
+        .await?;
+
+    let mut produce = ProduceBlocks::new(1);
+    let _ = arc_execution_e2e::Action::execute(&mut produce, &mut env).await;
+
+    let result = env
+        .node()
+        .inner
+        .pool
+        .add_consensus_transaction(panicking_tx, TransactionOrigin::Local)
+        .await;
+
+    match result {
+        Err(PoolError {
+            kind: PoolErrorKind::InvalidTransaction(ref e),
+            ..
+        }) => {
+            let arc_err = e
+                .downcast_other_ref::<ArcTransactionValidatorError>()
+                .expect("Expected ArcTransactionValidatorError");
+            assert!(
+                matches!(arc_err, ArcTransactionValidatorError::InvalidTxError),
+                "Expected InvalidTxError, got: {arc_err:?}"
+            );
+            Ok(())
+        }
+        Ok(_) => Err(eyre::eyre!(
+            "Transaction {panicking_tx_hash} accepted on resubmission, expected rejection under default config"
+        )),
+        Err(e) => Err(eyre::eyre!(
+            "Transaction {panicking_tx_hash} rejected with unexpected error: {e:?}"
+        )),
+    }
+}

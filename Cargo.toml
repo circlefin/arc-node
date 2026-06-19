@@ -269,72 +269,67 @@ wiremock = "0.6"
 [workspace.dependencies.malachitebft-app]
 package = "arc-malachitebft-app"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
+rev = "8ee5d998"
 
 [workspace.dependencies.malachitebft-app-channel]
 package = "arc-malachitebft-app-channel"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
+rev = "8ee5d998"
 
 [workspace.dependencies.malachitebft-codec]
 package = "arc-malachitebft-codec"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
+rev = "8ee5d998"
 
 [workspace.dependencies.malachitebft-config]
 package = "arc-malachitebft-config"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
+rev = "8ee5d998"
 
 [workspace.dependencies.malachitebft-core-consensus]
 package = "arc-malachitebft-core-consensus"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
+rev = "8ee5d998"
 
 [workspace.dependencies.malachitebft-core-state-machine]
 package = "arc-malachitebft-core-state-machine"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
+rev = "8ee5d998"
 
 [workspace.dependencies.malachitebft-core-types]
 package = "arc-malachitebft-core-types"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
-
-[workspace.dependencies.malachitebft-engine]
-package = "arc-malachitebft-engine"
-git = "https://github.com/circlefin/malachite.git"
-rev = "6d95e673"
+rev = "8ee5d998"
 
 [workspace.dependencies.malachitebft-network]
 package = "arc-malachitebft-network"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
+rev = "8ee5d998"
 
 [workspace.dependencies.malachitebft-peer]
 package = "arc-malachitebft-peer"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
+rev = "8ee5d998"
 
 [workspace.dependencies.malachitebft-proto]
 package = "arc-malachitebft-proto"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
+rev = "8ee5d998"
 
 [workspace.dependencies.malachitebft-signing]
 package = "arc-malachitebft-signing"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
+rev = "8ee5d998"
 
 [workspace.dependencies.malachitebft-signing-ed25519]
 package = "arc-malachitebft-signing-ed25519"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
+rev = "8ee5d998"
 
 [workspace.dependencies.malachitebft-sync]
 package = "arc-malachitebft-sync"
 git = "https://github.com/circlefin/malachite.git"
-rev = "0422137f"
+rev = "8ee5d998"
 
 [profile.dev]
 # enable basic optimizations (otherwise reth can't process txs)

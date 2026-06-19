@@ -38,6 +38,7 @@ use arc_eth_engine::retry::NoRetry;
 use arc_eth_engine::rpc::EngineApiRpcError;
 use arc_eth_engine::{engine::Engine, rpc::engine_rpc::EngineRpc};
 use arc_evm_node::node::{ArcNode, ArcRpcConfig};
+use arc_evm_node::ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT;
 use arc_execution_config::addresses_denylist::AddressesDenylistConfig;
 use arc_execution_config::chainspec::ArcChainSpec;
 use arc_execution_config::chainspec::LOCAL_DEV;
@@ -159,7 +160,9 @@ async fn test_engine() {
         None,
         true,
         true,
+        false,
         160 * 1024 * 1024,
+        ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
         std::time::Duration::from_secs(0), // disable rebroadcast in integration tests
     );
     let node_handle = NodeBuilder::new(node_config)

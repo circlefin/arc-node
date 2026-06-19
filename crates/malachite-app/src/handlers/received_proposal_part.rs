@@ -163,6 +163,9 @@ async fn on_received_proposal_part(
     let parts = match context.streams_map.insert(from, part) {
         InsertResult::Complete(parts) => parts,
         InsertResult::Pending => return Ok(None),
+        // Benign: an old proposal part re-circulating on the network. Dropped
+        // without warning — not peer misbehaviour.
+        InsertResult::Stale => return Ok(None),
         InsertResult::Invalid(e) => {
             warn!(%from, error = %e, "Rejecting stream message");
             return Ok(None);

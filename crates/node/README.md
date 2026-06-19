@@ -105,8 +105,9 @@ In addition to standard Reth flags, `arc-node-execution` provides the following 
 | `--enable-arc-rpc` | `false` | - | Enable custom ARC RPC namespace (certificates, etc.) |
 | `--arc-rpc-upstream-url <URL>` | - | `ARC_RPC_UPSTREAM_URL` | Upstream malachite-app base URL for ARC RPC (e.g., `http://127.0.0.1:31000`). Only read if `--enable-arc-rpc` is set |
 | `--unsafe-follow [URL]` | - | `ARC_UNSAFE_FOLLOW_URL` | Run an RPC node (unsafe - no verification). Use without value for auto-config or specify WebSocket URL (e.g., `ws://trusted-node:8546`) |
-| `--invalid-tx-list-enable` | `false` | - | Enable the invalid transaction list feature |
-| `--invalid-tx-list-cap <CAPACITY>` | `100000` | - | Maximum capacity of the invalid tx list LRU cache. Only read if `--invalid-tx-list-enable` is set |
+| `--invalid-tx-list-enable[=<bool>]` | `true` | - | Enable the invalid transaction list feature. Opt out with `--invalid-tx-list-enable=false`. |
+| `--invalid-tx-list-cap <CAPACITY>` | `100000` | - | Maximum capacity of the invalid tx list LRU cache. Only read if `--invalid-tx-list-enable` is `true`. |
+| `--arc.rpc.max-batch-entries <N>` | `100` | - | Maximum number of entries permitted in a JSON-RPC batch request. Oversized batches are rejected with JSON-RPC error `-32600` before any per-entry handler runs. Must be `>= 1`. |
 | `--full` | - | - | Full-node pruning preset. Fully prunes sender recovery; keeps the last 237,600 blocks for all other segments. Also sets `--prune.block-interval=5000`. Mutually exclusive with `--minimal`. |
 | `--minimal` | - | - | Minimal-storage pruning preset. Fully prunes sender recovery; keeps transaction lookup for 64 blocks, receipts for 64 blocks, account/storage history for 10,064 blocks, and block bodies for 237,600 blocks. Also sets `--prune.block-interval=5000`. Mutually exclusive with `--full`. |
 | `--arc.expose-pending-txs` | `false` | - | Expose pending-tx RPCs. By default pending-tx subscriptions, filters, and pending-block queries are blocked — set this on trusted / internal nodes where exposing pending state is intentional. |
@@ -123,12 +124,27 @@ arc-node-execution node \
   --chain genesis.json
 ```
 
-Enable invalid transaction list with custom capacity:
+Override the invalid transaction list capacity (the feature is enabled by default):
 
 ```bash
 arc-node-execution node \
-  --invalid-tx-list-enable \
   --invalid-tx-list-cap 50000 \
+  --chain genesis.json
+```
+
+Disable the invalid transaction list:
+
+```bash
+arc-node-execution node \
+  --invalid-tx-list-enable=false \
+  --chain genesis.json
+```
+
+Tighten the JSON-RPC batch entry cap:
+
+```bash
+arc-node-execution node \
+  --arc.rpc.max-batch-entries 25 \
   --chain genesis.json
 ```
 
@@ -153,18 +169,18 @@ arc-node-execution db --help
 
 ## Invalid Transaction List
 
-The node includes an optional in-memory invalid transaction list (LRU) used to proactively reject known-bad transaction hashes and to add all currently pending transactions to the list in the event the payload builder panics.
+The node includes an in-memory invalid transaction list (LRU) used to proactively reject known-bad transaction hashes and to add all currently pending transactions to the list in the event the payload builder panics. Enabled by default; opt out with `--invalid-tx-list-enable=false`.
 
 **Configuration:**
 
 Use the `--invalid-tx-list-enable` and `--invalid-tx-list-cap` flags (see Custom flags section above).
 
-**Behavior when enabled:**
-- On payload builder panic, all pending transactions are added to the invalid tx list and removed from the mempool
+**Behavior when enabled (default):**
+- On payload builder panic, all pending transactions are added to the invalid tx list and removed from the mempool — resubmit them after investigating the panic
 - O(1) hash membership check during transaction validation
 - Metrics exposed: `arc_invalid_tx_list_size`, `arc_invalid_tx_list_hits_total`, `arc_invalid_tx_list_inserts_total`, `arc_invalid_tx_list_batch_inserts_total`
 
-**Behavior when disabled (default):**
+**Behavior when disabled (`--invalid-tx-list-enable=false`):**
 - No invalid tx list is created
 - No metrics are exposed
 - On payload builder panic, no action is taken
@@ -173,12 +189,10 @@ Use the `--invalid-tx-list-enable` and `--invalid-tx-list-cap` flags (see Custom
 ```bash
 arc-node-execution node \
   --chain genesis.json \
-  --invalid-tx-list-enable \
   --invalid-tx-list-cap 10000
 ```
 
 **Operational Notes:**
-- Enable only on validator nodes
 - Setting `--invalid-tx-list-cap 0` keeps the invalid tx list logically enabled (metrics + panic handling) but stores no hashes
 
 ## Pending Txs Filter

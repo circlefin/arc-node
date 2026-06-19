@@ -52,7 +52,7 @@ pub async fn handle(
         get_block_to_restream(state.store(), height, value_id.block_hash()).await?;
 
     if let Some(block) = block_to_restream {
-        let stream_id = state.next_stream_id();
+        let stream_id = state.next_stream_id(block.height, block.round);
         let signing_provider = state.signing_provider();
 
         restream_proposal(&channels.network, stream_id, signing_provider, &block).await

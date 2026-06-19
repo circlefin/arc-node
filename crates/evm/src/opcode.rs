@@ -33,6 +33,14 @@ enum TransferLogMode {
     Eip7708Transfer,
 }
 
+#[derive(Clone, Copy)]
+enum BlocklistReadPolicy {
+    /// SLOAD failures are treated as "not blocklisted" for backward compatibility.
+    FailOpen,
+    /// SLOAD failures propagate to the caller; an unexpected cold NCC account is loaded and retried.
+    FailClosed,
+}
+
 use reth_ethereum::evm::primitives::Database;
 use reth_evm::revm::{
     context_interface::{host::LoadError, Host},
@@ -59,6 +67,7 @@ fn arc_network_selfdestruct_impl<WIRE: InterpreterTypes, DB: Database>(
     mut context: InstructionContext<'_, EthEvmContext<DB>, WIRE>,
     check_target_destructed: bool,
     log_mode: Option<TransferLogMode>,
+    blocklist_read_policy: BlocklistReadPolicy,
 ) {
     require_non_staticcall!(context.interpreter);
     popn!([target], context.interpreter);
@@ -94,6 +103,7 @@ fn arc_network_selfdestruct_impl<WIRE: InterpreterTypes, DB: Database>(
                 target,
                 skip_cold_load,
                 check_target_destructed,
+                blocklist_read_policy,
             ) else {
                 // The next action is set in the check_selfdestruct_accounts.
                 return;
@@ -177,26 +187,85 @@ fn arc_network_selfdestruct_impl<WIRE: InterpreterTypes, DB: Database>(
 pub(crate) fn arc_network_selfdestruct_zero4<WIRE: InterpreterTypes, DB: Database>(
     context: InstructionContext<'_, EthEvmContext<DB>, WIRE>,
 ) {
-    arc_network_selfdestruct_impl(context, false, Some(TransferLogMode::NativeCoinTransferred));
+    arc_network_selfdestruct_impl(
+        context,
+        false,
+        Some(TransferLogMode::NativeCoinTransferred),
+        BlocklistReadPolicy::FailOpen,
+    );
 }
 
-/// Current (Zero5+): checks target destructed status and emits EIP-7708 Transfer logs.
-pub(crate) fn arc_network_selfdestruct<WIRE: InterpreterTypes, DB: Database>(
+/// Zero5 and Zero6: checks target destructed status and emits EIP-7708 Transfer logs.
+pub(crate) fn arc_network_selfdestruct_zero5<WIRE: InterpreterTypes, DB: Database>(
     context: InstructionContext<'_, EthEvmContext<DB>, WIRE>,
 ) {
-    arc_network_selfdestruct_impl(context, true, Some(TransferLogMode::Eip7708Transfer));
+    arc_network_selfdestruct_impl(
+        context,
+        true,
+        Some(TransferLogMode::Eip7708Transfer),
+        BlocklistReadPolicy::FailOpen,
+    );
+}
+
+/// Zero7+: fail closed on blocklist read failures.
+pub(crate) fn arc_network_selfdestruct_zero7<WIRE: InterpreterTypes, DB: Database>(
+    context: InstructionContext<'_, EthEvmContext<DB>, WIRE>,
+) {
+    arc_network_selfdestruct_impl(
+        context,
+        true,
+        Some(TransferLogMode::Eip7708Transfer),
+        BlocklistReadPolicy::FailClosed,
+    );
 }
 
 /// Checks whether a given account is currently on the blocklist
 fn is_blocklisted<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: &mut InstructionContext<'_, H, WIRE>,
     account: alloy_primitives::Address,
-) -> bool {
+    blocklist_read_policy: BlocklistReadPolicy,
+) -> Result<bool, LoadError> {
     let slot = compute_is_blocklisted_storage_slot(account).into();
-    context
-        .host
-        .sload(native_coin_control::NATIVE_COIN_CONTROL_ADDRESS, slot)
-        .is_some_and(|state_load| is_blocklisted_status(state_load.data))
+    match blocklist_read_policy {
+        BlocklistReadPolicy::FailOpen => Ok(context
+            .host
+            .sload(native_coin_control::NATIVE_COIN_CONTROL_ADDRESS, slot)
+            .is_some_and(|state_load| is_blocklisted_status(state_load.data))),
+        BlocklistReadPolicy::FailClosed => {
+            let state_load = match context.host.sload_skip_cold_load(
+                native_coin_control::NATIVE_COIN_CONTROL_ADDRESS,
+                slot,
+                false,
+            ) {
+                Ok(state_load) => state_load,
+                Err(LoadError::ColdLoadSkipped) => {
+                    let native_coin_control_was_cold = {
+                        let native_coin_control_load =
+                            context.host.load_account_info_skip_cold_load(
+                                native_coin_control::NATIVE_COIN_CONTROL_ADDRESS,
+                                false,
+                                false,
+                            )?;
+                        native_coin_control_load.is_cold
+                    };
+                    debug_assert!(
+                        !native_coin_control_was_cold,
+                        "NativeCoinControl should be preloaded before Zero7 SELFDESTRUCT blocklist reads"
+                    );
+                    // The account is now loaded and warm; the retry should succeed.
+                    // If it doesn't, the `?` propagates the load error to the caller.
+                    context.host.sload_skip_cold_load(
+                        native_coin_control::NATIVE_COIN_CONTROL_ADDRESS,
+                        slot,
+                        false,
+                    )?
+                }
+                Err(LoadError::DBError) => return Err(LoadError::DBError),
+            };
+
+            Ok(is_blocklisted_status(state_load.data))
+        }
+    }
 }
 
 /// Checks the source and target addresses are valid or not, and return target is cold or warm if the target account is loaded.
@@ -209,12 +278,14 @@ fn is_blocklisted<WIRE: InterpreterTypes, H: Host + ?Sized>(
 /// - returns Ok(None) pass the check, and we did not load the target account.
 /// - returns Ok(bool) pass the check, return `true` if the account is cold, `false` if it is warm.
 /// - returns Err(()) if the source or target account is invalid. The error should update in the context.interpreter.
+/// - returns Err(()) if a fail-closed blocklist load fails; the interpreter is halted fatally.
 fn check_selfdestruct_accounts<WIRE: InterpreterTypes, DB: Database>(
     context: &mut InstructionContext<'_, EthEvmContext<DB>, WIRE>,
     source: alloy_primitives::Address,
     target: alloy_primitives::Address,
     skip_cold_load: bool,
     check_target_destructed: bool,
+    blocklist_read_policy: BlocklistReadPolicy,
 ) -> Result<Option<bool>, ()> {
     // Disallow selfdestruct if target == source
     if source == target {
@@ -223,7 +294,43 @@ fn check_selfdestruct_accounts<WIRE: InterpreterTypes, DB: Database>(
     }
 
     // Check if either account is blocklisted
-    if is_blocklisted(context, target) || is_blocklisted(context, source) {
+    let target_blocklisted = match is_blocklisted(context, target, blocklist_read_policy) {
+        Ok(is_blocklisted) => is_blocklisted,
+        Err(err) => {
+            tracing::error!(
+                address = %target,
+                err = ?err,
+                "blocklist read failed for selfdestruct target"
+            );
+            context.interpreter.halt_fatal();
+            return Err(());
+        }
+    };
+    if target_blocklisted {
+        context
+            .interpreter
+            .bytecode
+            .set_action(InterpreterAction::new_return(
+                InstructionResult::Revert,
+                helpers::revert_message_to_bytes(ERR_BLOCKED_ADDRESS),
+                context.interpreter.gas,
+            ));
+        return Err(());
+    }
+
+    let source_blocklisted = match is_blocklisted(context, source, blocklist_read_policy) {
+        Ok(is_blocklisted) => is_blocklisted,
+        Err(err) => {
+            tracing::error!(
+                address = %source,
+                err = ?err,
+                "blocklist read failed for selfdestruct source"
+            );
+            context.interpreter.halt_fatal();
+            return Err(());
+        }
+    };
+    if source_blocklisted {
         context
             .interpreter
             .bytecode
@@ -478,11 +585,52 @@ mod tests {
             log_mode: Option<TransferLogMode>,
             initial_gas_limit: Option<u64>,
         ) -> InterpreterResult {
-            // Load precompile account
-            self.host
-                .journal_mut()
-                .load_account(native_coin_control::NATIVE_COIN_CONTROL_ADDRESS)
-                .expect("load account to state");
+            self.simulate_arc_selfdestruct_full_with_preload(
+                account,
+                target,
+                check_target_destructed,
+                log_mode,
+                initial_gas_limit,
+                true,
+                BlocklistReadPolicy::FailClosed,
+            )
+        }
+
+        fn simulate_arc_selfdestruct_without_native_coin_control_preload(
+            &mut self,
+            account: Address,
+            target: Address,
+            check_target_destructed: bool,
+            blocklist_read_policy: BlocklistReadPolicy,
+        ) -> InterpreterResult {
+            self.simulate_arc_selfdestruct_full_with_preload(
+                account,
+                target,
+                check_target_destructed,
+                Some(TransferLogMode::NativeCoinTransferred),
+                None,
+                false,
+                blocklist_read_policy,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn simulate_arc_selfdestruct_full_with_preload(
+            &mut self,
+            account: Address,
+            target: Address,
+            check_target_destructed: bool,
+            log_mode: Option<TransferLogMode>,
+            initial_gas_limit: Option<u64>,
+            preload_native_coin_control: bool,
+            blocklist_read_policy: BlocklistReadPolicy,
+        ) -> InterpreterResult {
+            if preload_native_coin_control {
+                self.host
+                    .journal_mut()
+                    .load_account(native_coin_control::NATIVE_COIN_CONTROL_ADDRESS)
+                    .expect("load account to state");
+            }
 
             // Builds an interpreter instance with the SELFDESTRUCT target already on the stack.
             let mut interpreter = Interpreter::<EthInterpreter>::default();
@@ -508,7 +656,12 @@ mod tests {
                 interpreter: &mut interpreter,
                 host: &mut self.host,
             };
-            arc_network_selfdestruct_impl(context, check_target_destructed, log_mode);
+            arc_network_selfdestruct_impl(
+                context,
+                check_target_destructed,
+                log_mode,
+                blocklist_read_policy,
+            );
 
             // The selfdestruct should halt and return a Return action.
             let next_action = interpreter.take_next_action();
@@ -779,6 +932,78 @@ mod tests {
                 res.gas.spent() <= initial_gas,
                 "gas spent should not exceed initial limit"
             );
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "NativeCoinControl should be preloaded")
+    )]
+    fn selfdestruct_zero7_recovers_or_debug_asserts_when_native_coin_control_is_not_loaded() {
+        let check_target_destruct_locally_values: &[bool] = if cfg!(debug_assertions) {
+            &[true]
+        } else {
+            &[true, false]
+        };
+
+        for check_target_destruct_locally in check_target_destruct_locally_values {
+            let mut db = InMemoryDB::default();
+            let slot = native_coin_control::compute_is_blocklisted_storage_slot(TARGET);
+            db.insert_account_storage(
+                native_coin_control::NATIVE_COIN_CONTROL_ADDRESS,
+                slot.into(),
+                U256::from(1),
+            )
+            .expect("insert blocklist storage");
+            let mut env = HostTestEnv::new(db);
+            env.set_account_balance(ACCOUNT, U256::from(1));
+
+            let res = env.simulate_arc_selfdestruct_without_native_coin_control_preload(
+                ACCOUNT,
+                TARGET,
+                *check_target_destruct_locally,
+                BlocklistReadPolicy::FailClosed,
+            );
+
+            #[cfg(debug_assertions)]
+            let _ = res;
+
+            #[cfg(not(debug_assertions))]
+            {
+                assert_eq!(res.result, InstructionResult::Revert);
+                assert_eq!(res.gas.spent(), STATIC_GAS_COST);
+                assert_eq!(res.gas.refunded(), 0);
+                assert_account_matches!(env, ACCOUNT, State::touch_new(), U256::from(1));
+                assert_account_matches!(env, TARGET, State::loaded_new(), U256::ZERO);
+            }
+        }
+    }
+
+    #[test]
+    fn selfdestruct_pre_zero7_preserves_fail_open_without_native_coin_control_loaded() {
+        for check_target_destruct_locally in [true, false] {
+            let mut db = InMemoryDB::default();
+            let slot = native_coin_control::compute_is_blocklisted_storage_slot(TARGET);
+            db.insert_account_storage(
+                native_coin_control::NATIVE_COIN_CONTROL_ADDRESS,
+                slot.into(),
+                U256::from(1),
+            )
+            .expect("insert blocklist storage");
+            let mut env = HostTestEnv::new(db);
+            env.set_account_balance(ACCOUNT, U256::from(1));
+
+            let res = env.simulate_arc_selfdestruct_without_native_coin_control_preload(
+                ACCOUNT,
+                TARGET,
+                check_target_destruct_locally,
+                BlocklistReadPolicy::FailOpen,
+            );
+
+            assert_eq!(res.result, InstructionResult::SelfDestruct);
+            assert_account_matches!(env, ACCOUNT, State::touch_new(), U256::ZERO);
+            assert_account_matches!(env, TARGET, State::touch_new(), U256::from(1));
         }
     }
 

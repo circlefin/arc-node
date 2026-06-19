@@ -155,7 +155,7 @@ https://example.com,wss=ws.example.com:1212
 
 - `--p2p.persistent-peers` - Comma-separated list of persistent peer multiaddrs
 - `--p2p.persistent-peers-only` - Only allow connections to/from persistent peers (default: false). Useful for sentry node setups where a validator should only communicate with known trusted peers.
-- `--validator` - Run as a validator: load the consensus signing key, sign the validator proof (ADR-006), and advertise a validator identity. Without this flag the node runs as a full node (no signing, ephemeral consensus key). Mutually exclusive with `--no-consensus` and `--follow`. Requires `--suggested-fee-recipient`.
+- `--validator` - Run as a validator: load the consensus signing key, sign the validator proof, and advertise a validator identity. Without this flag the node runs as a full node (no signing, ephemeral consensus key). Mutually exclusive with `--no-consensus` and `--follow`. Requires `--suggested-fee-recipient`.
 - `--no-consensus` - Run as a sync-only node that does not subscribe to consensus gossip topics. Mutually exclusive with `--validator`.
 - `--discovery` - Enable peer discovery (default: false)
 - `--discovery.num-outbound-peers` - Number of outbound peers (default: 20)

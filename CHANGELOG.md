@@ -2,6 +2,32 @@
 
 All notable changes to arc-node are documented in this file.
 
+## [v0.7.2]
+
+**Changes:** [v0.7.1...v0.7.2](https://github.com/circlefin/arc-node/compare/v0.7.1...v0.7.2) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.7.2)
+
+*Note: testnet node operators must use v0.7.2 before timestamp `1781791200` (2026-06-18 14:00:00 UTC), when Zero7 activates on testnet. Earlier versions are not supported.*
+
+### For Node Operators
+
+- **[Config] EL JSON-RPC gas cap default lowered to 30M.** `--rpc.gascap` now defaults to `30000000` (previously `50000000`). `eth_call` and `eth_estimateGas` requests that need more than 30M gas now fail unless the cap is raised. Operators who never set `--rpc.gascap` and do not rely on calls above 30M gas are unaffected; pass `--rpc.gascap <N>` to restore a larger budget. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v072) for migration details.
+- **[CLI] Replay-unprotected (pre-EIP-155) transactions are rejected over JSON-RPC by default.** The new `--arc.rpc.allow-unprotected-txs` flag defaults to `false`; raw transaction submission returns "only replay-protected (EIP-155) transactions allowed over RPC", matching Geth. Operators that must accept legacy unprotected transactions over RPC pass `--arc.rpc.allow-unprotected-txs`. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v072) for migration details.
+- **[Config] JSON-RPC batch requests are capped at 100 entries by default.** The new `--arc.rpc.max-batch-entries` flag defaults to `100`; batches with more entries are rejected with JSON-RPC error `-32600` before any per-entry handler runs, and `0` is rejected so the cap cannot be silently disabled. Operators whose tooling sends larger batches raise `--arc.rpc.max-batch-entries <COUNT>`. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v072) for migration details.
+- **[Config] The invalid-transaction list is enabled by default.** `--invalid-tx-list-enable` now defaults to `true` (previously `false`). On a payload-builder panic, all pending transactions are added to the list and removed from the mempool; resubmit them after investigating. Opt out with `--invalid-tx-list-enable=false`. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v072) for migration details.
+
+### Fixes
+
+- [CL] Stop stale proposal streams from blocking live proposals
+- [EL] Preserve cold account state when evaluating the SELFDESTRUCT beneficiary check
+- [EL] Charge gas before performing storage I/O in precompile helpers
+- [EL] Fail closed in the SELFDESTRUCT handler when a blocklist read fails
+
+### Docs
+
+Full documentation tree at this release: [`arc-node` v0.7.2 docs](https://github.com/circlefin/arc-node/tree/v0.7.2/docs). New or updated topics in this release:
+
+- Add an RPC provider node section to the public node-operation guide
+
 ## [v0.7.1]
 
 **Changes:** [v0.7.0...v0.7.1](https://github.com/circlefin/arc-node/compare/v0.7.0...v0.7.1) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.7.1)

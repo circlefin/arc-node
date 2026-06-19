@@ -473,14 +473,18 @@ impl State {
         self.cleanup_synced_heights(info.next_height);
     }
 
-    pub fn next_stream_id(&mut self) -> StreamId {
+    /// Build the next stream ID for a proposal at the given `height` and `round`.
+    ///
+    /// The height and round come from the proposal being streamed, so the
+    /// stream_id agrees with the proposal's `Init` part by construction.
+    pub fn next_stream_id(&mut self, height: Height, round: Round) -> StreamId {
         let nonce = self.stream_nonce;
-        // Stream nonce is reset each height; cannot realistically reach u32::MAX
+        // Stream nonce increases monotonically; collision unreachable within a session
         #[allow(clippy::arithmetic_side_effects)]
         {
             self.stream_nonce += 1;
         }
-        streaming::new_stream_id(self.current_height, self.current_round, nonce)
+        streaming::new_stream_id(height, round, nonce)
     }
 
     pub async fn restart_height(

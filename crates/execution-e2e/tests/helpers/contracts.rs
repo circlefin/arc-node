@@ -19,7 +19,7 @@
 //! Each test binary only uses a subset of these; unused items are expected.
 #![allow(dead_code)]
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{keccak256, Address, Bytes};
 use revm_bytecode::opcode::*;
 
 /// Contract with `receive() external payable {}` — accepts value, does nothing.
@@ -172,6 +172,69 @@ pub fn call_target_with_value_contract_deploy_code() -> Bytes {
     deploy_code(&runtime)
 }
 
+/// Contract that attempts CREATE2 with value=1, then checks the balance of an
+/// expected CREATE2 address passed in calldata.
+/// - stores the CREATE2 return value in slot 0.
+/// - stores the balance + swap1 + pop gas cost in slot 1.
+///
+/// The calldata address is expected as a right-padded 32-byte word.
+///
+/// ```eas
+/// push32 0x00..00  ;; [salt]            — salt = 0
+/// push1 0x01       ;; [1, salt]         — value = 1
+/// push1 0x00       ;; [0, 1, salt]      — offset = 0 (mem[0] is 0x00 by default)
+/// push1 0x01       ;; [1, 0, 1, salt]   — initcode length = 1
+/// create2          ;; [addr]            — create2(value=1, offset=0, len=1, salt=0)
+/// push1 0x00       ;; [0, addr]
+/// sstore           ;; []                — sstore(0, addr)
+/// push1 0x00       ;; [0]               — calldata offset
+/// calldataload     ;; [cd[0..32]]       — load expected address word
+/// push1 0x60       ;; [96, cd[0..32]]   — shift amount
+/// shr              ;; [expected_addr]   — isolate expected address
+/// gas              ;; [gas before, expected_addr]
+/// swap1            ;; [expected_addr, gas before]
+/// balance          ;; [balance, gas before]
+/// pop              ;; [gas before]
+/// gas              ;; [gas after, gas before]
+/// swap1            ;; [gas before, gas after]
+/// sub              ;; [gas cost]
+/// push1 0x01       ;; [0, gas cost]
+/// sstore           ;; []               - sstore(1, gas cost)
+///
+/// ```
+pub fn create2_with_balance_probe() -> Bytes {
+    #[rustfmt::skip]
+    let runtime = [
+        PUSH32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        PUSH1, 0x01,
+        PUSH1, 0x00,
+        PUSH1, 0x01,
+        CREATE2,      // create2(value=1, offset=0, len=1, salt=0)
+        PUSH1, 0x00,
+        SSTORE,       // sstore(0, CREATE2 return value)
+        PUSH1, 0x00,
+        CALLDATALOAD,
+        PUSH1, 0x60,
+        SHR,
+        GAS,
+        SWAP1,
+        BALANCE,
+        POP,
+        GAS,
+        SWAP1,
+        SUB,
+        PUSH1, 0x01,
+        SSTORE,       // sstore(1, gas cost)
+    ];
+    deploy_code(&runtime)
+}
+
+/// Creates calldata for the create2 balance probe contract.
+pub fn create2_balance_probe_calldata(creator: Address) -> Bytes {
+    right_pad_address(creator.create2([0u8; 32], keccak256([0u8])))
+}
+
 /// Right-pads an address to 32 bytes for use as calldata.
 ///
 /// Contracts that read a target address via `CALLDATALOAD(0) + SHR(96)` expect
@@ -206,7 +269,7 @@ fn deploy_code(runtime: &[u8]) -> Bytes {
     );
     #[rustfmt::skip]
     code.extend_from_slice(&[
-        PUSH1, len_u8,           // codecopy(0,
+        PUSH1, len_u8,            // codecopy(0,
         DUP1,                     //
         PUSH1, constructor_len,   //   11,
         PUSH1, 0x00,              //   len)
