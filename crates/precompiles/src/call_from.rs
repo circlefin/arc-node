@@ -190,6 +190,8 @@ impl SubcallPrecompile for CallFromPrecompile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::Bytes;
+    use revm::interpreter::{CallOutcome, Gas, InstructionResult, InterpreterResult};
 
     /// Guard against silent upstream changes to the EVM COPY gas cost.
     /// An unexpected change would alter `abi_decode_gas` and `abi_encode_gas` results,
@@ -280,6 +282,157 @@ mod tests {
         assert_eq!(
             trace_result.is_static, init_child.is_static,
             "is_static mismatch"
+        );
+    }
+
+    fn make_call_frame_result(result: InstructionResult, output: Bytes) -> FrameResult {
+        FrameResult::Call(CallOutcome {
+            result: InterpreterResult::new(result, output, Gas::new(0)),
+            memory_offset: 0..0,
+            was_precompile_called: false,
+            precompile_call_logs: Default::default(),
+        })
+    }
+
+    fn empty_continuation() -> SubcallContinuationData {
+        SubcallContinuationData {
+            state: Box::new(()),
+        }
+    }
+
+    #[test]
+    fn complete_subcall_child_success_encodes_success_true() {
+        let precompile = CallFromPrecompile;
+        let output: Bytes = vec![0xde, 0xad, 0xbe, 0xef].into();
+        let child = make_call_frame_result(InstructionResult::Return, output.clone());
+
+        let completion = precompile
+            .complete_subcall(empty_continuation(), &child)
+            .expect("Call frame result should produce Ok");
+
+        let decoded = ICallFrom::callFromCall::abi_decode_returns(&completion.output)
+            .expect("output should decode as callFrom return");
+        assert!(decoded.success, "child Return ⇒ success=true");
+        assert_eq!(decoded.returnData.as_ref(), output.as_ref());
+        assert_eq!(completion.gas_overhead, abi_encode_gas(output.len()));
+        assert!(
+            completion.success,
+            "precompile completion is always success=true; the caller inspects the encoded bool"
+        );
+    }
+
+    #[test]
+    fn complete_subcall_child_revert_encodes_success_false() {
+        let precompile = CallFromPrecompile;
+        let revert_output: Bytes = vec![0x08, 0xc3, 0x79, 0xa0].into();
+        let child = make_call_frame_result(InstructionResult::Revert, revert_output.clone());
+
+        let completion = precompile
+            .complete_subcall(empty_continuation(), &child)
+            .expect("Call frame result with Revert should still produce Ok");
+
+        let decoded = ICallFrom::callFromCall::abi_decode_returns(&completion.output)
+            .expect("output should decode as callFrom return");
+        assert!(!decoded.success, "child Revert ⇒ success=false");
+        assert_eq!(decoded.returnData.as_ref(), revert_output.as_ref());
+        assert_eq!(completion.gas_overhead, abi_encode_gas(revert_output.len()));
+    }
+
+    #[test]
+    fn complete_subcall_non_call_frame_result_errors() {
+        use revm_interpreter::CreateOutcome;
+
+        let precompile = CallFromPrecompile;
+        let create_result = FrameResult::Create(CreateOutcome {
+            result: InterpreterResult::new(InstructionResult::Return, Bytes::new(), Gas::new(0)),
+            address: None,
+        });
+
+        let result = precompile.complete_subcall(empty_continuation(), &create_result);
+        assert!(
+            matches!(result, Err(SubcallError::UnexpectedFrameResult)),
+            "non-Call FrameResult must yield UnexpectedFrameResult"
+        );
+    }
+
+    fn call_from_inputs(data: Vec<u8>, gas_limit: u64) -> CallInputs {
+        use alloy_primitives::address;
+        use alloy_sol_types::SolCall;
+        use revm::interpreter::interpreter_action::{CallInput, CallScheme, CallValue};
+
+        let calldata = ICallFrom::callFromCall {
+            sender: address!("e000000000000000000000000000000000000001"),
+            target: address!("c000000000000000000000000000000000000002"),
+            data: data.into(),
+        }
+        .abi_encode();
+
+        CallInputs {
+            scheme: CallScheme::Call,
+            target_address: CALL_FROM_ADDRESS,
+            bytecode_address: CALL_FROM_ADDRESS,
+            known_bytecode: None,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(calldata.into()),
+            gas_limit,
+            is_static: false,
+            caller: address!("c000000000000000000000000000000000000001"),
+            return_memory_offset: 0..0,
+        }
+    }
+
+    #[test]
+    fn abi_decode_gas_base_plus_per_word() {
+        // 0 bytes → base only (div_ceil(0, 32) = 0)
+        assert_eq!(abi_decode_gas(0), ABI_DECODE_BASE_GAS);
+        // 1 byte → 1 word
+        assert_eq!(abi_decode_gas(1), ABI_DECODE_BASE_GAS + gas::COPY);
+        // 32 bytes → 1 word
+        assert_eq!(abi_decode_gas(32), ABI_DECODE_BASE_GAS + gas::COPY);
+        // 33 bytes → 2 words
+        assert_eq!(abi_decode_gas(33), ABI_DECODE_BASE_GAS + 2 * gas::COPY);
+        // 64 bytes → 2 words
+        assert_eq!(abi_decode_gas(64), ABI_DECODE_BASE_GAS + 2 * gas::COPY);
+    }
+
+    #[test]
+    fn init_subcall_below_abi_decode_overhead_returns_insufficient_gas() {
+        let precompile = CallFromPrecompile;
+        // Empty data: overhead = abi_decode_gas(0). One gas short must revert.
+        let inputs = call_from_inputs(vec![], abi_decode_gas(0) - 1);
+        assert!(
+            matches!(
+                precompile.init_subcall(&inputs),
+                Err(SubcallError::InsufficientGas(_))
+            ),
+            "gas_limit one below the ABI decode overhead must return InsufficientGas"
+        );
+    }
+
+    #[test]
+    fn init_subcall_at_abi_decode_overhead_succeeds() {
+        let precompile = CallFromPrecompile;
+        // Exactly the overhead leaves zero gas for the child but still completes init.
+        let inputs = call_from_inputs(vec![], abi_decode_gas(0));
+        let result = precompile
+            .init_subcall(&inputs)
+            .expect("gas_limit equal to overhead should succeed");
+        assert_eq!(result.gas_overhead, abi_decode_gas(0));
+    }
+
+    #[test]
+    fn init_subcall_below_per_word_overhead_returns_insufficient_gas() {
+        let precompile = CallFromPrecompile;
+        // 33 bytes → 2 words → overhead = base + 2*COPY. One gas short must revert.
+        let data = vec![0u8; 33];
+        let overhead = abi_decode_gas(data.len());
+        let inputs = call_from_inputs(data, overhead - 1);
+        assert!(
+            matches!(
+                precompile.init_subcall(&inputs),
+                Err(SubcallError::InsufficientGas(_))
+            ),
+            "nonempty data: gas below base+per-word overhead must return InsufficientGas"
         );
     }
 }

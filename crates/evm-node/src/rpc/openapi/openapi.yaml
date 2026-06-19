@@ -40,16 +40,20 @@ paths:
       description: |
         Single JSON-RPC 2.0 POST endpoint. Methods currently implemented under the `arc` namespace:
 
-          1. arc_getCertificate(height: u64) -> RpcCommitCertificate
+          1. arc_getCertificate(height: u64 | hex string) -> RpcCommitCertificate
              Returns the consensus commit certificate for the specified height if available.
+             The height parameter accepts either a decimal number (7) or a hex quantity string ("0x7").
              Error Mapping (error.code -> meaning):
                -32602 Invalid params (height < 1)
                -32004 Not found (no certificate upstream)
                -32005 Upstream unreachable (connect errors)
                -32603 Internal (timeout / decode / generic upstream HTTP status)
-             Curl Example:
+             Curl Examples:
                curl -s -X POST -H 'Content-Type: application/json' \
                  --data '{"jsonrpc":"2.0","method":"arc_getCertificate","params":[7],"id":1}' \
+                 http://127.0.0.1:8545
+               curl -s -X POST -H 'Content-Type: application/json' \
+                 --data '{"jsonrpc":"2.0","method":"arc_getCertificate","params":["0x7"],"id":1}' \
                  http://127.0.0.1:8545
 
           2. arc_getVersion() -> RpcVersionInfo
@@ -108,9 +112,13 @@ components:
           minItems: 1
           maxItems: 1
           items:
-            type: integer
-            minimum: 1
-            format: int64
+            oneOf:
+              - type: integer
+                minimum: 1
+                format: int64
+              - type: string
+                pattern: "^0[xX][0-9a-fA-F]+$"
+                description: Hex-encoded quantity (e.g. "0x7"). Must be >= 1.
         id:
           oneOf:
             - type: integer
