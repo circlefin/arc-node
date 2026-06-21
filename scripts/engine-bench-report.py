@@ -6,16 +6,16 @@ Usage:
     engine-bench-report.py <results_dir> [--baseline <dir>] [--markdown <path>]
 
 Reads `combined_latency.csv` from `results_dir`, aggregates per-block data into
-headline throughput and latency metrics, uses `summary.csv` existence only as
-a benchmark-completion marker, resolves a report status
+headline throughput and latency metrics, uses a non-empty `summary.csv` as a
+benchmark-completion marker, resolves a report status
 (`normal`/`partial`/`no_data`/`error`), and prints a JSON analysis document to
 stdout. Callers (e.g., CI) parse the JSON directly.
 
 With `--baseline <dir>`, averages the headline metrics across prior-run
 complete prior runs under `<dir>/<run_id>/{summary,combined_latency}.csv`,
-where `summary.csv` is only a completion marker, and emits a Δ table alongside
-current values, flagging regressions against the trailing average. Incomplete
-baseline runs are skipped.
+where a non-empty `summary.csv` is the completion marker, and emits a Δ table
+alongside current values, flagging regressions against the trailing average.
+Incomplete baseline runs are skipped.
 
 With `--markdown <path>`, also renders a markdown report at that path.
 
@@ -180,8 +180,12 @@ def _load_combined_rows(path):
 
 def summary_marker_status(results_dir):
     path = os.path.join(results_dir, "summary.csv")
-    if not os.path.exists(path):
+    try:
+        size = os.path.getsize(path)
+    except FileNotFoundError:
         return SUMMARY_MARKER_MISSING
+    if size == 0:
+        return SUMMARY_MARKER_EMPTY
     return SUMMARY_MARKER_PRESENT
 
 
