@@ -647,10 +647,48 @@ where
     }
 }
 
+type ArcConsensusModifier = Box<
+    dyn FnOnce(Arc<ArcConsensus<ArcChainSpec>>) -> eyre::Result<Arc<ArcConsensus<ArcChainSpec>>>
+        + Send
+        + 'static,
+>;
+
 /// A basic Arc consensus builder.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default)]
 pub struct ArcConsensusBuilder {
-    // TODO add closure to modify consensus
+    modify_consensus: Option<ArcConsensusModifier>,
+}
+
+impl std::fmt::Debug for ArcConsensusBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArcConsensusBuilder")
+            .field("modify_consensus", &self.modify_consensus.is_some())
+            .finish()
+    }
+}
+
+impl ArcConsensusBuilder {
+    /// Returns a builder that applies `modify_consensus` after constructing the
+    /// default [`ArcConsensus`].
+    pub fn with_consensus_modifier<F>(mut self, modify_consensus: F) -> Self
+    where
+        F: FnOnce(Arc<ArcConsensus<ArcChainSpec>>) -> eyre::Result<Arc<ArcConsensus<ArcChainSpec>>>
+            + Send
+            + 'static,
+    {
+        self.modify_consensus = Some(Box::new(modify_consensus));
+        self
+    }
+
+    fn apply_consensus_modifier(
+        self,
+        consensus: Arc<ArcConsensus<ArcChainSpec>>,
+    ) -> eyre::Result<Arc<ArcConsensus<ArcChainSpec>>> {
+        match self.modify_consensus {
+            Some(modify_consensus) => modify_consensus(consensus),
+            None => Ok(consensus),
+        }
+    }
 }
 
 impl<Node> ConsensusBuilder<Node> for ArcConsensusBuilder
@@ -660,7 +698,7 @@ where
     type Consensus = Arc<ArcConsensus<<Node::Types as NodeTypes>::ChainSpec>>;
 
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
-        Ok(Arc::new(ArcConsensus::new(ctx.chain_spec())))
+        self.apply_consensus_modifier(Arc::new(ArcConsensus::new(ctx.chain_spec())))
     }
 }
 
@@ -868,5 +906,27 @@ mod tests {
         let builder =
             ArcNetworkBuilder::default().with_rebroadcast_interval(std::time::Duration::ZERO);
         assert!(builder.rebroadcast_interval.is_zero());
+    }
+
+    #[test]
+    fn arc_consensus_builder_applies_modifier() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let called = Arc::new(AtomicBool::new(false));
+        let called_for_modifier = called.clone();
+        let consensus = Arc::new(ArcConsensus::new(
+            arc_execution_config::chainspec::LOCAL_DEV.clone(),
+        ));
+
+        let modified = ArcConsensusBuilder::default()
+            .with_consensus_modifier(move |consensus| {
+                called_for_modifier.store(true, Ordering::Relaxed);
+                Ok(consensus)
+            })
+            .apply_consensus_modifier(consensus.clone())
+            .expect("modifier should succeed");
+
+        assert!(called.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(&modified, &consensus));
     }
 }
