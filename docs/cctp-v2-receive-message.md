@@ -28,16 +28,19 @@ can be a meaningful relative change.
 ## Mitigation
 
 Estimate fees on the destination chain immediately before calling
-`receiveMessage()`, then add headroom to `maxFeePerGas`.
+`receiveMessage()`, then add headroom to the fee fields that chain actually
+accepts. EIP-1559 chains should receive `maxFeePerGas` and, when available,
+`maxPriorityFeePerGas`. Legacy-gas chains should receive `gasPrice` instead.
 
 ```ts
 import { createPublicClient, http, type Chain } from "viem";
 
-const FEE_BUMP_BASIS_POINTS = 13_000n; // 130%
+const MAX_FEE_BUMP_BASIS_POINTS = 13_000n; // 130%
+const PRIORITY_FEE_BUMP_BASIS_POINTS = 11_500n; // 115%
 const BASIS_POINTS = 10_000n;
 
-function bumpFee(value: bigint): bigint {
-  return (value * FEE_BUMP_BASIS_POINTS + BASIS_POINTS - 1n) / BASIS_POINTS;
+function bumpFee(value: bigint, basisPoints: bigint): bigint {
+  return (value * basisPoints + BASIS_POINTS - 1n) / BASIS_POINTS;
 }
 
 async function estimateReceiveMessageFees({
@@ -53,18 +56,28 @@ async function estimateReceiveMessageFees({
   });
 
   const fees = await destinationClient.estimateFeesPerGas();
-  const maxFeePerGas = fees.maxFeePerGas ?? fees.gasPrice;
 
-  if (maxFeePerGas == null) {
-    return {};
+  if (fees.maxFeePerGas != null) {
+    return {
+      maxFeePerGas: bumpFee(fees.maxFeePerGas, MAX_FEE_BUMP_BASIS_POINTS),
+      ...(fees.maxPriorityFeePerGas == null
+        ? {}
+        : {
+            maxPriorityFeePerGas: bumpFee(
+              fees.maxPriorityFeePerGas,
+              PRIORITY_FEE_BUMP_BASIS_POINTS,
+            ),
+          }),
+    };
   }
 
-  return {
-    maxFeePerGas: bumpFee(maxFeePerGas),
-    ...(fees.maxPriorityFeePerGas == null
-      ? {}
-      : { maxPriorityFeePerGas: fees.maxPriorityFeePerGas }),
-  };
+  if (fees.gasPrice != null) {
+    return {
+      gasPrice: bumpFee(fees.gasPrice, MAX_FEE_BUMP_BASIS_POINTS),
+    };
+  }
+
+  return {};
 }
 ```
 
@@ -95,10 +108,22 @@ const hash = await walletClient.writeContract({
 - Add enough `maxFeePerGas` headroom for the destination chain's fee volatility.
   The example above uses 130%; more conservative relayers may choose a higher
   multiplier.
-- Keep `maxPriorityFeePerGas` from the destination chain estimate unless your
-  wallet or relayer has a chain-specific priority-fee policy.
+- Add modest `maxPriorityFeePerGas` headroom too when the destination chain uses
+  EIP-1559. The example above uses 115%.
+- On legacy-gas destination chains, pass a bumped `gasPrice` and do not include
+  EIP-1559 fee fields.
 - Retry by re-estimating fees rather than resubmitting the same stale signed
   transaction.
+
+## Arc Testnet as destination
+
+For reverse CCTP flows where Arc Testnet is the destination, use the legacy
+`gasPrice` branch above. Arc Testnet transactions should not include
+`maxFeePerGas` or `maxPriorityFeePerGas` overrides. Arc Testnet gas estimates
+can also be stale during rapid transaction sequences, so keep the same 130%
+headroom when re-estimating `gasPrice` immediately before submission. See
+[#87](https://github.com/circlefin/arc-node/issues/87) for the Arc Testnet
+`gasPrice` workaround.
 
 For more on Arc's own base-fee model, see
 [ADR-0004: Base Fee Parameter Validation](./adr/0004-base-fee-validation.md).
