@@ -670,17 +670,26 @@ impl std::fmt::Debug for ArcConsensusBuilder {
 impl ArcConsensusBuilder {
     /// Returns a builder that applies `modify_consensus` after constructing the
     /// default [`ArcConsensus`].
+    ///
+    /// Calling this more than once replaces the previous modifier. To apply
+    /// multiple transformations, compose them into one closure before passing it
+    /// to this method.
     pub fn with_consensus_modifier<F>(mut self, modify_consensus: F) -> Self
     where
         F: FnOnce(Arc<ArcConsensus<ArcChainSpec>>) -> eyre::Result<Arc<ArcConsensus<ArcChainSpec>>>
             + Send
             + 'static,
     {
+        debug_assert!(
+            self.modify_consensus.is_none(),
+            "consensus modifier already set; compose modifiers before passing them to ArcConsensusBuilder"
+        );
         self.modify_consensus = Some(Box::new(modify_consensus));
         self
     }
 
-    fn apply_consensus_modifier(
+    /// Applies the configured modifier to a constructed consensus instance.
+    pub(crate) fn apply_consensus_modifier(
         self,
         consensus: Arc<ArcConsensus<ArcChainSpec>>,
     ) -> eyre::Result<Arc<ArcConsensus<ArcChainSpec>>> {
@@ -928,5 +937,13 @@ mod tests {
 
         assert!(called.load(Ordering::Relaxed));
         assert!(Arc::ptr_eq(&modified, &consensus));
+    }
+
+    #[test]
+    #[should_panic(expected = "consensus modifier already set")]
+    fn arc_consensus_builder_panics_on_double_modifier_in_debug() {
+        let _builder = ArcConsensusBuilder::default()
+            .with_consensus_modifier(Ok)
+            .with_consensus_modifier(Ok);
     }
 }
