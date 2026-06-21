@@ -55,7 +55,12 @@ async function estimateReceiveMessageFees({
     transport: http(destinationRpcUrl),
   });
 
-  const fees = await destinationClient.estimateFeesPerGas();
+  let fees: Awaited<ReturnType<typeof destinationClient.estimateFeesPerGas>>;
+  try {
+    fees = await destinationClient.estimateFeesPerGas();
+  } catch (err) {
+    throw new Error(`fee estimation failed on ${destinationChain.name}: ${err}`);
+  }
 
   if (fees.maxFeePerGas != null) {
     return {
@@ -77,7 +82,9 @@ async function estimateReceiveMessageFees({
     };
   }
 
-  return {};
+  throw new Error(
+    `estimateFeesPerGas returned no usable fee fields on ${destinationChain.name}; cannot construct safe fee overrides`,
+  );
 }
 ```
 
@@ -120,8 +127,8 @@ const hash = await walletClient.writeContract({
 For reverse CCTP flows where Arc Testnet is the destination, use the legacy
 `gasPrice` branch above. Arc Testnet transactions should not include
 `maxFeePerGas` or `maxPriorityFeePerGas` overrides. Arc Testnet gas estimates
-can also be stale during rapid transaction sequences, so keep the same 130%
-headroom when re-estimating `gasPrice` immediately before submission. See
+can be stale even for a single transaction, so re-estimate `gasPrice`
+immediately before submission and apply the same 130% headroom. See
 [#87](https://github.com/circlefin/arc-node/issues/87) for the Arc Testnet
 `gasPrice` workaround.
 
