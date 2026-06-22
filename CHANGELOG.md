@@ -2,6 +2,17 @@
 
 All notable changes to arc-node are documented in this file.
 
+## [Unreleased]
+
+### Breaking Changes
+
+- **[API] `ArcConsensusBuilder` is no longer `Clone` or `Copy`.** The builder
+  can now hold a one-shot consensus modifier closure, so downstream Rust code
+  that cloned or copied the builder must construct a fresh builder or finish
+  configuring it before moving it into the node builder. See
+  [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#unreleased) for migration
+  details.
+
 ## [v0.7.2]
 
 **Changes:** [v0.7.1...v0.7.2](https://github.com/circlefin/arc-node/compare/v0.7.1...v0.7.2) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.7.2)
