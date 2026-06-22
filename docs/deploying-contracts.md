@@ -64,8 +64,9 @@ solc = "0.8.20"
 evm_version = "paris"
 optimizer = true
 optimizer_runs = 200
-# Useful when your contract hits Solidity's stack-depth limit.
-via_ir = true
+# Uncomment only if your contract hits Solidity's stack-depth limit.
+# This can significantly increase compile time.
+# via_ir = true
 
 [rpc_endpoints]
 arc_testnet = "https://rpc.testnet.arc.network"
@@ -139,6 +140,7 @@ forge verify-contract \
   --verifier blockscout \
   --verifier-url "https://testnet.arcscan.app/api/" \
   --compiler-version 0.8.20 \
+  --evm-version paris \
   --chain 5042002 \
   <contract-address> src/<Contract>.sol:<Contract>
 ```
@@ -150,6 +152,7 @@ forge verify-contract \
   --verifier blockscout \
   --verifier-url "https://testnet.arcscan.app/api/" \
   --compiler-version 0.8.20 \
+  --evm-version paris \
   --chain 5042002 \
   --constructor-args "$(cast abi-encode 'constructor(address,address)' <arg1> <arg2>)" \
   <contract-address> src/<Contract>.sol:<Contract>
@@ -159,6 +162,8 @@ Notes:
 
 - Blockscout does not require a real Etherscan API key, but
   `@nomicfoundation/hardhat-verify` still expects a non-empty string.
+- Replace `0.8.20` with the Solidity compiler version used for the deployment.
+  The verification compiler version must match the build exactly.
 - Keep the explorer URL as `https://testnet.arcscan.app` for wallet and dApp
   transaction links.
 
@@ -174,6 +179,10 @@ Notes:
 | CCTP domain          | `26`                                         |
 | TokenMessengerV2     | `0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA` |
 | MessageTransmitterV2 | `0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275` |
+
+Native USDC uses 6 decimals through its ERC-20 interface for transfers,
+allowances, and balances, but native gas accounting such as `eth_getBalance`
+uses 18 decimals.
 
 For explorer readability, contracts can expose an `owner` view such as
 `address public owner`. Arcscan displays public variables in the contract view,
