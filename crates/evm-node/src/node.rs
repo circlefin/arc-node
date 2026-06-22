@@ -940,6 +940,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "consensus modifier already set")]
     fn arc_consensus_builder_panics_on_double_modifier_in_debug() {
         let _builder = ArcConsensusBuilder::default()
