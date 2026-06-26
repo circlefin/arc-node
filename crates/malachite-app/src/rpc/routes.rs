@@ -28,6 +28,7 @@ use tracing::{error, info};
 use super::middleware::extract_version;
 use super::types::{EndpointInfo, RpcState, TxConsensusReq, TxNetworkReq};
 use super::version::ApiVersion;
+use crate::metrics::AppMetrics;
 use crate::request::TxAppReq;
 
 // List of RPC routes.
@@ -131,7 +132,32 @@ pub async fn serve(
     tx_app_req: TxAppReq,
     tx_network_req: TxNetworkReq,
 ) {
-    if let Err(e) = inner(listen_addr, tx_consensus_req, tx_app_req, tx_network_req).await {
+    serve_with_metrics(
+        listen_addr,
+        tx_consensus_req,
+        tx_app_req,
+        tx_network_req,
+        AppMetrics::default(),
+    )
+    .await
+}
+
+pub(crate) async fn serve_with_metrics(
+    listen_addr: impl ToSocketAddrs,
+    tx_consensus_req: TxConsensusReq,
+    tx_app_req: TxAppReq,
+    tx_network_req: TxNetworkReq,
+    metrics: AppMetrics,
+) {
+    if let Err(e) = inner(
+        listen_addr,
+        tx_consensus_req,
+        tx_app_req,
+        tx_network_req,
+        metrics,
+    )
+    .await
+    {
         error!("RPC server failed: {e}");
     }
 }
@@ -145,10 +171,25 @@ pub fn build_router(
     tx_app_req: TxAppReq,
     tx_network_req: TxNetworkReq,
 ) -> Router {
+    build_router_with_metrics(
+        tx_consensus_req,
+        tx_app_req,
+        tx_network_req,
+        AppMetrics::default(),
+    )
+}
+
+pub(crate) fn build_router_with_metrics(
+    tx_consensus_req: TxConsensusReq,
+    tx_app_req: TxAppReq,
+    tx_network_req: TxNetworkReq,
+    metrics: AppMetrics,
+) -> Router {
     let rpc_state = RpcState {
         tx_consensus_req,
         tx_app_req,
         tx_network_req,
+        metrics,
     };
 
     let routes = build_routes();
@@ -179,8 +220,9 @@ async fn inner(
     tx_consensus_req: TxConsensusReq,
     tx_app_req: TxAppReq,
     tx_network_req: TxNetworkReq,
+    metrics: AppMetrics,
 ) -> Result<()> {
-    let app = build_router(tx_consensus_req, tx_app_req, tx_network_req);
+    let app = build_router_with_metrics(tx_consensus_req, tx_app_req, tx_network_req, metrics);
 
     let listener = TcpListener::bind(listen_addr).await?;
     let address = listener.local_addr()?;
@@ -347,7 +389,12 @@ mod tests {
                     let _ = reply.send(state);
                 }
                 MockConfig::AppGetCertificate(ret) => {
-                    let Some(AppRequest::GetCertificate(None, reply_port)) = msg else {
+                    let Some(AppRequest::GetCertificate {
+                        height: None,
+                        reply: reply_port,
+                        ..
+                    }) = msg
+                    else {
                         panic!("Unexpected msg");
                     };
                     let _ = reply_port.send(match ret {

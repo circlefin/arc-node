@@ -82,6 +82,8 @@ pub fn revert_message_to_bytes(msg: &str) -> Bytes {
 /// Zero6+: also applied to authorization and validation reverts (unauthorized
 /// caller, blocklist, zero address, zero amount, overflow) via
 /// [`new_reverted_with_early_penalty`].
+///
+/// Zero8+: also applied to delegatecall rejections via [`check_delegatecall`].
 pub(crate) const PRECOMPILE_EARLY_REVERT_GAS_PENALTY: u64 = 200;
 
 /// Enum to represent either a reverted precompile output or an error
@@ -552,14 +554,20 @@ pub(crate) fn check_delegatecall(
     precompile_address: Address,
     precompile_input: &PrecompileInput,
     gas_counter: &Gas,
+    hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
     if precompile_input.target_address != precompile_address
         || precompile_input.bytecode_address != precompile_address
     {
-        return Err(PrecompileErrorOrRevert::new_reverted(
-            *gas_counter,
-            ERR_DELEGATE_CALL_NOT_ALLOWED,
-        ));
+        return Err(if hardfork_flags.is_active(ArcHardfork::Zero8) {
+            PrecompileErrorOrRevert::new_reverted_with_penalty(
+                *gas_counter,
+                PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+                ERR_DELEGATE_CALL_NOT_ALLOWED,
+            )
+        } else {
+            PrecompileErrorOrRevert::new_reverted(*gas_counter, ERR_DELEGATE_CALL_NOT_ALLOWED)
+        });
     }
     Ok(())
 }
@@ -1070,5 +1078,44 @@ mod tests {
         let result: Result<PrecompileOutput, PrecompileError> = err_or_revert.into();
 
         assert!(matches!(result, Err(PrecompileError::OutOfGas)));
+    }
+
+    #[test]
+    fn new_reverted_with_early_penalty_is_zero6_gated() {
+        let pre_zero6 = ArcHardforkFlags::with(&[ArcHardfork::Zero5]);
+        let zero6 = ArcHardforkFlags::with(&[ArcHardfork::Zero6]);
+
+        let pre = new_reverted_with_early_penalty(Gas::new(10_000), "err", pre_zero6);
+        let pre_output: Result<PrecompileOutput, PrecompileError> = pre.into();
+        let pre_output = pre_output.expect("pre-Zero6 returns Revert");
+        assert_eq!(pre_output.gas_used, 0);
+        assert!(pre_output.reverted);
+
+        let post = new_reverted_with_early_penalty(Gas::new(10_000), "err", zero6);
+        let post_output: Result<PrecompileOutput, PrecompileError> = post.into();
+        let post_output = post_output.expect("Zero6 returns Revert");
+        assert_eq!(post_output.gas_used, PRECOMPILE_EARLY_REVERT_GAS_PENALTY);
+        assert!(post_output.reverted);
+    }
+
+    #[test]
+    fn new_reverted_with_early_penalty_oog_under_zero6() {
+        let zero6 = ArcHardforkFlags::with(&[ArcHardfork::Zero6]);
+        let result = new_reverted_with_early_penalty(
+            Gas::new(PRECOMPILE_EARLY_REVERT_GAS_PENALTY - 1),
+            "err",
+            zero6,
+        );
+        assert!(matches!(
+            result,
+            PrecompileErrorOrRevert::Error(PrecompileError::OutOfGas)
+        ));
+    }
+
+    #[test]
+    fn precompile_early_revert_gas_penalty_is_200() {
+        // Zero6 consensus rule: early-path reverts on stateful precompiles charge a uniform
+        // 200-gas penalty. Pin the literal so a silent change is caught.
+        assert_eq!(PRECOMPILE_EARLY_REVERT_GAS_PENALTY, 200);
     }
 }

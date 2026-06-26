@@ -33,4 +33,24 @@ ignore = [
     # Transitive dependency via reth-dns-discovery (reth v1.11.3) and libp2p-mdns
     # (libp2p 0.56.0) — both pin hickory-proto to 0.25.x; cannot update without bumping reth.
     "RUSTSEC-2026-0119",
+
+    # core2 0.4.0 is unmaintained and all versions yanked; no replacement available.
+    # Transitive dependency via multihash 0.19.3 → multiaddr → libp2p 0.56.0. Cannot update
+    # without bumping the malachite/libp2p dependency chain.
+    "RUSTSEC-2026-0105",
+
+    # proc-macro-error2 2.0.1 is unmaintained; no newer version available in the 2.x series.
+    # Transitive dependency via aquamarine → reth-transaction-pool (reth v1.11.3).
+    # Cannot update without bumping reth.
+    "RUSTSEC-2026-0173",
+
+    # git2 0.20.4 - potential UB in Remote::list(); no patched version available.
+    # Transitive dependency via vergen-git2 9.1.0 → reth-node-core (reth v1.11.3).
+    # Cannot update without bumping reth.
+    "RUSTSEC-2026-0183",
+
+    # git2 0.20.4 - potential UB with Signature from buffer-created BlameHunk; no patched version.
+    # Transitive dependency via vergen-git2 9.1.0 → reth-node-core (reth v1.11.3).
+    # Cannot update without bumping reth.
+    "RUSTSEC-2026-0184",
 ]

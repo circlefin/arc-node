@@ -17,7 +17,7 @@
 //! Hardfork transition e2e tests for Arc Chain.
 //!
 //! These tests verify that block production works correctly across
-//! hardfork boundaries for Zero4, Zero5, Zero6, and Zero7 hardforks.
+//! hardfork boundaries for Zero4, Zero5, Zero6, Zero7, and Zero8 hardforks.
 
 use arc_execution_config::hardforks::ArcHardfork;
 use arc_execution_e2e::{
@@ -39,6 +39,7 @@ async fn test_hardfork_active_at_genesis() -> Result<()> {
         .with_action(AssertHardfork::is_active(ArcHardfork::Zero5))
         .with_action(AssertHardfork::is_active(ArcHardfork::Zero6))
         .with_action(AssertHardfork::is_active(ArcHardfork::Zero7))
+        .with_action(AssertHardfork::is_active(ArcHardfork::Zero8))
         .run()
         .await
 }
@@ -54,6 +55,7 @@ async fn test_sequential_hardfork_transitions() -> Result<()> {
         (ArcHardfork::Zero5, ForkCondition::Block(6)),
         (ArcHardfork::Zero6, ForkCondition::Block(8)),
         (ArcHardfork::Zero7, ForkCondition::Block(10)),
+        (ArcHardfork::Zero8, ForkCondition::Block(12)),
     ]);
 
     ArcTestBuilder::new()
@@ -64,6 +66,7 @@ async fn test_sequential_hardfork_transitions() -> Result<()> {
         .with_action(AssertHardfork::is_not_active(ArcHardfork::Zero5))
         .with_action(AssertHardfork::is_not_active(ArcHardfork::Zero6))
         .with_action(AssertHardfork::is_not_active(ArcHardfork::Zero7))
+        .with_action(AssertHardfork::is_not_active(ArcHardfork::Zero8))
         // Produce block 1-2 - Zero3 activates
         .with_action(ProduceBlocks::new(2))
         .with_action(AssertBlockNumber::new(2))
@@ -84,6 +87,10 @@ async fn test_sequential_hardfork_transitions() -> Result<()> {
         .with_action(ProduceBlocks::new(2))
         .with_action(AssertBlockNumber::new(10))
         .with_action(AssertHardfork::is_active(ArcHardfork::Zero7))
+        // Produce block 11-12 - Zero8 activates
+        .with_action(ProduceBlocks::new(2))
+        .with_action(AssertBlockNumber::new(12))
+        .with_action(AssertHardfork::is_active(ArcHardfork::Zero8))
         .run()
         .await
 }

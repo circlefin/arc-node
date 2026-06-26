@@ -15,13 +15,15 @@
 // limitations under the License.
 
 use alloy_consensus::TxEnvelope;
+use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_network::eip2718::Decodable2718;
 use alloy_primitives::Bytes;
 use jsonrpsee::{
     core::middleware::{layer::Either, Batch, BatchEntry, Notification, RpcServiceT},
-    types::{ErrorObject, ErrorObjectOwned, Id, Request, ResponsePayload},
+    types::{ErrorObject, ErrorObjectOwned, Id, Params, Request, ResponsePayload},
     BatchResponseBuilder, MethodResponse,
 };
+use serde::de::DeserializeOwned;
 use std::future::Future;
 use tower::Layer;
 
@@ -29,8 +31,22 @@ const ETH_SUBSCRIBE_METHOD: &str = "eth_subscribe";
 const PENDING_TX_SUBSCRIPTION_TYPE: &str = "newPendingTransactions";
 const ETH_NEW_PENDING_TX_FILTER_METHOD: &str = "eth_newPendingTransactionFilter";
 const ETH_GET_BLOCK_BY_NUMBER_METHOD: &str = "eth_getBlockByNumber";
-const PENDING_BLOCK_TAG: &str = "pending";
+const BLOCK_NUMBER_OBJECT_KEY: &str = "number";
+const BLOCK_ID_OBJECT_KEY_SNAKE: &str = "block_id";
+const BLOCK_ID_OBJECT_KEY_CAMEL: &str = "blockId";
 const ETH_GET_TX_BY_SENDER_AND_NONCE_METHOD: &str = "eth_getTransactionBySenderAndNonce";
+const ETH_GET_BLOCK_RECEIPTS_METHOD: &str = "eth_getBlockReceipts";
+const ETH_GET_BLOCK_TX_COUNT_BY_NUMBER_METHOD: &str = "eth_getBlockTransactionCountByNumber";
+const ETH_GET_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD: &str = "eth_getTransactionByBlockNumberAndIndex";
+const ETH_GET_RAW_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD: &str =
+    "eth_getRawTransactionByBlockNumberAndIndex";
+const ETH_GET_UNCLE_COUNT_BY_BLOCK_NUMBER_METHOD: &str = "eth_getUncleCountByBlockNumber";
+const ETH_GET_HEADER_BY_NUMBER_METHOD: &str = "eth_getHeaderByNumber";
+// jsonrpsee proc-macro field name for eth_getHeaderByNumber's BlockNumberOrTag param.
+// Reth's trait declares `hash: BlockNumberOrTag` (copy-paste from getHeaderByHash) —
+// see reth-rpc-eth-api/src/core.rs. If that arg is ever renamed, update this key and
+// the object-form test cases; the array/positional form is unaffected.
+const BLOCK_HEADER_NUMBER_OBJECT_KEY: &str = "hash";
 const ETH_SEND_RAW_TRANSACTION_METHOD: &str = "eth_sendRawTransaction";
 const ETH_SEND_RAW_TRANSACTION_SYNC_METHOD: &str = "eth_sendRawTransactionSync";
 const PENDING_TX_SUBSCRIPTION_ERROR_CODE: i32 = -32001;
@@ -45,9 +61,13 @@ pub const ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT: usize = 100;
 /// Config for the Arc-specific RPC middleware stack.
 #[derive(Clone, Debug)]
 pub struct ArcRpcLayer {
-    /// When true (default), `eth_subscribe("newPendingTransactions")`,
-    /// `eth_newPendingTransactionFilter`, `eth_getBlockByNumber("pending")`,
-    /// and `eth_getTransactionBySenderAndNonce` are blocked.
+    /// When true (default), blocks all RPC methods that can expose pending-block
+    /// state: `eth_subscribe("newPendingTransactions")`, `eth_newPendingTransactionFilter`,
+    /// `eth_getTransactionBySenderAndNonce`, and the block-content methods
+    /// `eth_getBlockByNumber`, `eth_getBlockReceipts`,
+    /// `eth_getBlockTransactionCountByNumber`, `eth_getTransactionByBlockNumberAndIndex`,
+    /// `eth_getRawTransactionByBlockNumberAndIndex`, `eth_getUncleCountByBlockNumber`,
+    /// and `eth_getHeaderByNumber` when called with the `"pending"` tag.
     /// When false, the filter is bypassed and these are allowed.
     /// CLI users opt out of the default via `--arc.expose-pending-txs`.
     pub filter_pending_txs: bool,
@@ -449,19 +469,59 @@ fn is_pool_pending_tx_lookup(req: &Request<'_>) -> bool {
     req.method_name() == ETH_GET_TX_BY_SENDER_AND_NONCE_METHOD
 }
 
-/// Returns true if the request is `eth_getBlockByNumber("pending", ...)`.
+fn is_pending_block_method(method: &str) -> bool {
+    method == ETH_GET_BLOCK_BY_NUMBER_METHOD
+        || method == ETH_GET_BLOCK_RECEIPTS_METHOD
+        || method == ETH_GET_BLOCK_TX_COUNT_BY_NUMBER_METHOD
+        || method == ETH_GET_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD
+        || method == ETH_GET_RAW_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD
+        || method == ETH_GET_UNCLE_COUNT_BY_BLOCK_NUMBER_METHOD
+        || method == ETH_GET_HEADER_BY_NUMBER_METHOD
+}
+
+/// Returns true if the request queries pending-block state via a block number/tag parameter.
 ///
 /// The consensus engine may briefly expose a pending block via `provider().pending_block()`
 /// even when `--rpc.pending-block=none` is set.  Intercepting at the middleware layer
 /// guarantees a consistent `null` response regardless of consensus-engine state.
 fn is_pending_block_query(req: &Request<'_>) -> bool {
-    if req.method_name() != ETH_GET_BLOCK_BY_NUMBER_METHOD {
+    if !is_pending_block_method(req.method_name()) {
         return false;
     }
-    if let Ok(Some(block_tag)) = req.params().sequence().optional_next::<String>() {
-        return block_tag == PENDING_BLOCK_TAG;
+    let params = req.params();
+    // eth_getBlockReceipts accepts BlockId: handles string tags and EIP-1898 object form
+    // ({"blockNumber": "pending"}).  All other methods accept BlockNumberOrTag.
+    if req.method_name() == ETH_GET_BLOCK_RECEIPTS_METHOD {
+        return extract_param::<BlockId>(
+            params,
+            &[BLOCK_ID_OBJECT_KEY_SNAKE, BLOCK_ID_OBJECT_KEY_CAMEL],
+        )
+        .is_some_and(|id| id.is_pending());
     }
-    false
+    // Object key for named params — coupled to jsonrpsee proc-macro field names.
+    let key = if req.method_name() == ETH_GET_HEADER_BY_NUMBER_METHOD {
+        BLOCK_HEADER_NUMBER_OBJECT_KEY
+    } else {
+        BLOCK_NUMBER_OBJECT_KEY
+    };
+    extract_param::<BlockNumberOrTag>(params, &[key]).is_some_and(|t| t.is_pending())
+}
+
+/// Extracts and deserializes the first positional or named RPC param.
+///
+/// For object-style params, tries each key in `keys` in order. For array-style
+/// params, reads the first element. Returns `None` on missing field or parse failure.
+///
+/// `BlockNumberOrTag` deserialization lowercases tags internally, so case variants
+/// ("Pending", "PENDING") deserialize correctly without extra normalization.
+fn extract_param<T: DeserializeOwned>(params: Params<'_>, keys: &[&str]) -> Option<T> {
+    if params.is_object() {
+        let obj = params.parse::<serde_json::Value>().ok()?;
+        let val = keys.iter().find_map(|k| obj.get(*k))?.clone();
+        serde_json::from_value(val).ok()
+    } else {
+        params.sequence().optional_next::<T>().ok().flatten()
+    }
 }
 
 /// Builds a JSON-RPC success response containing `null`.
@@ -860,6 +920,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_enabled_batch_new_method_pending_returns_null() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let batch = Batch::from(vec![
+            Ok(BatchEntry::Call(create_request_with_params(
+                "eth_blockNumber",
+                RawValue::from_string("[]".to_string()).unwrap(),
+                1,
+            ))),
+            Ok(BatchEntry::Call(create_request_with_params(
+                ETH_GET_BLOCK_RECEIPTS_METHOD,
+                RawValue::from_string(r#"["pending"]"#.to_string()).unwrap(),
+                2,
+            ))),
+        ]);
+        let response = middleware.batch(batch).await;
+        let json = response.into_json();
+        let responses: Vec<serde_json::Value> = serde_json::from_str(json.get()).unwrap();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["result"], "success");
+        assert!(
+            responses[1]["result"].is_null(),
+            "batch new-method pending should return null"
+        );
+    }
+
+    #[tokio::test]
     async fn test_enabled_batch_pool_lookup_returns_null() {
         let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
         let batch = Batch::from(vec![
@@ -1068,6 +1154,36 @@ mod tests {
             json["result"], "success",
             "filter_pending_txs=false should forward to inner service"
         );
+    }
+
+    #[tokio::test]
+    async fn test_disabled_allows_new_pending_block_methods() {
+        let layer = ArcRpcLayer {
+            filter_pending_txs: false,
+            ..Default::default()
+        };
+        let middleware = layer.layer(MockRpcService);
+        let methods = [
+            ETH_GET_BLOCK_RECEIPTS_METHOD,
+            ETH_GET_BLOCK_TX_COUNT_BY_NUMBER_METHOD,
+            ETH_GET_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD,
+            ETH_GET_RAW_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD,
+            ETH_GET_UNCLE_COUNT_BY_BLOCK_NUMBER_METHOD,
+        ];
+        for method in methods {
+            let params = RawValue::from_string(r#"["pending"]"#.to_string()).unwrap();
+            let request = create_request_with_params(method, params, 1);
+            let response = middleware.call(request).await;
+            assert!(
+                response.as_error_code().is_none(),
+                "filter_pending_txs=false should allow {method}"
+            );
+            let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+            assert_eq!(
+                json["result"], "success",
+                "filter_pending_txs=false should forward {method}"
+            );
+        }
     }
 
     // ── ArcRpcLayer::default() ──────────────────────────────────────────
@@ -1475,5 +1591,228 @@ mod tests {
         );
         let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
         assert_eq!(json["result"], "success");
+    }
+
+    // ── Case-insensitive "pending" tag + additional block-content methods ──
+    //
+    // All six block-content methods accept a block number/tag as first param.
+    // When that tag is "pending" (any case) the middleware returns null.
+
+    #[tokio::test]
+    async fn test_pending_block_methods_all_tags_return_null() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let cases = [
+            (ETH_GET_BLOCK_BY_NUMBER_METHOD, "pending"),
+            (ETH_GET_BLOCK_BY_NUMBER_METHOD, "Pending"),
+            (ETH_GET_BLOCK_BY_NUMBER_METHOD, "PENDING"),
+            (ETH_GET_BLOCK_RECEIPTS_METHOD, "pending"),
+            (ETH_GET_BLOCK_RECEIPTS_METHOD, "Pending"),
+            (ETH_GET_BLOCK_RECEIPTS_METHOD, "PENDING"),
+            (ETH_GET_BLOCK_TX_COUNT_BY_NUMBER_METHOD, "pending"),
+            (ETH_GET_BLOCK_TX_COUNT_BY_NUMBER_METHOD, "Pending"),
+            (ETH_GET_BLOCK_TX_COUNT_BY_NUMBER_METHOD, "PENDING"),
+            (ETH_GET_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD, "pending"),
+            (ETH_GET_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD, "Pending"),
+            (ETH_GET_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD, "PENDING"),
+            (ETH_GET_RAW_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD, "pending"),
+            (ETH_GET_RAW_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD, "Pending"),
+            (ETH_GET_RAW_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD, "PENDING"),
+            (ETH_GET_UNCLE_COUNT_BY_BLOCK_NUMBER_METHOD, "pending"),
+            (ETH_GET_UNCLE_COUNT_BY_BLOCK_NUMBER_METHOD, "Pending"),
+            (ETH_GET_UNCLE_COUNT_BY_BLOCK_NUMBER_METHOD, "PENDING"),
+            (ETH_GET_HEADER_BY_NUMBER_METHOD, "pending"),
+            (ETH_GET_HEADER_BY_NUMBER_METHOD, "Pending"),
+            (ETH_GET_HEADER_BY_NUMBER_METHOD, "PENDING"),
+        ];
+        for (method, tag) in cases {
+            let params = RawValue::from_string(format!("[\"{tag}\"]")).unwrap();
+            let request = create_request_with_params(method, params, 1);
+            let response = middleware.call(request).await;
+            assert!(
+                response.as_error_code().is_none(),
+                "{method} with \"{tag}\" should not error"
+            );
+            let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+            assert!(
+                json["result"].is_null(),
+                "{method} with \"{tag}\" should return null"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_additional_pending_block_methods_non_pending_tag_passes_through() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let cases: &[(&str, &str)] = &[
+            (ETH_GET_BLOCK_RECEIPTS_METHOD, r#"["latest"]"#),
+            (ETH_GET_BLOCK_TX_COUNT_BY_NUMBER_METHOD, r#"["latest"]"#),
+            (
+                ETH_GET_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD,
+                r#"["0x1", "0x0"]"#,
+            ),
+            (
+                ETH_GET_RAW_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD,
+                r#"["0x1", "0x0"]"#,
+            ),
+            (ETH_GET_UNCLE_COUNT_BY_BLOCK_NUMBER_METHOD, r#"["latest"]"#),
+            (ETH_GET_HEADER_BY_NUMBER_METHOD, r#"["latest"]"#),
+        ];
+        for (method, params_json) in cases {
+            let params = RawValue::from_string(params_json.to_string()).unwrap();
+            let request = create_request_with_params(method, params, 1);
+            let response = middleware.call(request).await;
+
+            assert!(
+                response.as_error_code().is_none(),
+                "{method} with non-pending tag should pass through"
+            );
+            let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+            assert_eq!(
+                json["result"], "success",
+                "{method} with non-pending tag should return inner service response"
+            );
+        }
+    }
+
+    // ── Object-style params bypass ──────────────────────────────────────
+    //
+    // jsonrpsee handlers accept both array and object params. The middleware
+    // must intercept object-style pending-block queries too.
+
+    #[tokio::test]
+    async fn test_object_params_pending_block_returns_null() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let cases: &[(&str, &str)] = &[
+            // Five methods use "number" key
+            (
+                ETH_GET_BLOCK_BY_NUMBER_METHOD,
+                r#"{"number": "pending", "full": false}"#,
+            ),
+            (
+                ETH_GET_BLOCK_TX_COUNT_BY_NUMBER_METHOD,
+                r#"{"number": "pending"}"#,
+            ),
+            (
+                ETH_GET_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD,
+                r#"{"number": "pending", "index": "0x0"}"#,
+            ),
+            (
+                ETH_GET_RAW_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD,
+                r#"{"number": "pending", "index": "0x0"}"#,
+            ),
+            (
+                ETH_GET_UNCLE_COUNT_BY_BLOCK_NUMBER_METHOD,
+                r#"{"number": "pending"}"#,
+            ),
+            // eth_getBlockReceipts uses "block_id" (snake) or "blockId" (camel)
+            (ETH_GET_BLOCK_RECEIPTS_METHOD, r#"{"block_id": "pending"}"#),
+            (ETH_GET_BLOCK_RECEIPTS_METHOD, r#"{"blockId": "pending"}"#),
+            // eth_getHeaderByNumber uses "hash" (Reth's proc-macro arg name)
+            (ETH_GET_HEADER_BY_NUMBER_METHOD, r#"{"hash": "pending"}"#),
+            // Case-insensitive variant via object params — guards that BlockNumberOrTag deserialization lowercases tags
+            (
+                ETH_GET_BLOCK_BY_NUMBER_METHOD,
+                r#"{"number": "PENDING", "full": false}"#,
+            ),
+        ];
+        for (method, params_json) in cases {
+            let params = RawValue::from_string(params_json.to_string()).unwrap();
+            let request = create_request_with_params(method, params, 1);
+            let response = middleware.call(request).await;
+            assert!(
+                response.as_error_code().is_none(),
+                "{method} with object params should not error"
+            );
+            let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+            assert!(
+                json["result"].is_null(),
+                "{method} with object params {{...\"pending\"...}} should return null"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_object_params_non_pending_passes_through() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let cases: &[(&str, &str)] = &[
+            (
+                ETH_GET_BLOCK_BY_NUMBER_METHOD,
+                r#"{"number": "0x1", "full": false}"#,
+            ),
+            (ETH_GET_BLOCK_RECEIPTS_METHOD, r#"{"block_id": "latest"}"#),
+            (ETH_GET_HEADER_BY_NUMBER_METHOD, r#"{"hash": "latest"}"#),
+            // Unknown field → passes through (Reth returns parse error, not middleware)
+            (ETH_GET_BLOCK_BY_NUMBER_METHOD, r#"{"garbage": "pending"}"#),
+        ];
+        for (method, params_json) in cases {
+            let params = RawValue::from_string(params_json.to_string()).unwrap();
+            let request = create_request_with_params(method, params, 1);
+            let response = middleware.call(request).await;
+            assert!(
+                response.as_error_code().is_none(),
+                "{method} with non-pending object params should pass through"
+            );
+            let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+            assert_eq!(
+                json["result"], "success",
+                "{method} with non-pending object params should reach inner service"
+            );
+        }
+    }
+
+    // ── EIP-1898 BlockId object form ────────────────────────────────────
+    //
+    // eth_getBlockReceipts accepts BlockId, which allows an EIP-1898 object
+    // form in addition to the plain string form.  {"blockNumber": "pending"}
+    // deserializes to BlockId::Number(Pending) and must also be intercepted.
+
+    #[tokio::test]
+    async fn test_eip1898_block_receipts_pending_returns_null() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let cases: &[&str] = &[
+            // Array-style: element is an EIP-1898 object
+            r#"[{"blockNumber": "pending"}]"#,
+            // Named params (snake_case key) with EIP-1898 value
+            r#"{"block_id": {"blockNumber": "pending"}}"#,
+            // Named params (camelCase key) with EIP-1898 value
+            r#"{"blockId": {"blockNumber": "pending"}}"#,
+        ];
+        for params_json in cases {
+            let params = RawValue::from_string(params_json.to_string()).unwrap();
+            let request = create_request_with_params(ETH_GET_BLOCK_RECEIPTS_METHOD, params, 1);
+            let response = middleware.call(request).await;
+            assert!(
+                response.as_error_code().is_none(),
+                "eth_getBlockReceipts EIP-1898 pending should not error"
+            );
+            let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+            assert!(
+                json["result"].is_null(),
+                "eth_getBlockReceipts with EIP-1898 pending ({params_json}) should return null"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_eip1898_block_receipts_non_pending_passes_through() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let cases: &[&str] = &[
+            r#"[{"blockNumber": "0x1"}]"#,
+            r#"{"block_id": {"blockNumber": "0x1"}}"#,
+        ];
+        for params_json in cases {
+            let params = RawValue::from_string(params_json.to_string()).unwrap();
+            let request = create_request_with_params(ETH_GET_BLOCK_RECEIPTS_METHOD, params, 1);
+            let response = middleware.call(request).await;
+            assert!(
+                response.as_error_code().is_none(),
+                "eth_getBlockReceipts EIP-1898 non-pending should pass through"
+            );
+            let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
+            assert_eq!(
+                json["result"], "success",
+                "eth_getBlockReceipts with EIP-1898 non-pending ({params_json}) should reach inner service"
+            );
+        }
     }
 }

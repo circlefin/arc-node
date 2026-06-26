@@ -54,7 +54,12 @@ task('genesis', 'Generate the genesis file')
     undefined,
     types.string,
   )
-  .addOptionalParam('hardfork', 'hardfork to use, available: zero3, zero4, zero5, zero6, zero7', 'zero7', types.string)
+  .addOptionalParam(
+    'hardfork',
+    'hardfork to use, available: zero3, zero4, zero5, zero6, zero7, zero8',
+    'zero8',
+    types.string,
+  )
   .addOptionalParam(
     'extraAccountBalance',
     'Initial balance for each prefunded account in whole token units (default: 1000000)',
@@ -105,9 +110,9 @@ task('genesis', 'Generate the genesis file')
             ...buildOptions,
             ...(parsedValidatorNames && parsedValidatorNames.length > 0
               ? {
-                validatorNames: parsedValidatorNames,
-                outputControllersConfig: outputPathWithSuffix('controllers-config'),
-              }
+                  validatorNames: parsedValidatorNames,
+                  outputControllersConfig: outputPathWithSuffix('controllers-config'),
+                }
               : {}),
             ...(parsedVotingPowers && parsedVotingPowers.length > 0 ? { votingPowers: parsedVotingPowers } : {}),
             outputGenesisConfig: outputPathWithSuffix('config'),

@@ -566,6 +566,7 @@ impl App {
     fn start_rpc_server(
         &self,
         channels: &Channels<ArcContext>,
+        metrics: AppMetrics,
     ) -> (
         mpsc::Sender<AppRequest>,
         mpsc::Receiver<AppRequest>,
@@ -578,11 +579,13 @@ impl App {
                 let listen_addr = self.config.rpc.listen_addr;
                 let request_handle = channels.requests.clone();
                 let net_request_handle = channels.net_requests.clone();
-                crate::rpc::serve(
+                let metrics = metrics.clone();
+                crate::rpc::serve_with_metrics(
                     listen_addr,
                     request_handle,
                     tx_rpc_req.clone(),
                     net_request_handle,
+                    metrics,
                 )
             });
             Some(join_handle)
@@ -710,7 +713,8 @@ impl App {
         let (channels, engine_handle) = self.start_consensus_engine(ctx, identity).await?;
 
         // Start the application RPC server
-        let (tx_app_req, rx_app_req, rpc_handle) = self.start_rpc_server(&channels);
+        let (tx_app_req, rx_app_req, rpc_handle) =
+            self.start_rpc_server(&channels, state.metrics().clone());
 
         let tx_event = channels.events.clone();
         let cancel_token = CancellationToken::new();

@@ -148,4 +148,31 @@ mod tests {
         let back: HttpCommitSignature = serde_json::from_str(&json).unwrap();
         assert_eq!(http, back);
     }
+
+    #[test]
+    fn http_commit_signature_serializes_as_base64_wire_format() {
+        let mut b = [0u8; 64];
+        b[0] = 1;
+        b[63] = 2;
+        let http = HttpCommitSignature::from(CommitSignature {
+            address: Address::default(),
+            signature: Signature::from_bytes(b),
+        });
+
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&http).unwrap()).unwrap();
+        let wire = value["signature"]
+            .as_str()
+            .expect("signature must serialize as a JSON string");
+
+        // Standard padded Base64 of the 64-byte signature, not hex.
+        let expected_b64 = format!("AQAA{}Ag==", "AAAA".repeat(20));
+        assert_eq!(
+            wire, expected_b64,
+            "signature must be standard padded Base64"
+        );
+
+        let hex = format!("01{}02", "00".repeat(62));
+        assert_ne!(wire, hex, "signature must not be hex-encoded");
+    }
 }

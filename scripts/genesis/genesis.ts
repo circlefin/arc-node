@@ -92,6 +92,7 @@ export const schemaGenesisConfig = z
         zero5Block: z.number().optional(),
         zero6Block: z.number().optional(),
         zero7Time: z.number().optional(),
+        zero8Time: z.number().optional(),
         osakaTime: z.number().optional(),
       })
       .optional(),
@@ -127,7 +128,7 @@ export const schemaGenesisConfig = z
 export type GenesisConfig = z.infer<typeof schemaGenesisConfig>
 
 // Defines hardfork name, this is used for genesis builder command line arguments.
-export const hardforkNameSchema = z.enum(['zero3', 'zero4', 'zero5', 'zero6', 'zero7'])
+export const hardforkNameSchema = z.enum(['zero3', 'zero4', 'zero5', 'zero6', 'zero7', 'zero8'])
 
 // Defines the mapping from hardfork name to genesis hardforks initialize setting.
 export function initialHardforksByName(hardforkName: z.infer<typeof hardforkNameSchema>): GenesisConfig['hardforks'] {
@@ -137,6 +138,15 @@ export function initialHardforksByName(hardforkName: z.infer<typeof hardforkName
     zero5: { zero3Block: 0, zero4Block: 0, zero5Block: 0, osakaTime: 0 },
     zero6: { zero3Block: 0, zero4Block: 0, zero5Block: 0, zero6Block: 0, osakaTime: 0 },
     zero7: { zero3Block: 0, zero4Block: 0, zero5Block: 0, zero6Block: 0, zero7Time: 0, osakaTime: 0 },
+    zero8: {
+      zero3Block: 0,
+      zero4Block: 0,
+      zero5Block: 0,
+      zero6Block: 0,
+      zero7Time: 0,
+      zero8Time: 0,
+      osakaTime: 0,
+    },
   }[hardforkName]
 }
 

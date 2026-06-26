@@ -167,6 +167,18 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                             hardfork_flags,
                         ));
                     }
+                    // Zero8: surface the delegatecall penalty before the
+                    // success-path floor; otherwise an authorized delegatecall
+                    // in the 200..floor gas window OOGs before it can revert
+                    // with the 200-gas penalty.
+                    if hardfork_flags.is_active(ArcHardfork::Zero8) {
+                        check_delegatecall(
+                            NATIVE_COIN_CONTROL_ADDRESS,
+                            &precompile_input,
+                            &gas_counter,
+                            hardfork_flags,
+                        )?;
+                    }
                     check_gas_remaining(
                         &gas_counter,
                         BLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST,
@@ -206,6 +218,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                 NATIVE_COIN_CONTROL_ADDRESS,
                 &precompile_input,
                 &gas_counter,
+                hardfork_flags,
             )?;
 
             // Add to blocklist
@@ -307,6 +320,18 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                             hardfork_flags,
                         ));
                     }
+                    // Zero8: surface the delegatecall penalty before the
+                    // success-path floor; otherwise an authorized delegatecall
+                    // in the 200..floor gas window OOGs before it can revert
+                    // with the 200-gas penalty.
+                    if hardfork_flags.is_active(ArcHardfork::Zero8) {
+                        check_delegatecall(
+                            NATIVE_COIN_CONTROL_ADDRESS,
+                            &precompile_input,
+                            &gas_counter,
+                            hardfork_flags,
+                        )?;
+                    }
                     check_gas_remaining(
                         &gas_counter,
                         UNBLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST,
@@ -346,6 +371,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                 NATIVE_COIN_CONTROL_ADDRESS,
                 &precompile_input,
                 &gas_counter,
+                hardfork_flags,
             )?;
 
             // Remove from blocklist
@@ -458,6 +484,60 @@ mod tests {
         zero6_only: bool,
         /// If true, skip this test case for hardfork combinations with Zero6.
         pre_zero6_only: bool,
+        /// If true, skip this test case for hardfork combinations without Zero8.
+        /// Used for cases whose result shape only holds once the Zero8
+        /// delegatecall reorder is active (penalty revert vs OOG).
+        zero8_only: bool,
+        /// If true, skip this test case for hardfork combinations with Zero8.
+        pre_zero8_only: bool,
+    }
+
+    impl NativeCoinControlTest {
+        /// Whether this case should be skipped for the given hardfork combination.
+        fn skip_for(&self, hardfork_flags: ArcHardforkFlags) -> bool {
+            let zero5 = hardfork_flags.is_active(ArcHardfork::Zero5);
+            let zero6 = hardfork_flags.is_active(ArcHardfork::Zero6);
+            let zero8 = hardfork_flags.is_active(ArcHardfork::Zero8);
+            // ZeroX hardforks are cumulative; Zero6 implies Zero5.
+            let invalid_combo = zero6 && !zero5;
+            invalid_combo
+                || (self.zero6_only && !zero6)
+                || (self.pre_zero6_only && zero6)
+                || (self.zero8_only && !zero8)
+                || (self.pre_zero8_only && zero8)
+        }
+    }
+
+    fn run_native_coin_control_case(tc: &NativeCoinControlTest, hardfork_flags: ArcHardforkFlags) {
+        let tc_name = format!("{} (hardfork_flags: {hardfork_flags:?})", tc.name);
+
+        // Sanity check that we're not configuring test cases incorrectly
+        if !matches!(
+            tc.expected_result,
+            InstructionResult::Revert | InstructionResult::Return
+        ) {
+            assert!(
+                tc.return_data.is_none(),
+                "{tc_name}: expected no return data"
+            );
+        }
+
+        let mut ctx = mock_context(hardfork_flags);
+        let inputs = CallInputs {
+            scheme: CallScheme::Call,
+            target_address: tc.target_address,
+            bytecode_address: tc.bytecode_address,
+            known_bytecode: None,
+            caller: tc.caller,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(tc.calldata.clone()),
+            gas_limit: tc.gas_limit,
+            is_static: false,
+            return_memory_offset: 0..0,
+        };
+
+        let precompile_res = call_native_coin_control(&mut ctx, &inputs, hardfork_flags);
+        assert_precompile_result(precompile_res, tc, hardfork_flags, &tc_name);
     }
 
     // Test constants
@@ -513,6 +593,14 @@ mod tests {
                 } else {
                     tc.pre_zero5_gas_used.unwrap_or(tc.gas_used)
                 };
+                // Zero8: a delegatecall rejection charges the uniform early-revert penalty.
+                let expected_gas_used = if hardfork_flags.is_active(ArcHardfork::Zero8)
+                    && tc.expected_revert_str == Some(ERR_DELEGATE_CALL_NOT_ALLOWED)
+                {
+                    expected_gas_used.saturating_add(PRECOMPILE_EARLY_REVERT_GAS_PENALTY)
+                } else {
+                    expected_gas_used
+                };
                 assert_eq!(
                     result.gas.used(),
                     expected_gas_used,
@@ -544,6 +632,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -563,6 +653,8 @@ mod tests {
                 zero6_gas_used: Some(PRECOMPILE_EARLY_REVERT_GAS_PENALTY),
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -581,6 +673,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -597,6 +691,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -616,6 +712,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: ADDRESS_B,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -635,6 +733,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: ADDRESS_B,
             },
@@ -654,6 +754,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -672,6 +774,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -688,6 +792,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -707,6 +813,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -726,6 +834,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: ADDRESS_B,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -745,6 +855,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: ADDRESS_B,
             },
@@ -764,6 +876,8 @@ mod tests {
                 zero6_gas_used: Some(PRECOMPILE_EARLY_REVERT_GAS_PENALTY),
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -782,6 +896,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -798,6 +914,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -819,6 +937,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: true,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -840,6 +960,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: true,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -858,6 +980,8 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: true,
                 pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
@@ -876,59 +1000,106 @@ mod tests {
                 zero6_gas_used: None,
                 zero6_only: false,
                 pre_zero6_only: true,
+                zero8_only: false,
+                pre_zero8_only: false,
                 target_address: NATIVE_COIN_CONTROL_ADDRESS,
+                bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
+            },
+            // Zero8: an authorized delegatecall with gas in the
+            // 200..floor window reverts with the delegatecall penalty,
+            // because the delegatecall check now runs before the
+            // success-path gas floor.
+            NativeCoinControlTest {
+                name: "blocklist() Zero8 low-gas authorized delegatecall reverts with penalty",
+                caller: ALLOWED_CALLER_ADDRESS,
+                calldata: INativeCoinControl::blocklistCall { account: ADDRESS_B }
+                    .abi_encode()
+                    .into(),
+                gas_limit: 1000,
+                expected_result: InstructionResult::Revert,
+                expected_revert_str: Some(ERR_DELEGATE_CALL_NOT_ALLOWED),
+                return_data: None,
+                gas_used: 0,
+                pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: true,
+                pre_zero6_only: false,
+                zero8_only: true,
+                pre_zero8_only: false,
+                target_address: ADDRESS_B,
+                bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
+            },
+            // Pre-Zero8: the same call OOGs on the success-path floor
+            // before reaching the delegatecall check. Locks in that the
+            // reorder is Zero8-gated and does not touch live networks.
+            NativeCoinControlTest {
+                name: "blocklist() pre-Zero8 low-gas authorized delegatecall OOGs",
+                caller: ALLOWED_CALLER_ADDRESS,
+                calldata: INativeCoinControl::blocklistCall { account: ADDRESS_B }
+                    .abi_encode()
+                    .into(),
+                gas_limit: 1000,
+                expected_result: InstructionResult::PrecompileOOG,
+                expected_revert_str: None,
+                return_data: None,
+                gas_used: 0,
+                pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: true,
+                target_address: ADDRESS_B,
+                bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
+            },
+            NativeCoinControlTest {
+                name: "unBlocklist() Zero8 low-gas authorized delegatecall reverts with penalty",
+                caller: ALLOWED_CALLER_ADDRESS,
+                calldata: INativeCoinControl::unBlocklistCall { account: ADDRESS_B }
+                    .abi_encode()
+                    .into(),
+                gas_limit: 1000,
+                expected_result: InstructionResult::Revert,
+                expected_revert_str: Some(ERR_DELEGATE_CALL_NOT_ALLOWED),
+                return_data: None,
+                gas_used: 0,
+                pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: true,
+                pre_zero6_only: false,
+                zero8_only: true,
+                pre_zero8_only: false,
+                target_address: ADDRESS_B,
+                bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
+            },
+            NativeCoinControlTest {
+                name: "unBlocklist() pre-Zero8 low-gas authorized delegatecall OOGs",
+                caller: ALLOWED_CALLER_ADDRESS,
+                calldata: INativeCoinControl::unBlocklistCall { account: ADDRESS_B }
+                    .abi_encode()
+                    .into(),
+                gas_limit: 1000,
+                expected_result: InstructionResult::PrecompileOOG,
+                expected_revert_str: None,
+                return_data: None,
+                gas_used: 0,
+                pre_zero5_gas_used: None,
+                zero6_gas_used: None,
+                zero6_only: false,
+                pre_zero6_only: false,
+                zero8_only: false,
+                pre_zero8_only: true,
+                target_address: ADDRESS_B,
                 bytecode_address: NATIVE_COIN_CONTROL_ADDRESS,
             },
         ];
 
         for tc in cases {
             for hardfork_flags in ArcHardforkFlags::all_combinations() {
-                // ZeroX hardforks are cumulative; Zero6 implies Zero5.
-                if hardfork_flags.is_active(ArcHardfork::Zero6)
-                    && !hardfork_flags.is_active(ArcHardfork::Zero5)
-                {
+                if tc.skip_for(hardfork_flags) {
                     continue;
                 }
-
-                if tc.zero6_only && !hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    continue;
-                }
-                if tc.pre_zero6_only && hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    continue;
-                }
-
-                let tc_name =
-                    tc.name.to_string() + &format!(" (hardfork_flags: {:?})", hardfork_flags);
-
-                // Sanity check that we're not configuring test cases incorrectly
-                match tc.expected_result {
-                    InstructionResult::Revert | InstructionResult::Return => {}
-                    _ => {
-                        assert!(
-                            tc.return_data.is_none(),
-                            "{tc_name}: expected no return data",
-                        );
-                    }
-                }
-
-                let mut ctx = mock_context(hardfork_flags);
-
-                // Prepare inputs
-                let inputs = CallInputs {
-                    scheme: CallScheme::Call,
-                    target_address: tc.target_address,
-                    bytecode_address: tc.bytecode_address,
-                    known_bytecode: None,
-                    caller: tc.caller,
-                    value: CallValue::Transfer(U256::ZERO),
-                    input: CallInput::Bytes(tc.calldata.clone()),
-                    gas_limit: tc.gas_limit,
-                    is_static: false,
-                    return_memory_offset: 0..0,
-                };
-
-                let precompile_res = call_native_coin_control(&mut ctx, &inputs, hardfork_flags);
-                assert_precompile_result(precompile_res, tc, hardfork_flags, &tc_name);
+                run_native_coin_control_case(tc, hardfork_flags);
             }
         }
     }

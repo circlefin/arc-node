@@ -197,7 +197,9 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_height() {
         let api = ArcApiImpl::new(MockCertSource);
-        let err = ArcApiServer::get_certificate(&api, 0).await.unwrap_err();
+        let err = ArcApiServer::get_certificate(&api, 0.into())
+            .await
+            .unwrap_err();
         assert!(err.message().contains("height must be"));
     }
 
@@ -211,7 +213,9 @@ mod tests {
             }
         }
         let api = ArcApiImpl::new(EmptySource);
-        let err = ArcApiServer::get_certificate(&api, 5).await.unwrap_err();
+        let err = ArcApiServer::get_certificate(&api, 5.into())
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), NOT_FOUND);
     }
     struct ConnectFail;
@@ -225,7 +229,9 @@ mod tests {
     #[tokio::test]
     async fn connect_failure_maps_to_custom_code() {
         let api = ArcApiImpl::new(ConnectFail);
-        let err = ArcApiServer::get_certificate(&api, 10).await.unwrap_err();
+        let err = ArcApiServer::get_certificate(&api, 10.into())
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), UPSTREAM_UNREACHABLE);
         assert!(err.message().contains("unreachable"));
     }
@@ -233,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn returns_real_cert_from_source() {
         let api = ArcApiImpl::new(MockCertSource);
-        let cert = ArcApiServer::get_certificate(&api, 7).await.unwrap();
+        let cert = ArcApiServer::get_certificate(&api, 7.into()).await.unwrap();
         assert_eq!(cert.height, 7);
         assert_eq!(cert.round, 3);
     }
@@ -248,7 +254,9 @@ mod tests {
     #[tokio::test]
     async fn timeout_maps_to_internal_error() {
         let api = ArcApiImpl::new(TimeoutSource);
-        let err = ArcApiServer::get_certificate(&api, 9).await.unwrap_err();
+        let err = ArcApiServer::get_certificate(&api, 9.into())
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), ErrorCode::InternalError.code());
         assert!(err.message().contains("Timeout"));
     }
@@ -264,7 +272,9 @@ mod tests {
     #[tokio::test]
     async fn decode_error_maps_to_internal_error() {
         let api = ArcApiImpl::new(DecodeFailSource);
-        let err = ArcApiServer::get_certificate(&api, 11).await.unwrap_err();
+        let err = ArcApiServer::get_certificate(&api, 11.into())
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), ErrorCode::InternalError.code());
         assert!(err.message().contains("Failed to decode"));
     }
@@ -280,7 +290,9 @@ mod tests {
     #[tokio::test]
     async fn network_status_maps_to_internal_error() {
         let api = ArcApiImpl::new(NetworkFailSource);
-        let err = ArcApiServer::get_certificate(&api, 13).await.unwrap_err();
+        let err = ArcApiServer::get_certificate(&api, 13.into())
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), ErrorCode::InternalError.code());
         assert!(err.message().contains("Upstream HTTP error"));
         assert!(err.message().contains("500"));

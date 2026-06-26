@@ -247,6 +247,7 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
                 NATIVE_COIN_AUTHORITY_ADDRESS,
                 &precompile_input,
                 &gas_counter,
+                hardfork_flags,
             )?;
 
             // Reject minting to zero address (Zero5+)
@@ -360,6 +361,7 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
                 NATIVE_COIN_AUTHORITY_ADDRESS,
                 &precompile_input,
                 &gas_counter,
+                hardfork_flags,
             )?;
 
             // Reject burning from zero address (Zero5+)
@@ -476,6 +478,7 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
                 NATIVE_COIN_AUTHORITY_ADDRESS,
                 &precompile_input,
                 &gas_counter,
+                hardfork_flags,
             )?;
 
             // Reject transfers involving zero address (Zero5+)
@@ -759,6 +762,14 @@ mod tests {
                     tc.eip7708_gas_used.unwrap_or(tc.gas_used)
                 } else {
                     tc.pre_zero5_gas_used.unwrap_or(tc.gas_used)
+                };
+                // Zero8: a delegatecall rejection charges the uniform early-revert penalty.
+                let expected_gas_used = if hardfork_flags.is_active(ArcHardfork::Zero8)
+                    && tc.expected_revert_str == Some(ERR_DELEGATE_CALL_NOT_ALLOWED)
+                {
+                    expected_gas_used.saturating_add(PRECOMPILE_EARLY_REVERT_GAS_PENALTY)
+                } else {
+                    expected_gas_used
                 };
                 assert_eq!(
                     result.gas.used(),

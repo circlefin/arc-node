@@ -1095,4 +1095,61 @@ mod tests {
             "Before Zero6, zero beneficiary should be allowed: {result:?}"
         );
     }
+
+    // Drives the public `HeaderValidator::validate_header` path so that
+    // accidentally removing the beneficiary check from `validate_header()`
+    // would be caught at the trait boundary, not just at the helper.
+    #[test]
+    fn validate_header_rejects_zero_beneficiary_at_zero6() {
+        use alloy_primitives::Address;
+
+        // Activate Zero6 at genesis but defer Zero5 so the Zero5-gated
+        // extra_data/base_fee/gas_limit checks don't fail before reaching
+        // the beneficiary check.
+        let mut inner = ChainSpecBuilder::mainnet().build();
+        inner
+            .hardforks
+            .insert(ArcHardfork::Zero5, ForkCondition::Block(100));
+        inner
+            .hardforks
+            .insert(ArcHardfork::Zero6, ForkCondition::Block(0));
+        let consensus = ArcConsensus::new(Arc::new(ArcChainSpec::new(inner)));
+
+        let header = Header {
+            number: 1,
+            beneficiary: Address::ZERO,
+            ..Default::default()
+        };
+        let sealed = SealedHeader::new(header.clone(), header.hash_slow());
+        let result =
+            <ArcConsensus<_> as HeaderValidator<Header>>::validate_header(&consensus, &sealed);
+        assert!(
+            matches!(result, Err(ConsensusError::Other(_))),
+            "validate_header should reject zero beneficiary under Zero6: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_header_accepts_zero_beneficiary_before_zero6() {
+        use alloy_primitives::Address;
+
+        let mut inner = ChainSpecBuilder::mainnet().build();
+        inner
+            .hardforks
+            .insert(ArcHardfork::Zero6, ForkCondition::Block(100));
+        let consensus = ArcConsensus::new(Arc::new(ArcChainSpec::new(inner)));
+
+        let header = Header {
+            number: 99,
+            beneficiary: Address::ZERO,
+            ..Default::default()
+        };
+        let sealed = SealedHeader::new(header.clone(), header.hash_slow());
+        let result =
+            <ArcConsensus<_> as HeaderValidator<Header>>::validate_header(&consensus, &sealed);
+        assert!(
+            result.is_ok(),
+            "validate_header should accept zero beneficiary before Zero6: {result:?}"
+        );
+    }
 }

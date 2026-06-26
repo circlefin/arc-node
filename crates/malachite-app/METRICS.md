@@ -71,8 +71,40 @@ This application exposes Prometheus metrics on the `/metrics` endpoint. The foll
     - `api`: The Engine API method name.
   - **Buckets:** Provides a histogram of API call times with exponential buckets from 0.001 to 2.0 seconds.
 
+- **`arc_malachite_app_rpc_request_time`** (Histogram)
+  - **Description:** Time taken to serve RPC requests, in seconds.
+  - **Labels:**
+    - `endpoint`: The RPC endpoint path.
+  - **Buckets:** Provides a histogram of RPC request times with exponential buckets from 0.001 to 2.0 seconds.
+
+  The `app_request_*` metric names below intentionally render with `app_app` in
+  Prometheus because the `arc_malachite_app` registry prefix is combined with
+  the registered `app_request_*` metric names.
+
+- **`arc_malachite_app_app_request_full_count`** (Counter)
+  - **Description:** Number of app requests rejected because the app request channel was full.
+  - **Labels:**
+    - `request`: The app request type.
+
+- **`arc_malachite_app_app_request_queue_time`** (Histogram)
+  - **Description:** Time app requests spend waiting in the app request channel, in seconds.
+  - **Labels:**
+    - `request`: The app request type.
+  - **Buckets:** Provides a histogram of app request queue times with exponential buckets from 0.001 to 2.0 seconds.
+
+- **`arc_malachite_app_app_request_process_time`** (Histogram)
+  - **Description:** Time taken to process app requests, in seconds.
+  - **Labels:**
+    - `request`: The app request type.
+  - **Buckets:** Provides a histogram of app request processing times with exponential buckets from 0.001 to 2.0 seconds.
+
 - **`arc_malachite_app_height_restart_count`** (Counter)
   - **Description:** Number of times the consensus height has been restarted due to errors or recovery scenarios.
+
+- **`arc_malachite_app_consensus_round_missed`** (Counter)
+  - **Description:** Number of consensus rounds that failed to decide before advancing to the next round.
+  - **Labels:**
+    - `proposer`: Address of the validator that was proposer for the missed round.
 
 - **`arc_malachite_app_sync_fell_behind_count`** (Counter)
   - **Description:** Number of times the node fell behind and transitioned from InSync to CatchingUp.
