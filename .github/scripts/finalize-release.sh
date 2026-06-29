@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=scripts/release-config.sh
+source "${REPO_ROOT}/scripts/release-config.sh"
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -51,12 +56,27 @@ extract_body_field() {
 
 remote_ref_exists() {
   local ref="$1"
-  git ls-remote --exit-code origin "${ref}" >/dev/null 2>&1
+  local output status
+
+  if output="$(git ls-remote --exit-code origin "${ref}" 2>&1)"; then
+    return 0
+  else
+    status=$?
+  fi
+
+  if [[ "${status}" -eq 2 ]]; then
+    return 1
+  fi
+
+  die "Unable to query remote ref ${ref}: ${output}"
 }
 
 remote_ref_sha() {
   local ref="$1"
-  git ls-remote origin "${ref}" | awk 'NR == 1 {print $1}'
+  local output
+
+  output="$(git ls-remote origin "${ref}" 2>&1)" || die "Unable to query remote ref ${ref}: ${output}"
+  awk 'NR == 1 {print $1}' <<< "${output}"
 }
 
 ensure_valid_ref() {
@@ -64,12 +84,39 @@ ensure_valid_ref() {
   git check-ref-format "${ref}" >/dev/null 2>&1 || die "Invalid Git ref: ${ref}"
 }
 
+tag_version() {
+  local prefix
+
+  for prefix in "${TAG_PREFIXES[@]}"; do
+    if [[ "${TAG:0:${#prefix}}" == "${prefix}" ]]; then
+      printf '%s\n' "${TAG:${#prefix}}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+tag_prefixes_for_error() {
+  local joined="" prefix
+
+  for prefix in "${TAG_PREFIXES[@]}"; do
+    if [[ -z "${joined}" ]]; then
+      joined="${prefix}"
+    else
+      joined="${joined} or ${prefix}"
+    fi
+  done
+
+  printf '%s\n' "${joined}"
+}
+
 resolve_namespace() {
   local requested="${RELEASE_NAMESPACE:-auto}"
 
   case "${requested}" in
     auto)
-      if [[ "${TAG}" == test/v* || "${RELEASE_BRANCH}" == test-release/* || "${PR_BASE_REF}" == test-main || "${PR_BASE_REF}" == test-release/* ]]; then
+      if [[ "${TAG}" == test-v* || "${TAG}" == test/v* || "${RELEASE_BRANCH}" == test-release/* || "${PR_BASE_REF}" == test-main || "${PR_BASE_REF}" == test-release/* ]]; then
         NAMESPACE="test"
       else
         NAMESPACE="production"
@@ -85,13 +132,15 @@ resolve_namespace() {
 
   case "${NAMESPACE}" in
     production)
-      TAG_PREFIX="v"
-      RELEASE_BRANCH_PREFIX="release/"
+      RELEASE_REF_PREFIX=""
+      TAG_PREFIXES=("$(release_tag_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")")
+      RELEASE_BRANCH_PREFIX="$(release_branch_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")"
       MAIN_BRANCH="main"
       ;;
     test)
-      TAG_PREFIX="test/v"
-      RELEASE_BRANCH_PREFIX="test-release/"
+      RELEASE_REF_PREFIX="test-"
+      TAG_PREFIXES=("$(release_tag_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")" "test/v")
+      RELEASE_BRANCH_PREFIX="$(release_branch_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")"
       MAIN_BRANCH="test-main"
       ;;
   esac
@@ -102,7 +151,8 @@ parse_release_metadata() {
   require_env PR_BASE_REF
   require_env PR_HEAD_REF
 
-  [[ "${PR_HEAD_REF}" == sync/copybara-export-* ]] || die "Release finalizer only accepts Copybara export branches"
+  [[ "${PR_HEAD_REF}" =~ ^sync/[A-Za-z0-9._-]+$ ]] || die "Release finalizer only accepts Copybara sync branches"
+  git check-ref-format --branch "${PR_HEAD_REF}" >/dev/null 2>&1 || die "Invalid Copybara sync branch: ${PR_HEAD_REF}"
 
   TAG="$(extract_body_field "Release tag")" || die "PR body is missing 'Release tag: ...'"
   RELEASE_BRANCH="$(extract_body_field "Release branch")" || die "PR body is missing 'Release branch: ...'"
@@ -116,14 +166,13 @@ parse_release_metadata() {
 
   resolve_namespace
 
-  [[ "${TAG}" == "${TAG_PREFIX}"* ]] || die "${NAMESPACE} release tags must start with ${TAG_PREFIX}: ${TAG}"
+  VERSION="$(tag_version)" || die "${NAMESPACE} release tags must start with $(tag_prefixes_for_error): ${TAG}"
   [[ "${RELEASE_BRANCH}" == "${RELEASE_BRANCH_PREFIX}"* ]] || die "${NAMESPACE} release branches must start with ${RELEASE_BRANCH_PREFIX}: ${RELEASE_BRANCH}"
 
   ensure_valid_ref "refs/tags/${TAG}"
   ensure_valid_ref "refs/heads/${RELEASE_BRANCH}"
   ensure_valid_ref "refs/heads/${MAIN_BRANCH}"
 
-  VERSION="${TAG:${#TAG_PREFIX}}"
   if [[ ! "${VERSION}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
     die "Public finalization only supports final SemVer tags, got ${TAG}"
   fi

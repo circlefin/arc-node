@@ -19,10 +19,6 @@ env:
   RUST_BACKTRACE: 1
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
-concurrency:
-  group: release-binaries-${{ inputs.tag || github.ref_name }}
-  cancel-in-progress: false
-
 jobs:
   build:
     name: Build (${{ matrix.target }})
@@ -49,12 +45,14 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          VERSION="$INPUT_TAG"
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?$ ]]; then
-            echo "::error::Invalid tag format: '$VERSION' (expected e.g. v1.2.3 or v1.2.3-rc.1)"
+          TAG="$INPUT_TAG"
+          if [[ ! "$TAG" =~ (^|[-/])(v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?)$ ]]; then
+            echo "::error::Invalid tag format: '$TAG' (expected e.g. v1.2.3 or test-v1.2.3)"
             exit 1
           fi
+          VERSION="${BASH_REMATCH[2]}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "asset_tag=${TAG//\//-}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -111,7 +109,7 @@ jobs:
 
       - name: Package release assets
         env:
-          TAG: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.asset_tag }}
           TARGET: ${{ matrix.target }}
         run: ./scripts/release-package.sh "$TAG" "$TARGET"
 
@@ -162,6 +160,9 @@ jobs:
     needs: sign
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    concurrency:
+      group: release-binaries-publish-${{ inputs.tag }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -171,12 +172,13 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           TAG="$INPUT_TAG"
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?$ ]]; then
-            echo "::error::Invalid tag format: '$TAG' (expected e.g. v1.2.3 or v1.2.3-rc.1)"
+          if [[ ! "$TAG" =~ (^|[-/])(v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?)$ ]]; then
+            echo "::error::Invalid tag format: '$TAG' (expected e.g. v1.2.3 or test-v1.2.3)"
             exit 1
           fi
+          VERSION="${BASH_REMATCH[2]}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]; then
+          if [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]; then
             echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
@@ -202,9 +204,16 @@ jobs:
             edit_args+=(--prerelease=true)
           fi
 
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "::error::Release ${TAG} already exists; delete the existing draft/release before rerunning"
-            exit 1
+          if release_is_draft="$(gh release view "${TAG}" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [[ "$release_is_draft" != "true" ]]; then
+              echo "::error::Release ${TAG} is already published; refusing to replace public assets"
+              exit 1
+            fi
+
+            echo "::notice::Draft release ${TAG} already exists; replacing draft release assets"
+            gh release upload "${TAG}" release-assets/* --clobber
+            gh release edit "${TAG}" "${edit_args[@]}"
+            exit 0
           fi
 
           gh release create "${TAG}" "${create_args[@]}"

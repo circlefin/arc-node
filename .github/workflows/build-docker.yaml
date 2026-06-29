@@ -73,9 +73,16 @@ jobs:
           else
             RELEASE_TAG=""
           fi
-          if [[ -n "$RELEASE_TAG" && ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?$ ]]; then
-            echo "::error::Invalid tag format: '$RELEASE_TAG' (expected e.g. v1.2.3 or v1.2.3-rc.1)"
-            exit 1
+          if [[ -n "$RELEASE_TAG" ]]; then
+            # shellcheck source=scripts/release-config.sh
+            source scripts/release-config.sh
+            if ! image_version="$(release_docker_image_version_from_tag "$RELEASE_TAG")"; then
+              echo "::error::Invalid tag format: '$RELEASE_TAG' (expected e.g. v1.2.3, test-v1.2.3, or test/v1.2.3)"
+              exit 1
+            fi
+            echo "image_version=${image_version}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_version=" >> "$GITHUB_OUTPUT"
           fi
           {
             echo "full_hash=${SHA}"
@@ -178,7 +185,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          sparse-checkout: .github/actions
+          ref: ${{ format('refs/tags/{0}', inputs.tag) }}
+          sparse-checkout: |
+            .github/actions
+            scripts
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
@@ -201,8 +211,15 @@ jobs:
           IMAGE: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          VERSION="${RELEASE_TAG#v}"
-          TAG="${IMAGE}:${VERSION}"
+          # shellcheck source=scripts/release-config.sh
+          source scripts/release-config.sh
+          if ! IMAGE_VERSION="$(release_docker_image_version_from_tag "$RELEASE_TAG")"; then
+            echo "::error::Invalid tag format: '$RELEASE_TAG' (expected e.g. v1.2.3, test-v1.2.3, or test/v1.2.3)"
+            exit 1
+          fi
+          SHORT_HASH="$(git rev-parse --short=8 HEAD)"
+          TAG="${IMAGE}:${IMAGE_VERSION}"
+          SHA_TAG="${IMAGE}:${IMAGE_VERSION}-${SHORT_HASH}"
 
           # Build digest args from all platform artifacts
           DIGEST_ARGS=()
@@ -216,7 +233,7 @@ jobs:
           fi
 
           # Create and push the manifest list
-          docker buildx imagetools create -t "${TAG}" "${DIGEST_ARGS[@]}"
+          docker buildx imagetools create -t "${TAG}" -t "${SHA_TAG}" "${DIGEST_ARGS[@]}"
 
           MANIFEST_DIGEST=$(docker buildx imagetools inspect "${TAG}" --raw | sha256sum | awk '{print "sha256:"$1}')
           echo "digest=${MANIFEST_DIGEST}" >> "$GITHUB_OUTPUT"
