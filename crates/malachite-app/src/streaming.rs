@@ -280,11 +280,16 @@ impl StreamState {
             // If we have received the fin message, we can determine when we will be done.
             // We are done if we have already received all messages from 0 to fin.sequence,
             // included. That is to say, if we have received `fin.sequence + 1` messages.
-            // Sequence is a u64 protocol field; on 64-bit targets usize == u64.
-            // The +1 cannot overflow because MAX_MESSAGES_PER_STREAM << u64::MAX.
-            #[allow(clippy::cast_possible_truncation, clippy::arithmetic_side_effects)]
+            //
+            // `msg.sequence` is an unvalidated u64 straight off the wire, so a
+            // malicious peer can set it to `u64::MAX`. `as usize + 1` would then
+            // overflow: panic under debug-assertions, wrap to 0 in release. Use a
+            // saturating add so the worst case is `usize::MAX` (an unreachable
+            // completion target the stream is later evicted for), never a panic
+            // or a spurious wrap-to-zero.
+            #[allow(clippy::cast_possible_truncation)]
             {
-                self.expected_messages = msg.sequence as usize + 1;
+                self.expected_messages = (msg.sequence as usize).saturating_add(1);
             }
         }
 
