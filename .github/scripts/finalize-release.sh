@@ -234,7 +234,7 @@ ensure_release_tag() {
 
   if remote_ref_exists "refs/tags/${TAG}"; then
     git fetch --no-tags origin "refs/tags/${TAG}:refs/tags/${TAG}"
-    existing_commit="$(git rev-list -n 1 "${TAG}")"
+    existing_commit="$(git rev-list -n 1 "refs/tags/${TAG}")"
     [[ "${existing_commit}" == "${TARGET_SHA}" ]] || die "Release tag ${TAG} points to ${existing_commit}, expected ${TARGET_SHA}"
     note "Release tag already exists at ${TARGET_SHA}: ${TAG}"
     return

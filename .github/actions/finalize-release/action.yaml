@@ -45,11 +45,12 @@ runs:
       shell: bash
       env:
         MODE: ${{ inputs.mode }}
+        REPOSITORY_PATH: ${{ inputs.repository-path }}
         PR_BODY: ${{ inputs.pr-body }}
         PR_BASE_REF: ${{ inputs.pr-base-ref }}
         PR_HEAD_REF: ${{ inputs.pr-head-ref }}
         MERGE_COMMIT_SHA: ${{ inputs.merge-commit-sha }}
       run: |
         set -euo pipefail
-        cd "${{ inputs.repository-path }}"
+        cd "${REPOSITORY_PATH}"
         bash "${{ github.action_path }}/../../scripts/finalize-release.sh" "${MODE}"
