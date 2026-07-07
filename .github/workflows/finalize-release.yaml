@@ -5,9 +5,7 @@ on:
     types: [opened, edited, synchronize, reopened, labeled, unlabeled, closed]
     branches:
       - main
-      - test-main
       - release/**
-      - test-release/**
 
 concurrency:
   group: public-release-finalizer-${{ github.event.pull_request.number }}
@@ -30,7 +28,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout base branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.event.pull_request.base.ref }}
           fetch-depth: 0
@@ -39,7 +37,6 @@ jobs:
         uses: ./.github/actions/finalize-release
         with:
           mode: validate
-          release-namespace: auto
           pr-body: ${{ github.event.pull_request.body }}
           pr-base-ref: ${{ github.event.pull_request.base.ref }}
           pr-head-ref: ${{ github.event.pull_request.head.ref }}
@@ -64,7 +61,7 @@ jobs:
       release_kind: ${{ steps.finalize.outputs.release_kind }}
     steps:
       - name: Checkout base branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.event.pull_request.base.ref }}
           fetch-depth: 0
@@ -74,7 +71,6 @@ jobs:
         uses: ./.github/actions/finalize-release
         with:
           mode: finalize
-          release-namespace: auto
           pr-body: ${{ github.event.pull_request.body }}
           pr-base-ref: ${{ github.event.pull_request.base.ref }}
           pr-head-ref: ${{ github.event.pull_request.head.ref }}
@@ -83,7 +79,7 @@ jobs:
   release-binaries:
     name: Release binaries
     needs: finalize-release
-    if: needs.finalize-release.outputs.namespace == 'production'
+    if: needs.finalize-release.result == 'success'
     uses: ./.github/workflows/release-binaries.yaml
     with:
       tag: ${{ needs.finalize-release.outputs.tag }}

@@ -17,7 +17,6 @@ Environment:
   PR_BASE_REF            Pull request base branch.
   PR_HEAD_REF            Pull request head branch.
   MERGE_COMMIT_SHA       Required for finalize mode.
-  RELEASE_NAMESPACE      Optional: auto, production, or test. Defaults to auto.
 USAGE
 }
 
@@ -112,38 +111,11 @@ tag_prefixes_for_error() {
 }
 
 resolve_namespace() {
-  local requested="${RELEASE_NAMESPACE:-auto}"
-
-  case "${requested}" in
-    auto)
-      if [[ "${TAG}" == test-v* || "${TAG}" == test/v* || "${RELEASE_BRANCH}" == test-release/* || "${PR_BASE_REF}" == test-main || "${PR_BASE_REF}" == test-release/* ]]; then
-        NAMESPACE="test"
-      else
-        NAMESPACE="production"
-      fi
-      ;;
-    production|test)
-      NAMESPACE="${requested}"
-      ;;
-    *)
-      die "Invalid RELEASE_NAMESPACE: ${requested}"
-      ;;
-  esac
-
-  case "${NAMESPACE}" in
-    production)
-      RELEASE_REF_PREFIX=""
-      TAG_PREFIXES=("$(release_tag_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")")
-      RELEASE_BRANCH_PREFIX="$(release_branch_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")"
-      MAIN_BRANCH="main"
-      ;;
-    test)
-      RELEASE_REF_PREFIX="test-"
-      TAG_PREFIXES=("$(release_tag_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")" "test/v")
-      RELEASE_BRANCH_PREFIX="$(release_branch_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")"
-      MAIN_BRANCH="test-main"
-      ;;
-  esac
+  NAMESPACE="production"
+  RELEASE_REF_PREFIX=""
+  TAG_PREFIXES=("$(release_tag_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")")
+  RELEASE_BRANCH_PREFIX="$(release_branch_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")"
+  MAIN_BRANCH="main"
 }
 
 parse_release_metadata() {
@@ -166,8 +138,8 @@ parse_release_metadata() {
 
   resolve_namespace
 
-  VERSION="$(tag_version)" || die "${NAMESPACE} release tags must start with $(tag_prefixes_for_error): ${TAG}"
-  [[ "${RELEASE_BRANCH}" == "${RELEASE_BRANCH_PREFIX}"* ]] || die "${NAMESPACE} release branches must start with ${RELEASE_BRANCH_PREFIX}: ${RELEASE_BRANCH}"
+  VERSION="$(tag_version)" || die "Release tags must start with $(tag_prefixes_for_error): ${TAG}"
+  [[ "${RELEASE_BRANCH}" == "${RELEASE_BRANCH_PREFIX}"* ]] || die "Release branches must start with ${RELEASE_BRANCH_PREFIX}: ${RELEASE_BRANCH}"
 
   ensure_valid_ref "refs/tags/${TAG}"
   ensure_valid_ref "refs/heads/${RELEASE_BRANCH}"
