@@ -90,15 +90,3 @@ jobs:
     secrets: inherit
     permissions:
       contents: write
-
-  release-docker:
-    name: Release Docker images
-    needs: finalize-release
-    if: needs.finalize-release.outputs.namespace == 'production'
-    uses: circlefin/arc-node/.github/workflows/build-docker.yaml@main
-    with:
-      tag: ${{ needs.finalize-release.outputs.tag }}
-    permissions:
-      attestations: write
-      contents: read
-      id-token: write
