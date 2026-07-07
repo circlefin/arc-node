@@ -217,7 +217,8 @@ jobs:
             echo "::error::Invalid tag format: '$RELEASE_TAG' (expected e.g. v1.2.3 or v1.2.3-rc.1)"
             exit 1
           fi
-          SHORT_HASH="$(git rev-parse --short=8 HEAD)"
+          SHA="$(git rev-parse HEAD)"
+          SHORT_HASH="${SHA::8}"
           TAG="${IMAGE}:${IMAGE_VERSION}"
           SHA_TAG="${IMAGE}:${IMAGE_VERSION}-${SHORT_HASH}"
 

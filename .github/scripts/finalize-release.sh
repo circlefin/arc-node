@@ -38,6 +38,8 @@ require_env() {
 
 extract_body_field() {
   local label="$1"
+  # awk exits after the first match, so output is always single-line — this prevents
+  # GITHUB_OUTPUT injection if PR_BODY contains a newline embedded in a field value.
   awk -v label="${label}: " '
     index($0, label) == 1 {
       sub(label, "")
@@ -123,6 +125,7 @@ parse_release_metadata() {
   require_env PR_BASE_REF
   require_env PR_HEAD_REF
 
+  # Matches Copybara's sync branch naming convention; update here if the sync workflow changes.
   [[ "${PR_HEAD_REF}" =~ ^sync/[A-Za-z0-9._-]+$ ]] || die "Release finalizer only accepts Copybara sync branches"
   git check-ref-format --branch "${PR_HEAD_REF}" >/dev/null 2>&1 || die "Invalid Copybara sync branch: ${PR_HEAD_REF}"
 
@@ -158,6 +161,7 @@ parse_release_metadata() {
   EFFECTIVE_RELEASE_KIND="${RELEASE_KIND}"
   if [[ "${RELEASE_KIND}" == "patch" && "${PATCH}" == "0" ]]; then
     EFFECTIVE_RELEASE_KIND="minor"
+    note "Release kind promoted from patch to minor for ${TAG} (PATCH=0 means first release on a new branch)"
   fi
 
   case "${EFFECTIVE_RELEASE_KIND}" in
@@ -219,7 +223,7 @@ ensure_release_branch() {
       fi
 
       git update-ref "refs/heads/${RELEASE_BRANCH}" "${TARGET_SHA}"
-      git push origin "refs/heads/${RELEASE_BRANCH}:refs/heads/${RELEASE_BRANCH}"
+      git push origin -- "refs/heads/${RELEASE_BRANCH}:refs/heads/${RELEASE_BRANCH}"
       note "Created release branch ${RELEASE_BRANCH} at ${TARGET_SHA}"
       ;;
   esac
@@ -238,8 +242,8 @@ ensure_release_tag() {
 
   git config user.name "${GIT_COMMITTER_NAME:-github-actions[bot]}"
   git config user.email "${GIT_COMMITTER_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}"
-  git tag -a "${TAG}" "${TARGET_SHA}" -m "Release ${TAG}"
-  git push origin "refs/tags/${TAG}:refs/tags/${TAG}"
+  git tag -a -m "Release ${TAG}" -- "${TAG}" "${TARGET_SHA}"
+  git push origin -- "refs/tags/${TAG}:refs/tags/${TAG}"
   note "Created release tag ${TAG} at ${TARGET_SHA}"
 }
 
@@ -262,7 +266,6 @@ main() {
   esac
 
   parse_release_metadata
-  write_outputs
 
   if [[ "${mode}" == "validate" ]]; then
     validate_remote_preconditions
@@ -273,6 +276,7 @@ main() {
   fetch_base_and_target
   ensure_release_branch
   ensure_release_tag
+  write_outputs
 }
 
 main "$@"
