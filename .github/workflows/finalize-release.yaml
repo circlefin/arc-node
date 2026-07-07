@@ -95,7 +95,11 @@ jobs:
     name: Release Docker images
     needs: finalize-release
     if: needs.finalize-release.outputs.namespace == 'production'
-    uses: ./.github/workflows/build-docker.yaml
+    # Pinned to main (not a local `./` reference) so job_workflow_ref is always
+    # main regardless of whether this run started on a release/* branch (patch
+    # releases) or main (minor/major releases). Keep in sync with the Cloudsmith
+    # OIDC trust condition in crcl-main/terraform-cicd's accounts/ops/cloudsmith/oidc.tf.
+    uses: circlefin/arc-node/.github/workflows/build-docker.yaml@main
     with:
       tag: ${{ needs.finalize-release.outputs.tag }}
     permissions:
