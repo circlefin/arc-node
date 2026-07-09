@@ -15,7 +15,7 @@ Consult the table below to confirm which version to run for each network.
 
 | Network     | Version |
 |-------------|---------|
-| Arc Testnet | v0.6.0  |
+| Arc Testnet | v0.7.2  |
 
 ## Pre-built Binary
 
@@ -61,7 +61,7 @@ source "$ARC_HOME/env"
 To install a specific version, run `arcup` with `--install`:
 
 ```sh
-arcup --install v0.6.0
+arcup --install v0.7.2
 ```
 
 Next, verify that the three Arc binaries are installed:
