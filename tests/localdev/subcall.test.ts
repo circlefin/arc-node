@@ -409,6 +409,113 @@ describe('Memo', () => {
     })
   })
 
+  // Regression for issue #189: eth_estimateGas / eth_call must succeed for the
+  // canonical `memo(address,bytes,bytes32,bytes)` entry point when `from` is an
+  // EOA. The original report used a non-existent `callWithMemo(...string)`
+  // signature, which reverts with empty data during estimation and looks like a
+  // node/precompile simulation bug.
+  it('eth_estimateGas succeeds for memo(address,bytes,bytes32,bytes)', async () => {
+    const { client, sender, receiver } = await clients()
+
+    const amount = USDC.parseUnits('0.001')
+    const transferData = encodeUSDCTransfer(receiver.account.address, amount)
+    const callData = encodeMemo(USDC.address, transferData, keccak256(toHex('estimate-memo')), toHex('estimate ok'))
+
+    const gas = await client.estimateGas({
+      account: sender.account.address,
+      to: memoAddress,
+      data: callData,
+    })
+
+    expect(gas).to.be.a('bigint')
+    expect(gas).to.be.greaterThan(21_000n)
+  })
+
+  // eth_call uses the same non-static simulation path as estimateGas; both must
+  // accept state-changing memo() simulation (memoIndex++ is discarded after the call).
+  it('eth_call succeeds for memo(address,bytes,bytes32,bytes)', async () => {
+    const { client, sender, receiver } = await clients()
+
+    const amount = USDC.parseUnits('0.001')
+    const transferData = encodeUSDCTransfer(receiver.account.address, amount)
+    const callData = encodeMemo(USDC.address, transferData, keccak256(toHex('eth-call-memo')), toHex('call ok'))
+
+    // Succeeds without throwing (return data is empty for non-view memo()).
+    await client.call({
+      account: sender.account.address,
+      to: memoAddress,
+      data: callData,
+    })
+  })
+
+  // Wrong / outdated ABI (callWithMemo with string memo) must not match memo().
+  // Empty revert data is expected and is NOT a CallFrom simulation failure.
+  it('outdated callWithMemo(string) selector reverts (issue #189 pitfall)', async () => {
+    const { client, sender, receiver } = await clients()
+
+    const amount = USDC.parseUnits('0.001')
+    const transferData = encodeUSDCTransfer(receiver.account.address, amount)
+
+    // Historical incorrect signature from issue #189:
+    // callWithMemo(address,bytes,bytes32,string) — never deployed on Memo.
+    const wrongAbi = parseAbi([
+      'function callWithMemo(address target, bytes data, bytes32 memoId, string memo) external returns (bool, bytes)',
+    ])
+    const wrongData = encodeFunctionData({
+      abi: wrongAbi,
+      functionName: 'callWithMemo',
+      args: [USDC.address, transferData, keccak256(toHex('wrong-abi')), 'test'],
+    })
+
+    await expect(
+      client.estimateGas({
+        account: sender.account.address,
+        to: memoAddress,
+        data: wrongData,
+      }),
+    ).to.be.rejected
+
+    await expect(
+      client.call({
+        account: sender.account.address,
+        to: memoAddress,
+        data: wrongData,
+      }),
+    ).to.be.rejected
+  })
+
+  // Gas estimated for memo() must be sufficient to land a real transaction.
+  it('estimated gas is enough to execute memo transfer on-chain', async () => {
+    const { client, sender, receiver } = await clients()
+
+    const amount = USDC.parseUnits('0.001')
+    const nativeAmount = USDC.toNative(amount)
+    const transferData = encodeUSDCTransfer(receiver.account.address, amount)
+    const callData = encodeMemo(
+      USDC.address,
+      transferData,
+      keccak256(toHex('estimate-then-send')),
+      toHex('send with estimate'),
+    )
+
+    const gas = await client.estimateGas({
+      account: sender.account.address,
+      to: memoAddress,
+      data: callData,
+    })
+
+    const balances = await balancesSnapshot(client, { sender, receiver })
+    const receipt = await sender
+      .sendTransaction({ to: memoAddress, data: callData, gas })
+      .then(ReceiptVerifier.waitSuccess)
+
+    expect(receipt.gasUsed).to.be.lessThanOrEqual(gas)
+    await balances
+      .increase({ receiver: nativeAmount })
+      .decrease({ sender: nativeAmount + receipt.totalFee() })
+      .verify()
+  })
+
   // EOA directly calling callFrom is not allowlisted — reverts with "unauthorized caller".
   // sender → callFrom(sender, receiver, "0x") → REVERT
   it('unauthorized direct call to callFrom precompile reverts', async () => {

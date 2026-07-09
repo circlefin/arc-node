@@ -19,6 +19,7 @@ pragma solidity ^0.8.29;
 import {Test} from "forge-std/Test.sol";
 
 import {Memo as MemoContract} from "../../src/memo/Memo.sol";
+import {IMemo} from "../../src/memo/IMemo.sol";
 import {Addresses} from "../../scripts/Addresses.sol";
 
 /// @dev Mock that simulates the callFrom precompile by forwarding the call to the target.
@@ -86,6 +87,17 @@ contract MemoTest is Test {
 
         assertEq(target.value(), 42);
         assertEq(memoContract.memoIndex(), 1);
+    }
+
+    /// @dev Regression guard for the #189 pitfall class: only the `memo` selector
+    ///      is implemented. A non-existent `callWithMemo` selector must not
+    ///      accidentally dispatch into `memo` (would require matching 4-byte
+    ///      selector, which it does not).
+    function test_callWithMemo_selector_is_not_memo() public pure {
+        bytes4 memoSel = IMemo.memo.selector;
+        // keccak256("callWithMemo(address,bytes,bytes32,string)") first 4 bytes
+        bytes4 callWithMemoSel = bytes4(keccak256("callWithMemo(address,bytes,bytes32,string)"));
+        assertTrue(memoSel != callWithMemoSel, "callWithMemo must not share memo selector");
     }
 
     function test_memo_memoIndexIncrements() public {
