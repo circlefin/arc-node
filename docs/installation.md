@@ -17,6 +17,22 @@ Consult the table below to confirm which version to run for each network.
 |-------------|---------|
 | Arc Testnet | v0.7.2  |
 
+
+> [!IMPORTANT]
+> **Breaking changes for DApp developers.** Upgrading your target node to v0.7.2 affects
+> applications, not just node operators:
+>
+> - `eth_call` / `eth_estimateGas` gas cap default lowered from 50M to 30M. Calls that
+>   need more than 30M gas fail unless the node raises `--rpc.gascap`.
+> - JSON-RPC batch requests are capped at 100 entries by default. Oversized batches are
+>   rejected with error `-32600` before any entry runs. Clients with a large query
+>   fan-out (e.g. viem's default batch transport) should stay under the cap.
+> - Precompile gas accounting changed across v0.7.x (EIP-2929 warm/cold pricing on
+>   precompile account loads in v0.7.0, gas charging order in v0.7.2). Re-estimate gas
+>   against an updated node instead of reusing cached or hardcoded values.
+>
+> See [BREAKING_CHANGES.md](../BREAKING_CHANGES.md#v072) for details.
+
 ## Pre-built Binary
 
 This repository includes `arcup`, a script that installs Arc node binaries
