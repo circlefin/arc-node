@@ -22,11 +22,12 @@ Consult the table below to confirm which version to run for each network.
 > **Breaking changes for DApp developers.** Upgrading your target node to v0.7.2 affects
 > applications, not just node operators:
 >
-> - `eth_call` / `eth_estimateGas` gas cap default lowered from 50M to 30M. Calls that
->   need more than 30M gas fail unless the node raises `--rpc.gascap`.
+> - `eth_call` / `eth_estimateGas` gas cap default lowered from 50M to 30M. Calls or
+>   simulations that previously relied on the higher cap will fail. Node operators can
+>   raise the limit with `--rpc.gascap`; DApps should optimize calls to stay within 30M.
 > - JSON-RPC batch requests are capped at 100 entries by default. Oversized batches are
->   rejected with error `-32600` before any entry runs. Clients with a large query
->   fan-out (e.g. viem's default batch transport) should stay under the cap.
+>   rejected with error `-32600` before any entry runs. Clients with JSON-RPC batching
+>   enabled should keep batch size at or under 100.
 > - Precompile gas accounting changed across v0.7.x (EIP-2929 warm/cold pricing on
 >   precompile account loads in v0.7.0, gas charging order in v0.7.2). Re-estimate gas
 >   against an updated node instead of reusing cached or hardcoded values.
