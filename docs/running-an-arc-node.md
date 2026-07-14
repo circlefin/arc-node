@@ -448,9 +448,10 @@ prohibited: `txpool`, `debug`, `trace`, `admin`, `flashbots`, `mev`, `ots`.
 --public-api
 ```
 
-The `--public-api` flag enforces these restrictions at runtime: it hides
-pending-transaction RPCs and warns at startup if `--http.api` or `--ws.api`
-exposes namespaces outside the safe set.
+The `--public-api` flag enforces pending-transaction hiding, but it does not
+rewrite or reject `--http.api` / `--ws.api` selections. It warns at startup if
+either selection exposes namespaces outside the safe set, so operators must
+still configure public endpoints with only the safe namespaces above.
 
 To verify, call `rpc_modules`:
 
