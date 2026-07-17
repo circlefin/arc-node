@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-# shellcheck source=scripts/release-config.sh
-source "${REPO_ROOT}/scripts/release-config.sh"
-
 # Public finalization only ever targets the production namespace.
 readonly NAMESPACE="production"
 readonly TAG_PREFIX="v"
