@@ -69,26 +69,17 @@ jobs:
         run: |
           SHA="$(git rev-parse HEAD)"
           if [[ "$EVENT_NAME" == "workflow_call" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            RELEASE_TAG="$INPUT_TAG"
-          else
-            RELEASE_TAG=""
-          fi
-          if [[ -n "$RELEASE_TAG" ]]; then
             # shellcheck source=scripts/release-config.sh
             source scripts/release-config.sh
-            if ! image_version="$(release_docker_image_version_from_tag "$RELEASE_TAG")"; then
-              echo "::error::Invalid tag format: '$RELEASE_TAG' (expected e.g. v1.2.3 or v1.2.3-rc.1)"
+            if ! release_docker_image_version_from_tag "$INPUT_TAG" >/dev/null; then
+              echo "::error::Invalid tag format: '$INPUT_TAG' (expected e.g. v1.2.3 or v1.2.3-rc.1)"
               exit 1
             fi
-            echo "image_version=${image_version}" >> "$GITHUB_OUTPUT"
-          else
-            echo "image_version=" >> "$GITHUB_OUTPUT"
           fi
           {
             echo "full_hash=${SHA}"
             echo "short_hash=${SHA::8}"
             echo "git_version=$(git describe --tags --always --dirty 2>/dev/null || echo 'v0.0.0-unknown')"
-            echo "release_tag=${RELEASE_TAG}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
