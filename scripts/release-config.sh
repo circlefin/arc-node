@@ -1,17 +1,5 @@
 #!/usr/bin/env bash
 
-release_tag_prefix_from_ref_prefix() {
-  local ref_prefix="${1:-}"
-
-  printf '%sv\n' "${ref_prefix}"
-}
-
-release_branch_prefix_from_ref_prefix() {
-  local ref_prefix="${1:-}"
-
-  printf '%srelease/\n' "${ref_prefix}"
-}
-
 release_docker_image_version_from_tag() {
   local tag="$1"
   local version

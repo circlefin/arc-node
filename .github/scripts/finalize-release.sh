@@ -6,6 +6,12 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # shellcheck source=scripts/release-config.sh
 source "${REPO_ROOT}/scripts/release-config.sh"
 
+# Public finalization only ever targets the production namespace.
+readonly NAMESPACE="production"
+readonly TAG_PREFIX="v"
+readonly RELEASE_BRANCH_PREFIX="release/"
+readonly MAIN_BRANCH="main"
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -86,38 +92,8 @@ ensure_valid_ref() {
 }
 
 tag_version() {
-  local prefix
-
-  for prefix in "${TAG_PREFIXES[@]}"; do
-    if [[ "${TAG:0:${#prefix}}" == "${prefix}" ]]; then
-      printf '%s\n' "${TAG:${#prefix}}"
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-tag_prefixes_for_error() {
-  local joined="" prefix
-
-  for prefix in "${TAG_PREFIXES[@]}"; do
-    if [[ -z "${joined}" ]]; then
-      joined="${prefix}"
-    else
-      joined="${joined} or ${prefix}"
-    fi
-  done
-
-  printf '%s\n' "${joined}"
-}
-
-resolve_namespace() {
-  NAMESPACE="production"
-  RELEASE_REF_PREFIX=""
-  TAG_PREFIXES=("$(release_tag_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")")
-  RELEASE_BRANCH_PREFIX="$(release_branch_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")"
-  MAIN_BRANCH="main"
+  [[ "${TAG}" == "${TAG_PREFIX}"* ]] || return 1
+  printf '%s\n' "${TAG#"${TAG_PREFIX}"}"
 }
 
 parse_release_metadata() {
@@ -132,16 +108,15 @@ parse_release_metadata() {
   TAG="$(extract_body_field "Release tag")" || die "PR body is missing 'Release tag: ...'"
   RELEASE_BRANCH="$(extract_body_field "Release branch")" || die "PR body is missing 'Release branch: ...'"
   RELEASE_KIND="$(extract_body_field "Release kind" || true)"
-  RELEASE_KIND="${RELEASE_KIND:-patch}"
+  # Trim surrounding whitespace and lowercase, since this field may be hand-edited in the PR body.
+  RELEASE_KIND="$(echo "${RELEASE_KIND:-patch}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 
   case "${RELEASE_KIND}" in
     patch|minor|major) ;;
     *) die "Invalid Release kind: ${RELEASE_KIND}" ;;
   esac
 
-  resolve_namespace
-
-  VERSION="$(tag_version)" || die "Release tags must start with $(tag_prefixes_for_error): ${TAG}"
+  VERSION="$(tag_version)" || die "Release tags must start with ${TAG_PREFIX}: ${TAG}"
   [[ "${RELEASE_BRANCH}" == "${RELEASE_BRANCH_PREFIX}"* ]] || die "Release branches must start with ${RELEASE_BRANCH_PREFIX}: ${RELEASE_BRANCH}"
 
   ensure_valid_ref "refs/tags/${TAG}"
