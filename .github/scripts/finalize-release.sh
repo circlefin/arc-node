@@ -108,8 +108,12 @@ parse_release_metadata() {
   TAG="$(extract_body_field "Release tag")" || die "PR body is missing 'Release tag: ...'"
   RELEASE_BRANCH="$(extract_body_field "Release branch")" || die "PR body is missing 'Release branch: ...'"
   RELEASE_KIND="$(extract_body_field "Release kind" || true)"
-  # Trim surrounding whitespace and lowercase, since this field may be hand-edited in the PR body.
-  RELEASE_KIND="$(echo "${RELEASE_KIND:-patch}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  RELEASE_KIND="${RELEASE_KIND:-patch}"
+  # Trim leading/trailing whitespace and lowercase (field may be hand-edited in the PR body).
+  # Only outer whitespace is stripped, not internal, so a typo like "min or" still fails loudly.
+  RELEASE_KIND="${RELEASE_KIND#"${RELEASE_KIND%%[![:space:]]*}"}"
+  RELEASE_KIND="${RELEASE_KIND%"${RELEASE_KIND##*[![:space:]]}"}"
+  RELEASE_KIND="$(tr '[:upper:]' '[:lower:]' <<< "${RELEASE_KIND}")"
 
   case "${RELEASE_KIND}" in
     patch|minor|major) ;;
