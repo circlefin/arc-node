@@ -6,12 +6,21 @@ on:
     branches:
       - main
       - release/*
-  push:
-    tags:
-      - 'v*'
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to build and publish Docker images for (e.g. v0.6.0)'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish Docker images for (e.g. v0.6.0)'
+        required: true
+        type: string
 
 concurrency:
-  group: docker-${{ github.ref }}
+  group: docker-${{ (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch') && inputs.tag || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -21,7 +30,8 @@ env:
 jobs:
   build:
     if: >-
-      github.event_name == 'push' ||
+      github.event_name == 'workflow_call' ||
+      github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'build-docker')
     name: Build ${{ matrix.image }} (${{ matrix.platform }})
     permissions:
@@ -48,13 +58,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          ref: ${{ (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch') && format('refs/tags/{0}', inputs.tag) || github.ref }}
           submodules: recursive
 
-      - name: Compute short hash
+      - name: Resolve image metadata
         id: vars
         env:
-          SHA: ${{ github.sha }}
-        run: echo "short_hash=${SHA::8}" >> "$GITHUB_OUTPUT"
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          SHA="$(git rev-parse HEAD)"
+          if [[ "$EVENT_NAME" == "workflow_call" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            # shellcheck source=scripts/release-config.sh
+            source scripts/release-config.sh
+            if ! release_docker_image_version_from_tag "$INPUT_TAG" >/dev/null; then
+              echo "::error::Invalid tag format: '$INPUT_TAG' (expected e.g. v1.2.3 or v1.2.3-rc.1)"
+              exit 1
+            fi
+          fi
+          {
+            echo "full_hash=${SHA}"
+            echo "short_hash=${SHA::8}"
+            echo "git_version=$(git describe --tags --always --dirty 2>/dev/null || echo 'v0.0.0-unknown')"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
@@ -73,8 +99,8 @@ jobs:
         env:
           BUILDX_NO_DEFAULT_ATTESTATIONS: 1
           GITHUB_TOKEN: ${{ github.token }}
-          GIT_COMMIT_HASH: ${{ github.sha }}
-          GIT_VERSION: ${{ github.ref_name }}
+          GIT_COMMIT_HASH: ${{ steps.vars.outputs.full_hash }}
+          GIT_VERSION: ${{ steps.vars.outputs.git_version }}
           GIT_SHORT_HASH: ${{ steps.vars.outputs.short_hash }}
 
       - name: Trivy vulnerability scan
@@ -95,13 +121,13 @@ jobs:
           path: trivy-results.sarif
 
       - name: Login to Cloudsmith
-        if: ${{ github.event_name == 'push' }}
+        if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' }}
         uses: ./.github/actions/cloudsmith-login
         with:
           registry: ${{ env.REGISTRY }}
 
       - name: Push image by digest
-        if: ${{ github.event_name == 'push' }}
+        if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' }}
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}
           BAKE_METADATA: ${{ steps.build.outputs.metadata }}
@@ -124,7 +150,7 @@ jobs:
           echo "${REGISTRY_DIGEST}" > "/tmp/digests/${MATRIX_IMAGE}/${PLATFORM_SLUG}"
 
       - name: Upload digest
-        if: ${{ github.event_name == 'push' }}
+        if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: digest-${{ matrix.image }}-${{ matrix.arch }}
@@ -132,7 +158,7 @@ jobs:
           if-no-files-found: error
 
   manifest:
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' }}
     name: Manifest ${{ matrix.image }}
     permissions:
       contents: read
@@ -150,7 +176,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          sparse-checkout: .github/actions
+          ref: ${{ format('refs/tags/{0}', inputs.tag) }}
+          sparse-checkout: |
+            .github/actions
+            scripts
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
@@ -171,10 +200,18 @@ jobs:
         id: manifest
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          VERSION="${RELEASE_TAG#v}"
-          TAG="${IMAGE}:${VERSION}"
+          # shellcheck source=scripts/release-config.sh
+          source scripts/release-config.sh
+          if ! IMAGE_VERSION="$(release_docker_image_version_from_tag "$RELEASE_TAG")"; then
+            echo "::error::Invalid tag format: '$RELEASE_TAG' (expected e.g. v1.2.3 or v1.2.3-rc.1)"
+            exit 1
+          fi
+          SHA="$(git rev-parse HEAD)"
+          SHORT_HASH="${SHA::8}"
+          TAG="${IMAGE}:${IMAGE_VERSION}"
+          SHA_TAG="${IMAGE}:${IMAGE_VERSION}-${SHORT_HASH}"
 
           # Build digest args from all platform artifacts
           DIGEST_ARGS=()
@@ -188,7 +225,7 @@ jobs:
           fi
 
           # Create and push the manifest list
-          docker buildx imagetools create -t "${TAG}" "${DIGEST_ARGS[@]}"
+          docker buildx imagetools create -t "${TAG}" -t "${SHA_TAG}" "${DIGEST_ARGS[@]}"
 
           MANIFEST_DIGEST=$(docker buildx imagetools inspect "${TAG}" --raw | sha256sum | awk '{print "sha256:"$1}')
           echo "digest=${MANIFEST_DIGEST}" >> "$GITHUB_OUTPUT"
