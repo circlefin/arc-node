@@ -41,3 +41,53 @@ Tested against the MultiAgentOrchestrator contract from arc-multi-agent:
 - Arc Transaction Memos announcement: https://community.arc.io/home/blogs/arc-transaction-memos-structured-transaction-context-for-financial-workflows-on-arc-2026-06-18
 - Arc Contract Addresses: https://docs.arc.io/arc/references/contract-addresses
 - Full implementation: https://github.com/consumeobeydie/arc-agent-api
+
+## Known Limitations
+
+### EOA-only Constraint
+
+The Memo contract is **EOA-only**. This is enforced at the precompile level, not in the Memo contract itself.
+
+When `memo()` is called, it internally invokes the `callFrom` precompile at `0x1800000000000000000000000000000000000003`. The precompile requires that `msg.sender` equals `tx.origin` — in other words, the caller must be an Externally Owned Account (EOA), not a smart contract.
+
+**What fails:**
+
+If you call `memo()` from a smart contract account — such as a Circle Developer Controlled Wallet, a Modular Wallet (ERC-4337 SCA), or any other contract-based account — the transaction will revert silently. The `MemoFailed` error is **not** raised in this case; the entire call reverts at the precompile level before the Memo contract can catch it.
+
+This was confirmed on Arc Testnet (Chain ID: 5042002) using the Circle Developer Controlled Wallets SDK. Gas estimation also fails for this reason when using `callFrom` simulation with contract-based senders.
+
+**What works:**
+
+Call `memo()` directly from an EOA wallet using a private key signer:
+
+```typescript
+// ✅ Works — EOA signer via viem
+import { createWalletClient, http } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+
+const account = privateKeyToAccount("0x...");
+const walletClient = createWalletClient({ account, transport: http(RPC_URL) });
+
+await walletClient.writeContract({
+  address: MEMO_CONTRACT,
+  abi: MEMO_ABI,
+  functionName: "memo",
+  args: [target, calldata, memoId, memoData],
+});
+```
+
+```typescript
+// ❌ Fails — Circle Developer Controlled Wallet (Smart Contract Account)
+// The callFrom precompile rejects contract callers silently.
+// Gas estimation will also fail with this setup.
+```
+
+**Reference:**
+
+From [`IMemo.sol`](../../../contracts/src/memo/IMemo.sol):
+
+> EOA-only: `memo()` invokes the `callFrom` precompile, which requires the sender argument (`msg.sender` of Memo) to equal the precompile caller or `tx.origin`. A contract caller is neither, so `callFrom` reverts and the entire call reverts without raising `MemoFailed`.
+
+From [`ICallFrom.sol`](../../../contracts/src/call-from/ICallFrom.sol):
+
+> Executes a call to `target` with `data` as if `sender` were the caller.
