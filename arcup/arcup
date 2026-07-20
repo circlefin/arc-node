@@ -262,16 +262,24 @@ version_gt() {
     [ "$1" = "$2" ] && return 1
 
     # Remove 'v' prefix if present
-    local ver1="${1#v}"
-    local ver2="${2#v}"
-    ver1="${ver1%%-*}"
-    ver2="${ver2%%-*}"
+    local v1="${1#v}"
+    local v2="${2#v}"
 
+    # Split into core "major.minor.patch" and prerelease; drop build metadata (+...),
+    # which SemVer ignores for precedence.
+    local core1="${v1%%-*}" pre1=""
+    [ "$v1" = "$core1" ] || pre1="${v1#*-}"
+    local core2="${v2%%-*}" pre2=""
+    [ "$v2" = "$core2" ] || pre2="${v2#*-}"
+    core1="${core1%%+*}"; core2="${core2%%+*}"
+    pre1="${pre1%%+*}"; pre2="${pre2%%+*}"
+
+    local major1 minor1 patch1 major2 minor2 patch2
     IFS=. read -r major1 minor1 patch1 <<EOF
-$ver1
+$core1
 EOF
     IFS=. read -r major2 minor2 patch2 <<EOF
-$ver2
+$core2
 EOF
 
     [ "$major1" -gt "$major2" ] && return 0
@@ -281,6 +289,35 @@ EOF
     [ "$patch1" -gt "$patch2" ] && return 0
     [ "$patch1" -lt "$patch2" ] && return 1
 
+    # Core versions are equal: apply SemVer prerelease precedence (semver.org section 11).
+    # A version WITHOUT a prerelease outranks the same version WITH one.
+    [ -z "$pre1" ] && [ -z "$pre2" ] && return 1
+    [ -z "$pre1" ] && return 0
+    [ -z "$pre2" ] && return 1
+
+    # Both have a prerelease: compare dot-separated identifiers left to right.
+    local LC_ALL=C IFS=.
+    local -a a1=($pre1) a2=($pre2)
+    local max=${#a1[@]}
+    [ "${#a2[@]}" -gt "$max" ] && max=${#a2[@]}
+    local i id1 id2
+    for ((i = 0; i < max; i++)); do
+        id1="${a1[i]-}"; id2="${a2[i]-}"
+        [ -z "$id1" ] && return 1   # fewer identifiers -> lower precedence
+        [ -z "$id2" ] && return 0   # more identifiers  -> higher precedence
+        [ "$id1" = "$id2" ] && continue
+        if [[ "$id1" =~ ^[0-9]+$ ]] && [[ "$id2" =~ ^[0-9]+$ ]]; then
+            [ "$id1" -gt "$id2" ] && return 0
+            [ "$id1" -lt "$id2" ] && return 1
+        elif [[ "$id1" =~ ^[0-9]+$ ]]; then
+            return 1   # numeric identifiers rank lower than alphanumeric
+        elif [[ "$id2" =~ ^[0-9]+$ ]]; then
+            return 0
+        else
+            [[ "$id1" > "$id2" ]] && return 0
+            [[ "$id1" < "$id2" ]] && return 1
+        fi
+    done
     return 1
 }
 
