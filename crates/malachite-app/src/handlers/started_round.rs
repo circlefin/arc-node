@@ -97,6 +97,15 @@ async fn on_started_round(
     assert!(round != Round::Nil, "Round cannot be Nil");
     assert!(round >= state.current_round, "Round cannot go backwards");
 
+    record_missed_rounds(
+        state.metrics(),
+        &state.ctx.proposer_selector,
+        state.validator_set(),
+        height,
+        state.current_round,
+        round,
+    );
+
     state.current_round = round;
     state.current_proposer = Some(proposer);
 
@@ -111,6 +120,44 @@ async fn on_started_round(
         state.metrics(),
     )
     .await
+}
+
+/// Increments the `consensus_round_missed` counter once for every round that was
+/// started but skipped over between `prev_round` and `new_round`, attributing each
+/// skipped round to the validator that round-robin would have made its proposer.
+///
+/// `prev_round` is the height's previously started round (`state.current_round`),
+/// with `Round::Nil` treated as round 0; the skipped rounds are the half-open
+/// range `prev_round..new_round`, so the round that actually started is never
+/// counted as missed.
+///
+/// This is an at-least-once alerting signal, not an exact ledger. On a mid-height
+/// restart `state.current_round` resets to `Round::Nil`, so a replayed
+/// `StartedRound` for a round the node had already advanced past will re-count
+/// rounds that were counted before the restart. The counter therefore never
+/// under-counts missed rounds but may over-count across restarts — acceptable for
+/// the alerting use case it serves.
+fn record_missed_rounds(
+    metrics: &AppMetrics,
+    proposer_selector: &dyn ProposerSelector,
+    validator_set: &ValidatorSet,
+    height: Height,
+    prev_round: Round,
+    new_round: Round,
+) {
+    let mut missed_round = prev_round.or(Round::Some(0));
+
+    while missed_round < new_round {
+        let missed_proposer = proposer_selector
+            .select_proposer(validator_set, height, missed_round)
+            .address;
+
+        warn!(%missed_proposer, %height, %missed_round, "Consensus round missed");
+
+        metrics.inc_consensus_round_missed(missed_proposer);
+
+        missed_round = missed_round.increment();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -371,6 +418,110 @@ mod tests {
         .await
         .unwrap();
         (store, dir)
+    }
+
+    #[test]
+    fn record_missed_rounds_counts_each_skipped_round() {
+        // Advancing from a fresh height (previous round Nil) straight to round 3
+        // means rounds 0, 1 and 2 were started but never decided: three missed
+        // rounds, each attributed to that round's round-robin proposer. The round
+        // that actually started (3) is not itself a miss.
+        let keys: Vec<PrivateKey> = (0..4)
+            .map(|_| PrivateKey::generate(rand::rngs::OsRng))
+            .collect();
+        let validator_set =
+            ValidatorSet::new(keys.iter().map(|k| Validator::new(k.public_key(), 1)));
+        let selector = RoundRobin;
+        let height = Height::new(1);
+        let metrics = AppMetrics::default();
+
+        record_missed_rounds(
+            &metrics,
+            &selector,
+            &validator_set,
+            height,
+            Round::Nil,
+            Round::new(3),
+        );
+
+        // At height 1 the round-robin index is `round % 4`, so rounds 0..=3 map to
+        // four distinct proposers; assert exactly one increment per skipped round.
+        for missed in [Round::new(0), Round::new(1), Round::new(2)] {
+            let proposer = selector
+                .select_proposer(&validator_set, height, missed)
+                .address;
+            assert_eq!(
+                metrics.get_consensus_round_missed_count(proposer),
+                1,
+                "round {missed} should be counted once against its proposer",
+            );
+        }
+
+        let started = selector
+            .select_proposer(&validator_set, height, Round::new(3))
+            .address;
+        assert_eq!(
+            metrics.get_consensus_round_missed_count(started),
+            0,
+            "the round that actually started is not a missed round",
+        );
+    }
+
+    #[test]
+    fn record_missed_rounds_starting_round_zero_is_noop() {
+        // Starting round 0 of a fresh height (previous round Nil) skips nothing.
+        let signing_key = PrivateKey::generate(rand::rngs::OsRng);
+        let validator_set = ValidatorSet::new(vec![Validator::new(signing_key.public_key(), 1)]);
+        let selector = RoundRobin;
+        let height = Height::new(1);
+        let metrics = AppMetrics::default();
+
+        record_missed_rounds(
+            &metrics,
+            &selector,
+            &validator_set,
+            height,
+            Round::Nil,
+            Round::new(0),
+        );
+
+        let proposer = selector
+            .select_proposer(&validator_set, height, Round::new(0))
+            .address;
+        assert_eq!(
+            metrics.get_consensus_round_missed_count(proposer),
+            0,
+            "no round is skipped when starting at round 0",
+        );
+    }
+
+    #[test]
+    fn record_missed_rounds_same_round_is_noop() {
+        // prev_round == new_round exercises the `missed_round < new_round` loop
+        // boundary: re-entering the current round counts nothing.
+        let signing_key = PrivateKey::generate(rand::rngs::OsRng);
+        let validator_set = ValidatorSet::new(vec![Validator::new(signing_key.public_key(), 1)]);
+        let selector = RoundRobin;
+        let height = Height::new(1);
+        let metrics = AppMetrics::default();
+
+        record_missed_rounds(
+            &metrics,
+            &selector,
+            &validator_set,
+            height,
+            Round::new(2),
+            Round::new(2),
+        );
+
+        let proposer = selector
+            .select_proposer(&validator_set, height, Round::new(2))
+            .address;
+        assert_eq!(
+            metrics.get_consensus_round_missed_count(proposer),
+            0,
+            "re-entering the same round is not a miss",
+        );
     }
 
     #[tokio::test]

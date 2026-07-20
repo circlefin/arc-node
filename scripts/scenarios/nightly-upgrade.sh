@@ -31,7 +31,7 @@ echo "Repository root: $REPO_ROOT"
 SCENARIO="${1:-crates/quake/scenarios/nightly-upgrade.toml}"
 LOAD_DURATION="${2:-90}"
 LOAD_RATE="${3:-100}"
-NEXT_HARDFORK_NAME="${4:-zero6}"
+NEXT_HARDFORK_NAME="${4:-zero8}"
 UPGRADE_TO_HARDFORK_BLOCKS=60      # block-based hardfork: activate this many blocks ahead
 UPGRADE_TO_HARDFORK_SECONDS=60     # timestamp-based hardfork: activate this many seconds ahead
 UPGRADE_TO_OSAKA_SECONDS=300       # osakaTime is always timestamp-patched; activate this many seconds ahead

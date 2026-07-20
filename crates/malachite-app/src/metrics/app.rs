@@ -92,6 +92,18 @@ pub struct Inner {
     /// Time taken for each Engine API call
     engine_api_time: Family<EngineApiLabel, Histogram>,
 
+    /// Time taken to serve RPC requests
+    rpc_request_time: Family<RpcEndpointLabel, Histogram>,
+
+    /// Number of app requests rejected because the app request channel was full
+    app_request_full_count: Family<AppRequestLabel, Counter>,
+
+    /// Time app requests spend waiting in the app request channel
+    app_request_queue_time: Family<AppRequestLabel, Histogram>,
+
+    /// Time taken to process app requests
+    app_request_process_time: Family<AppRequestLabel, Histogram>,
+
     /// The number of times the consensus height has been restarted
     height_restart_count: Counter,
 
@@ -110,6 +122,9 @@ pub struct Inner {
 
     /// Number of blocks replayed from CL to EL during startup handshake
     handshake_replay_blocks: Gauge<u64, AtomicU64>,
+
+    /// Number of consensus rounds that failed to decide before advancing to the next round
+    consensus_round_missed: Family<RoundMissedLabel, Counter>,
 
     /// Internal state recording the previous validator set.
     /// Useful field to manage validators' metrics.
@@ -139,12 +154,23 @@ impl Inner {
             engine_api_time: Family::new_with_constructor(|| {
                 Histogram::new(exponential_buckets_range(0.001, 2.0, 10))
             }),
+            rpc_request_time: Family::new_with_constructor(|| {
+                Histogram::new(exponential_buckets_range(0.001, 2.0, 16))
+            }),
+            app_request_full_count: Family::default(),
+            app_request_queue_time: Family::new_with_constructor(|| {
+                Histogram::new(exponential_buckets_range(0.001, 2.0, 16))
+            }),
+            app_request_process_time: Family::new_with_constructor(|| {
+                Histogram::new(exponential_buckets_range(0.001, 2.0, 16))
+            }),
             height_restart_count: Counter::default(),
             sync_fell_behind_count: Counter::default(),
             invalid_payloads_count: Family::default(),
             pending_proposal_parts_count: Gauge::default(),
             consensus_params: Family::default(),
             handshake_replay_blocks: Gauge::default(),
+            consensus_round_missed: Family::default(),
         }
     }
 }
@@ -251,6 +277,30 @@ impl AppMetrics {
             );
 
             registry.register(
+                "rpc_request_time",
+                "Time taken to serve RPC requests, in seconds",
+                metrics.rpc_request_time.clone(),
+            );
+
+            registry.register(
+                "app_request_full_count",
+                "Number of app requests rejected because the app request channel was full",
+                metrics.app_request_full_count.clone(),
+            );
+
+            registry.register(
+                "app_request_queue_time",
+                "Time app requests spend waiting in the app request channel, in seconds",
+                metrics.app_request_queue_time.clone(),
+            );
+
+            registry.register(
+                "app_request_process_time",
+                "Time taken to process app requests, in seconds",
+                metrics.app_request_process_time.clone(),
+            );
+
+            registry.register(
                 "height_restart_count",
                 "The number of times the consensus height has been restarted",
                 metrics.height_restart_count.clone(),
@@ -278,6 +328,12 @@ impl AppMetrics {
                 "handshake_replay_blocks",
                 "Number of blocks replayed from CL to EL during startup handshake",
                 metrics.handshake_replay_blocks.clone(),
+            );
+
+            registry.register(
+                "consensus_round_missed",
+                "Number of consensus rounds that failed to decide before advancing to the next round",
+                metrics.consensus_round_missed.clone(),
             );
 
             // Register version info as a separate Info metric
@@ -419,6 +475,46 @@ impl AppMetrics {
         })
     }
 
+    /// Start a timer for an RPC request.
+    ///
+    /// The returned guard will record the time taken for the request when dropped.
+    #[must_use]
+    pub fn start_rpc_request_timer(&self, endpoint: &'static str) -> MetricsGuard {
+        MetricsGuard::new(self.clone(), endpoint, |metrics, endpoint, elapsed| {
+            metrics
+                .rpc_request_time
+                .get_or_create(&RpcEndpointLabel::new(endpoint))
+                .observe(elapsed.as_secs_f64());
+        })
+    }
+
+    /// Increment the number of app requests rejected by a full app request channel.
+    pub fn inc_app_request_full_count(&self, request: &'static str) {
+        self.app_request_full_count
+            .get_or_create(&AppRequestLabel::new(request))
+            .inc();
+    }
+
+    /// Observe the time an app request spent waiting in the app request channel.
+    pub fn observe_app_request_queue_time(&self, request: &'static str, seconds: f64) {
+        self.app_request_queue_time
+            .get_or_create(&AppRequestLabel::new(request))
+            .observe(seconds);
+    }
+
+    /// Start a timer for app request processing.
+    ///
+    /// The returned guard will record processing time when dropped.
+    #[must_use]
+    pub fn start_app_request_process_timer(&self, request: &'static str) -> MetricsGuard {
+        MetricsGuard::new(self.clone(), request, |metrics, request, elapsed| {
+            metrics
+                .app_request_process_time
+                .get_or_create(&AppRequestLabel::new(request))
+                .observe(elapsed.as_secs_f64());
+        })
+    }
+
     /// Increment the number of times the consensus height has been restarted
     pub fn inc_height_restart_count(&self) {
         self.height_restart_count.inc();
@@ -468,6 +564,21 @@ impl AppMetrics {
     pub fn get_handshake_replay_blocks(&self) -> u64 {
         self.handshake_replay_blocks.get()
     }
+
+    /// Record that a consensus round failed to decide before advancing.
+    pub fn inc_consensus_round_missed(&self, proposer: Address) {
+        self.consensus_round_missed
+            .get_or_create(&RoundMissedLabel::new(proposer))
+            .inc();
+    }
+
+    /// Total number of missed consensus rounds since start.
+    #[cfg(test)]
+    pub fn get_consensus_round_missed_count(&self, proposer: Address) -> u64 {
+        self.consensus_round_missed
+            .get_or_create(&RoundMissedLabel::new(proposer))
+            .get()
+    }
 }
 
 impl Default for AppMetrics {
@@ -505,6 +616,19 @@ impl AddressLabel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RoundMissedLabel {
+    proposer: AsLabelValue<Address>,
+}
+
+impl RoundMissedLabel {
+    fn new(proposer: Address) -> Self {
+        Self {
+            proposer: AsLabelValue(proposer),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ProcessMsgLabel {
     msg: &'static str,
@@ -524,6 +648,28 @@ struct EngineApiLabel {
 impl EngineApiLabel {
     fn new(api: &'static str) -> Self {
         Self { api }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RpcEndpointLabel {
+    endpoint: &'static str,
+}
+
+impl RpcEndpointLabel {
+    fn new(endpoint: &'static str) -> Self {
+        Self { endpoint }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct AppRequestLabel {
+    request: &'static str,
+}
+
+impl AppRequestLabel {
+    fn new(request: &'static str) -> Self {
+        Self { request }
     }
 }
 
@@ -640,5 +786,17 @@ mod tests {
             !buf.contains("0x"),
             "Metrics should not contain 0x prefix: {buf}"
         );
+    }
+
+    #[test]
+    fn test_consensus_round_missed_counter() {
+        let metrics = AppMetrics::new();
+        let proposer = Address::new([0xAA; 20]);
+
+        metrics.inc_consensus_round_missed(proposer);
+        metrics.inc_consensus_round_missed(proposer);
+        metrics.inc_consensus_round_missed(proposer);
+
+        assert_eq!(metrics.get_consensus_round_missed_count(proposer), 3);
     }
 }

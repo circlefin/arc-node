@@ -10,7 +10,7 @@ image_cl="${IMAGE_REGISTRY_URL}/arc-consensus:latest"
 image_el="${IMAGE_REGISTRY_URL}/arc-execution:latest"
 
 # Set the execution layer initial hardfork to the highest version supported by the image.
-el_init_hardfork="zero4"
+el_init_hardfork="zero7"
 
 # Upgrade versions (what we upgrade to during the test)
 image_cl_upgrade="arc_consensus:latest"

@@ -28,25 +28,97 @@ use malachitebft_app_channel::app::types::core::Round;
 use crate::streaming;
 
 use arc_consensus_types::{
-    Address, AlloyAddress, ArcContext, BlockHash, ChainId, Config, ConsensusParams, ConsensusSpec,
-    Height, NetworkId, ValidatorSet,
+    signing::PublicKey, Address, AlloyAddress, ArcContext, BlockHash, ChainId, Config,
+    ConsensusParams, ConsensusSpec, Height, NetworkId, ValidatorSet,
 };
 use arc_eth_engine::json_structures::ExecutionBlock;
 use arc_eth_engine::persistence_meter::{NoopPersistenceMeter, PersistenceMeter};
 use arc_signer::ArcSigningProvider;
 use malachitebft_core_types::HeightParams;
 
-use crate::block::ConsensusBlock;
 use crate::env_config::EnvConfig;
 use crate::metrics::app::AppMetrics;
 use crate::node::ConsensusIdentity;
 use crate::request::Status;
 use crate::stats::Stats;
-use crate::store::repositories::UndecidedBlocksRepository;
 use crate::store::Store;
 use crate::streaming::PartStreamsMap;
 use crate::utils::sync_state::SyncState;
 use arc_consensus_types::proposal_monitor::ProposalMonitor;
+
+/// A snapshot of the volatile consensus state fields needed to serve status queries.
+///
+/// This is published via a `tokio::sync::watch` channel after each consensus message,
+/// so that the app-request task can read it without blocking the consensus loop.
+///
+/// The snapshot is eventually consistent with `State`: it is republished after the
+/// consensus loop finishes handling a message, so a reader may observe a snapshot
+/// that is up to one consensus-message stale. Fields derived from it (e.g. the
+/// `(height, round)` used to query `get_undecided_blocks`) inherit that staleness.
+/// This is acceptable for the `/status` RPC — strict freshness would require
+/// re-coupling the request handler to the consensus loop.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatusSnapshot {
+    pub height: Height,
+    pub round: Round,
+    pub proposer: Option<Address>,
+    pub address: Address,
+    pub public_key: PublicKey,
+    pub previous_block: Option<ExecutionBlock>,
+    pub validator_set: ValidatorSet,
+    pub sync_state: SyncState,
+}
+
+impl StatusSnapshot {
+    /// Build the full `Status` response from this snapshot plus live DB/stats queries.
+    pub async fn get_status(&self, store: &Store, stats: &Stats) -> eyre::Result<Status> {
+        let undecided_blocks_count = store
+            .get_undecided_blocks(self.height, self.round)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "Failed to get undecided blocks for height {} and round {} from the state",
+                    self.height, self.round,
+                )
+            })?
+            .len();
+
+        let db_latest_height = store
+            .max_height()
+            .await
+            .wrap_err("Failed to get the latest height from the state")?
+            .unwrap_or_default();
+
+        let db_earliest_height = store
+            .min_height()
+            .await
+            .wrap_err("Failed to get earliest height from the state")?
+            .unwrap_or_default();
+
+        let pending_proposal_parts = store
+            .get_pending_proposal_parts_counts()
+            .await
+            .wrap_err("Failed to get pending proposal parts counts from the state")?;
+
+        Ok(Status {
+            height: self.height,
+            round: self.round,
+            address: self.address,
+            public_key: self.public_key,
+            proposer: self.proposer,
+            // elapsed() is always <= time since epoch, so this won't underflow
+            #[allow(clippy::arithmetic_side_effects)]
+            height_start_time: SystemTime::now() - stats.height_started().elapsed(),
+            prev_payload_hash: self.previous_block.map(|b| b.block_hash),
+            db_latest_height,
+            db_earliest_height,
+            undecided_blocks_count,
+            pending_proposal_parts,
+            validator_set: self.validator_set.clone(),
+            sync_state: self.sync_state,
+        })
+    }
+}
 
 /// Information needed to start the next height after a decision is reached.
 #[derive(Debug)]
@@ -386,69 +458,18 @@ impl State {
         limit
     }
 
-    /// Return important current information.
-    pub async fn get_status(&self) -> eyre::Result<Status> {
-        let undecided_blocks_count = self
-            .get_undecided_blocks(self.current_height, self.current_round)
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to get undecided blocks for height {} and round {} from the state",
-                    self.current_height, self.current_round,
-                )
-            })?
-            .len();
-
-        let pending_proposal_parts = self
-            .store
-            .get_pending_proposal_parts_counts()
-            .await
-            .wrap_err("Failed to get pending proposal parts counts from the state")?;
-
-        Ok(Status {
+    /// Create a snapshot of the volatile consensus state fields.
+    pub fn status_snapshot(&self) -> StatusSnapshot {
+        StatusSnapshot {
             height: self.current_height,
             round: self.current_round,
+            proposer: self.current_proposer,
             address: self.address(),
             public_key: *self.identity.public_key(),
-            proposer: self.current_proposer,
-            // elapsed() is always <= time since epoch, so this won't underflow
-            #[allow(clippy::arithmetic_side_effects)]
-            height_start_time: SystemTime::now() - self.stats.height_started().elapsed(),
-            prev_payload_hash: self.previous_block.map(|b| b.block_hash),
-            db_latest_height: self
-                .store()
-                .max_height()
-                .await
-                .wrap_err("Failed to get the latest height from the state")?
-                .unwrap_or_default(),
-            db_earliest_height: self
-                .store()
-                .min_height()
-                .await
-                .wrap_err("Failed to get earliest height from the state")?
-                .unwrap_or_default(),
-            undecided_blocks_count,
-            pending_proposal_parts,
-            validator_set: self.validator_set().to_owned(),
+            previous_block: self.previous_block,
+            validator_set: self.validator_set().clone(),
             sync_state: self.sync_state,
-        })
-    }
-
-    /// Return unit type. Used to check the app is active.
-    pub fn get_health(&self) {}
-
-    /// Retrieves all undecided blocks at the given height and round.
-    pub async fn get_undecided_blocks(
-        &self,
-        height: Height,
-        round: Round,
-    ) -> eyre::Result<Vec<ConsensusBlock>> {
-        self.store
-            .get_by_round(height, round)
-            .await
-            .wrap_err_with(|| {
-                format!("Failed to get undecided blocks for height {height} and round {round} from the database")
-            })
+        }
     }
 
     /// Move to the next height, updating the previous block, validator set, and consensus params.

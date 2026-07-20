@@ -16,19 +16,24 @@
 
 use eyre::{eyre, Context as _};
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use malachitebft_app_channel::{AppMsg, Channels};
 use malachitebft_core_types::utils::height::DisplayRange;
-use malachitebft_core_types::Context;
 
+use arc_consensus_types::proposer::{ProposerSelector, RoundRobin};
 use arc_consensus_types::{ArcContext, StoredCommitCertificate};
 use arc_eth_engine::engine::Engine;
 
 use crate::handlers::*;
+use crate::metrics::AppMetrics;
 use crate::request::{AppRequest, CommitCertificateInfo};
-use crate::state::State;
+use crate::state::{State, StatusSnapshot};
+use crate::stats::Stats;
+use crate::store::Store;
 
 pub async fn run(
     mut state: State,
@@ -41,11 +46,36 @@ pub async fn run(
         warn!("Consensus configured to halt at block height: {halt_height}");
     }
 
+    let (status_tx, status_rx) = watch::channel(state.status_snapshot());
+
+    let ctx = AppRequestContext {
+        store: state.store().clone(),
+        engine: engine.clone(),
+        stats: state.stats().clone(),
+        metrics: state.metrics().clone(),
+        proposer_selector: state.ctx.proposer_selector,
+        status_rx,
+    };
+
+    let mut app_req_task: JoinHandle<eyre::Result<Never>> =
+        tokio::spawn(process_app_requests(rx_app_req, ctx));
+
     let result = cancel_token
-        .run_until_cancelled_owned(go(&mut state, channels, &engine, rx_app_req))
+        .run_until_cancelled_owned(go(
+            &mut state,
+            channels,
+            &engine,
+            status_tx,
+            &mut app_req_task,
+        ))
         .await;
 
+    // Always abort the app-request task, including on graceful cancellation
+    // where `go` is dropped at an await point and would otherwise detach it.
+    app_req_task.abort();
+
     let result = match result {
+        Some(Ok(never)) => match never {},
         Some(Err(e)) => {
             error!("🔴 Error in application: {e:#}");
             error!("🔴 Shutting down");
@@ -68,10 +98,42 @@ pub async fn run(
 /// Used to indicate that the function never returns normally.
 enum Never {}
 
+/// Context shared with the spawned app-request processing task.
+///
+/// All fields are cheap to clone (`Arc`-based or `Copy`).
+struct AppRequestContext {
+    store: Store,
+    engine: Engine,
+    stats: Stats,
+    metrics: AppMetrics,
+    proposer_selector: RoundRobin,
+    status_rx: watch::Receiver<StatusSnapshot>,
+}
+
+/// Runs in a dedicated tokio task, processing app requests concurrently
+/// with the consensus event loop.
+async fn process_app_requests(
+    mut rx: Receiver<AppRequest>,
+    ctx: AppRequestContext,
+) -> eyre::Result<Never> {
+    loop {
+        match rx.recv().await {
+            Some(req) => {
+                if let Err(e) = handle_app_request(req, &ctx).await {
+                    error!("🔴 Error handling application request: {e:#}");
+                }
+            }
+            None => {
+                return Err(eyre!("Application request channel closed unexpectedly"));
+            }
+        }
+    }
+}
+
 /// The main event loop of the application.
 ///
-/// It listens for messages from consensus and application requests,
-/// and dispatches them to the appropriate handlers.
+/// It listens for messages from consensus and monitors the app-request task.
+/// App requests are processed in a separate task so they don't block consensus.
 ///
 /// # Errors
 /// Returns an error if handling a message fails or one of the channels is closed unexpectedly.
@@ -81,7 +143,8 @@ async fn go(
     state: &mut State,
     mut channels: Channels<ArcContext>,
     engine: &Engine,
-    mut rx_app_req: Receiver<AppRequest>,
+    status_tx: watch::Sender<StatusSnapshot>,
+    app_req_task: &mut JoinHandle<eyre::Result<Never>>,
 ) -> eyre::Result<Never> {
     loop {
         tokio::select! {
@@ -92,25 +155,33 @@ async fn go(
                     // Abort on error to shut down the application.
                     handle_consensus(msg, state, &mut channels, engine).await
                         .wrap_err("Error handling consensus message")?;
+
+                    // Skip the publish when nothing changed: most consensus messages
+                    // (sync queries, restream requests, vote-extension hooks) leave the
+                    // snapshot untouched, so there is no point updating the watch.
+                    status_tx.send_if_modified(|current| {
+                        let new = state.status_snapshot();
+                        if *current != new {
+                            *current = new;
+                            true
+                        } else {
+                            false
+                        }
+                    });
                 },
                 None => {
                     return Err(eyre!("Consensus channel closed unexpectedly"));
                 }
             },
 
-            req = rx_app_req.recv() => match req {
-                Some(req) => {
-                    if let Err(e) = handle_app_request(req, state, engine).await {
-                        error!("🔴 Error handling application request: {e:#}");
-
-                        // We continue processing other requests even if one fails.
-                        continue;
-                    }
-                },
-                None => {
-                    return Err(eyre!("Application request channel closed unexpectedly"));
+            result = &mut *app_req_task => {
+                // The app-request task should run forever; if it exits, propagate the error.
+                match result {
+                    Ok(Ok(never)) => match never {},
+                    Ok(Err(e)) => return Err(e.wrap_err("App request task failed")),
+                    Err(e) => return Err(eyre!("App request task panicked: {e}")),
                 }
-            }
+            },
         }
     }
 }
@@ -302,20 +373,35 @@ async fn handle_consensus(
     Ok(())
 }
 
-#[allow(clippy::unit_arg)]
-async fn handle_app_request(req: AppRequest, state: &State, engine: &Engine) -> eyre::Result<()> {
+async fn handle_app_request(req: AppRequest, ctx: &AppRequestContext) -> eyre::Result<()> {
     match req {
-        AppRequest::GetCertificate(height, reply) => {
-            let result = state
-                .store()
-                .get_certificate(height)
-                .await
-                .wrap_err_with(|| {
-                    format!("GetCertificate: Failed to get certificate for height {height:?}")
-                })?;
+        AppRequest::GetCertificate {
+            height,
+            enqueued_at,
+            reply,
+        } => {
+            ctx.metrics.observe_app_request_queue_time(
+                "GetCertificate",
+                enqueued_at.elapsed().as_secs_f64(),
+            );
+            let _guard = ctx
+                .metrics
+                .start_app_request_process_timer("GetCertificate");
+
+            let result = ctx.store.get_certificate(height).await.wrap_err_with(|| {
+                format!("GetCertificate: Failed to get certificate for height {height:?}")
+            })?;
 
             let info = match result {
-                Some(certificate) => get_certificate_info(&state.ctx, engine, certificate).await,
+                Some(certificate) => {
+                    get_certificate_info(
+                        ctx.proposer_selector,
+                        &ctx.engine,
+                        &ctx.metrics,
+                        certificate,
+                    )
+                    .await
+                }
                 None => None,
             };
 
@@ -325,7 +411,7 @@ async fn handle_app_request(req: AppRequest, state: &State, engine: &Engine) -> 
         }
 
         AppRequest::GetMisbehaviorEvidence(height, reply) => {
-            let evidence = state.store().get_misbehavior_evidence(height).await.wrap_err_with(|| {
+            let evidence = ctx.store.get_misbehavior_evidence(height).await.wrap_err_with(|| {
                 format!(
                     "GetMisbehaviorEvidence: Failed to get misbehavior evidence for height {height:?}",
                 )
@@ -336,8 +422,7 @@ async fn handle_app_request(req: AppRequest, state: &State, engine: &Engine) -> 
         }
 
         AppRequest::GetProposalMonitorData(height, reply) => {
-            let data = state
-                .store()
+            let data = ctx.store
                 .get_proposal_monitor_data(height)
                 .await
                 .wrap_err_with(|| {
@@ -352,7 +437,7 @@ async fn handle_app_request(req: AppRequest, state: &State, engine: &Engine) -> 
         }
 
         AppRequest::GetInvalidPayloads(height, reply) => {
-            let payloads = state.store().get_invalid_payloads(height).await.wrap_err_with(|| {
+            let payloads = ctx.store.get_invalid_payloads(height).await.wrap_err_with(|| {
                 format!(
                     "Failed to get invalid payloads for height {:?} in response to a GetInvalidPayloads request", height,
                 )
@@ -363,8 +448,9 @@ async fn handle_app_request(req: AppRequest, state: &State, engine: &Engine) -> 
         }
 
         AppRequest::GetStatus(reply) => {
-            let status = state
-                .get_status()
+            let snapshot = ctx.status_rx.borrow().clone();
+            let status = snapshot
+                .get_status(&ctx.store, &ctx.stats)
                 .await
                 .wrap_err("GetStatus: Failed to get the current status")?;
 
@@ -374,13 +460,14 @@ async fn handle_app_request(req: AppRequest, state: &State, engine: &Engine) -> 
         }
 
         AppRequest::GetHealth(reply) => {
-            if let Err(e) = reply.send(state.get_health()) {
+            if let Err(e) = reply.send(()) {
                 error!("GetHealth: Failed to reply: {e:?}");
             }
         }
 
         AppRequest::GetSyncState(reply) => {
-            if let Err(e) = reply.send(state.sync_state) {
+            let sync_state = ctx.status_rx.borrow().sync_state;
+            if let Err(e) = reply.send(sync_state) {
                 error!("GetSyncState: Failed to reply: {e:?}");
             }
         }
@@ -390,27 +477,39 @@ async fn handle_app_request(req: AppRequest, state: &State, engine: &Engine) -> 
 }
 
 async fn get_certificate_info(
-    ctx: &ArcContext,
+    proposer_selector: impl ProposerSelector,
     engine: &Engine,
+    metrics: &AppMetrics,
     stored: StoredCommitCertificate,
 ) -> Option<CommitCertificateInfo> {
+    if let Some(proposer) = stored.proposer {
+        return Some(CommitCertificateInfo {
+            certificate: stored.certificate,
+            certificate_type: stored.certificate_type,
+            proposer,
+        });
+    }
+
     // The validator set that signed the certificate is the one *before* executing that block,
     // since the block itself could contain validator set changes.
     let prev_height = stored.certificate.height.as_u64().saturating_sub(1);
-    let validator_set = engine
-        .eth
-        .get_active_validator_set(prev_height)
-        .await
-        .ok()?;
+    let validator_set = {
+        let _guard =
+            metrics.start_engine_api_timer("get_certificate_info.get_active_validator_set");
+        engine
+            .eth
+            .get_active_validator_set(prev_height)
+            .await
+            .ok()?
+    };
 
-    let proposer = stored.proposer.unwrap_or_else(|| {
-        ctx.select_proposer(
+    let proposer = proposer_selector
+        .select_proposer(
             &validator_set,
             stored.certificate.height,
             stored.certificate.round,
         )
-        .address
-    });
+        .address;
 
     Some(CommitCertificateInfo {
         certificate: stored.certificate,
@@ -423,13 +522,17 @@ async fn get_certificate_info(
 mod tests {
     use super::*;
 
+    use arc_consensus_types::signing::PrivateKey;
     use arc_consensus_types::{
-        Address, BlockHash, CommitCertificate, CommitCertificateType, Height, Round, ValueId,
+        Address, BlockHash, CommitCertificate, CommitCertificateType, Height, Round, Validator,
+        ValidatorSet, ValueId,
     };
     use arc_eth_engine::engine::{MockEngineAPI, MockEthereumAPI};
     use mockall::predicate::eq;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
-    fn stored_cert(height: u64) -> StoredCommitCertificate {
+    fn stored_cert(height: u64, proposer: Option<Address>) -> StoredCommitCertificate {
         StoredCommitCertificate {
             certificate: CommitCertificate::new(
                 Height::new(height),
@@ -438,53 +541,105 @@ mod tests {
                 vec![],
             ),
             certificate_type: CommitCertificateType::Minimal,
-            // Set so get_certificate_info skips select_proposer (keeps the test focused
-            // on the validator set lookup).
-            proposer: Some(Address::new([0x42; 20])),
+            proposer,
         }
+    }
+
+    fn validator_set() -> ValidatorSet {
+        let mut rng = StdRng::seed_from_u64(0x42);
+        let signing_key = PrivateKey::generate(&mut rng);
+        ValidatorSet::new(vec![Validator::new(signing_key.public_key(), 1)])
+    }
+
+    #[tokio::test]
+    async fn get_certificate_info_uses_stored_proposer_without_validator_set_lookup() {
+        let stored_proposer = Address::new([0x42; 20]);
+        let engine = Engine::new(
+            Box::new(MockEngineAPI::new()),
+            Box::new(MockEthereumAPI::new()),
+        );
+        let metrics = AppMetrics::default();
+        let ctx = ArcContext::default();
+
+        let info = get_certificate_info(
+            ctx.proposer_selector,
+            &engine,
+            &metrics,
+            stored_cert(42, Some(stored_proposer)),
+        )
+        .await
+        .expect("should return Some");
+
+        assert_eq!(info.proposer, stored_proposer);
+        assert_eq!(info.certificate.height, Height::new(42));
     }
 
     /// get_certificate_info must fetch the validator set at `certificate.height - 1` — the
     /// set that signed the certificate, i.e. the state *before* executing the certified block.
     #[tokio::test]
-    async fn get_certificate_info_queries_validator_set_at_prev_height() {
+    async fn get_certificate_info_queries_validator_set_at_prev_height_when_proposer_is_missing() {
         let cert_height = 42u64;
+        let fallback_validator_set = validator_set();
+        let expected_proposer = fallback_validator_set
+            .get_by_index(0)
+            .expect("test validator set is non-empty")
+            .address;
 
         let mut mock_eth = MockEthereumAPI::new();
         mock_eth
             .expect_get_active_validator_set()
             .with(eq(cert_height - 1))
             .once()
-            .returning(|_| Ok(Default::default()));
+            .returning(move |_| Ok(fallback_validator_set.clone()));
 
         let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(mock_eth));
+        let metrics = AppMetrics::default();
         let ctx = ArcContext::default();
 
-        let info = get_certificate_info(&ctx, &engine, stored_cert(cert_height))
-            .await
-            .expect("should return Some");
+        let info = get_certificate_info(
+            ctx.proposer_selector,
+            &engine,
+            &metrics,
+            stored_cert(cert_height, None),
+        )
+        .await
+        .expect("should return Some");
 
         assert_eq!(info.certificate.height, Height::new(cert_height));
+        assert_eq!(info.proposer, expected_proposer);
     }
 
-    /// At genesis (height 0), the saturating subtraction must keep the query at 0 rather
-    /// than underflowing.
+    /// At the first certificate height, the previous-height validator-set lookup
+    /// must query height 0.
     #[tokio::test]
-    async fn get_certificate_info_handles_genesis_height() {
+    async fn get_certificate_info_queries_validator_set_at_zero_for_first_certificate_height() {
+        let fallback_validator_set = validator_set();
+        let expected_proposer = fallback_validator_set
+            .get_by_index(0)
+            .expect("test validator set is non-empty")
+            .address;
+
         let mut mock_eth = MockEthereumAPI::new();
         mock_eth
             .expect_get_active_validator_set()
             .with(eq(0u64))
             .once()
-            .returning(|_| Ok(Default::default()));
+            .returning(move |_| Ok(fallback_validator_set.clone()));
 
         let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(mock_eth));
+        let metrics = AppMetrics::default();
         let ctx = ArcContext::default();
 
-        let info = get_certificate_info(&ctx, &engine, stored_cert(0))
-            .await
-            .expect("should return Some");
+        let info = get_certificate_info(
+            ctx.proposer_selector,
+            &engine,
+            &metrics,
+            stored_cert(1, None),
+        )
+        .await
+        .expect("should return Some");
 
-        assert_eq!(info.certificate.height, Height::new(0));
+        assert_eq!(info.certificate.height, Height::new(1));
+        assert_eq!(info.proposer, expected_proposer);
     }
 }

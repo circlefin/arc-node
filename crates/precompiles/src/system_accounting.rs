@@ -173,6 +173,7 @@ precompile!(run_system_accounting, precompile_input, hardfork_flags; {
                 SYSTEM_ACCOUNTING_ADDRESS,
                 &precompile_input,
                 &gas_counter,
+                hardfork_flags,
             )?;
 
             // Update storage
@@ -631,31 +632,103 @@ mod tests {
         }
     }
 
-    #[test]
-    fn store_gas_values_table_tests() {
-        struct StoreCase {
-            name: &'static str,
-            caller: Address,
-            calldata: Bytes,
-            gas_limit: u64,
-            /// If set, overrides `gas_limit` when Zero6 is active. Needed when
-            /// the Zero6 early-revert penalty pushes required gas above the
-            /// Zero5 limit.
-            zero6_gas_limit: Option<u64>,
-            expected_result: InstructionResult,
-            expected_revert_str: Option<&'static str>,
-            return_data: Option<Bytes>,
-            gas_used: u64,
-            /// If set, overrides `gas_used` for pre-Zero5 hardforks (fixed
-            /// SSTORE cost vs. EIP-2929/EIP-2200 warm/cold pricing).
-            pre_zero5_gas_used: Option<u64>,
-            /// If set, overrides `gas_used` when Zero6 is active (auth reverts
-            /// charge `PRECOMPILE_EARLY_REVERT_GAS_PENALTY`).
-            zero6_gas_used: Option<u64>,
-            target_address: Address,
-            bytecode_address: Address,
+    struct StoreCase {
+        name: &'static str,
+        caller: Address,
+        calldata: Bytes,
+        gas_limit: u64,
+        /// If set, overrides `gas_limit` when Zero6 is active. Needed when
+        /// the Zero6 early-revert penalty pushes required gas above the
+        /// Zero5 limit.
+        zero6_gas_limit: Option<u64>,
+        expected_result: InstructionResult,
+        expected_revert_str: Option<&'static str>,
+        return_data: Option<Bytes>,
+        gas_used: u64,
+        /// If set, overrides `gas_used` for pre-Zero5 hardforks (fixed
+        /// SSTORE cost vs. EIP-2929/EIP-2200 warm/cold pricing).
+        pre_zero5_gas_used: Option<u64>,
+        /// If set, overrides `gas_used` when Zero6 is active (auth reverts
+        /// charge `PRECOMPILE_EARLY_REVERT_GAS_PENALTY`).
+        zero6_gas_used: Option<u64>,
+        target_address: Address,
+        bytecode_address: Address,
+    }
+
+    /// Resolves the expected gas used for a `StoreCase` under the given hardfork flags.
+    fn expected_store_gas_used(tc: &StoreCase, hardfork_flags: ArcHardforkFlags) -> u64 {
+        let base = if hardfork_flags.is_active(ArcHardfork::Zero6) {
+            tc.zero6_gas_used.unwrap_or(tc.gas_used)
+        } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
+            tc.gas_used
+        } else {
+            tc.pre_zero5_gas_used.unwrap_or(tc.gas_used)
+        };
+        // Zero8: a delegatecall rejection charges the uniform early-revert penalty.
+        if hardfork_flags.is_active(ArcHardfork::Zero8)
+            && tc.expected_revert_str == Some(ERR_DELEGATE_CALL_NOT_ALLOWED)
+        {
+            base.saturating_add(PRECOMPILE_EARLY_REVERT_GAS_PENALTY)
+        } else {
+            base
+        }
+    }
+
+    /// Runs one `StoreCase` under a single hardfork combination and asserts the outcome.
+    /// Non-cumulative combinations (Zero6 without Zero5) are skipped.
+    fn run_store_gas_values_case(tc: &StoreCase, hardfork_flags: ArcHardforkFlags) {
+        if hardfork_flags.is_active(ArcHardfork::Zero6)
+            && !hardfork_flags.is_active(ArcHardfork::Zero5)
+        {
+            return;
         }
 
+        let tc_name = format!("{} (hardfork_flags: {:?})", tc.name, hardfork_flags);
+
+        let gas_limit = if hardfork_flags.is_active(ArcHardfork::Zero6) {
+            tc.zero6_gas_limit.unwrap_or(tc.gas_limit)
+        } else {
+            tc.gas_limit
+        };
+        let expected_gas_used = expected_store_gas_used(tc, hardfork_flags);
+
+        let mut ctx = Context::mainnet();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("Unable to load system accounting account");
+
+        let inputs = CallInputs {
+            scheme: CallScheme::Call,
+            target_address: tc.target_address,
+            bytecode_address: tc.bytecode_address,
+            known_bytecode: None,
+            caller: tc.caller,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(tc.calldata.clone()),
+            gas_limit,
+            is_static: false,
+            return_memory_offset: 0..0,
+        };
+
+        let res = call_system_accounting(&mut ctx, &inputs, hardfork_flags)
+            .unwrap()
+            .unwrap();
+        assert_eq!(res.result, tc.expected_result, "{tc_name}");
+
+        if let Some(expected_revert_str) = tc.expected_revert_str {
+            let reason = bytes_to_revert_message(res.output.as_ref()).expect("revert reason");
+            assert_eq!(reason, expected_revert_str, "{tc_name}");
+        }
+
+        if let Some(expected_return) = &tc.return_data {
+            assert_eq!(res.output, *expected_return, "{tc_name}");
+        }
+
+        assert_eq!(res.gas.used(), expected_gas_used, "{tc_name}");
+    }
+
+    #[test]
+    fn store_gas_values_table_tests() {
         let bn_ok = 1024u64;
         let val_ok = GasValues {
             gasUsed: 11,
@@ -816,68 +889,75 @@ mod tests {
 
         for tc in cases {
             for hardfork_flags in ArcHardforkFlags::all_combinations() {
-                // ZeroX hardforks are cumulative; Zero6 implies Zero5.
-                if hardfork_flags.is_active(ArcHardfork::Zero6)
-                    && !hardfork_flags.is_active(ArcHardfork::Zero5)
-                {
-                    continue;
-                }
-
-                let tc_name = format!("{} (hardfork_flags: {:?})", tc.name, hardfork_flags);
-
-                let gas_limit = if hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    tc.zero6_gas_limit.unwrap_or(tc.gas_limit)
-                } else {
-                    tc.gas_limit
-                };
-
-                let expected_gas_used = if hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    tc.zero6_gas_used.unwrap_or(tc.gas_used)
-                } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
-                    tc.gas_used
-                } else {
-                    tc.pre_zero5_gas_used.unwrap_or(tc.gas_used)
-                };
-
-                let mut ctx = Context::mainnet();
-                ctx.journal_mut()
-                    .load_account(SYSTEM_ACCOUNTING_ADDRESS)
-                    .expect("Unable to load system accounting account");
-
-                let inputs = CallInputs {
-                    scheme: CallScheme::Call,
-                    target_address: tc.target_address,
-                    bytecode_address: tc.bytecode_address,
-                    known_bytecode: None,
-                    caller: tc.caller,
-                    value: CallValue::Transfer(U256::ZERO),
-                    input: CallInput::Bytes(tc.calldata.clone()),
-                    gas_limit,
-                    is_static: false,
-                    return_memory_offset: 0..0,
-                };
-
-                let res = call_system_accounting(&mut ctx, &inputs, hardfork_flags)
-                    .unwrap()
-                    .unwrap();
-                // Check result
-                assert_eq!(res.result, tc.expected_result, "{tc_name}");
-
-                // Revert string
-                if let Some(expected_revert_str) = tc.expected_revert_str {
-                    let reason =
-                        bytes_to_revert_message(res.output.as_ref()).expect("revert reason");
-                    assert_eq!(reason, expected_revert_str, "{tc_name}");
-                }
-
-                // Return data
-                if let Some(expected_return) = &tc.return_data {
-                    assert_eq!(res.output, *expected_return, "{tc_name}");
-                }
-                // Gas used
-                assert_eq!(res.gas.used(), expected_gas_used, "{tc_name}");
+                run_store_gas_values_case(tc, hardfork_flags);
             }
         }
+    }
+
+    /// A delegatecall into a stateful precompile is rejected by `check_delegatecall`.
+    /// Under Zero8 the rejection charges the uniform 200-gas early-revert penalty;
+    /// before Zero8 it reverts with no penalty.
+    #[test]
+    fn delegatecall_charges_early_revert_penalty_only_under_zero8() {
+        let calldata = ISystemAccounting::storeGasValuesCall {
+            blockNumber: 1,
+            gasValues: GasValues {
+                gasUsed: 1,
+                gasUsedSmoothed: 2,
+                nextBaseFee: 3,
+            },
+        }
+        .abi_encode();
+
+        let gas_used_for = |hardfork_flags: ArcHardforkFlags| -> u64 {
+            let mut ctx = Context::mainnet();
+            ctx.journal_mut()
+                .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+                .expect("load system accounting account");
+            let inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: SYSTEM_ACCOUNTING_ADDRESS,
+                // bytecode_address != precompile address => delegatecall shape.
+                bytecode_address: address!("0x0000000000000000000000000000000000000123"),
+                known_bytecode: None,
+                caller: ARC_SYSTEM_CALLER,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(calldata.clone().into()),
+                gas_limit: 1_000_000,
+                is_static: false,
+                return_memory_offset: 0..0,
+            };
+            let res = call_system_accounting(&mut ctx, &inputs, hardfork_flags)
+                .unwrap()
+                .unwrap();
+            assert_eq!(res.result, InstructionResult::Revert);
+            assert_eq!(
+                bytes_to_revert_message(res.output.as_ref()).expect("revert reason"),
+                ERR_DELEGATE_CALL_NOT_ALLOWED,
+            );
+            res.gas.used()
+        };
+
+        let pre_zero8 = gas_used_for(ArcHardforkFlags::with(&[
+            ArcHardfork::Zero5,
+            ArcHardfork::Zero6,
+            ArcHardfork::Zero7,
+        ]));
+        let zero8 = gas_used_for(ArcHardforkFlags::with(&[
+            ArcHardfork::Zero5,
+            ArcHardfork::Zero6,
+            ArcHardfork::Zero7,
+            ArcHardfork::Zero8,
+        ]));
+
+        assert_eq!(
+            pre_zero8, 0,
+            "pre-Zero8 delegatecall rejection charges no penalty"
+        );
+        assert_eq!(
+            zero8, PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+            "Zero8 delegatecall rejection charges the 200-gas early-revert penalty",
+        );
     }
 
     #[test]

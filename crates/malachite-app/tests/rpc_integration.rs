@@ -160,7 +160,7 @@ async fn test_commit_endpoint_with_height() {
 
     // Respond to certificate request
     server.expect_app_request(|req| match req {
-        AppRequest::GetCertificate(height, reply) => {
+        AppRequest::GetCertificate { height, reply, .. } => {
             assert_eq!(height, Some(Height::new(42)));
             reply.send(None).ok();
         }
@@ -184,7 +184,7 @@ async fn test_commit_endpoint_without_height() {
 
     // Respond to certificate request
     server.expect_app_request(|req| match req {
-        AppRequest::GetCertificate(height, reply) => {
+        AppRequest::GetCertificate { height, reply, .. } => {
             assert_eq!(height, None);
             reply.send(None).ok();
         }

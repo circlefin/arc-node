@@ -397,6 +397,9 @@ pub fn localdev_with_hardforks(hardforks: &[(ArcHardfork, ForkCondition)]) -> Ar
             ArcHardfork::Zero7 => inner
                 .hardforks
                 .insert(ArcHardfork::Zero7.boxed(), condition),
+            ArcHardfork::Zero8 => inner
+                .hardforks
+                .insert(ArcHardfork::Zero8.boxed(), condition),
         };
     }
 
@@ -951,7 +954,7 @@ mod tests {
             .expect("Failed to parse arc-localdev");
         assert_eq!(spec.chain().id(), LOCALDEV_CHAIN_ID);
         assert_arc_chainspec_evm_hardforks(&spec);
-        assert_eq!(spec.forks_iter().count(), 23);
+        assert_eq!(spec.forks_iter().count(), 24);
         assert!(spec.is_osaka_active_at_timestamp(0));
 
         // verify zero3 hardfork block
@@ -980,12 +983,18 @@ mod tests {
             spec.is_fork_active_at_timestamp(ArcHardfork::Zero7, 0),
             "Zero7 should be active at timestamp 0 in hardfork.rs, and load by chainspec"
         );
+        // Zero8 activates by timestamp (Arc convention from Zero7 onward).
+        assert!(
+            spec.is_fork_active_at_timestamp(ArcHardfork::Zero8, 0),
+            "Zero8 should be active at timestamp 0 in hardfork.rs, and load by chainspec"
+        );
         let flags = spec.get_hardfork_flags(0, 0);
         assert!(flags.is_active(ArcHardfork::Zero3));
         assert!(flags.is_active(ArcHardfork::Zero4));
         assert!(flags.is_active(ArcHardfork::Zero5));
         assert!(flags.is_active(ArcHardfork::Zero6));
         assert!(flags.is_active(ArcHardfork::Zero7));
+        assert!(flags.is_active(ArcHardfork::Zero8));
     }
 
     #[test]
@@ -994,7 +1003,7 @@ mod tests {
         assert_eq!(spec.chain().id(), LOCALDEV_CHAIN_ID);
         assert_arc_chainspec_evm_hardforks(&spec);
         assert!(spec.is_osaka_active_at_timestamp(0));
-        assert_eq!(spec.forks_iter().count(), 23);
+        assert_eq!(spec.forks_iter().count(), 24);
 
         // verify zero3 hardfork block
         assert!(!spec.is_fork_active_at_timestamp(ArcHardfork::Zero3, 1762732800));
@@ -1011,12 +1020,16 @@ mod tests {
         // Zero7 activates by timestamp (Arc convention from Zero7 onward).
         assert!(spec.is_fork_active_at_timestamp(ArcHardfork::Zero7, 0));
         assert!(!spec.is_fork_active_at_block(ArcHardfork::Zero7, 0));
+        // Zero8 activates by timestamp (Arc convention from Zero7 onward).
+        assert!(spec.is_fork_active_at_timestamp(ArcHardfork::Zero8, 0));
+        assert!(!spec.is_fork_active_at_block(ArcHardfork::Zero8, 0));
         let flags = spec.get_hardfork_flags(0, 0);
         assert!(flags.is_active(ArcHardfork::Zero3));
         assert!(flags.is_active(ArcHardfork::Zero4));
         assert!(flags.is_active(ArcHardfork::Zero5));
         assert!(flags.is_active(ArcHardfork::Zero6));
         assert!(flags.is_active(ArcHardfork::Zero7));
+        assert!(flags.is_active(ArcHardfork::Zero8));
         assert_eq!(
             spec.display_hardforks().to_string(),
             r#"Pre-merge hard forks (block based):
@@ -1044,7 +1057,8 @@ Post-merge hard forks (timestamp based):
 - Cancun                           @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Prague                           @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Osaka                            @0          blob: (target: 6, max: 9, fraction: 5007716)
-- Zero7                            @0          blob: (target: 6, max: 9, fraction: 5007716)"#
+- Zero7                            @0          blob: (target: 6, max: 9, fraction: 5007716)
+- Zero8                            @0          blob: (target: 6, max: 9, fraction: 5007716)"#
         );
     }
 
@@ -1167,6 +1181,7 @@ Post-merge hard forks (timestamp based):
             (ArcHardfork::Zero5, true),
             (ArcHardfork::Zero6, true),
             (ArcHardfork::Zero7, false), // deferred — not active at launch
+            (ArcHardfork::Zero8, false), // deferred — not active at launch
         ];
         let paths: [(&str, &ArcChainSpec); 3] = [
             ("parser", &from_parser),

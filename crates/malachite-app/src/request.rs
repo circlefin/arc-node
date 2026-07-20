@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
@@ -80,12 +80,14 @@ pub struct CommitCertificateInfo {
 #[allow(clippy::enum_variant_names)]
 pub enum AppRequest {
     /// Retrieves a commit certificate at the given height
-    GetCertificate(
+    GetCertificate {
         /// The height to get the certificate for. If None, get the latest certificate.
-        Option<Height>,
+        height: Option<Height>,
+        /// The time the request was enqueued.
+        enqueued_at: Instant,
         /// The channel to send the certificate back on.
-        oneshot::Sender<Option<CommitCertificateInfo>>,
-    ),
+        reply: oneshot::Sender<Option<CommitCertificateInfo>>,
+    },
     /// Retrieves misbehavior evidence at the given height
     GetMisbehaviorEvidence(
         /// The height to get the evidence for. If None, use the latest height.
@@ -127,7 +129,11 @@ impl AppRequest {
     ) -> Result<Option<CommitCertificateInfo>, AppRequestError> {
         let (tx, rx) = oneshot::channel();
         tx_app_req
-            .try_send(Self::GetCertificate(height, tx))
+            .try_send(Self::GetCertificate {
+                height,
+                enqueued_at: Instant::now(),
+                reply: tx,
+            })
             .inspect_err(|e| error!("Failed to send GetCertificate request to consensus: {e}"))?;
 
         let cert = rx.await.inspect_err(|e| {

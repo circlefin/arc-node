@@ -321,7 +321,7 @@ services:
     environment:
       <<: *aws-base
       APP_ENV: ${APP_ENV:-dev}
-      APP_PROVIDER_ENCLAVE_CLIENT_BASEURL: http://{{name}}-signer-enclave:10350
+      APP_PROVIDER_ENCLAVE_CLIENT_BASEURL: {{name}}-signer-enclave:10350
       APP_PROVIDER_SECRETS_LOCALSTACK_ENABLED: false
       APP_SERVICE_SIGNER_KEYID: ${APP_SERVICE_SIGNER{{inc @index}}_KEYID:-dev/arc/remote-signer/{{remote_signer}}}
       APP_PROVIDER_AWSKMS_ARNS: ${APP_PROVIDER_AWSKMS_ARNS}
@@ -356,7 +356,7 @@ services:
       memlock: -1
     entrypoint: ["/usr/local/circle/run_enclave.dev.sh"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -f --insecure http://localhost:10350/ping"]
+      test: ["CMD", "grpc_health_probe", "-addr=localhost:10350"]
       <<: *health-retry
   {{/if}}
 
