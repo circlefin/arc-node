@@ -15,11 +15,11 @@ Consult the table below to confirm which version to run for each network.
 
 | Network     | Version |
 |-------------|---------|
-| Arc Testnet | v0.7.2  |
+| Arc Testnet | v0.7.3  |
 
 
 > [!IMPORTANT]
-> **Breaking changes for DApp developers.** Upgrading your target node to v0.7.2 affects
+> **Breaking changes for DApp developers.** Upgrading your target node from v0.6.0 to v0.7.3 affects
 > applications, not just node operators:
 >
 > - `eth_call` / `eth_estimateGas` gas cap default lowered from 50M to 30M. Calls or
@@ -78,7 +78,7 @@ source "$ARC_HOME/env"
 To install a specific version, run `arcup` with `--install`:
 
 ```sh
-arcup --install v0.7.2
+arcup --install v0.7.3
 ```
 
 Next, verify that the three Arc binaries are installed:
