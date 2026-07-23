@@ -27,6 +27,9 @@ import {IMemo} from "./IMemo.sol";
  *      The callFrom precompile enforces its own allowlist — this contract does not add access control.
  * @dev EOA-only: contract callers hit the callFrom sender-spoofing constraint
  *      and the call reverts without raising {MemoFailed}. See {IMemo}.
+ * @dev Entry point is {memo} only (`memo(address,bytes,bytes32,bytes)`). There is
+ *      no `callWithMemo`. Wrong selectors cause empty reverts during
+ *      `eth_estimateGas` / `eth_call` and on-chain execution. See {IMemo}.
  */
 contract Memo is IMemo {
     /// @inheritdoc IMemo

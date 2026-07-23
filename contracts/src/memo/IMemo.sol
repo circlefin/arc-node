@@ -25,6 +25,16 @@ pragma solidity ^0.8.29;
 ///
 ///      Target-contract reverts (callFrom returning `success=false`) are
 ///      re-raised as {MemoFailed} with the target's revert bytes.
+///
+/// @dev Canonical entry point is {memo} with signature
+///      `memo(address,bytes,bytes32,bytes)`. There is no `callWithMemo` function.
+///      Calling a wrong selector reverts with empty data and will also make
+///      `eth_estimateGas` / `eth_call` fail — that is an ABI mismatch, not a
+///      CallFrom simulation bug. Pass an EOA as `from` when estimating.
+///
+/// @dev {memo} is state-changing (`memoIndex++`). STATICCALL into Memo is
+///      rejected; ordinary `eth_call` / `eth_estimateGas` (non-static top-level
+///      simulation) succeeds with the correct ABI.
 interface IMemo {
     /// @notice Thrown when the call via callFrom fails.
     error MemoFailed(bytes returnData);
@@ -50,6 +60,6 @@ interface IMemo {
     /// @param target The address to call via the precompile.
     /// @param data The calldata to forward to the target.
     /// @param memoId A caller-supplied identifier for the memo.
-    /// @param memoData Arbitrary memo bytes attached to the subcall.
+    /// @param memoData Arbitrary memo bytes attached to the subcall (not `string`).
     function memo(address target, bytes calldata data, bytes32 memoId, bytes calldata memoData) external;
 }

@@ -2,6 +2,16 @@
 
 This directory contains Solidity contracts and tests for the Arc project, built with Foundry.
 
+## Memo contract
+
+- Source: [`src/memo/Memo.sol`](src/memo/Memo.sol)
+- Interface: [`src/memo/IMemo.sol`](src/memo/IMemo.sol)
+- Developer guide (ABI, `eth_estimateGas`, pitfalls): [docs/transaction-memos.md](../docs/transaction-memos.md)
+
+Canonical entry point: `memo(address,bytes,bytes32,bytes)`. There is no
+`callWithMemo` function — wrong selectors cause empty reverts during gas
+estimation (see issue [#189](https://github.com/circlefin/arc-node/issues/189)).
+
 ## Compiler choice for genesis-deployed contracts
 
 **Forge is the canonical compiler** for every CREATE2-deployed contract in Arc genesis
