@@ -29,6 +29,7 @@ Arc is an open EVM-compatible layer 1 built on [Malachite](https://github.com/ci
 
 - 🚀 **[Execution](crates/node/README.md)** - Execution binary and configuration
 - 🗳️ **[Consensus](crates/malachite-app/README.md)** - Consensus binary and configuration
+- 💸 **[CCTP V2 Integration](docs/cctp-v2-integration.md)** - Move native USDC on and off Arc with Cross-Chain Transfer Protocol
 - More: see Arc [developer docs](https://docs.arc.network/arc/concepts/welcome-to-arc) for guides, APIs, and specs
 
 ## Install and Run a Node
