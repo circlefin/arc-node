@@ -226,6 +226,16 @@ Common causes are a missing or incomplete snapshot, mismatched `$ARC_RUN`
 between the two processes, or the consensus layer not reaching any follow
 endpoint.
 
+For real-time logs, run these commands in separate terminals:
+
+```sh
+# Consensus layer logs (most useful for sync issues)
+sudo journalctl -u arc-consensus -f
+
+# Execution layer logs
+sudo journalctl -u arc-execution -f
+```
+
 > Notice that this command queries the execution layer's HTTP server offering
 > a local JSON-RPC API.
 > If the address and port of the HTTP endpoint are configured differently than
