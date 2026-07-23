@@ -412,9 +412,23 @@ pub(crate) fn generate_jwt_secret(testnet_dir: &Path, force: bool) -> Result<()>
 /// can write to mounted volumes. Required on Linux where bind-mount permissions are strict.
 pub(crate) fn set_local_testnet_directory_permissions(
     testnet_dir: &Path,
+    monitoring_dir: &Path,
     node_names: &[String],
 ) -> Result<()> {
     let logs_dir = testnet_dir.join("logs");
+    let writable_dirs = [
+        logs_dir.clone(),
+        monitoring_dir.join("data").join("grafana"),
+        monitoring_dir.join("data").join("prometheus"),
+        testnet_dir.join("blockscout").join("logs"),
+        testnet_dir.join("blockscout").join("dets"),
+    ];
+
+    for dir in &writable_dirs {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
+    }
+
     for name in node_names {
         let reth_dir = testnet_dir.join(name).join("reth");
         fs::create_dir_all(&reth_dir)
@@ -426,8 +440,6 @@ pub(crate) fn set_local_testnet_directory_permissions(
     #[cfg(unix)]
     {
         let perms = fs::Permissions::from_mode(0o777);
-        fs::set_permissions(&logs_dir, perms.clone())
-            .with_context(|| format!("Failed to set permissions on {}", logs_dir.display()))?;
         for name in node_names {
             let node_dir = testnet_dir.join(name);
             if node_dir.exists() {
@@ -441,6 +453,10 @@ pub(crate) fn set_local_testnet_directory_permissions(
                     format!("Failed to set permissions on {}", sockets_dir.display())
                 })?;
             }
+        }
+        for dir in &writable_dirs {
+            fs::set_permissions(dir, perms.clone())
+                .with_context(|| format!("Failed to set permissions on {}", dir.display()))?;
         }
     }
     Ok(())
@@ -1236,6 +1252,28 @@ mod tests {
             actual, expected,
             "{node}: expected {expected} peers, got {actual}"
         );
+    }
+
+    #[test]
+    fn local_testnet_directory_permissions_create_service_volume_dirs() {
+        let dir = tempdir().unwrap();
+        let testnet_dir = dir.path().join("localdev");
+        let monitoring_dir = dir.path().join("monitoring");
+        let node_names = vec!["validator1".to_string()];
+
+        set_local_testnet_directory_permissions(&testnet_dir, &monitoring_dir, &node_names)
+            .unwrap();
+
+        for path in [
+            monitoring_dir.join("data").join("grafana"),
+            monitoring_dir.join("data").join("prometheus"),
+            testnet_dir.join("blockscout").join("logs"),
+            testnet_dir.join("blockscout").join("dets"),
+            testnet_dir.join("validator1").join("reth"),
+            testnet_dir.join("validator1").join("sockets"),
+        ] {
+            assert!(path.is_dir(), "expected {} to exist", path.display());
+        }
     }
 
     #[test]
