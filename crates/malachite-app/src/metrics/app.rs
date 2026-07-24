@@ -111,6 +111,9 @@ pub struct Inner {
     /// Number of blocks replayed from CL to EL during startup handshake
     handshake_replay_blocks: Gauge<u64, AtomicU64>,
 
+    /// Number of consensus rounds that failed to decide before advancing to the next round
+    consensus_round_missed: Family<RoundMissedLabel, Counter>,
+
     /// Internal state recording the previous validator set.
     /// Useful field to manage validators' metrics.
     /// This field is only accessible internally, and is not a metrics itself.
@@ -145,6 +148,7 @@ impl Inner {
             pending_proposal_parts_count: Gauge::default(),
             consensus_params: Family::default(),
             handshake_replay_blocks: Gauge::default(),
+            consensus_round_missed: Family::default(),
         }
     }
 }
@@ -278,6 +282,12 @@ impl AppMetrics {
                 "handshake_replay_blocks",
                 "Number of blocks replayed from CL to EL during startup handshake",
                 metrics.handshake_replay_blocks.clone(),
+            );
+
+            registry.register(
+                "consensus_round_missed",
+                "Number of consensus rounds that failed to decide before advancing to the next round",
+                metrics.consensus_round_missed.clone(),
             );
 
             // Register version info as a separate Info metric
@@ -468,6 +478,21 @@ impl AppMetrics {
     pub fn get_handshake_replay_blocks(&self) -> u64 {
         self.handshake_replay_blocks.get()
     }
+
+    /// Record that a consensus round failed to decide before advancing.
+    pub fn inc_consensus_round_missed(&self, proposer: Address) {
+        self.consensus_round_missed
+            .get_or_create(&RoundMissedLabel::new(proposer))
+            .inc();
+    }
+
+    /// Total number of missed consensus rounds since start.
+    #[cfg(test)]
+    pub fn get_consensus_round_missed_count(&self, proposer: Address) -> u64 {
+        self.consensus_round_missed
+            .get_or_create(&RoundMissedLabel::new(proposer))
+            .get()
+    }
 }
 
 impl Default for AppMetrics {
@@ -501,6 +526,31 @@ impl AddressLabel {
     fn new(address: Address) -> Self {
         Self {
             address: AsLabelValue(address),
+        }
+    }
+}
+
+impl EncodeLabelValue for AsLabelValue<i64> {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
+        encoder.write_fmt(format_args!("{}", self.0))
+    }
+}
+
+impl EncodeLabelValue for AsLabelValue<u64> {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
+        encoder.write_fmt(format_args!("{}", self.0))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RoundMissedLabel {
+    proposer: AsLabelValue<Address>,
+}
+
+impl RoundMissedLabel {
+    fn new(proposer: Address) -> Self {
+        Self {
+            proposer: AsLabelValue(proposer),
         }
     }
 }
@@ -640,5 +690,17 @@ mod tests {
             !buf.contains("0x"),
             "Metrics should not contain 0x prefix: {buf}"
         );
+    }
+
+    #[test]
+    fn test_consensus_round_missed_and_blocks_proposed_counters() {
+        let metrics = AppMetrics::new();
+        let proposer = Address::new([0xAA; 20]);
+
+        metrics.inc_consensus_round_missed(proposer);
+        metrics.inc_consensus_round_missed(proposer);
+        metrics.inc_consensus_round_missed(proposer);
+
+        assert_eq!(metrics.get_consensus_round_missed_count(proposer), 3);
     }
 }

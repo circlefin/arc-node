@@ -74,6 +74,13 @@ This application exposes Prometheus metrics on the `/metrics` endpoint. The foll
 - **`arc_malachite_app_height_restart_count`** (Counter)
   - **Description:** Number of times the consensus height has been restarted due to errors or recovery scenarios.
 
+- **`arc_malachite_app_consensus_round_missed`** (Counter)
+  - **Description:** Number of consensus rounds that failed to decide before advancing to the next round.
+  - **Labels:**
+    - `proposer`: Address of the validator that was proposer for the missed round.
+    - `height`: Current height of the chain.
+    - `round`: The round number that failed to decide.
+
 - **`arc_malachite_app_sync_fell_behind_count`** (Counter)
   - **Description:** Number of times the node fell behind and transitioned from InSync to CatchingUp.
 

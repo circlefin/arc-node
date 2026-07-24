@@ -97,6 +97,22 @@ async fn on_started_round(
     assert!(round != Round::Nil, "Round cannot be Nil");
     assert!(round >= state.current_round, "Round cannot go backwards");
 
+    let mut missed_round = state.current_round.or(Round::Some(0));
+
+    while missed_round < round {
+        let missed_proposer = state
+            .ctx
+            .proposer_selector
+            .select_proposer(state.validator_set(), height, missed_round)
+            .address;
+
+        warn!(%missed_proposer, %height, %missed_round, "Consensus round missed");
+
+        state.metrics().inc_consensus_round_missed(missed_proposer);
+
+        missed_round = missed_round.increment();
+    }
+
     state.current_round = round;
     state.current_proposer = Some(proposer);
 
