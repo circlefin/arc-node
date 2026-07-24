@@ -31,7 +31,11 @@ use std::{
 
 use eyre::Result;
 use lz4::Decoder;
-use reqwest::{blocking::Client as BlockingClient, header::RANGE, Client, StatusCode};
+use reqwest::{
+    blocking::Client as BlockingClient,
+    header::{CONTENT_RANGE, RANGE},
+    Client, StatusCode,
+};
 use serde::Deserialize;
 use tar::Archive;
 use tokio::task;
@@ -257,14 +261,17 @@ fn file_name_from_url(url: &str) -> String {
         .unwrap_or_else(|| "snapshot.tar.lz4".to_string())
 }
 
+fn parse_content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split('/').next_back())
+        .and_then(|v| v.parse().ok())
+}
+
 fn parse_total_size(response: &reqwest::blocking::Response) -> Option<u64> {
     if response.status() == StatusCode::PARTIAL_CONTENT {
-        response
-            .headers()
-            .get("Content-Range")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split('/').next_back())
-            .and_then(|v| v.parse().ok())
+        parse_content_range_total(response.headers())
     } else {
         response.content_length()
     }
@@ -292,7 +299,23 @@ fn attempt_download(client: &BlockingClient, url: &str, part_path: &Path) -> Res
         request = request.header(RANGE, format!("bytes={existing_size}-"));
     }
 
-    let mut response = request.send().and_then(|r| r.error_for_status())?;
+    let response = request.send()?;
+
+    if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        let total = parse_content_range_total(response.headers()).ok_or_else(|| {
+            eyre::eyre!("Server rejected resume range without Content-Range total size")
+        })?;
+
+        if existing_size == total {
+            return Ok(total);
+        }
+
+        eyre::bail!(
+            "Server rejected resume range for part file size {existing_size}, remote size is {total}"
+        );
+    }
+
+    let mut response = response.error_for_status()?;
 
     let is_partial = response.status() == StatusCode::PARTIAL_CONTENT;
     let total = parse_total_size(&response).ok_or_else(|| {
@@ -753,6 +776,43 @@ mod tests {
     // ---------------------------------------------------------------------------
     // download_and_extract via local HTTP server (wiremock)
     // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resumable_download_renames_complete_part_file_on_416() -> Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let data = b"complete snapshot archive";
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/snapshot.tar.lz4"))
+            .respond_with(
+                ResponseTemplate::new(416)
+                    .append_header("Content-Range", format!("bytes */{}", data.len()).as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir()?;
+        let target_dir = dir.path().join("tmp");
+        std::fs::create_dir_all(&target_dir)?;
+        let part_path = target_dir.join("snapshot.tar.lz4.part");
+        std::fs::write(&part_path, data)?;
+
+        let url = format!("{}/snapshot.tar.lz4", server.uri());
+        let target_dir_for_download = target_dir.clone();
+        let (final_path, total) =
+            tokio::task::spawn_blocking(move || resumable_download(&url, &target_dir_for_download))
+                .await??;
+
+        assert_eq!(total, data.len() as u64);
+        assert_eq!(final_path, target_dir.join("snapshot.tar.lz4"));
+        assert_eq!(std::fs::read(&final_path)?, data);
+        assert!(!part_path.exists());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn download_and_extract_fetches_and_extracts() -> Result<()> {
