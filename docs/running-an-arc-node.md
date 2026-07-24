@@ -697,7 +697,7 @@ Check out [reth system requirements](https://reth.rs/run/system-requirements/) f
 
 **Note**: during periods of sustained high load, such as during startup or extended sync if the node is far behind, the execution layer memory may surge on some hardware. This should not be an issue if running with the suggested System Requirements. However, if you do observe this, you can enable backpressure to throttle the pace of execution according to the speed of disk writes, which will constrain memory growth.
 
-To enable this, the `reth_` namespace should enabled on the **execution layer**:
+To enable this, the `reth_` namespace should be enabled on the **execution layer**:
 
 ```sh
 --http.api eth,net,web3,txpool,trace,debug,reth
