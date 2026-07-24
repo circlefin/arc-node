@@ -1,9 +1,12 @@
 name: Release Binaries
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to build and release (e.g. v0.6.0)'
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -11,14 +14,14 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: release-binaries-${{ inputs.tag }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-
-concurrency:
-  group: release-binaries-${{ inputs.tag || github.ref_name }}
-  cancel-in-progress: false
 
 jobs:
   build:
@@ -44,27 +47,19 @@ jobs:
       - name: Resolve artifact version
         id: version
         env:
-          EVENT_NAME: ${{ github.event_name }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            VERSION="$INPUT_TAG"
-          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/}"
-          else
-            echo "::error::Unsupported release trigger: $EVENT_NAME $GITHUB_REF"
+          TAG="$INPUT_TAG"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?$ ]]; then
+            echo "::error::Invalid tag format: '$TAG' (expected e.g. v1.2.3 or v1.2.3-rc.1)"
             exit 1
           fi
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?$ ]]; then
-            echo "::error::Invalid tag format: '$VERSION' (expected e.g. v1.2.3 or v1.2.3-rc.1)"
-            exit 1
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "asset_tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          ref: ${{ format('refs/tags/{0}', inputs.tag) }}
           submodules: recursive
 
       - name: Install Linux system dependencies
@@ -116,7 +111,7 @@ jobs:
 
       - name: Package release assets
         env:
-          TAG: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.asset_tag }}
           TARGET: ${{ matrix.target }}
         run: ./scripts/release-package.sh "$TAG" "$TARGET"
 
@@ -165,7 +160,6 @@ jobs:
   release:
     name: Create Release
     needs: sign
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -174,17 +168,9 @@ jobs:
       - name: Resolve tag
         id: tag
         env:
-          EVENT_NAME: ${{ github.event_name }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            TAG="$INPUT_TAG"
-          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
-          else
-            echo "::error::Unsupported release trigger: $EVENT_NAME $GITHUB_REF"
-            exit 1
-          fi
+          TAG="$INPUT_TAG"
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?$ ]]; then
             echo "::error::Invalid tag format: '$TAG' (expected e.g. v1.2.3 or v1.2.3-rc.1)"
             exit 1
@@ -216,9 +202,16 @@ jobs:
             edit_args+=(--prerelease=true)
           fi
 
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "::error::Release ${TAG} already exists; delete the existing draft/release before rerunning"
-            exit 1
+          if release_is_draft="$(gh release view "${TAG}" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [[ "$release_is_draft" != "true" ]]; then
+              echo "::error::Release ${TAG} is already published; refusing to replace public assets"
+              exit 1
+            fi
+
+            echo "::notice::Draft release ${TAG} already exists; replacing draft release assets"
+            gh release upload "${TAG}" release-assets/* --clobber
+            gh release edit "${TAG}" "${edit_args[@]}"
+            exit 0
           fi
 
           gh release create "${TAG}" "${create_args[@]}"

@@ -1,0 +1,109 @@
+name: Finalize Public Release
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled, closed]
+    branches:
+      - main
+      - release/**
+
+concurrency:
+  group: public-release-finalizer-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  validate-release-pr:
+    name: Validate release metadata
+    if: >-
+      github.event.action != 'closed' &&
+      contains(github.event.pull_request.labels.*.name, 'release') &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      startsWith(github.event.pull_request.head.ref, 'sync/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - name: Validate release metadata
+        uses: ./.github/actions/finalize-release
+        with:
+          mode: validate
+          pr-body: ${{ github.event.pull_request.body }}
+          pr-base-ref: ${{ github.event.pull_request.base.ref }}
+          pr-head-ref: ${{ github.event.pull_request.head.ref }}
+
+  finalize-release:
+    name: Create release branch and tag
+    if: >-
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'release') &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      startsWith(github.event.pull_request.head.ref, 'sync/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      namespace: ${{ steps.finalize.outputs.namespace }}
+      tag: ${{ steps.finalize.outputs.tag }}
+      release_branch: ${{ steps.finalize.outputs.release_branch }}
+      release_kind: ${{ steps.finalize.outputs.release_kind }}
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - name: Create release branch and tag
+        id: finalize
+        uses: ./.github/actions/finalize-release
+        with:
+          mode: finalize
+          pr-body: ${{ github.event.pull_request.body }}
+          pr-base-ref: ${{ github.event.pull_request.base.ref }}
+          pr-head-ref: ${{ github.event.pull_request.head.ref }}
+          merge-commit-sha: ${{ github.event.pull_request.merge_commit_sha }}
+
+  release-binaries:
+    name: Release binaries
+    needs: finalize-release
+    if: needs.finalize-release.result == 'success'
+    uses: ./.github/workflows/release-binaries.yaml
+    with:
+      tag: ${{ needs.finalize-release.outputs.tag }}
+    secrets: inherit
+    permissions:
+      contents: write
+
+  remind-docker-publish:
+    name: Remind to publish Docker images
+    needs: finalize-release
+    if: needs.finalize-release.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment reminder on release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.finalize-release.outputs.tag }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Docker publishing can't be chained automatically (Cloudsmith OIDC can't trust
+          # a release/* wildcard claim), so this is a reminder, not automation.
+          gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body "Release \`${TAG}\` finalized. Docker images are **not** published automatically — trigger the \`Build Docker Images\` workflow manually via \`workflow_dispatch\` with tag \`${TAG}\` to publish them."

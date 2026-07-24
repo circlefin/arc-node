@@ -19,13 +19,19 @@ Compare and release-notes links resolve once the corresponding tag is published 
 ### For Rust API Consumers
 
 - **[API] `ArcConsensusBuilder` is no longer `Clone` or `Copy`.**
-  - Old (`v0.7.2`): `ArcConsensusBuilder` derived `Clone` and `Copy`, so
+  - Old (`v0.7.3`): `ArcConsensusBuilder` derived `Clone` and `Copy`, so
     downstream Rust code could duplicate the builder after construction.
   - New (next release): the builder can hold a `Box<dyn FnOnce + Send + 'static>`
     consensus modifier and is therefore move-only.
   - Code that cloned or copied the builder must construct a fresh
     `ArcConsensusBuilder::default()` or finish applying builder configuration
     before moving it into the node builder.
+
+## [v0.7.3]
+
+**Changes:** [v0.7.2...v0.7.3](https://github.com/circlefin/arc-node/compare/v0.7.2...v0.7.3) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.7.3)
+
+No breaking changes in this release.
 
 ## [v0.7.2]
 
