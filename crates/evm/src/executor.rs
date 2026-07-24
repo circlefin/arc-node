@@ -65,6 +65,7 @@ use revm::DatabaseCommit;
 const ERR_BLOCKLIST_READ_FAILED: &str = "Failed to read beneficiary blocklist status";
 const ERR_BLOCK_NUMBER_CONVERSION_FAILED: &str = "Failed to convert block number to u64";
 const ERR_BLOCK_TIMESTAMP_CONVERSION_FAILED: &str = "Failed to convert block timestamp to u64";
+const ERR_CUMULATIVE_GAS_OVERFLOW: &str = "cumulative gas overflow while executing block";
 
 /// Result of executing an Arc transaction.
 #[derive(Debug)]
@@ -456,7 +457,7 @@ where
         self.gas_used = self
             .gas_used
             .checked_add(gas_used)
-            .expect("cumulative gas overflow");
+            .ok_or_else(|| BlockExecutionError::msg(ERR_CUMULATIVE_GAS_OVERFLOW))?;
 
         // Cancun is always active for arc
         self.blob_gas_used = self.blob_gas_used.saturating_add(blob_gas_used);
