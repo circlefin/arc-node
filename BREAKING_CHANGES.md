@@ -7,10 +7,25 @@ Each bullet is prefixed with a flag identifying the kind of breaking change:
 - `[CLI]` -- CLI flag added, renamed, removed, or made required.
 - `[Config]` -- default value, environment variable, or manifest field change.
 - `[Format]` -- log, metric label, or serialized output format change that breaks parsers.
+- `[API]` -- public Rust API change that can break downstream crates.
 
 Entries are split by audience. A change appears under `### For Validators` when validator-mode operation must change; otherwise it appears under `### For Node Operators`. A change requiring both audiences to act appears in both sections (rare).
+Rust API compatibility changes appear under `### For Rust API Consumers`.
 
 Compare and release-notes links resolve once the corresponding tag is published at [`circlefin/arc-node`](https://github.com/circlefin/arc-node).
+
+## [Unreleased]
+
+### For Rust API Consumers
+
+- **[API] `ArcConsensusBuilder` is no longer `Clone` or `Copy`.**
+  - Old (`v0.7.3`): `ArcConsensusBuilder` derived `Clone` and `Copy`, so
+    downstream Rust code could duplicate the builder after construction.
+  - New (next release): the builder can hold a `Box<dyn FnOnce + Send + 'static>`
+    consensus modifier and is therefore move-only.
+  - Code that cloned or copied the builder must construct a fresh
+    `ArcConsensusBuilder::default()` or finish applying builder configuration
+    before moving it into the node builder.
 
 ## [v0.7.3]
 
