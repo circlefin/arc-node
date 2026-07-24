@@ -1740,7 +1740,7 @@ describe('NativeFiatToken', () => {
     it('delegateCall USDC.transfer', async () => {
       const { receipt, balances, helper } = await testCallType({ functionName: 'delegateCall', fn: 'transfer' })
       // since the impl address is not set, the delegate call will call to zero address
-      // which will sucess execute with empty return
+      // which will successfully execute with empty return
       receipt.verifyEvents((ev) => {
         ev.expectCount(1).expectExecutionResult({ helper, success: true, result: '0x' })
       })
@@ -1768,7 +1768,7 @@ describe('NativeFiatToken', () => {
     it('delegateCall USDC.mint', async () => {
       const { receipt, balances, helper } = await testCallType({ functionName: 'delegateCall', fn: 'mint' })
       // since the impl address is not set, the delegate call will call to zero address
-      // which will sucess execute with empty return
+      // which will successfully execute with empty return
       receipt.verifyEvents((ev) => {
         ev.expectCount(1).expectExecutionResult({ helper, success: true, result: '0x' })
       })
