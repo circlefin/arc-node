@@ -100,6 +100,21 @@ impl PartitionMode {
             (n + d / 2) / d
         }
 
+        // Issue #137: the guard below and the boundary loop further
+        // down both compute `1usize << k` where `k` can be as large as
+        // `num_generators - 1`. A left shift by `usize::BITS` or more
+        // overflows: it panics in debug builds and silently wraps in
+        // release builds, letting nonsensical inputs (e.g. 65
+        // generators on a 64-bit target) reach the partition logic
+        // and produce bogus ranges. Reject them up front with a clear
+        // error message.
+        let max_generators = usize::BITS as usize;
+        if num_generators > max_generators {
+            eyre::bail!(
+                "too many generators: {num_generators} exceeds the maximum of {max_generators} supported by the exponential partition",
+            );
+        }
+
         if round_div(num_accounts, 1 << (num_generators - 1)) == 0 {
             eyre::bail!("too many generators: it would result in a bucket with size 0");
         }
@@ -186,5 +201,48 @@ mod tests {
             assert_eq!(ranges.ok(), expected);
         }
         Ok(())
+    }
+
+    /// Regression test for issue #137: `partition_exponential` used
+    /// `1 << (num_generators - 1)` and `1usize << j` in its boundary
+    /// loop without first validating the shift distance. Once
+    /// `num_generators - 1` reached the platform word width the
+    /// `<<` operation overflowed, panicking in debug builds and
+    /// silently wrapping to a small power of two in release builds
+    /// — letting nonsensical inputs through the existing
+    /// "smallest-bucket-is-zero" guard.
+    ///
+    /// The post-fix contract: for any `num_generators` that cannot
+    /// be represented safely (i.e. `num_generators - 1 >= usize::BITS`,
+    /// or `num_generators > usize::BITS` after a saturating sub),
+    /// `partition_exponential` returns `Err` with a clear message
+    /// rather than panicking or returning a bogus partition.
+    #[test]
+    fn partition_exponential_rejects_shift_overflow() {
+        // num_generators = 65: the original bug report case. Pre-fix,
+        // this panics in debug builds and silently returns Ok with
+        // incorrect ranges in release builds.
+        let r = PartitionMode::Exponential.partition_accounts(130, 65);
+        assert!(
+            r.is_err(),
+            "expected Err for num_generators=65 (would shift by 64), got {r:?}",
+        );
+
+        // One past the platform boundary. On 64-bit targets
+        // usize::BITS == 64, so num_generators == 65 is the first
+        // unsafe value.
+        let r = PartitionMode::Exponential.partition_accounts(usize::MAX, usize::BITS as usize + 1);
+        assert!(
+            r.is_err(),
+            "expected Err for num_generators=usize::BITS+1 when num_accounts=usize::MAX, got {r:?}",
+        );
+
+        // num_generators way past the cap: must also be rejected
+        // without panicking.
+        let r = PartitionMode::Exponential.partition_accounts(1_000, usize::MAX);
+        assert!(
+            r.is_err(),
+            "expected Err for num_generators=usize::MAX, got {r:?}",
+        );
     }
 }
