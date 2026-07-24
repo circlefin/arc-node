@@ -172,6 +172,13 @@ fn generate_tc_script(
 
     script.push_str("set -e\n\n");
 
+    script
+        .push_str("# WSL2 kernels often do not include the qdisc modules required by tc netem.\n");
+    script.push_str("if grep -qi microsoft /proc/sys/kernel/osrelease 2> /dev/null; then\n");
+    script.push_str("    echo \"WSL2 detected; skipping tc latency emulation.\"\n");
+    script.push_str("    exit 0\n");
+    script.push_str("fi\n\n");
+
     // Install iproute2 and iptables if ip or tc commands are missing (e.g. release images)
     script.push_str("if [ -f /etc/debian_version ] && ! which ip tc > /dev/null; then\n");
     script.push_str("  (apt-get update -qq && apt-get install -y -qq --no-install-recommends iproute2 iptables) >/dev/null 2>&1\n");
@@ -288,6 +295,37 @@ fn generate_tc_script(
     ));
 
     Ok(script)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_tc_script_skips_latency_emulation_on_wsl2() {
+        let node_name = "validator1".to_string();
+        let mut node_regions = IndexMap::new();
+        node_regions.insert(node_name.clone(), Region::UsEast1);
+
+        let script = generate_tc_script(
+            &node_name,
+            &Region::UsEast1,
+            &node_regions,
+            &NodesMetadata::default(),
+        )
+        .expect("script generation should succeed");
+
+        let wsl_guard = script
+            .find("grep -qi microsoft /proc/sys/kernel/osrelease")
+            .expect("script should detect WSL2");
+        let tc_setup = script
+            .find("tc qdisc add dev $IF root handle 1: htb default 10")
+            .expect("script should still configure tc on supported hosts");
+
+        assert!(wsl_guard < tc_setup);
+        assert!(script.contains("WSL2 detected; skipping tc latency emulation."));
+        assert!(script.contains("exit 0"));
+    }
 }
 
 /// Generate and save latency scripts for all nodes
