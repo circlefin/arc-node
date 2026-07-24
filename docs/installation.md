@@ -15,7 +15,24 @@ Consult the table below to confirm which version to run for each network.
 
 | Network     | Version |
 |-------------|---------|
-| Arc Testnet | v0.6.0  |
+| Arc Testnet | v0.7.3  |
+
+
+> [!IMPORTANT]
+> **Breaking changes for DApp developers.** Upgrading your target node from v0.6.0 to v0.7.3 affects
+> applications, not just node operators:
+>
+> - `eth_call` / `eth_estimateGas` gas cap default lowered from 50M to 30M. Calls or
+>   simulations that previously relied on the higher cap will fail. Node operators can
+>   raise the limit with `--rpc.gascap`; DApps should optimize calls to stay within 30M.
+> - JSON-RPC batch requests are capped at 100 entries by default. Oversized batches are
+>   rejected with error `-32600` before any entry runs. Clients with JSON-RPC batching
+>   enabled should keep batch size at or under 100.
+> - Precompile gas accounting changed across v0.7.x (EIP-2929 warm/cold pricing on
+>   precompile account loads in v0.7.0, gas charging order in v0.7.2). Re-estimate gas
+>   against an updated node instead of reusing cached or hardcoded values.
+>
+> See [BREAKING_CHANGES.md](../BREAKING_CHANGES.md#v072) for details.
 
 ## Pre-built Binary
 
@@ -61,7 +78,7 @@ source "$ARC_HOME/env"
 To install a specific version, run `arcup` with `--install`:
 
 ```sh
-arcup --install v0.6.0
+arcup --install v0.7.3
 ```
 
 Next, verify that the three Arc binaries are installed:
