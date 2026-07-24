@@ -465,7 +465,7 @@ impl Db {
         let height = decided_block.height();
         let tx = self.db.begin_write()?;
 
-        {
+        let block_time = {
             let mut blocks = tx.open_table(DECIDED_BLOCKS_TABLE)?;
             let block_bytes = encode_execution_payload(&decided_block.execution_payload);
             #[allow(clippy::arithmetic_side_effects)]
@@ -473,7 +473,8 @@ impl Db {
                 write_bytes += block_bytes.len();
             }
             blocks.insert(height, block_bytes)?;
-        }
+            start.elapsed()
+        };
 
         self.insert_certificate(
             &tx,
@@ -483,8 +484,7 @@ impl Db {
         )?;
 
         tx.commit()?;
-
-        self.update_write_metrics(write_bytes, start.elapsed());
+        self.update_write_metrics(write_bytes, block_time);
 
         Ok(())
     }
