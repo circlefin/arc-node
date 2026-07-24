@@ -249,6 +249,56 @@ mod tests {
         assert!(!supports_cli_flags(Some("v0.4.0-rc1")));
     }
 
+    /// `check_cli_version` exposes a three-state result. `supports_cli_flags`
+    /// only exercises the `RequiresConfigToml` boundary, so the distinction
+    /// between confirmed-`SupportsCli` and unparseable-`Assumed` is only
+    /// covered implicitly. This test pins the three states down so a
+    /// future refactor cannot quietly collapse `Assumed` into `SupportsCli`
+    /// (or vice versa) — they are documented as distinct so callers can
+    /// log or branch on unparseable tags if needed.
+    #[test]
+    fn check_cli_version_distinguishes_confirmed_from_assumed() {
+        // Confirmed: parseable version >= v0.5.0 -> SupportsCli.
+        assert_eq!(
+            check_cli_version(Some("v0.5.0")),
+            CliVersionCheck::SupportsCli
+        );
+        assert_eq!(
+            check_cli_version(Some("arc_consensus:v0.6.0")),
+            CliVersionCheck::SupportsCli
+        );
+
+        // Confirmed: parseable version < v0.5.0 -> RequiresConfigToml.
+        assert_eq!(
+            check_cli_version(Some("v0.4.0")),
+            CliVersionCheck::RequiresConfigToml
+        );
+        assert_eq!(
+            check_cli_version(Some("arc_consensus:v0.3.0")),
+            CliVersionCheck::RequiresConfigToml
+        );
+
+        // "latest" is an explicit "we know this is fine" signal, not an
+        // assumption. It must report SupportsCli, not Assumed.
+        assert_eq!(
+            check_cli_version(Some("latest")),
+            CliVersionCheck::SupportsCli
+        );
+        assert_eq!(
+            check_cli_version(Some("arc_consensus:latest")),
+            CliVersionCheck::SupportsCli
+        );
+
+        // Unparseable tags (git SHAs, branches, "main", etc.) are
+        // assumptions, not confirmations. This is the only situation
+        // that produces Assumed besides missing tags.
+        assert_eq!(check_cli_version(Some("abc123")), CliVersionCheck::Assumed);
+        assert_eq!(check_cli_version(Some("main")), CliVersionCheck::Assumed);
+
+        // Missing tag is the original Assumed case.
+        assert_eq!(check_cli_version(None), CliVersionCheck::Assumed);
+    }
+
     /// Run `apply_version_compat` over `input` for the given `image_tag` and
     /// assert the rewritten list equals `expected`.
     #[track_caller]
