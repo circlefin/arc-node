@@ -209,6 +209,7 @@ impl RemoteSignerClient {
 
                 Err(RemoteSigningError::RetryExhausted {
                     retries: config.retry_config.max_retries,
+                    source: Box::new(e),
                 })
             }
         }
@@ -389,7 +390,7 @@ mod integration_tests {
                 "Signing should fail with bad endpoint"
             );
 
-            if let Err(RemoteSigningError::RetryExhausted { retries }) = sign_result {
+            if let Err(RemoteSigningError::RetryExhausted { retries, .. }) = sign_result {
                 assert_eq!(retries, 2, "Should have exhausted exactly 2 retries");
             }
         }

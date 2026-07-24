@@ -59,6 +59,7 @@ use arc_eth_engine::engine::Engine;
 use arc_eth_engine::json_structures::ExecutionBlock;
 use arc_node_consensus_cli::metrics;
 use arc_signer::local::{LocalSigningProvider, PrivateKey};
+use arc_signer::remote::RemoteSigningError;
 use arc_signer::ArcSigningProvider;
 
 use crate::env_config::EnvConfig;
@@ -771,6 +772,24 @@ impl App {
             Err(e) => {
                 let startup_error = e.wrap_err("Node failed to start");
                 error!("{startup_error:?}");
+
+                // Transient remote-signer / network failures at startup should not park
+                // the process. Parking (waiting for SIGTERM below) leaves the process alive
+                // but idle, so a supervisor's restart policy never fires and liveness checks
+                // that only test the process don't notice. Instead, return an error so the
+                // caller (main) exits non-zero and the supervisor restarts us — the same
+                // behavior used for the EL IPC watchdog below. The actual restart absorbs
+                // the blip; the signer's runtime path already retries (sign_message_with_retry),
+                // only the eager startup connect() fails fast.
+                if is_retryable_startup_error(&startup_error) {
+                    error!(
+                        "Could not reach the remote signer at startup (connection failed, \
+                         unavailable, or timed out); exiting non-zero so the supervisor can \
+                         restart the node once the signer is reachable again..."
+                    );
+                    return Err(startup_error);
+                }
+
                 error!("Manual intervention required! Waiting for termination signal (SIGTERM)...");
 
                 // Wait for SIGTERM to allow graceful shutdown
@@ -868,6 +887,21 @@ fn install_sigterm_handler(handle: &Handle) {
 
 #[cfg(not(unix))]
 fn install_sigterm_handler(_handle: &Handle) {}
+
+/// Returns `true` if the startup error chain contains a *transient* remote-signer
+/// error — one that a restart is likely to recover from (the remote signer or the
+/// network to it being temporarily unavailable). Permanent errors (configuration,
+/// authentication, malformed responses) return `false` so they still park for
+/// manual intervention rather than restart-looping.
+///
+/// The exact retryability rules live with `RemoteSigningError`, where tonic status
+/// codes and retry-exhaustion sources can be classified without string matching.
+fn is_retryable_startup_error(error: &eyre::Report) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<RemoteSigningError>())
+        .any(RemoteSigningError::is_retryable_startup_error)
+}
 
 /// Wait for a termination signal (SIGTERM on Unix)
 async fn wait_for_termination() {
@@ -994,6 +1028,78 @@ mod tests {
         let file_provider = LocalSigningProvider::new(original_key);
         let file_address = Address::from_public_key(&file_provider.public_key());
         assert_eq!(identity.consensus.address(), file_address);
+    }
+
+    // Mirror the production call site: RemoteSigningProvider::new returns a
+    // RemoteSigningError, which is wrapped twice with eyre context
+    // ("Failed to create remote signing provider" then "Node failed to start")
+    // before reaching is_retryable_startup_error. The test must exercise the
+    // chain-walk + downcast, not the bare enum.
+    fn wrapped(err: RemoteSigningError) -> eyre::Report {
+        eyre::Report::new(err)
+            .wrap_err("Failed to create remote signing provider")
+            .wrap_err("Node failed to start")
+    }
+
+    fn wrapped_validator_proof_signing(err: RemoteSigningError) -> eyre::Report {
+        let signing_error = arc_consensus_types::signing::SigningError::from_source(err);
+        eyre::Report::new(signing_error)
+            .wrap_err("Failed to sign validator proof")
+            .wrap_err("Failed to create network identity with validator proof")
+            .wrap_err("Node failed to start")
+    }
+
+    #[test]
+    fn transient_remote_signer_errors_are_retryable() {
+        assert!(is_retryable_startup_error(&wrapped(
+            RemoteSigningError::ServiceUnavailable("down".into())
+        )));
+        assert!(is_retryable_startup_error(&wrapped(
+            RemoteSigningError::Timeout("slow".into())
+        )));
+        assert!(is_retryable_startup_error(&wrapped(
+            RemoteSigningError::Status(Box::new(tonic::Status::unavailable("signer warming up")))
+        )));
+        assert!(is_retryable_startup_error(&wrapped(
+            RemoteSigningError::Status(Box::new(tonic::Status::deadline_exceeded(
+                "signer request timed out"
+            )))
+        )));
+        assert!(is_retryable_startup_error(
+            &wrapped_validator_proof_signing(RemoteSigningError::RetryExhausted {
+                retries: 3,
+                source: Box::new(RemoteSigningError::Status(Box::new(
+                    tonic::Status::unavailable("signer warming up")
+                ))),
+            })
+        ));
+    }
+
+    #[test]
+    fn permanent_remote_signer_errors_are_not_retryable() {
+        assert!(!is_retryable_startup_error(&wrapped(
+            RemoteSigningError::Configuration("bad config".into())
+        )));
+        assert!(!is_retryable_startup_error(&wrapped(
+            RemoteSigningError::Authentication("denied".into())
+        )));
+        assert!(!is_retryable_startup_error(&wrapped(
+            RemoteSigningError::Status(Box::new(tonic::Status::unauthenticated("bad credentials")))
+        )));
+        assert!(!is_retryable_startup_error(
+            &wrapped_validator_proof_signing(RemoteSigningError::RetryExhausted {
+                retries: 3,
+                source: Box::new(RemoteSigningError::Status(Box::new(
+                    tonic::Status::unauthenticated("bad credentials")
+                ))),
+            })
+        ));
+    }
+
+    #[test]
+    fn non_signer_startup_errors_are_not_retryable() {
+        let report = eyre::eyre!("disk full").wrap_err("Node failed to start");
+        assert!(!is_retryable_startup_error(&report));
     }
 
     #[test]
