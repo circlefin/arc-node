@@ -589,10 +589,9 @@ where
         }
 
         // ensure we still have capacity for this transaction
-        if block_gas_limit
-            < cumulative_gas_used
-                .checked_add(pool_tx.gas_limit())
-                .expect("total gas shouldn't overflow")
+        if cumulative_gas_used
+            .checked_add(pool_tx.gas_limit())
+            .is_none_or(|total| total > block_gas_limit)
         {
             // we can't fit this transaction into the block, so we need to mark it as invalid
             // which also removes all dependent transaction from the iterator before we can
@@ -677,7 +676,14 @@ where
         }
         cumulative_gas_used = cumulative_gas_used
             .checked_add(gas_used)
-            .expect("total gas shouldn't overflow");
+            .ok_or_else(|| {
+                PayloadBuilderError::other(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cumulative gas overflow while building payload: {cumulative_gas_used} + {gas_used}"
+                    ),
+                ))
+            })?;
     }
 
     PayloadBuildMetrics::record_stage_tx_execution(loop_started.elapsed());
