@@ -185,6 +185,22 @@ We welcome contributions! Please follow these steps:
 
 For more details, see our [Contributing Guide](CONTRIBUTING.md).
 
+## Troubleshooting
+
+### Windows setup
+
+If Python or dependencies fail:
+
+- Check Python version
+- Install required tools
+- Reinstall dependencies
+
+### Common node issues
+
+- Docker not running
+- Wrong configuration
+- RPC connection errors
+
 ## Resources
 
 - [Arc Network](https://www.arc.io/) - Official Arc Network website
