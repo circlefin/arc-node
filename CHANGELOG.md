@@ -2,6 +2,27 @@
 
 All notable changes to arc-node are documented in this file.
 
+## [v0.7.3]
+
+**Changes:** [v0.7.2...v0.7.3](https://github.com/circlefin/arc-node/compare/v0.7.2...v0.7.3) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.7.3)
+
+### Features
+
+- [CL] Add consensus and RPC Prometheus metrics on the `/metrics` endpoint: `arc_malachite_app_consensus_round_missed` (counter, labeled by the missed round's proposer), `arc_malachite_app_rpc_request_time`, and app-request channel queue-time, process-time, and full-channel-rejection metrics
+- [EL] Add the Zero8 hardfork (dormant). Once active on a chain, a rejected delegatecall into a stateful Arc precompile is charged the uniform 200-gas early-revert penalty, matching the penalty already applied to other precompile authorization and validation reverts. Zero8 is not scheduled on any public chain
+- [EL] `arc_getCertificate` now accepts a hex-encoded quantity string (e.g. `"0x7"`) for the block-height parameter in addition to a plain decimal number, aligning with the EVM hex-quantity convention used by `eth_getBlockByNumber`
+
+### Fixes
+
+- [EL] Complete the pending-block RPC filter so permissionless callers can no longer read the proposed pre-finalization block through case-variant `pending` tags, previously-uncovered block-content methods, or object-style block parameters
+- [Shared] Remediate cargo audit advisories via dependency bumps
+
+### Docs
+
+Full documentation tree at this release: [`arc-node` v0.7.3 docs](https://github.com/circlefin/arc-node/tree/v0.7.3/docs). New or updated topics in this release:
+
+- Revise the base-fee validation ADR to match the implemented code: rename `elasticity_multiplier` to `inverse_elasticity_multiplier`, drop the unimplemented proportional check, and clarify the `k_rate` description
+
 ## [v0.7.2]
 
 **Changes:** [v0.7.1...v0.7.2](https://github.com/circlefin/arc-node/compare/v0.7.1...v0.7.2) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.7.2)

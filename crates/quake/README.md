@@ -3,7 +3,7 @@
 Quake is a tool for deploying Arc testnets and running end-to-end tests.
 
 > **Quake testnets vs. the Arc Testnet:** Arc has a public, persistent
-> [Testnet](https://docs.arc.network/arc/tutorials/deploy-on-arc) open to
+> [Testnet](https://docs.arc.io/arc/tutorials/deploy-on-arc) open to
 > external developers and validators. Quake testnets are different: they are
 > private, ephemeral networks spun up on demand for development and CI, then
 > torn down when testing is complete. All mentions of "testnet" in this
