@@ -27,7 +27,6 @@
 //! By design, monitoring data is only stored for round-0 proposals.
 
 use std::time::SystemTime;
-use tracing::warn;
 
 use crate::{Address, Height, ValueId};
 
@@ -115,24 +114,23 @@ impl ProposalMonitor {
         }
     }
 
-    /// Record that proposal was received.
-    /// Takes precedence over synced value.
-    pub fn record_proposal(&mut self, value_id: ValueId) {
-        // FIXME: this log message should not be produced here.
-        if let Some(first_value) = self.value_id
-            && !self.synced
-        {
-            warn!(
-                height = %self.height,
-                %first_value,
-                new_value = %value_id,
-                "Equivocating proposal at round 0"
-            );
-            return;
+    /// Record that a proposal was received. Takes precedence over a synced value.
+    ///
+    /// Returns `true` when the proposal is recorded — the first proposal for
+    /// this height, or one superseding a synced placeholder. Returns `false`
+    /// without mutating state when the proposal equivocates: a different value
+    /// was already recorded for this round-0 height without an intervening
+    /// sync. The existing record is kept; callers own any logging of the
+    /// equivocation so each can use its own context-aware format.
+    #[must_use]
+    pub fn record_proposal(&mut self, value_id: ValueId) -> bool {
+        if self.value_id.is_some() && !self.synced {
+            return false;
         }
         self.proposal_receive_time = Some(SystemTime::now());
         self.value_id = Some(value_id);
         self.synced = false;
+        true
     }
 
     /// Check if the decided value matches the recorded proposal.
@@ -195,7 +193,10 @@ mod tests {
         let mut monitor = ProposalMonitor::new(Height::new(1), test_address(), before);
         let value_id = test_value_id(0xAB);
 
-        monitor.record_proposal(value_id);
+        assert!(
+            monitor.record_proposal(value_id),
+            "first proposal should be recorded"
+        );
 
         assert!(monitor.proposal_receive_time.unwrap() >= before);
         assert_eq!(monitor.value_id, Some(value_id));
@@ -213,7 +214,10 @@ mod tests {
 
         // Real proposal - should overwrite
         let value_id = test_value_id(0xCD);
-        monitor.record_proposal(value_id);
+        assert!(
+            monitor.record_proposal(value_id),
+            "proposal should supersede a synced placeholder"
+        );
 
         assert!(monitor.proposal_receive_time.unwrap() >= synced_time);
         assert_eq!(monitor.value_id, Some(value_id));
@@ -221,16 +225,22 @@ mod tests {
     }
 
     #[test]
-    fn test_record_proposal_duplicate_without_sync_warns() {
+    fn test_record_proposal_duplicate_without_sync_is_rejected() {
         let mut monitor = ProposalMonitor::new(Height::new(1), test_address(), SystemTime::now());
 
         let value_id1 = test_value_id(0x11);
-        monitor.record_proposal(value_id1);
+        assert!(
+            monitor.record_proposal(value_id1),
+            "first proposal should be recorded (returns true)"
+        );
         let time1 = monitor.proposal_receive_time.unwrap();
 
-        // Second proposal, should be ignored with warning
+        // Second, equivocating proposal: rejected (returns false), first record kept.
         let value_id2 = test_value_id(0x22);
-        monitor.record_proposal(value_id2);
+        assert!(
+            !monitor.record_proposal(value_id2),
+            "equivocating proposal should be rejected (returns false)"
+        );
 
         assert_eq!(monitor.proposal_receive_time, Some(time1));
         assert_eq!(monitor.value_id, Some(value_id1));
@@ -241,7 +251,7 @@ mod tests {
         let mut monitor = ProposalMonitor::new(Height::new(1), test_address(), SystemTime::now());
         let value_id = test_value_id(0xAA);
 
-        monitor.record_proposal(value_id);
+        assert!(monitor.record_proposal(value_id));
         monitor.mark_decided(&value_id);
 
         assert_eq!(monitor.successful, ProposalSuccessState::Successful);
@@ -253,7 +263,7 @@ mod tests {
         let proposed_value = test_value_id(0xAA);
         let decided_value = test_value_id(0xBB);
 
-        monitor.record_proposal(proposed_value);
+        assert!(monitor.record_proposal(proposed_value));
         monitor.mark_decided(&decided_value);
 
         assert_eq!(monitor.successful, ProposalSuccessState::Unsuccessful);
