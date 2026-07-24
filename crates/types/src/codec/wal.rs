@@ -343,4 +343,44 @@ mod tests {
             err_v1
         );
     }
+
+    /// Regression test for issue #131: the V1 versioned decode path
+    /// must not pay the cost of a full protobuf parse of the
+    /// un-versioned message before noticing the leading version
+    /// byte. After `encode`, the first byte is `0x01` (`V1`); a
+    /// correctly-placed fast path strips it and decodes the rest as
+    /// protobuf in a single pass.
+    ///
+    /// This test does not measure wall-clock time (it would be flaky
+    /// on shared CI). Instead it locks in the two observable
+    /// invariants of the fast path:
+    ///
+    /// 1. The encoded form of a versioned message starts with the
+    ///    version byte (`SignedConsensusMsgVersion::V1 == 0x01`).
+    /// 2. Decoding that exact byte sequence returns the original
+    ///    message — i.e. the fast path is functionally equivalent
+    ///    to the legacy "try-protobuf-first" path.
+    ///
+    /// The legacy branch in the macro is exercised separately by
+    /// `test_previous_codec_compatibility` above, so removing or
+    /// regressing it would surface there, not here.
+    #[test]
+    fn fast_path_decodes_v1_prefixed_message_in_one_pass() {
+        let codec = WalCodec;
+
+        let msg = create_test_vote();
+        let encoded = codec.encode(&msg).expect("encode should succeed");
+
+        // Invariant 1: encoded form is prefixed with the V1 version byte.
+        assert_eq!(
+            encoded[0],
+            SignedConsensusMsgVersion::V1 as u8,
+            "encoded WAL messages must be prefixed with the V1 version byte",
+        );
+
+        // Invariant 2: decoding the versioned bytes returns the original
+        // message, with no leftover version byte in the payload.
+        let decoded = codec.decode(encoded).expect("decode should succeed");
+        assert_eq!(msg, decoded);
+    }
 }

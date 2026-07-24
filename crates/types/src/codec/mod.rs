@@ -38,6 +38,30 @@ macro_rules! impl_versioned_codec {
                     return Err($crate::codec::error::CodecError::EmptyBytes);
                 }
 
+                // Fast path: the first byte matches the version we expect
+                // for a versioned message. `0x01` cannot start a real
+                // protobuf-encoded Arc message (the smallest protobuf
+                // field tag with a non-zero field number is `0x08`), so
+                // this check is unambiguous: a leading `0x01` byte
+                // always means a V1 versioned message. Skipping the
+                // legacy decode attempt below saves the cost of a
+                // full protobuf parse on every consensus message, which
+                // is the common case once all nodes have been upgraded.
+                //
+                // The legacy "try-raw-protobuf-first" branch is kept
+                // below for backward compatibility with messages from
+                // pre-versioning nodes; that branch is the only one
+                // exercised by the existing `test_previous_codec_compatibility`
+                // tests in `wal.rs` and `network.rs`.
+                if bytes[0] == $version_val as u8 {
+                    let _ = bytes.get_u8();
+                    return malachitebft_codec::Codec::decode(
+                        &$crate::codec::proto::ProtobufCodec,
+                        bytes,
+                    )
+                    .map_err($crate::codec::error::CodecError::Protobuf);
+                }
+
                 // TODO: Phase 3: Remove after all nodes are upgraded to use versioning
                 if let Ok(msg) = malachitebft_codec::Codec::decode(
                     &$crate::codec::proto::ProtobufCodec,
