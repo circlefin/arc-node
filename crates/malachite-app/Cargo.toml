@@ -89,6 +89,7 @@ reqwest = { workspace = true, features = ["json"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tonic.workspace = true
 tower = { workspace = true }
 
 [lints]

@@ -25,7 +25,7 @@ use arc_consensus_types::codec::{network::NetCodec, Codec};
 use arc_consensus_types::signing::Signer;
 use arc_signer::ArcSigningProvider;
 use bytes::Bytes;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use tracing::info;
 
 /// Create a signed validator proof binding the consensus public key to the P2P peer ID.
@@ -50,7 +50,8 @@ pub async fn create_validator_proof(
     let proof = signing_provider
         .sign_validator_proof(public_key_bytes, peer_id_bytes)
         .await
-        .map_err(|e| eyre::eyre!("Failed to sign validator proof: {e}"))?;
+        .map_err(eyre::Report::new)
+        .wrap_err("Failed to sign validator proof")?;
 
     let proof_bytes = NetCodec
         .encode(&proof)

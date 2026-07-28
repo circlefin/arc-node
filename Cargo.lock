@@ -1820,6 +1820,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tokio-util",
+ "tonic 0.12.3",
  "tower 0.5.3",
  "tracing",
  "url",

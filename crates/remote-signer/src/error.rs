@@ -37,11 +37,31 @@ pub enum RemoteSigningError {
     Timeout(String),
 
     #[error("Retry exhausted after {retries} attempts")]
-    RetryExhausted { retries: usize },
+    RetryExhausted {
+        retries: usize,
+        #[source]
+        source: Box<RemoteSigningError>,
+    },
 
     #[error("Configuration error: {0}")]
     Configuration(String),
 
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
+}
+
+impl RemoteSigningError {
+    /// Returns `true` if this error represents a transient startup failure that a
+    /// process restart is likely to recover from.
+    pub fn is_retryable_startup_error(&self) -> bool {
+        match self {
+            Self::Transport(_) | Self::ServiceUnavailable(_) | Self::Timeout(_) => true,
+            Self::Status(status) => matches!(
+                status.code(),
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+            ),
+            Self::RetryExhausted { source, .. } => source.is_retryable_startup_error(),
+            Self::Authentication(_) | Self::Configuration(_) | Self::InvalidResponse(_) => false,
+        }
+    }
 }
