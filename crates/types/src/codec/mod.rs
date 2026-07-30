@@ -38,6 +38,15 @@ macro_rules! impl_versioned_codec {
                     return Err($crate::codec::error::CodecError::EmptyBytes);
                 }
 
+                if bytes[0] == $version_val as u8 {
+                    let _ = bytes.get_u8();
+                    return malachitebft_codec::Codec::decode(
+                        &$crate::codec::proto::ProtobufCodec,
+                        bytes,
+                    )
+                    .map_err($crate::codec::error::CodecError::Protobuf);
+                }
+
                 // TODO: Phase 3: Remove after all nodes are upgraded to use versioning
                 if let Ok(msg) = malachitebft_codec::Codec::decode(
                     &$crate::codec::proto::ProtobufCodec,
@@ -47,16 +56,9 @@ macro_rules! impl_versioned_codec {
                 }
 
                 let version_byte = bytes.get_u8();
-                let version = <$version_ty>::try_from(version_byte)
-                    .map_err($crate::codec::error::CodecError::UnsupportedVersion)?;
-                if version != $version_val {
-                    return Err($crate::codec::error::CodecError::UnsupportedVersion(
-                        version_byte,
-                    ));
-                }
-
-                malachitebft_codec::Codec::decode(&$crate::codec::proto::ProtobufCodec, bytes)
-                    .map_err($crate::codec::error::CodecError::Protobuf)
+                Err($crate::codec::error::CodecError::UnsupportedVersion(
+                    version_byte,
+                ))
             }
 
             fn encode(&self, msg: &$ty) -> Result<bytes::Bytes, Self::Error> {
