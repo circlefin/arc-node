@@ -856,3 +856,30 @@ can restart without `--full`.
 > issues on constrained machines. If you encounter memory pressure, enable
 > backpressure (see [System Requirements](#system-requirements) section) and remove
 > `--full` after the first successful start.
+## EVM Compatibility Notes
+
+### PUSH0 Opcode Not Supported
+
+Arc Testnet does not support the `PUSH0` opcode (introduced in EVM Shanghai).
+Solidity >= 0.8.20 defaults to emitting `PUSH0` for zero-valued stack pushes.
+
+Contracts compiled with `evmVersion: "shanghai"`, `"cancun"`, or `"prague"` will
+deploy successfully but all calls will revert silently with no error data.
+
+**Fix:** Always set `evmVersion: "paris"` in your compilation config.
+
+For Hardhat (`hardhat.config.ts`):
+```ts
+solidity: {
+  version: '0.8.29',
+  settings: {
+    optimizer: { enabled: true, runs: 200 },
+    evmVersion: 'paris', // required for Arc Testnet
+  },
+},
+```
+
+For Foundry (`foundry.toml`):
+```toml
+evm_version = "paris"
+```
