@@ -30,6 +30,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
 
 use arc_evm_node::node::{ArcNode, ArcRpcConfig};
+use arc_evm_node::rebroadcast::DEFAULT_REBROADCAST_INTERVAL;
 use arc_evm_node::ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT;
 use arc_execution_config::addresses_denylist::{
     AddressesDenylistConfig, AddressesDenylistConfigError, DEFAULT_DENYLIST_ADDRESS,
@@ -325,7 +326,7 @@ struct ArcExtraCli {
     #[arg(
         long = "txpool.rebroadcast-interval",
         value_name = "SECONDS",
-        default_value_t = 60,
+        default_value_t = DEFAULT_REBROADCAST_INTERVAL.as_secs(),
         help_heading = "Transaction pool"
     )]
     txpool_rebroadcast_interval: u64,
