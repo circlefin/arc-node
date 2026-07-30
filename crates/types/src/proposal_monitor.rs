@@ -27,7 +27,6 @@
 //! By design, monitoring data is only stored for round-0 proposals.
 
 use std::time::SystemTime;
-use tracing::warn;
 
 use crate::{Address, Height, ValueId};
 
@@ -117,22 +116,18 @@ impl ProposalMonitor {
 
     /// Record that proposal was received.
     /// Takes precedence over synced value.
-    pub fn record_proposal(&mut self, value_id: ValueId) {
-        // FIXME: this log message should not be produced here.
+    /// Returns `Some(ValueId)` if a previous proposal exist (equivocation),
+    /// `None` if this is the first proposal recorded.
+    pub fn record_proposal(&mut self, value_id: ValueId) -> Option<ValueId> {
         if let Some(first_value) = self.value_id
             && !self.synced
         {
-            warn!(
-                height = %self.height,
-                %first_value,
-                new_value = %value_id,
-                "Equivocating proposal at round 0"
-            );
-            return;
+            return Some(first_value);
         }
         self.proposal_receive_time = Some(SystemTime::now());
         self.value_id = Some(value_id);
         self.synced = false;
+        None
     }
 
     /// Check if the decided value matches the recorded proposal.
@@ -231,6 +226,22 @@ mod tests {
         // Second proposal, should be ignored with warning
         let value_id2 = test_value_id(0x22);
         monitor.record_proposal(value_id2);
+
+        assert_eq!(monitor.proposal_receive_time, Some(time1));
+        assert_eq!(monitor.value_id, Some(value_id1));
+    }
+
+    #[test]
+    fn test_record_proposal_duplicate_returns_prev_value() {
+        let mut monitor = ProposalMonitor::new(Height::new(1), test_address(), SystemTime::now());
+
+        let value_id1 = test_value_id(0x11);
+        assert_eq!(monitor.record_proposal(value_id1), None);
+        let time1 = monitor.proposal_receive_time.unwrap();
+
+        // Second proposal returns the first value (equivocation), first value preserved
+        let value_id2 = test_value_id(0x22);
+        assert_eq!(monitor.record_proposal(value_id2), Some(value_id1));
 
         assert_eq!(monitor.proposal_receive_time, Some(time1));
         assert_eq!(monitor.value_id, Some(value_id1));

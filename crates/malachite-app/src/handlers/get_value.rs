@@ -26,7 +26,7 @@ use malachitebft_app_channel::app::types::LocallyProposedValue;
 use malachitebft_app_channel::{NetworkMsg, Reply};
 use malachitebft_core_types::Validity;
 
-use arc_consensus_types::{Address, ArcContext, Height};
+use arc_consensus_types::{Address, ArcContext, Height, ValueId};
 use arc_eth_engine::engine::Engine;
 use arc_eth_engine::json_structures::ExecutionBlock;
 use arc_signer::ArcSigningProvider;
@@ -90,12 +90,7 @@ pub async fn handle(
 
     if let Some(proposed_value) = proposed_value {
         if round.as_i64() == 0 {
-            if let Some(monitor) = &mut state.proposal_monitor {
-                debug_assert_eq!(monitor.height, height, "proposal monitor height mismatch");
-                monitor.record_proposal(proposed_value.value.id());
-            } else {
-                warn!(%height, %round, "No proposal monitor present");
-            }
+            record_self_proposal_in_monitor(state, height, proposed_value.value.id());
         }
 
         if let Err(e) = reply.send(proposed_value) {
@@ -307,4 +302,21 @@ async fn get_previously_built_block(
     let blocks = undecided_blocks.get_by_round(height, round).await?;
     let block = blocks.into_iter().find(|p| p.proposer == proposer);
     Ok(block)
+}
+
+/// Records the proposed value in the proposal monitor for the given height, if the monitor exists.
+fn record_self_proposal_in_monitor(state: &mut State, height: Height, value_id: ValueId) {
+    let Some(monitor) = &mut state.proposal_monitor else {
+        warn!(%height, round = 0, "No proposal monitor present");
+        return;
+    };
+    debug_assert_eq!(monitor.height, height, "proposal monitor height mismatch");
+    if let Some(first_value) = monitor.record_proposal(value_id) {
+        warn!(
+            height = %monitor.height,
+            first_value = %first_value,
+            new_value = %value_id,
+            "Equivocating proposal at round 0"
+        );
+    }
 }
