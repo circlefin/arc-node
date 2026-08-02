@@ -276,10 +276,27 @@ pub struct StartCmd {
     /// If omitted, RPC is disabled.
     /// If provided, RPC is enabled on the given address.
     ///
-    /// Example: 0.0.0.0:31000
+    /// The CL RPC port is an internal interface. Bind it to loopback or to a
+    /// private interface, and firewall it off from the public internet.
+    ///
+    /// Example: 127.0.0.1:31000
     #[clap(long = "rpc.addr", value_name = "ADDR")]
     #[serde(skip)]
     pub rpc_addr: Option<SocketAddr>,
+
+    /// Path to a file holding the bearer token that the privileged RPC routes
+    /// require. Those are the routes that change node state at runtime: adding
+    /// and removing persistent peers.
+    ///
+    /// If omitted, the privileged routes are not served at all and the RPC
+    /// listener answers read-only monitoring requests only.
+    ///
+    /// Generate a token with: openssl rand -hex 32 > admin-token
+    ///
+    /// Example: /etc/arc/rpc-admin-token
+    #[clap(long = "rpc.admin-token-file", value_name = "PATH")]
+    #[serde(skip)]
+    pub rpc_admin_token_file: Option<PathBuf>,
 
     // ===== Runtime =====
     /// Tokio runtime flavor to use.
@@ -511,6 +528,7 @@ impl Default for StartCmd {
             execution_jwt: None,
             metrics: None,
             rpc_addr: None,
+            rpc_admin_token_file: None,
             runtime_flavor: RUNTIME_MULTI_THREADED.to_string(),
             worker_threads: None,
             full: false,
@@ -626,6 +644,9 @@ impl StartCmd {
         push_if_some!("execution-jwt", self.execution_jwt);
         push_if_some!("metrics", self.metrics);
         push_if_some!("rpc.addr", self.rpc_addr);
+        if let Some(ref path) = self.rpc_admin_token_file {
+            flags.push(format!("--rpc.admin-token-file={}", path.display()));
+        }
         push_if!("full", self.full);
         push_if!("minimal", self.minimal);
         if let Some(ref path) = self.private_key {
@@ -1283,6 +1304,38 @@ mod tests {
         let cmd = new_start_cmd();
         assert_eq!(cmd.metrics, None);
         assert_eq!(cmd.rpc_addr, None);
+        assert_eq!(cmd.rpc_admin_token_file, None);
+    }
+
+    #[test]
+    fn rpc_admin_token_file_flag_parses_a_path() {
+        let args = vec![
+            "arc-node-consensus",
+            "--moniker",
+            "test",
+            "--p2p.addr",
+            "/ip4/127.0.0.1/tcp/27000",
+            "--rpc.addr",
+            "127.0.0.1:31000",
+            "--rpc.admin-token-file",
+            "/etc/arc/rpc-admin-token",
+        ];
+        let cmd = StartCmd::try_parse_from(args).unwrap();
+        assert_eq!(
+            cmd.rpc_admin_token_file,
+            Some(PathBuf::from("/etc/arc/rpc-admin-token"))
+        );
+    }
+
+    #[test]
+    fn rpc_admin_token_file_round_trips_through_flags() {
+        let cmd = StartCmd {
+            rpc_admin_token_file: Some(PathBuf::from("/etc/arc/rpc-admin-token")),
+            ..new_start_cmd()
+        };
+        assert!(cmd
+            .to_cli_flags()
+            .contains(&"--rpc.admin-token-file=/etc/arc/rpc-admin-token".to_string()));
     }
 
     // Pruning tests
@@ -1603,6 +1656,7 @@ mod tests {
             execution_jwt: None,
             metrics: Some("127.0.0.1:9000".parse().unwrap()),
             rpc_addr: Some("127.0.0.1:31000".parse().unwrap()),
+            rpc_admin_token_file: Some(PathBuf::from("/etc/arc/rpc-admin-token")),
             runtime_flavor: RUNTIME_SINGLE_THREADED.to_string(),
             worker_threads: Some(8),
             full: false,

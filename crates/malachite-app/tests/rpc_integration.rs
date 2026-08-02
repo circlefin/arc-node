@@ -500,3 +500,149 @@ async fn test_no_misbehavior_evidence_endpoint_without_height() {
 
     assert_eq!(response.status(), 404); // Not found since we returned None
 }
+
+const ADMIN_TOKEN: &str = "integration-admin-token";
+
+fn a_peer_addr() -> serde_json::Value {
+    serde_json::json!({
+        "addr": "/ip4/127.0.0.1/tcp/26656/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
+    })
+}
+
+/// An unauthenticated caller must not be able to add a persistent peer on a node
+/// that serves the privileged routes.
+#[tokio::test]
+async fn test_add_persistent_peer_unauthenticated_is_rejected() {
+    let server = TestServer::start_with_admin_token(ADMIN_TOKEN).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{}/persistent-peers", server.url()))
+        .json(&a_peer_addr())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), 401);
+    assert_eq!(
+        response
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer")
+    );
+
+    let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+    assert_eq!(body.get("error").unwrap(), "Missing bearer token");
+}
+
+/// Same for removing a peer, which is the direction that can partition a node.
+#[tokio::test]
+async fn test_remove_persistent_peer_unauthenticated_is_rejected() {
+    let server = TestServer::start_with_admin_token(ADMIN_TOKEN).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .delete(format!("{}/persistent-peers", server.url()))
+        .json(&a_peer_addr())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), 401);
+}
+
+#[tokio::test]
+async fn test_persistent_peer_with_wrong_token_is_rejected() {
+    let server = TestServer::start_with_admin_token(ADMIN_TOKEN).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{}/persistent-peers", server.url()))
+        .bearer_auth("guessed-token")
+        .json(&a_peer_addr())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), 401);
+    let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+    assert_eq!(body.get("error").unwrap(), "Invalid admin token");
+}
+
+/// The operator's own request still works, and the multiaddr still reaches the
+/// networking layer.
+#[tokio::test]
+async fn test_add_persistent_peer_with_admin_token_succeeds() {
+    let server = TestServer::start_with_admin_token(ADMIN_TOKEN).await;
+    let client = reqwest::Client::new();
+
+    server.expect_network_request(|req| match req {
+        NetworkRequest::UpdatePersistentPeers(_, reply) => {
+            reply.send(Ok(())).ok();
+        }
+        _ => panic!("Unexpected request type"),
+    });
+
+    let response = client
+        .post(format!("{}/persistent-peers", server.url()))
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&a_peer_addr())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+    assert_eq!(body.get("status").unwrap(), "ok");
+}
+
+#[tokio::test]
+async fn test_remove_persistent_peer_with_admin_token_succeeds() {
+    let server = TestServer::start_with_admin_token(ADMIN_TOKEN).await;
+    let client = reqwest::Client::new();
+
+    server.expect_network_request(|req| match req {
+        NetworkRequest::UpdatePersistentPeers(_, reply) => {
+            reply.send(Ok(())).ok();
+        }
+        _ => panic!("Unexpected request type"),
+    });
+
+    let response = client
+        .delete(format!("{}/persistent-peers", server.url()))
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&a_peer_addr())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), 200);
+}
+
+/// A node started without `--rpc.admin-token-file` does not route the peer
+/// mutation methods at all.
+#[tokio::test]
+async fn test_persistent_peers_absent_without_admin_token() {
+    let server = TestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{}/persistent-peers", server.url()))
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&a_peer_addr())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), 404);
+
+    let response = client
+        .delete(format!("{}/persistent-peers", server.url()))
+        .json(&a_peer_addr())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), 404);
+}

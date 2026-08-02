@@ -607,6 +607,7 @@ fn build_node_consensus_config(
         rpc: arc_consensus_types::RpcConfig {
             enabled: true,
             listen_addr: rpc_listen_addr,
+            admin_token: None,
         },
         ..Default::default()
     };

@@ -25,7 +25,9 @@ use serde_json::json;
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tracing::{error, info};
 
-use super::middleware::extract_version;
+use arc_consensus_types::AdminToken;
+
+use super::middleware::{extract_version, require_admin_token};
 use super::types::{EndpointInfo, RpcState, TxConsensusReq, TxNetworkReq};
 use super::version::ApiVersion;
 use crate::request::TxAppReq;
@@ -105,19 +107,21 @@ routes![
         "Get the current network state (peers, topics, scores)"
     ),
     route!(
+        admin,
         post,
         "/persistent-peers",
         crate::rpc::handlers::add_persistent_peer,
-        "Add a persistent peer at runtime.",
+        "Add a persistent peer at runtime. Requires the admin bearer token.",
         params = {
             "body" => "JSON object with \"addr\" (string): multiaddr of the peer, e.g. \"/ip4/127.0.0.1/tcp/26656/p2p/12D3KooW...\"."
         }
     ),
     route!(
+        admin,
         delete,
         "/persistent-peers",
         crate::rpc::handlers::remove_persistent_peer,
-        "Remove a persistent peer at runtime.",
+        "Remove a persistent peer at runtime. Requires the admin bearer token.",
         params = {
             "body" => "JSON object with \"addr\" (string): multiaddr of the peer to remove, e.g. \"/ip4/127.0.0.1/tcp/26656/p2p/12D3KooW...\"."
         }
@@ -130,8 +134,17 @@ pub async fn serve(
     tx_consensus_req: TxConsensusReq,
     tx_app_req: TxAppReq,
     tx_network_req: TxNetworkReq,
+    admin_token: Option<AdminToken>,
 ) {
-    if let Err(e) = inner(listen_addr, tx_consensus_req, tx_app_req, tx_network_req).await {
+    if let Err(e) = inner(
+        listen_addr,
+        tx_consensus_req,
+        tx_app_req,
+        tx_network_req,
+        admin_token,
+    )
+    .await
+    {
         error!("RPC server failed: {e}");
     }
 }
@@ -140,10 +153,17 @@ pub async fn serve(
 ///
 /// This is exposed publicly for testing purposes, allowing integration tests
 /// to create a server with the actual production router.
+///
+/// Routes marked `admin` change node state at runtime. They are registered only
+/// when `admin_token` is set, and then they sit behind
+/// [`require_admin_token`](super::middleware::require_admin_token). With no token
+/// configured the listener serves read-only monitoring routes and the privileged
+/// paths do not exist.
 pub fn build_router(
     tx_consensus_req: TxConsensusReq,
     tx_app_req: TxAppReq,
     tx_network_req: TxNetworkReq,
+    admin_token: Option<AdminToken>,
 ) -> Router {
     let rpc_state = RpcState {
         tx_consensus_req,
@@ -151,15 +171,37 @@ pub fn build_router(
         tx_network_req,
     };
 
-    let routes = build_routes();
+    let (admin_routes, public_routes): (Vec<_>, Vec<_>) =
+        build_routes().into_iter().partition(|route| route.admin);
 
     let mut router = Router::new();
-    for route in &routes {
+    for route in &public_routes {
         router = router.route(route.path, (route.handler)());
     }
 
-    let docs = routes
+    let admin_enabled = admin_token.is_some();
+    if let Some(token) = admin_token {
+        let mut admin_router = Router::new();
+        for route in &admin_routes {
+            admin_router = admin_router.route(route.path, (route.handler)());
+        }
+
+        // route_layer only runs for requests that match one of these routes, so
+        // unmatched paths still fall through to the public router.
+        router = router.merge(
+            admin_router.route_layer(axum::middleware::from_fn_with_state(
+                token,
+                require_admin_token,
+            )),
+        );
+    } else {
+        info!("RPC admin routes disabled: no --rpc.admin-token-file configured");
+    }
+
+    // Document only what this node actually serves.
+    let docs = public_routes
         .into_iter()
+        .chain(admin_routes.into_iter().filter(|_| admin_enabled))
         .map(|r| (format!("{} {}", r.method, r.path), r.doc))
         .collect::<BTreeMap<_, _>>();
 
@@ -179,8 +221,9 @@ async fn inner(
     tx_consensus_req: TxConsensusReq,
     tx_app_req: TxAppReq,
     tx_network_req: TxNetworkReq,
+    admin_token: Option<AdminToken>,
 ) -> Result<()> {
-    let app = build_router(tx_consensus_req, tx_app_req, tx_network_req);
+    let app = build_router(tx_consensus_req, tx_app_req, tx_network_req, admin_token);
 
     let listener = TcpListener::bind(listen_addr).await?;
     let address = listener.local_addr()?;
@@ -515,6 +558,12 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    const TEST_ADMIN_TOKEN: &str = "test-admin-token";
+
+    fn test_admin_token() -> AdminToken {
+        AdminToken::from_file_contents(TEST_ADMIN_TOKEN).unwrap()
+    }
+
     async fn build_no_backend_router_and_request(uri: &str) -> (StatusCode, serde_json::Value) {
         let (tx_dummy_cons_req, _dummy_rx_c) = mpsc::channel::<ConsensusRequest<ArcContext>>(1);
         let (tx_dummy_app_req, _dummy_rx_a) = mpsc::channel::<AppRequest>(1);
@@ -528,7 +577,7 @@ mod tests {
         tx_network_req: mpsc::Sender<NetworkRequest>,
         uri: &str,
     ) -> (StatusCode, serde_json::Value) {
-        let app = build_router(tx_consensus_req, tx_app_req, tx_network_req);
+        let app = build_router(tx_consensus_req, tx_app_req, tx_network_req, None);
         let req = Request::builder()
             .method("GET")
             .uri(uri)
@@ -540,6 +589,8 @@ mod tests {
         (status, val)
     }
 
+    /// Request with a JSON body against a router that serves the admin routes,
+    /// presenting the configured token.
     async fn build_router_and_request_with_body(
         method: &str,
         tx_consensus_req: mpsc::Sender<ConsensusRequest<ArcContext>>,
@@ -548,17 +599,87 @@ mod tests {
         uri: &str,
         body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
-        let app = build_router(tx_consensus_req, tx_app_req, tx_network_req);
-        let req = Request::builder()
+        request_with_body(
+            method,
+            tx_consensus_req,
+            tx_app_req,
+            tx_network_req,
+            uri,
+            body,
+            Some(test_admin_token()),
+            Some(TEST_ADMIN_TOKEN),
+        )
+        .await
+    }
+
+    /// Same, with explicit control over the token the node is configured with and
+    /// the token the caller presents.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_with_body(
+        method: &str,
+        tx_consensus_req: mpsc::Sender<ConsensusRequest<ArcContext>>,
+        tx_app_req: mpsc::Sender<AppRequest>,
+        tx_network_req: mpsc::Sender<NetworkRequest>,
+        uri: &str,
+        body: serde_json::Value,
+        configured: Option<AdminToken>,
+        presented: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = build_router(tx_consensus_req, tx_app_req, tx_network_req, configured);
+        let mut builder = Request::builder()
             .method(method)
             .uri(uri)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(token) = presented {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let req = builder
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
-        let val = response_to_json(resp).await;
+        let val = response_to_json_lenient(resp).await;
         (status, val)
+    }
+
+    /// Like `response_to_json`, but tolerates an empty body. A router that does
+    /// not know a path answers 404 with no body at all.
+    async fn response_to_json_lenient(resp: Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        if bytes.is_empty() {
+            return serde_json::Value::Null;
+        }
+
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Peer-mutation request with no backend listening at all. The receivers are
+    /// dropped, so a request that reaches a handler fails fast instead of waiting
+    /// for a reply that will never come.
+    async fn peer_request_without_backend(
+        method: &str,
+        configured: Option<AdminToken>,
+        presented: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let (tx_cons_req, rx_c) = mpsc::channel::<ConsensusRequest<ArcContext>>(1);
+        let (tx_app_req, rx_a) = mpsc::channel::<AppRequest>(1);
+        let (tx_nw_req, rx_n) = mpsc::channel::<NetworkRequest>(1);
+        drop((rx_c, rx_a, rx_n));
+
+        request_with_body(
+            method,
+            tx_cons_req,
+            tx_app_req,
+            tx_nw_req,
+            "/persistent-peers",
+            valid_add_persistent_peer_addr(),
+            configured,
+            presented,
+        )
+        .await
     }
 
     #[test]
@@ -642,12 +763,131 @@ mod tests {
         );
         assert_eq!(
             endpoints["POST /persistent-peers"]["desc"],
-            "Add a persistent peer at runtime."
+            "Add a persistent peer at runtime. Requires the admin bearer token."
         );
         assert_eq!(
             endpoints["DELETE /persistent-peers"]["desc"],
-            "Remove a persistent peer at runtime."
+            "Remove a persistent peer at runtime. Requires the admin bearer token."
         );
+    }
+
+    #[test]
+    fn test_only_peer_mutation_routes_are_privileged() {
+        let admin: Vec<_> = build_routes()
+            .iter()
+            .filter(|r| r.admin)
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect();
+        assert_eq!(
+            admin,
+            vec![
+                "POST /persistent-peers".to_string(),
+                "DELETE /persistent-peers".to_string(),
+            ]
+        );
+    }
+
+    /// The index of a node with no admin token must not advertise routes it does
+    /// not serve.
+    #[tokio::test]
+    async fn test_index_omits_admin_routes_without_a_token() {
+        let (_, val) = build_no_backend_router_and_request("/").await;
+        let endpoints = &val["endpoints"];
+        assert!(endpoints.get("POST /persistent-peers").is_none());
+        assert!(endpoints.get("DELETE /persistent-peers").is_none());
+        assert!(endpoints.get("GET /network-state").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_index_lists_admin_routes_with_a_token() {
+        let (tx_cons_req, rx_c) = mpsc::channel::<ConsensusRequest<ArcContext>>(1);
+        let (tx_app_req, rx_a) = mpsc::channel::<AppRequest>(1);
+        let (tx_nw_req, rx_n) = mpsc::channel::<NetworkRequest>(1);
+        drop((rx_c, rx_a, rx_n));
+
+        let app = build_router(tx_cons_req, tx_app_req, tx_nw_req, Some(test_admin_token()));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let val = response_to_json(resp).await;
+        let endpoints = &val["endpoints"];
+        assert!(endpoints.get("POST /persistent-peers").is_some());
+        assert!(endpoints.get("DELETE /persistent-peers").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_add_persistent_peer_without_token_is_unauthorized() {
+        let (status, val) =
+            peer_request_without_backend("POST", Some(test_admin_token()), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(val, json!({"error": "Missing bearer token"}));
+    }
+
+    #[tokio::test]
+    async fn test_remove_persistent_peer_without_token_is_unauthorized() {
+        let (status, val) =
+            peer_request_without_backend("DELETE", Some(test_admin_token()), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(val, json!({"error": "Missing bearer token"}));
+    }
+
+    #[tokio::test]
+    async fn test_add_persistent_peer_with_wrong_token_is_unauthorized() {
+        let (status, val) =
+            peer_request_without_backend("POST", Some(test_admin_token()), Some("not-the-token"))
+                .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(val, json!({"error": "Invalid admin token"}));
+    }
+
+    #[tokio::test]
+    async fn test_remove_persistent_peer_with_wrong_token_is_unauthorized() {
+        let (status, val) =
+            peer_request_without_backend("DELETE", Some(test_admin_token()), Some("not-the-token"))
+                .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(val, json!({"error": "Invalid admin token"}));
+    }
+
+    /// With no admin token configured the peer-mutation paths are not registered,
+    /// so they are not there to be called even by a caller that guesses a token.
+    #[tokio::test]
+    async fn test_peer_mutation_is_not_served_without_an_admin_token() {
+        for method in ["POST", "DELETE"] {
+            let (status, _) = peer_request_without_backend(method, None, None).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{method} /persistent-peers must not be routed without an admin token"
+            );
+
+            let (status, _) =
+                peer_request_without_backend(method, None, Some(TEST_ADMIN_TOKEN)).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{method} /persistent-peers must not be routed without an admin token"
+            );
+        }
+    }
+
+    /// Read-only routes stay public on a node that has admin routes enabled.
+    #[tokio::test]
+    async fn test_public_routes_need_no_admin_token() {
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::NetworkDumpState(MockValue::Present));
+        let app = build_router(tx_cons_req, tx_app_req, tx_nw_req, Some(test_admin_token()));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/network-state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

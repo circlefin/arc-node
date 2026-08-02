@@ -160,6 +160,15 @@ pub struct RpcConfig {
 
     /// Address to bind the RPC server to
     pub listen_addr: SocketAddr,
+
+    /// Bearer token required by the privileged RPC routes.
+    ///
+    /// Set from `--rpc.admin-token-file`. While it is `None` the routes that
+    /// mutate node state are not registered at all, so the listener serves only
+    /// the read-only monitoring endpoints. It is never read from or written to a
+    /// config file, so the credential lives in the token file alone.
+    #[serde(skip)]
+    pub admin_token: Option<AdminToken>,
 }
 
 impl Default for RpcConfig {
@@ -169,8 +178,65 @@ impl Default for RpcConfig {
             listen_addr: format!("127.0.0.1:{RPC_BASE_PORT}")
                 .parse()
                 .expect("valid socket address"),
+            admin_token: None,
         }
     }
+}
+
+/// Bearer credential a caller must present to reach the privileged RPC routes.
+///
+/// `Debug` is redacted, so dumping the configuration (`trace!(?config)`) cannot
+/// leak the token, and comparisons do not exit early on the first wrong byte.
+#[derive(Clone)]
+pub struct AdminToken(String);
+
+impl AdminToken {
+    /// Build a token from the contents of an admin token file.
+    ///
+    /// Surrounding whitespace is trimmed, which is what an operator gets from
+    /// `openssl rand -hex 32 > token`. An empty file is rejected rather than
+    /// accepted as an empty credential.
+    pub fn from_file_contents(contents: &str) -> eyre::Result<Self> {
+        let token = contents.trim();
+
+        if token.is_empty() {
+            bail!("admin token file is empty");
+        }
+
+        Ok(Self(token.to_owned()))
+    }
+
+    /// Whether a presented credential matches this token.
+    pub fn matches(&self, presented: &str) -> bool {
+        bytes_eq_no_early_exit(self.0.as_bytes(), presented.as_bytes())
+    }
+}
+
+impl std::fmt::Debug for AdminToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AdminToken(redacted)")
+    }
+}
+
+impl PartialEq for AdminToken {
+    fn eq(&self, other: &Self) -> bool {
+        bytes_eq_no_early_exit(self.0.as_bytes(), other.0.as_bytes())
+    }
+}
+
+/// Compare two byte strings without returning early on the first difference, so
+/// the count of matching leading bytes does not show up in the response time.
+fn bytes_eq_no_early_exit(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+
+    diff == 0
 }
 
 /// Execution-layer tuning parameters.
@@ -267,6 +333,65 @@ impl Default for RetryConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod admin_token {
+        use super::AdminToken;
+        use crate::config::RpcConfig;
+
+        #[test]
+        fn trims_surrounding_whitespace() {
+            let token = AdminToken::from_file_contents("  s3cret\n").unwrap();
+            assert!(token.matches("s3cret"));
+            assert!(!token.matches("  s3cret\n"));
+        }
+
+        #[test]
+        fn rejects_an_empty_file() {
+            assert!(AdminToken::from_file_contents("").is_err());
+            assert!(AdminToken::from_file_contents("   \n\t").is_err());
+        }
+
+        #[test]
+        fn does_not_match_a_prefix_or_a_different_token() {
+            let token = AdminToken::from_file_contents("s3cret").unwrap();
+            assert!(!token.matches("s3cre"));
+            assert!(!token.matches("s3cretx"));
+            assert!(!token.matches(""));
+            assert!(!token.matches("S3CRET"));
+        }
+
+        #[test]
+        fn debug_output_is_redacted() {
+            let token = AdminToken::from_file_contents("s3cret").unwrap();
+            let rendered = format!("{token:?}");
+            assert!(!rendered.contains("s3cret"), "rendered: {rendered}");
+
+            let config = RpcConfig {
+                admin_token: Some(token),
+                ..RpcConfig::default()
+            };
+            let rendered = format!("{config:?}");
+            assert!(!rendered.contains("s3cret"), "rendered: {rendered}");
+        }
+
+        #[test]
+        fn is_never_serialised_into_a_config_file() {
+            let config = RpcConfig {
+                admin_token: Some(AdminToken::from_file_contents("s3cret").unwrap()),
+                ..RpcConfig::default()
+            };
+
+            let serialised = serde_json::to_string(&config).unwrap();
+            assert!(!serialised.contains("s3cret"), "serialised: {serialised}");
+            assert!(
+                !serialised.contains("admin_token"),
+                "serialised: {serialised}"
+            );
+
+            let round_tripped: RpcConfig = serde_json::from_str(&serialised).unwrap();
+            assert_eq!(round_tripped.admin_token, None);
+        }
+    }
 
     mod pruning {
         use super::Config;

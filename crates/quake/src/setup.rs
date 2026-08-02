@@ -648,6 +648,8 @@ fn generate_legacy_consensus_config(
             listen_addr: format!("0.0.0.0:{APP_RPC_DEFAULT_PORT}")
                 .parse()
                 .context("failed to parse RPC listen address")?,
+            // Local devnet: no privileged RPC routes are served.
+            admin_token: None,
         },
         signing: if node.remote_signer.is_some() {
             SigningConfig::Remote(RemoteSigningConfig {

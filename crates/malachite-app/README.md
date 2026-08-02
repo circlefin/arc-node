@@ -78,7 +78,7 @@ arc-node-consensus start \
    --p2p.addr=/ip4/172.19.0.5/tcp/27000 \
    --p2p.persistent-peers=/ip4/172.19.0.6/tcp/27000,/ip4/172.19.0.7/tcp/27000 \
    --metrics=172.19.0.5:29000 \
-   --rpc.addr=0.0.0.0:31000 \
+   --rpc.addr=172.19.0.5:31000 \
    --eth-socket=/tmp/reth.ipc \
    --execution-socket=/tmp/auth.ipc \
    --minimal
@@ -95,12 +95,14 @@ arc-node-consensus start \
    --p2p.addr=/ip4/172.19.0.5/tcp/27000 \
    --p2p.persistent-peers=/ip4/172.19.0.6/tcp/27000,/ip4/172.19.0.7/tcp/27000 \
    --metrics=0.0.0.0:29000 \
-   --rpc.addr=0.0.0.0:31000 \
+   --rpc.addr=127.0.0.1:31000 \
    --eth-rpc-endpoint=http://localhost:8545 \
    --execution-endpoint=http://localhost:8551 \
    --execution-jwt=jwtsecret \
    --minimal
 ```
+
+The CL RPC port is an internal interface. These examples bind it to loopback or to the node's private interface, never to `0.0.0.0`. See the port table in [running-an-arc-node.md](../../docs/running-an-arc-node.md).
 
 Note: to generate a JWT (JSON web token), use the following command:
 
@@ -162,7 +164,8 @@ https://example.com,wss=ws.example.com:1212
 - `--discovery.num-inbound-peers` - Number of inbound peers (default: 20)
 - `--value-sync` - Enable value sync (default: true)
 - `--metrics` - Enable metrics and set listen address (e.g., "0.0.0.0:29000")
-- `--rpc.addr` - Enable RPC and set listen address (e.g., "0.0.0.0:31000")
+- `--rpc.addr` - Enable RPC and set listen address (e.g., "127.0.0.1:31000"). The CL RPC port is an internal interface: bind it to loopback or a private interface and firewall it off from the public internet (see the port table in [running-an-arc-node.md](../../docs/running-an-arc-node.md))
+- `--rpc.admin-token-file` - Path to a file holding the bearer token required by the privileged RPC routes (adding and removing persistent peers). Without it those routes are not served at all. Generate one with `openssl rand -hex 32 > admin-token`
 - `--full` - Arc full-node pruning preset; sets `--prune.certificates.distance 237600`; mutually exclusive with `--minimal` and the individual `--prune.certificates.*` flags
 - `--minimal` - Arc minimal-storage pruning preset; sets `--prune.certificates.distance 237600`; mutually exclusive with `--full` and the individual `--prune.certificates.*` flags
 - `--prune.certificates.distance` - Keep certificates for the last N heights (default: 0, disabled/archive node); mutually exclusive with `--prune.certificates.before` and `--full/--minimal` presets
@@ -274,7 +277,16 @@ The following environment variables can be used to modify behavior:
 
 ## REST API
 
-The consensus layer exposes a REST API for monitoring and querying consensus state when `--rpc.addr` is set (e.g., `--rpc.addr=0.0.0.0:26658`).
+The consensus layer exposes a REST API for monitoring and querying consensus state when `--rpc.addr` is set (e.g., `--rpc.addr=127.0.0.1:26658`).
+
+### Public and privileged routes
+
+The API has two classes of route, and the split is the security boundary of this listener:
+
+- **Public, read-only.** Everything under [Available Endpoints](#available-endpoints). These only report state.
+- **Privileged.** `POST /persistent-peers` and `DELETE /persistent-peers` change the node's peer set while it is running. They are served only when `--rpc.admin-token-file` is set, and a request must then carry that token as `Authorization: Bearer <token>`. Without the flag the paths are not routed at all and `GET /` does not list them.
+
+Peer mutation is an operator action. An unauthenticated caller that could reach it would be able to add its own peer or remove the peers a validator depends on, which matters most for a node run with `--p2p.persistent-peers-only`. Keep the RPC port internal either way: the token is the second line of defence, not a licence to expose the port.
 
 ### API Versioning
 
@@ -333,6 +345,11 @@ All endpoints support versioning:
 - `GET /commit?height=N` - Commit certificate for specific height
 - `GET /network-state` - Network peer information
 
+Privileged, and served only with `--rpc.admin-token-file` (see [Public and privileged routes](#public-and-privileged-routes)):
+
+- `POST /persistent-peers` - Add a persistent peer at runtime
+- `DELETE /persistent-peers` - Remove a persistent peer at runtime
+
 #### Example API Usage
 
 **Get Status:**
@@ -355,6 +372,18 @@ curl http://localhost:26658/health
 ```bash
 curl http://localhost:26658/
 ```
+
+**Add a persistent peer (privileged):**
+```bash
+curl -X POST \
+  -H "Accept: application/vnd.arc.v1+json" \
+  -H "Authorization: Bearer $(cat /etc/arc/rpc-admin-token)" \
+  -H "Content-Type: application/json" \
+  -d '{"addr":"/ip4/10.0.0.2/tcp/27000/p2p/12D3KooW..."}' \
+  http://localhost:26658/persistent-peers
+```
+
+Without the header the node answers `401` with `{"error":"Missing bearer token"}`. On a node started without `--rpc.admin-token-file` the route does not exist and the node answers `404`.
 
 ### Deprecation Policy
 

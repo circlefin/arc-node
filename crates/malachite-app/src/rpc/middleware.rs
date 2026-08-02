@@ -14,16 +14,75 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Middleware for API version extraction and negotiation
+//! Middleware for API version extraction and negotiation, and for the admin
+//! credential the privileged routes require.
 
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use tracing::debug;
 
+use arc_consensus_types::AdminToken;
+
 use super::version::ApiVersion;
+
+/// Axum middleware that rejects a request unless it presents the configured admin
+/// token as `Authorization: Bearer <token>`.
+///
+/// This is applied with `Router::route_layer`, so it only runs for the privileged
+/// routes. Those routes are not registered at all when no token is configured,
+/// which keeps peer mutation off a node that has not opted in.
+pub async fn require_admin_token(
+    State(expected): State<AdminToken>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(presented) = bearer_token(&req) else {
+        debug!(
+            path = %req.uri().path(),
+            "Privileged RPC request without a bearer token, returning 401"
+        );
+        return unauthorized("Missing bearer token");
+    };
+
+    if !expected.matches(presented) {
+        debug!(
+            path = %req.uri().path(),
+            "Privileged RPC request with a bearer token that does not match, returning 401"
+        );
+        return unauthorized("Invalid admin token");
+    }
+
+    next.run(req).await
+}
+
+/// Extract the credential from an `Authorization: Bearer <token>` header.
+fn bearer_token(req: &Request) -> Option<&str> {
+    let value = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+
+    Some(token)
+}
+
+fn unauthorized(message: &'static str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        axum::Json(json!({ "error": message })),
+    )
+        .into_response()
+}
 
 /// Axum middleware that extracts the API version from the Accept header
 /// and stores it in the request extensions.
@@ -111,6 +170,27 @@ mod tests {
         assert_eq!(ApiVersion::from_accept_header(""), Some(ApiVersion::V1));
         assert_eq!(
             ApiVersion::from_accept_header("application/vnd.arc.v99+json"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_bearer_token_parsing() {
+        let with_auth = |value: &str| {
+            Request::builder()
+                .header(header::AUTHORIZATION, value)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        assert_eq!(bearer_token(&with_auth("Bearer s3cret")), Some("s3cret"));
+        assert_eq!(bearer_token(&with_auth("bearer s3cret")), Some("s3cret"));
+        assert_eq!(bearer_token(&with_auth("Bearer  s3cret ")), Some("s3cret"));
+        assert_eq!(bearer_token(&with_auth("Basic s3cret")), None);
+        assert_eq!(bearer_token(&with_auth("Bearer")), None);
+        assert_eq!(bearer_token(&with_auth("Bearer ")), None);
+        assert_eq!(
+            bearer_token(&Request::builder().body(axum::body::Body::empty()).unwrap()),
             None
         );
     }

@@ -579,6 +579,19 @@ EL:
 --rpc.addr=127.0.0.1:31000
 ```
 
+The CL RPC listener serves read-only monitoring routes. The routes that change
+the node's persistent peer set at runtime (`POST` and `DELETE
+/persistent-peers`) are not served unless you point the CL at a token file:
+
+```bash
+--rpc.admin-token-file=/etc/arc/rpc-admin-token
+```
+
+Requests to those routes must then carry `Authorization: Bearer <token>`.
+Generate the token with `openssl rand -hex 32 > /etc/arc/rpc-admin-token` and
+keep it readable only by the node user. Leave the flag off if you do not manage
+peers over RPC.
+
 #### Sync-only mode
 
 By default the CL participates in the consensus protocol. To run a node that

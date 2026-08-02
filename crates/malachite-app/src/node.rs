@@ -578,11 +578,13 @@ impl App {
                 let listen_addr = self.config.rpc.listen_addr;
                 let request_handle = channels.requests.clone();
                 let net_request_handle = channels.net_requests.clone();
+                let admin_token = self.config.rpc.admin_token.clone();
                 crate::rpc::serve(
                     listen_addr,
                     request_handle,
                     tx_rpc_req.clone(),
                     net_request_handle,
+                    admin_token,
                 )
             });
             Some(join_handle)

@@ -22,11 +22,11 @@ const PRESETS_PRUNE_CERTIFICATES_DISTANCE: u64 = 237_600;
 
 use bytesize::ByteSize;
 use eyre::{eyre, Result};
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 use arc_consensus_types::{
-    Config, ExecutionConfig, Height, MetricsConfig, PruningConfig, RpcConfig, RuntimeConfig,
-    SigningConfig,
+    AdminToken, Config, ExecutionConfig, Height, MetricsConfig, PruningConfig, RpcConfig,
+    RuntimeConfig, SigningConfig,
 };
 use arc_node_consensus::hardcoded_config;
 use arc_node_consensus::node::{App, StartConfig};
@@ -122,6 +122,29 @@ fn build_signing_config(cmd: &StartCmd) -> Result<SigningConfig> {
     }
 }
 
+/// Read the bearer token that the privileged RPC routes require.
+///
+/// Returns `None` when `--rpc.admin-token-file` is not set, which leaves those
+/// routes unregistered. A path that cannot be read, or a file with no token in
+/// it, is a startup error rather than a silently open RPC surface.
+fn build_rpc_admin_token(cmd: &StartCmd) -> Result<Option<AdminToken>> {
+    let Some(path) = cmd.rpc_admin_token_file.as_ref() else {
+        return Ok(None);
+    };
+
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        eyre!(
+            "Failed to read --rpc.admin-token-file '{}': {e}",
+            path.display()
+        )
+    })?;
+
+    let token = AdminToken::from_file_contents(&contents)
+        .map_err(|e| eyre!("Invalid --rpc.admin-token-file '{}': {e}", path.display()))?;
+
+    Ok(Some(token))
+}
+
 /// Build configuration from CLI arguments
 fn build_config_from_cli(cmd: &StartCmd, logging: config::LoggingConfig) -> Result<Config> {
     let p2p_listen_addr = cmd.p2p_listen_addr()?;
@@ -174,7 +197,16 @@ fn build_config_from_cli(cmd: &StartCmd, logging: config::LoggingConfig) -> Resu
         listen_addr: cmd
             .rpc_addr
             .unwrap_or_else(|| "0.0.0.0:31000".parse().expect("valid socket address")),
+        admin_token: build_rpc_admin_token(cmd)?,
     };
+
+    if rpc.enabled && !rpc.listen_addr.ip().is_loopback() {
+        warn!(
+            listen_addr = %rpc.listen_addr,
+            "CL RPC is bound to a non-loopback address. It is an internal interface, so keep it \
+             off the public internet with a firewall or a private network"
+        );
+    }
 
     let certificates_distance = if cmd.full || cmd.minimal {
         PRESETS_PRUNE_CERTIFICATES_DISTANCE

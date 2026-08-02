@@ -67,6 +67,9 @@ pub(crate) struct RouteDef {
     pub path: &'static str,
     pub handler: fn() -> axum::routing::MethodRouter<RpcState>,
     pub doc: EndpointInfo,
+    /// Privileged route. It is registered only when an admin token is configured,
+    /// and then it is only reachable by a caller that presents that token.
+    pub admin: bool,
 }
 
 macro_rules! method_str {
@@ -90,13 +93,16 @@ macro_rules! routes {
 }
 
 macro_rules! route {
+    (admin, $method:ident, $path:expr, $handler_fn:path, $desc:expr, params = { $( $pkey:expr => $pval:expr ),* $(,)? }) => {
+        route!(@build $method, $path, $handler_fn, $desc, Some(::std::collections::BTreeMap::from([ $( ($pkey, $pval) ),* ])), true)
+    };
     ($method:ident, $path:expr, $handler_fn:path, $desc:expr) => {
-        route!(@build $method, $path, $handler_fn, $desc, None)
+        route!(@build $method, $path, $handler_fn, $desc, None, false)
     };
     ($method:ident, $path:expr, $handler_fn:path, $desc:expr, params = { $( $pkey:expr => $pval:expr ),* $(,)? }) => {
-        route!(@build $method, $path, $handler_fn, $desc, Some(::std::collections::BTreeMap::from([ $( ($pkey, $pval) ),* ])))
+        route!(@build $method, $path, $handler_fn, $desc, Some(::std::collections::BTreeMap::from([ $( ($pkey, $pval) ),* ])), false)
     };
-    (@build $method:ident, $path:expr, $handler_fn:path, $desc:expr, $params:expr) => {
+    (@build $method:ident, $path:expr, $handler_fn:path, $desc:expr, $params:expr, $admin:expr) => {
         crate::rpc::types::RouteDef {
             method: method_str!($method),
             path: $path,
@@ -105,6 +111,7 @@ macro_rules! route {
                 desc: $desc,
                 params: $params,
             },
+            admin: $admin,
         }
     };
 }

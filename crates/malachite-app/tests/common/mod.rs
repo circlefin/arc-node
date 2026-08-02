@@ -19,7 +19,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use arc_consensus_types::ArcContext;
+use arc_consensus_types::{AdminToken, ArcContext};
 use arc_node_consensus::request::AppRequest;
 use malachitebft_app_channel::{ConsensusRequest, NetworkRequest};
 use tokio::net::TcpListener;
@@ -43,6 +43,17 @@ impl TestServer {
 
     /// Start a new test server with specified channel capacity
     pub async fn start_with_capacity(capacity: usize) -> Self {
+        Self::start_with(capacity, None).await
+    }
+
+    /// Start a server that serves the privileged routes behind `token`, the way a
+    /// node started with `--rpc.admin-token-file` does.
+    pub async fn start_with_admin_token(token: &str) -> Self {
+        let token = AdminToken::from_file_contents(token).expect("valid admin token");
+        Self::start_with(100, Some(token)).await
+    }
+
+    async fn start_with(capacity: usize, admin_token: Option<AdminToken>) -> Self {
         // Create channels for communication
         let (app_tx, app_rx) = mpsc::channel(capacity);
         let (consensus_tx, consensus_rx) = mpsc::channel(capacity);
@@ -55,7 +66,8 @@ impl TestServer {
         let addr = listener.local_addr().expect("Failed to get local address");
 
         // Build the actual production router
-        let router = arc_node_consensus::rpc::build_router(consensus_tx, app_tx, network_tx);
+        let router =
+            arc_node_consensus::rpc::build_router(consensus_tx, app_tx, network_tx, admin_token);
 
         // Spawn the server
         let server_handle = tokio::spawn(async move {
