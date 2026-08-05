@@ -38,6 +38,24 @@ macro_rules! impl_versioned_codec {
                     return Err($crate::codec::error::CodecError::EmptyBytes);
                 }
 
+                // Fast path: a leading version byte unambiguously marks a
+                // versioned message, so decode it directly and skip the
+                // always-failing legacy protobuf attempt below. This is sound
+                // because the version prefix (0x01) can never be the first byte
+                // of a valid protobuf message: a protobuf field tag is
+                // `(field_number << 3) | wire_type` with `field_number >= 1`, so
+                // the smallest possible leading byte is 0x08. All current
+                // NetCodec/WalCodec messages carry this prefix, so this is the
+                // common case.
+                if bytes.first() == Some(&($version_val as u8)) {
+                    bytes.advance(1);
+                    return malachitebft_codec::Codec::decode(
+                        &$crate::codec::proto::ProtobufCodec,
+                        bytes,
+                    )
+                    .map_err($crate::codec::error::CodecError::Protobuf);
+                }
+
                 // TODO: Phase 3: Remove after all nodes are upgraded to use versioning
                 if let Ok(msg) = malachitebft_codec::Codec::decode(
                     &$crate::codec::proto::ProtobufCodec,

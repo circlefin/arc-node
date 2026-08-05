@@ -306,7 +306,6 @@ impl BlockStream {
                     &mut ws_client,
                     *next_expected_height,
                     height - 1,
-                    notification.received_at,
                     block_sender,
                 )
                 .await?;
@@ -351,7 +350,6 @@ impl BlockStream {
         ws_client: &mut WsClient,
         start_height: u64,
         end_height: u64,
-        received_at: u64,
         block_sender: &Sender<BlockEvent>,
     ) -> Result<()> {
         if start_height > end_height {
@@ -365,10 +363,12 @@ impl BlockStream {
             let hex_height = format!("0x{height:x}");
             match Self::fetch_block(ws_client, ETH_GET_BLOCK_BY_NUMBER, &hex_height).await {
                 FetchResult::Ok(block) => {
-                    // Send the block to the tracker.
-                    // The timestamp for catch-up blocks is the
-                    // arrival time of the first notification.
-                    // TODO: should we use the blocks' timestamps?
+                    // Timestamp each catch-up block at the moment it is actually
+                    // fetched, not with a single shared reconnect timestamp.
+                    // Sharing one `received_at` across the whole gap collapses
+                    // every missed block onto the same instant, flattening the
+                    // observed latency distribution during gap scans.
+                    let received_at = timestamp_now();
                     if block_sender
                         .send(BlockEvent { block, received_at })
                         .await

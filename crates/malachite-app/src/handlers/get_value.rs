@@ -92,7 +92,15 @@ pub async fn handle(
         if round.as_i64() == 0 {
             if let Some(monitor) = &mut state.proposal_monitor {
                 debug_assert_eq!(monitor.height, height, "proposal monitor height mismatch");
-                monitor.record_proposal(proposed_value.value.id());
+                let new_value = proposed_value.value.id();
+                if !monitor.record_proposal(new_value) {
+                    warn!(
+                        %height,
+                        first_value = ?monitor.value_id,
+                        %new_value,
+                        "Equivocating proposal at round 0",
+                    );
+                }
             } else {
                 warn!(%height, %round, "No proposal monitor present");
             }
