@@ -584,11 +584,13 @@ impl Db {
             CommitCertificateType::Extended,
             existing.proposer,
         )?;
-        let write_time = start.elapsed();
 
         tx.commit()?;
 
-        self.update_write_metrics(write_bytes, write_time);
+        // Measure through the commit: for redb the commit is where the durable
+        // write (fsync) cost lives, and `insert_decided_block` records its write
+        // the same way, so both paths feed `write_time` with the same scope.
+        self.update_write_metrics(write_bytes, start.elapsed());
 
         Ok(())
     }
@@ -2230,6 +2232,62 @@ mod tests {
         assert_eq!(retrieved.certificate.round, cert.round);
         assert_eq!(retrieved.certificate.value_id, cert.value_id);
         assert_eq!(retrieved.certificate.commit_signatures.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn extend_certificate_counts_a_single_write() {
+        use malachitebft_core_types::{NilOrVal, SignedMessage};
+
+        // extend_certificate is the other path whose metric ownership this change
+        // touches (it now records the write itself instead of relying on
+        // insert_certificate). A certificate extension is one committed
+        // transaction, so it must be counted exactly once.
+        let dir = tempdir().unwrap();
+        let metrics = DbMetrics::default();
+        let store = Store::open(
+            dir.path().join("db"),
+            metrics.clone(),
+            DbUpgrade::Skip,
+            TEST_CACHE_SIZE,
+        )
+        .await
+        .unwrap();
+
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let payload = arbitrary_payload();
+        let block_hash = payload.payload_inner.payload_inner.block_hash;
+        let value_id = ValueId::new(block_hash);
+
+        let signature = Signature::from_bytes([0xab; 64]);
+        let vote =
+            Vote::new_precommit(height, round, NilOrVal::Val(value_id), Address::new([1u8; 20]));
+        let cert = CommitCertificate::<ArcContext>::new(
+            height,
+            round,
+            value_id,
+            vec![SignedMessage::new(vote, signature)],
+        );
+
+        store
+            .store_decided_block(cert, payload, Address::new([0u8; 20]))
+            .await
+            .unwrap();
+
+        let mut stored = store.get_certificate(Some(height)).await.unwrap().unwrap();
+        stored.certificate.commit_signatures.push(CommitSignature::new(
+            Address::new([4u8; 20]),
+            Signature::from_bytes([0xcd; 64]),
+        ));
+
+        let writes_before = metrics.write_count();
+        store.extend_certificate(stored.certificate).await.unwrap();
+
+        assert_eq!(
+            metrics.write_count(),
+            writes_before + 1,
+            "extending a certificate is one committed transaction and must be counted once"
+        );
     }
 
     #[tokio::test]
