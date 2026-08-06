@@ -79,7 +79,7 @@ impl NextHeightInfo {
 /// such as whether to start the next height or restart the current height.
 #[derive(Debug)]
 pub enum Decision {
-    /// Decision was sucessfully committed, and we have the information needed to start the next height.
+    /// Decision was successfully committed, and we have the information needed to start the next height.
     Success(Box<NextHeightInfo>),
 
     /// Processing the decided value failed for the given height and round.
