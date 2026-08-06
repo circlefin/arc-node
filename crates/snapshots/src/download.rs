@@ -93,7 +93,13 @@ pub async fn fetch_latest_snapshot_urls(chain: Chain) -> Result<(String, String)
 }
 
 async fn fetch_latest_snapshot_urls_from(chain: Chain, base_url: &str) -> Result<(String, String)> {
-    let listing_url = format!("{}/snapshots?network={}", base_url, chain);
+    // The snapshot listing API is shared across all networks and currently
+    // does not support a server-side filter, so the client filters by
+    // network below. The `?network=` query parameter is intentionally
+    // omitted — it is silently ignored by the server, and including it
+    // would only suggest that the contract is enforced upstream when it
+    // is not.
+    let listing_url = format!("{base_url}/snapshots");
 
     #[derive(Deserialize)]
     struct SnapshotListResponse {
@@ -107,8 +113,11 @@ async fn fetch_latest_snapshot_urls_from(chain: Chain, base_url: &str) -> Result
         .error_for_status()?
         .json()
         .await?;
-    // FIXME: the API returns snapshots for all networks regardless of ?network=; filter manually
-    // until server-side filtering is fixed.
+    // Defense in depth: filter by network client-side, even though the
+    // server returns the same payload regardless of any query parameter.
+    // If the listing API ever starts returning entries for other
+    // networks, this filter is the one that actually keeps the wrong
+    // chain's snapshots out of the result.
     let network = chain.to_string();
     let entries: Vec<_> = response
         .snapshots
@@ -1143,7 +1152,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_latest_snapshot_urls_returns_correct_urls() -> Result<()> {
-        use wiremock::matchers::{method, path, query_param};
+        use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
@@ -1163,7 +1172,6 @@ mod tests {
         ]);
         Mock::given(method("GET"))
             .and(path("/snapshots"))
-            .and(query_param("network", "testnet"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
@@ -1241,6 +1249,56 @@ mod tests {
         assert!(
             cl_url.contains("testnet/cl-100"),
             "devnet entry must not be selected; got {cl_url}"
+        );
+        Ok(())
+    }
+
+    /// Symmetric to `fetch_latest_snapshot_urls_filters_by_network` for
+    /// the devnet chain — ensures the client-side `network` filter
+    /// also discards testnet entries when the caller asks for devnet.
+    /// (The listing API has no server-side filter, so this is the
+    /// only thing keeping the wrong chain's snapshots out of the
+    /// result.)
+    #[tokio::test]
+    async fn fetch_latest_snapshot_urls_filters_by_network_devnet() -> Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = snapshot_listing(&[
+            // testnet entries — should be ignored when querying devnet
+            snapshot_entry(
+                "testnet",
+                "execution",
+                "testnet/el-34885446.tar.lz4",
+                34_885_446,
+            ),
+            snapshot_entry(
+                "testnet",
+                "consensus",
+                "testnet/cl-34885446.tar.lz4",
+                34_885_446,
+            ),
+            // devnet entries — should be selected
+            snapshot_entry("devnet", "execution", "devnet/el-100.tar.lz4", 100),
+            snapshot_entry("devnet", "consensus", "devnet/cl-100.tar.lz4", 100),
+        ]);
+        Mock::given(method("GET"))
+            .and(path("/snapshots"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let (el_url, cl_url) =
+            fetch_latest_snapshot_urls_from(Chain::Devnet, &server.uri()).await?;
+
+        assert!(
+            el_url.contains("devnet/el-100"),
+            "testnet entry must not be selected; got {el_url}"
+        );
+        assert!(
+            cl_url.contains("devnet/cl-100"),
+            "testnet entry must not be selected; got {cl_url}"
         );
         Ok(())
     }
@@ -1352,28 +1410,45 @@ mod tests {
         Ok(())
     }
 
+    /// Verifies that the devnet chain is resolved through the same
+    /// listing endpoint as testnet, with no special-case branching.
+    /// The server returns entries for both networks; the client must
+    /// pick the devnet ones.
+    ///
+    /// (Replaces the previous `fetch_latest_snapshot_urls_uses_devnet_network_param`
+    /// test, which only made sense when the client sent `?network=`
+    /// in the request URL.)
     #[tokio::test]
-    async fn fetch_latest_snapshot_urls_uses_devnet_network_param() -> Result<()> {
-        use wiremock::matchers::{method, path, query_param};
+    async fn fetch_latest_snapshot_urls_uses_devnet_listing() -> Result<()> {
+        use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         let body = snapshot_listing(&[
-            snapshot_entry("devnet", "execution", "devnet/el.tar.lz4", 42),
-            snapshot_entry("devnet", "consensus", "devnet/cl.tar.lz4", 42),
+            // testnet entries — must be ignored when querying devnet
+            snapshot_entry("testnet", "execution", "testnet/el-99.tar.lz4", 99),
+            snapshot_entry("testnet", "consensus", "testnet/cl-99.tar.lz4", 99),
+            // devnet entries — must be selected
+            snapshot_entry("devnet", "execution", "devnet/el-42.tar.lz4", 42),
+            snapshot_entry("devnet", "consensus", "devnet/cl-42.tar.lz4", 42),
         ]);
-        // Only matches if the network param is exactly "devnet" (no "arc-" prefix)
         Mock::given(method("GET"))
             .and(path("/snapshots"))
-            .and(query_param("network", "devnet"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
 
-        // Returns an error if the query param doesn't match (mock returns 404 by default)
-        fetch_latest_snapshot_urls_from(Chain::Devnet, &server.uri())
-            .await
-            .expect("devnet query param must be 'devnet'");
+        let (el_url, cl_url) =
+            fetch_latest_snapshot_urls_from(Chain::Devnet, &server.uri()).await?;
+
+        assert!(
+            el_url.contains("devnet/el-42"),
+            "testnet entry must not be selected; got {el_url}"
+        );
+        assert!(
+            cl_url.contains("devnet/cl-42"),
+            "testnet entry must not be selected; got {cl_url}"
+        );
         Ok(())
     }
 
