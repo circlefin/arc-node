@@ -13,7 +13,7 @@
 
 Arc's block parameters — gas limit, base fee parameters, and reward beneficiary — are configured via the `ProtocolConfig` governance smart contract (`0x3600000000000000000000000000000000000001`). The proposer reads these values when building blocks, and other full nodes accept the resulting headers with minimal verification.
 
-Three governance-controlled values are dervied from `ProtocolConfig` values and end up in block headers:
+Three governance-controlled values are derived from `ProtocolConfig` values and end up in block headers:
 
 | Value | Header Field | Current Validation |
 |-------|--------------|--------------------|
@@ -21,7 +21,7 @@ Three governance-controlled values are dervied from `ProtocolConfig` values and 
 | Base fee | `base_fee_per_gas` (child), `extra_data` (parent) | Parent extra_data → child base_fee check, but silently skipped if extra_data is malformed |
 | Reward beneficiary | `beneficiary` | None — proposer can set any address |
 
-This design has several gaps, mainly around validation, intentionally ommitted until this time. This ADR focuses on the `gasLimit` in particular.
+This design has several gaps, mainly around validation, intentionally omitted until this time. This ADR focuses on the `gasLimit` in particular.
 
 ### Gap 1: No consensus-level gas limit validation
 
