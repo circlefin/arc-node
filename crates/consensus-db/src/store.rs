@@ -502,12 +502,16 @@ impl Db {
             blocks.insert(height, block_bytes)?;
         }
 
-        self.insert_certificate(
+        let certificate_bytes = self.insert_certificate(
             &tx,
             decided_block.certificate,
             CommitCertificateType::Minimal,
             Some(proposer),
         )?;
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            write_bytes += certificate_bytes;
+        }
 
         tx.commit()?;
 
@@ -573,27 +577,36 @@ impl Db {
             }
         }
 
-        self.insert_certificate(
+        let start = Instant::now();
+        let write_bytes = self.insert_certificate(
             &tx,
             certificate,
             CommitCertificateType::Extended,
             existing.proposer,
         )?;
+        let write_time = start.elapsed();
 
         tx.commit()?;
+
+        self.update_write_metrics(write_bytes, write_time);
 
         Ok(())
     }
 
+    /// Encode and insert `certificate` into the certificates table within the
+    /// caller's write transaction, returning the number of bytes written.
+    ///
+    /// This intentionally does not record write metrics: the caller owns and
+    /// commits the transaction, so it records a single write observation once
+    /// the commit succeeds. That keeps a decided block (block + certificate
+    /// committed together) counted as one write instead of two.
     fn insert_certificate(
         &self,
         tx: &WriteTransaction,
         certificate: CommitCertificate<ArcContext>,
         certificate_type: CommitCertificateType,
         proposer: Option<Address>,
-    ) -> Result<(), StoreError> {
-        let start = Instant::now();
-
+    ) -> Result<usize, StoreError> {
         let height = certificate.height;
 
         let stored = StoredCommitCertificate {
@@ -609,9 +622,8 @@ impl Db {
             let mut certificates = tx.open_table(CERTIFICATES_TABLE)?;
             certificates.insert(height, encoded_certificate)?;
         }
-        self.update_write_metrics(write_bytes, start.elapsed());
 
-        Ok(())
+        Ok(write_bytes)
     }
 
     /// Store misbehavior evidence for a given height.
@@ -2113,6 +2125,45 @@ mod tests {
         assert!(retrieved_payload.is_some());
         let retrieved_payload = retrieved_payload.unwrap();
         assert_eq!(retrieved.execution_payload, retrieved_payload);
+    }
+
+    #[tokio::test]
+    async fn store_decided_block_counts_a_single_write() {
+        // Regression for #142: insert_decided_block observed the write metrics
+        // twice — once for the block and once inside insert_certificate — which
+        // double-counted the certificate write in the write_count and write_time
+        // metrics. A decided block is a single committed transaction, so it must
+        // be counted exactly once.
+        let dir = tempdir().unwrap();
+        let metrics = DbMetrics::default();
+        let store = Store::open(
+            dir.path().join("db"),
+            metrics.clone(),
+            DbUpgrade::Skip,
+            TEST_CACHE_SIZE,
+        )
+        .await
+        .unwrap();
+
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let payload = arbitrary_payload();
+        let block_hash = payload.payload_inner.payload_inner.block_hash;
+        let value_id = ValueId::new(block_hash);
+        let cert = CommitCertificate::<ArcContext>::new(height, round, value_id, vec![]);
+        let proposer = Address::new([0u8; 20]);
+
+        let writes_before = metrics.write_count();
+        store
+            .store_decided_block(cert, payload, proposer)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            metrics.write_count(),
+            writes_before + 1,
+            "a decided block is one committed transaction and must be counted once"
+        );
     }
 
     #[tokio::test]
