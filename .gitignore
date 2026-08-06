@@ -121,3 +121,4 @@ terraform.tfvars*
 
 deployments/certs/*
 !deployments/certs/.gitkeep
+# newtest
