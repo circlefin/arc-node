@@ -5,8 +5,8 @@
 # Logs:   docker compose logs -f
 #
 # Required environment variables (see docs/running-an-arc-node.md#docker):
-#   ARC_EXECUTION_IMAGE  — EL Docker image (e.g. docker.cloudsmith.io/circle/arc-network/arc-execution:0.6.0)
-#   ARC_CONSENSUS_IMAGE  — CL Docker image (e.g. docker.cloudsmith.io/circle/arc-network/arc-consensus:0.6.0)
+#   ARC_EXECUTION_IMAGE  — EL Docker image (e.g. docker.cloudsmith.io/circle/arc-network/arc-execution:$ARC_VERSION — current release listed in the Versions table in docs/installation.md)
+#   ARC_CONSENSUS_IMAGE  — CL Docker image (e.g. docker.cloudsmith.io/circle/arc-network/arc-consensus:$ARC_VERSION — current release listed in the Versions table in docs/installation.md)
 #   ARC_HOME             — data directory on the host (e.g. ~/.arc)
 
 services:
