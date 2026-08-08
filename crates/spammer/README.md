@@ -541,11 +541,11 @@ CSV data. The script loads the CSV into a SQLite database for fast queries.
 
 ```bash
 # Full report over all data
-python3 scripts/tx_latency_report.py --csv tx-latency-1234567890.csv
+python3 scripts/tx_latency_report.py --csv tx_latency_20260310_151123.csv
 
 # Check data bounds
-python3 scripts/tx_latency_report.py --csv tx-latency-1234567890.csv timestamps
-python3 scripts/tx_latency_report.py --csv tx-latency-1234567890.csv blocks
+python3 scripts/tx_latency_report.py --csv tx_latency_20260310_151123.csv timestamps
+python3 scripts/tx_latency_report.py --csv tx_latency_20260310_151123.csv blocks
 ```
 
 #### Subcommands
