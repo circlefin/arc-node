@@ -1881,7 +1881,6 @@ dependencies = [
  "eyre",
  "metrics",
  "pprof_hyper_server",
- "protox",
  "reth-chainspec",
  "reth-db",
  "reth-e2e-test-utils",
@@ -1902,7 +1901,6 @@ dependencies = [
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
- "tonic-build",
  "tracing",
  "tracing-test",
 ]

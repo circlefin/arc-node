@@ -24,8 +24,7 @@ arbitrary = [
     "revm/arbitrary",
     "reth-ethereum/arbitrary",
 ]
-remote-signer = ["dep:protox", "dep:tonic-build"]
-integration = ["remote-signer"]
+integration = []
 
 [dependencies]
 alloy-evm.workspace = true
@@ -72,10 +71,6 @@ tracing.workspace = true
 # allocator
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
-
-[build-dependencies]
-protox = { workspace = true, optional = true }
-tonic-build = { workspace = true, optional = true }
 
 [dev-dependencies]
 arc-execution-config = { workspace = true, features = ["test-utils"] }
