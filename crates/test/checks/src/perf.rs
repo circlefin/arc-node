@@ -335,7 +335,7 @@ fn delta_histogram_stats(
 /// Parse performance metrics from the **delta** between two scrapes per node.
 ///
 /// Only nodes present in **both** scrapes are included (intersection by
-/// [`display_name_for_scrape`], same pairing idea as [`crate::health::compute_health_deltas`]).
+/// `display_name_for_scrape`, same pairing idea as [`crate::health::compute_health_deltas`]).
 /// Histograms use the same metric names as [`parse_perf_metrics`]; percentiles apply to
 /// observations recorded between the two scrapes.
 pub fn parse_perf_metrics_delta(

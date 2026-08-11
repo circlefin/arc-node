@@ -22,7 +22,7 @@ use jsonrpsee_types::error::{ErrorObject, INTERNAL_ERROR_CODE};
 use thiserror::Error;
 
 /// Error codes taken from reth's code.
-/// See https://github.com/paradigmxyz/reth/blob/7345e1e5b5b88e53c4b3f3152078653507d0d26f/crates/rpc/rpc-engine-api/src/error.rs
+/// See <https://>github.com/paradigmxyz/reth/blob/7345e1e5b5b88e53c4b3f3152078653507d0d26f/crates/rpc/rpc-engine-api/src/error.rs
 ///
 /// Code used by reth for EngineApiError::UnknownPayload.
 const UNKNOWN_PAYLOAD_CODE: i32 = -38001;

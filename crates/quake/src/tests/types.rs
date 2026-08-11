@@ -216,7 +216,7 @@ pub(crate) type TestFn =
     for<'a> fn(&'a Testnet, &'a RpcClientFactory, &'a TestParams) -> TestResult<'a>;
 
 /// Test registration submitted via the inventory system.
-/// This is used by the #[quake_test] macro to automatically register tests.
+/// This is used by the `#[quake_test]` macro to automatically register tests.
 pub(crate) struct TestRegistration {
     pub(crate) group: &'static str,
     pub(crate) name: &'static str,

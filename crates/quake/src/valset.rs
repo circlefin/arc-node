@@ -20,7 +20,7 @@ use crate::node::NodeName;
 
 /// A validator power update consisting of a validator name and new voting power.
 /// This is what quake's `valset` command parses from a string of the form
-/// [<validator>:<voting_power>] given as input to the command.
+/// `<validator>:<voting_power>` given as input to the command.
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatorPowerUpdate {
     /// Validator identifier, e.g., validator1

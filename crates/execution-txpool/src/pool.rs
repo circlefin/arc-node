@@ -32,7 +32,7 @@ use reth_transaction_pool::{blobstore::DiskFileBlobStore, TransactionValidationT
 
 /// A basic Arc transaction pool builder.
 ///
-/// Fork from https://github.com/paradigmxyz/reth/blob/v1.7.0/crates/ethereum/node/src/node.rs#L435-L509
+/// Fork from <https://>github.com/paradigmxyz/reth/blob/v1.7.0/crates/ethereum/node/src/node.rs#L435-L509
 /// with customization to use ArcTransactionValidator.
 ///
 /// This contains various settings that can be configured and take precedence over the node's

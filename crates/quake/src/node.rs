@@ -154,7 +154,7 @@ impl Container {
 
     /// Build a private IP address from the given subnet, container, and node indexes (for local mode)
     ///
-    /// Format: "172.<subnet>.<container>.<node>" where:
+    /// Format: `"172.<subnet>.<container>.<node>"` where:
     /// - subnet index starts at 21
     /// - container index is 1 for CL and 2 for EL
     /// - node index starts at 0

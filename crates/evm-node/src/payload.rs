@@ -15,7 +15,7 @@
 // limitations under the License.
 
 //! Arc payload attributes builder for dev-mode local mining.
-//! Fork from https://github.com/paradigmxyz/reth/blob/v1.11.3/crates/engine/local/src/payload.rs
+//! Fork from <https://github.com/paradigmxyz/reth/blob/v1.11.3/crates/engine/local/src/payload.rs>
 //! - Uses `max(parent.timestamp, wall_clock)` instead of `max(parent.timestamp + 1, wall_clock)`
 //!   to allow equal timestamps, matching Arc's relaxed validation.
 

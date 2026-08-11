@@ -89,7 +89,7 @@ where
 
 /// Custom block executor for Arc
 ///
-/// This functionality is mostly forked from: https://github.com/alloy-rs/evm/blob/v0.23.2/crates/evm/src/eth/block.rs
+/// This functionality is mostly forked from: <https://>github.com/alloy-rs/evm/blob/v0.23.2/crates/evm/src/eth/block.rs
 /// with modifications to support Arc-specific functionality.
 pub struct ArcBlockExecutor<'a, Evm, Spec, R: ReceiptBuilder> {
     /// Context for block execution.

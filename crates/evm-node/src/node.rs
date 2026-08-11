@@ -15,7 +15,7 @@
 // limitations under the License.
 
 //! Arc Node types config.
-//! Fork from https://github.com/paradigmxyz/reth/blob/v1.7.0/crates/ethereum/node/src/node.rs
+//! Fork from <https://github.com/paradigmxyz/reth/blob/v1.7.0/crates/ethereum/node/src/node.rs>
 //! Reference to EthereumNode and add our customization
 //! - inject the EVM customization in ArcExecutorBuilder
 //! - inject our consensus ArcConsensus in ArcConsensusBuilder

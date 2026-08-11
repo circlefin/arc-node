@@ -50,7 +50,7 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
 /// Tracks execution layer block persistence and applies backpressure when the
 /// EL falls behind.
 ///
-/// Callers invoke [`wait_for_persisted_block`] after submitting a block to the
+/// Callers invoke [`PersistenceMeter::wait_for_persisted_block`] after submitting a block to the
 /// EL. The call returns immediately if the EL has already persisted within the
 /// configured threshold, or blocks until persistence catches up. Returns `Err`
 /// on timeout.
@@ -115,7 +115,7 @@ struct SharedState {
     /// Wakes waiters when `last_persisted_block` advances or connection state changes.
     notify: Notify,
     /// Subscription lifecycle state. Backpressure is only enforced when
-    /// [`SUBSCRIPTION_STATUS_ACTIVE`].
+    /// `SUBSCRIPTION_STATUS_ACTIVE`.
     subscription_status: AtomicU8,
 }
 
@@ -123,18 +123,18 @@ struct SharedState {
 ///
 /// A background task maintains the subscription connection, updates an atomic
 /// counter on each notification, and wakes any waiters via [`Notify`]. This
-/// allows [`wait_for_persisted_block`] to return immediately when the
+/// allows [`PersistenceMeter::wait_for_persisted_block`] to return immediately when the
 /// canonical-minus-persisted gap is already below the configured threshold,
 /// and multiple callers can wait concurrently without contending on a lock.
 ///
 /// In the background, a task will maintain the connection, reconnecting as needed.
-/// When reconnecting, the internal [`subscription_status`] will transition to [`SUBSCRIPTION_STATUS_RECONNECTING`]
-/// which disables backpressure. Upon the first received notification, it will transition back to [`SUBSCRIPTION_STATUS_ACTIVE`],
+/// When reconnecting, the internal `subscription_status` will transition to `SUBSCRIPTION_STATUS_RECONNECTING`
+/// which disables backpressure. Upon the first received notification, it will transition back to `SUBSCRIPTION_STATUS_ACTIVE`,
 /// applying backpressure again.
 ///
 /// Seeding the meter with an initial height value will transition it to
-/// [`SUBSCRIPTION_STATUS_ACTIVE`] only if the subscription is already
-/// [`SUBSCRIPTION_STATUS_CONNECTED`]. If reconnecting, the seed updates the
+/// `SUBSCRIPTION_STATUS_ACTIVE` only if the subscription is already
+/// `SUBSCRIPTION_STATUS_CONNECTED`. If reconnecting, the seed updates the
 /// counter but backpressure remains suspended until the subscription is live.
 pub struct PersistedBlockMeter {
     shared: Arc<SharedState>,
