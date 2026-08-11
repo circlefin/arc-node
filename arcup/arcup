@@ -264,14 +264,19 @@ version_gt() {
     # Remove 'v' prefix if present
     local ver1="${1#v}"
     local ver2="${2#v}"
-    ver1="${ver1%%-*}"
-    ver2="${ver2%%-*}"
+    local core1="${ver1%%-*}"
+    local core2="${ver2%%-*}"
 
+    local pre1="" pre2=""
+    [[ "$ver1" == *-* ]] && pre1="${ver1#*-}"
+    [[ "$ver2" == *-* ]] && pre2="${ver2#*-}"
+
+    local major1 minor1 patch1 major2 minor2 patch2
     IFS=. read -r major1 minor1 patch1 <<EOF
-$ver1
+$core1
 EOF
     IFS=. read -r major2 minor2 patch2 <<EOF
-$ver2
+$core2
 EOF
 
     [ "$major1" -gt "$major2" ] && return 0
@@ -281,6 +286,47 @@ EOF
     [ "$patch1" -gt "$patch2" ] && return 0
     [ "$patch1" -lt "$patch2" ] && return 1
 
+    # Same major.minor.patch: per semver precedence, a version without a
+    # prerelease tag outranks one with a prerelease tag (1.2.3 > 1.2.3-rc.1).
+    # Previously the prerelease suffix was discarded entirely for this
+    # comparison, so e.g. version_gt("0.3.0", "0.3.0-rc.1") and
+    # version_gt("0.3.0-rc.2", "0.3.0-rc.1") both incorrectly returned
+    # "not newer".
+    if [[ -z "$pre1" && -n "$pre2" ]]; then
+        return 0
+    fi
+    if [[ -n "$pre1" && -z "$pre2" ]]; then
+        return 1
+    fi
+    if [[ -z "$pre1" && -z "$pre2" ]]; then
+        return 1
+    fi
+
+    # Both have prerelease tags: compare dot-separated identifiers.
+    # Numeric identifiers compare numerically; others compare lexically.
+    # A prerelease that is a prefix of the other (fewer identifiers) is
+    # lower, per semver precedence rules.
+    local -a ids1 ids2
+    local old_ifs="$IFS"
+    IFS=.
+    read -r -a ids1 <<< "$pre1"
+    read -r -a ids2 <<< "$pre2"
+    IFS="$old_ifs"
+
+    local i=0
+    while [[ $i -lt ${#ids1[@]} && $i -lt ${#ids2[@]} ]]; do
+        local a="${ids1[$i]}"
+        local b="${ids2[$i]}"
+        if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]]; then
+            [ "$a" -gt "$b" ] && return 0
+            [ "$a" -lt "$b" ] && return 1
+        else
+            [[ "$a" > "$b" ]] && return 0
+            [[ "$a" < "$b" ]] && return 1
+        fi
+        i=$((i + 1))
+    done
+    [ ${#ids1[@]} -gt ${#ids2[@]} ] && return 0
     return 1
 }
 

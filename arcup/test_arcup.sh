@@ -64,6 +64,31 @@ test_version_comparison() {
         fail "same prerelease base is not newer"
     fi
     pass "same prerelease base is not newer"
+
+    # A stable release outranks a prerelease with the same numeric core.
+    if ! version_gt "0.3.0" "0.3.0-rc.1"; then
+        fail "stable release is newer than its own prerelease"
+    fi
+    pass "stable release is newer than its own prerelease"
+
+    # Two prereleases sharing the same numeric core are compared by their
+    # prerelease identifiers, not treated as equal.
+    if ! version_gt "0.3.0-rc.2" "0.3.0-rc.1"; then
+        fail "higher prerelease counter is newer"
+    fi
+    pass "higher prerelease counter is newer"
+
+    if version_gt "0.3.0-rc.1" "0.3.0-rc.2"; then
+        fail "lower prerelease counter is not newer"
+    fi
+    pass "lower prerelease counter is not newer"
+
+    # Numeric prerelease identifiers compare numerically, not lexically
+    # (rc.10 > rc.9, not "rc.10" < "rc.9" as a string).
+    if ! version_gt "0.3.0-rc.10" "0.3.0-rc.9"; then
+        fail "prerelease counters compare numerically"
+    fi
+    pass "prerelease counters compare numerically"
 }
 
 test_target_mapping() {
