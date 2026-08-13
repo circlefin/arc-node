@@ -6,7 +6,7 @@ set -euo pipefail
 
 # NOTE: if you make modifications to this script, please increment the version number.
 # WARNING: the SemVer pattern: major.minor.patch must be followed as we use it to determine if the script is up to date.
-ARCUP_INSTALLER_VERSION="0.2.0"
+ARCUP_INSTALLER_VERSION="0.2.1"
 
 REPO="${ARC_REPO:-circlefin/arc-node}"
 if [[ -n "${ARC_REPO:-}" ]] && [[ ! "$ARC_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
@@ -656,7 +656,12 @@ verify_checksum_file() {
     local archive_name="$3"
     local expected_checksum expected_name actual_checksum
 
-    if ! read -r expected_checksum expected_name < "$checksum_path"; then
+    # `read` returns non-zero when the final line has no trailing newline, even
+    # though it still populates the variables. Check the parsed hash rather than
+    # read's exit status so a valid checksum file whose last line lacks a
+    # trailing newline is not rejected as empty.
+    read -r expected_checksum expected_name < "$checksum_path" || true
+    if [[ -z "$expected_checksum" ]]; then
         error "Checksum file is empty: $checksum_path"
     fi
 
