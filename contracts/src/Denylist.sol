@@ -29,6 +29,8 @@ contract Denylist is Initializable, Ownable2StepUpgradeable {
     error CannotDenylistOwner();
     /// @notice Thrown when caller is not a denylister
     error CallerIsNotDenylister();
+    /// @notice Thrown when caller is denylisted
+    error CallerIsDenylisted();
     /// @notice Thrown when address is zero
     error ZeroAddress();
 
@@ -56,6 +58,7 @@ contract Denylist is Initializable, Ownable2StepUpgradeable {
     modifier onlyDenylister() {
         DenylistStorage storage $ = _getDenylistStorage();
         if (!$.denylisters[msg.sender]) revert CallerIsNotDenylister();
+        if ($.denylisted[msg.sender]) revert CallerIsDenylisted();
         _;
     }
 
