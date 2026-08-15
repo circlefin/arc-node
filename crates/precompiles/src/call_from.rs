@@ -106,6 +106,12 @@ fn decode_child_call(inputs: &CallInputs) -> Result<(CallInputs, u64), SubcallEr
     let target = decoded.target;
     let calldata = decoded.data;
 
+    if let CallValue::Transfer(v) = inputs.value {
+        if v > U256::ZERO {
+            return Err(SubcallError::UnexpectedValue);
+        }
+    }
+
     // init_subcall overhead: fixed base + per-word charge for the dynamic `bytes data`.
     let overhead = abi_decode_gas(calldata.len());
 
@@ -129,7 +135,7 @@ fn decode_child_call(inputs: &CallInputs) -> Result<(CallInputs, u64), SubcallEr
         value: CallValue::Transfer(U256::ZERO),
         input: CallInput::Bytes(calldata),
         gas_limit: child_gas_limit,
-        is_static: false,
+        is_static: inputs.is_static,
         caller: sender,
         return_memory_offset: 0..0,
     };

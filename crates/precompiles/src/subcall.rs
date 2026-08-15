@@ -143,6 +143,8 @@ pub enum SubcallError {
     UnexpectedFrameResult,
     #[error("insufficient gas: {0}")]
     InsufficientGas(String),
+    #[error("unexpected value sent to precompile")]
+    UnexpectedValue,
     #[error("internal error: {0}")]
     InternalError(String),
 }
