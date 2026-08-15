@@ -396,13 +396,16 @@ impl Db {
             table.last()?.map(|(_, v)| v.value())
         };
 
-        let result = bytes.and_then(|bytes| {
-            #[allow(clippy::arithmetic_side_effects)]
-            {
-                read_bytes += bytes.len();
-            }
-            decode_certificate(&bytes).ok()
-        });
+        let result = bytes
+            .map(|bytes| {
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    read_bytes += bytes.len();
+                }
+                decode_certificate(&bytes)
+            })
+            .transpose()
+            .map_err(StoreError::from)?;
 
         self.update_read_metrics(read_bytes, size_of::<Height>(), start.elapsed());
 
@@ -434,14 +437,17 @@ impl Db {
         let certificate = {
             let table = tx.open_table(CERTIFICATES_TABLE)?;
             let value = table.get(&height)?;
-            value.and_then(|value| {
-                let bytes = value.value();
-                #[allow(clippy::arithmetic_side_effects)]
-                {
-                    read_bytes += bytes.len();
-                }
-                decode_certificate(&bytes).ok()
-            })
+            value
+                .map(|value| {
+                    let bytes = value.value();
+                    #[allow(clippy::arithmetic_side_effects)]
+                    {
+                        read_bytes += bytes.len();
+                    }
+                    decode_certificate(&bytes)
+                })
+                .transpose()
+                .map_err(StoreError::from)?
         };
 
         self.update_read_metrics(read_bytes, size_of::<Height>(), start.elapsed());
