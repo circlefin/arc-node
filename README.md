@@ -24,7 +24,22 @@ Arc is an open EVM-compatible layer 1 built on [Malachite](https://github.com/ci
 - **Deterministic Sub-second Finality** - Near-instant settlement finality powered by Malachite BFT consensus engine  
 - **Circle Platform Integration** - Integrates with Circle’s full-stack platform (e.g., USDC, Wallets, CCTP, Gateway) to help you go from prototype to production faster  
 - **(Coming soon) Opt-in Configurable Privacy** - Native privacy tooling enables selective shielding of sensitive financial data while preserving auditability
+### USDC units and decimals
 
+Arc exposes USDC as both the native token and through an ERC-20 interface. These
+interfaces use different decimal representations:
+
+- The ERC-20 USDC interface uses **6 decimals**.
+- Native balance and native-value accounting use **18-decimal units**.
+- Converting an ERC-20 USDC amount to native units multiplies the amount by
+  `10^12`.
+
+For example, 1 USDC is represented as `1_000_000` through the ERC-20 interface
+and as `1_000_000_000_000_000_000` in native units.
+
+When integrating with Arc, applications should use the decimal representation
+expected by the interface they are interacting with rather than assuming the
+same unit scale for both representations.
 ## Documentation
 
 - 🚀 **[Execution](crates/node/README.md)** - Execution binary and configuration
