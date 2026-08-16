@@ -45,3 +45,15 @@ pub enum RemoteSigningError {
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
 }
+
+impl RemoteSigningError {
+    /// Whether a retry is worth attempting for this error.
+    ///
+    /// Only `Status` (a gRPC error surfaced by the signing service, e.g. a
+    /// transient `Unavailable`) is retryable. `InvalidResponse` and
+    /// `Configuration` indicate the request or setup is wrong in a way a
+    /// retry can't fix, and `RetryExhausted` is already a terminal result.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Status(_))
+    }
+}

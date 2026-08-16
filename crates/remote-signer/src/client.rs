@@ -41,7 +41,10 @@ use tonic::{transport::Channel, Request};
 use tracing::{debug, error, trace, warn};
 
 use crate::metrics::RemoteSigningMetrics;
-use crate::{config::RemoteSigningConfig, error::RemoteSigningError};
+use crate::{
+    config::{RemoteSigningConfig, RetryConfig},
+    error::RemoteSigningError,
+};
 
 // Protobuf definitions for the external signing service
 pub mod proto {
@@ -122,15 +125,20 @@ impl RemoteSignerClient {
 
     /// Get the public key from the external signing service.
     ///
-    /// Returns the public key as a raw 32-byte Ed25519 key.
+    /// Returns the public key as a raw 32-byte Ed25519 key. Retries transient
+    /// failures with the same backoff policy as `sign_message()`: this call sits
+    /// on the consensus startup path (see `RemoteSigningProvider::public_key`),
+    /// and without a retry a brief network blip at exactly that moment would
+    /// otherwise strand the node waiting for manual intervention instead of
+    /// self-healing like a mid-session signing request would.
     #[tracing::instrument(name = "remote_signer", skip_all)]
     pub async fn get_public_key(&self) -> Result<Vec<u8>, RemoteSigningError> {
-        let mut client = self.client.clone();
-        Self::get_public_key_internal(&mut client, &self.config).await
+        let client = self.client.clone();
+        Self::get_public_key_with_retry(client, &self.config).await
     }
 
-    /// Internal async method to get public key
-    async fn get_public_key_internal(
+    /// Internal async method to get public key (single attempt, no retry)
+    async fn get_public_key_once(
         grpc_client: &mut SignerServiceClient<Channel>,
         config: &RemoteSigningConfig,
     ) -> Result<Vec<u8>, RemoteSigningError> {
@@ -169,6 +177,28 @@ impl RemoteSignerClient {
         Ok(public_key)
     }
 
+    /// Internal async method to get the public key with retry
+    async fn get_public_key_with_retry(
+        grpc_client: SignerServiceClient<Channel>,
+        config: &RemoteSigningConfig,
+    ) -> Result<Vec<u8>, RemoteSigningError> {
+        let task = |mut client: SignerServiceClient<Channel>| async {
+            let result = Self::get_public_key_once(&mut client, config).await;
+            (client, result)
+        };
+
+        // No dedicated metric for public-key-fetch retries exists yet, so
+        // this path doesn't bump a counter, unlike sign_message below.
+        Self::fetch_with_retry(
+            grpc_client,
+            config.retry_config,
+            "get public key",
+            || {},
+            task,
+        )
+        .await
+    }
+
     /// Internal async method to sign a message with retry
     async fn sign_message_with_retry(
         grpc_client: SignerServiceClient<Channel>,
@@ -181,34 +211,82 @@ impl RemoteSignerClient {
             (client, result)
         };
 
+        Self::fetch_with_retry(
+            grpc_client,
+            config.retry_config,
+            "sign message",
+            || {
+                metrics.inc_sign_request_retries();
+            },
+            task,
+        )
+        .await
+    }
+
+    /// Retries a gRPC operation against the signer service using the given
+    /// `RetryConfig` exponential backoff. Shared by `get_public_key()` and
+    /// `sign_message()` so every remote-signer RPC gets the same resilience to
+    /// transient failures instead of only the signing path.
+    ///
+    /// The retry budget is passed in by the caller rather than pulled from a
+    /// `RemoteSigningConfig` here, so callers stay free to use a different
+    /// budget than `config.retry_config` if a future call site needs one.
+    ///
+    /// Only errors for which `RemoteSigningError::is_retryable()` returns
+    /// `true` (currently just `Status`) are retried; anything else (e.g.
+    /// `InvalidResponse`) is returned immediately since retrying can't fix it.
+    ///
+    /// `op` receives an owned client per attempt and must hand it back
+    /// alongside the attempt's result so retries reuse the same connection.
+    /// `on_retry` runs before each retry (e.g. to bump call-specific metrics).
+    /// `op_name` labels the warn/error log lines (e.g. "sign message").
+    async fn fetch_with_retry<T, F, Fut>(
+        grpc_client: SignerServiceClient<Channel>,
+        retry_config: RetryConfig,
+        op_name: &str,
+        mut on_retry: impl FnMut(),
+        op: F,
+    ) -> Result<T, RemoteSigningError>
+    where
+        F: FnMut(SignerServiceClient<Channel>) -> Fut,
+        Fut: std::future::Future<
+            Output = (SignerServiceClient<Channel>, Result<T, RemoteSigningError>),
+        >,
+    {
         let mut attempt = 0u32;
 
-        let (_client, result) = task
-            .retry(config.retry_config)
+        let (_client, result) = op
+            .retry(retry_config)
             .context(grpc_client)
+            .when(RemoteSigningError::is_retryable)
             .notify(|error, backoff| {
-                // Bounded by config.retry_config.max_retries
+                // Bounded by retry_config.max_retries
                 #[allow(clippy::arithmetic_side_effects)]
                 {
                     attempt += 1;
                 }
-                metrics.inc_sign_request_retries();
+                on_retry();
 
                 warn!(
-                    %attempt, max_retries = %config.retry_config.max_retries,
-                    "Failed to sign message, retrying in {backoff:?}: {error}"
+                    %attempt, max_retries = %retry_config.max_retries,
+                    "Failed to {op_name}, retrying in {backoff:?}: {error}"
                 );
             })
             .await;
 
         match result {
-            Ok(signature) => Ok(signature),
+            Ok(value) => Ok(value),
+
+            // `.when()` above stops backon immediately on a non-retryable
+            // error, before any retry happened. Reporting that as
+            // `RetryExhausted` would be misleading, so surface it as-is.
+            Err(e) if !e.is_retryable() => Err(e),
 
             Err(e) => {
-                error!("Failed to sign message after {attempt} retries: {e}");
+                error!("Failed to {op_name} after {attempt} retries: {e}");
 
                 Err(RemoteSigningError::RetryExhausted {
-                    retries: config.retry_config.max_retries,
+                    retries: retry_config.max_retries,
                 })
             }
         }
@@ -273,6 +351,122 @@ impl RemoteSignerClient {
     /// Get the metrics
     pub fn metrics(&self) -> &RemoteSigningMetrics {
         &self.metrics
+    }
+}
+
+// These exercise `fetch_with_retry()` directly rather than going through
+// `get_public_key()`/`sign_message()` end-to-end: `build.rs` disables
+// server codegen for this crate (client-only), so there's no in-process
+// fake `SignerService` to speak real gRPC against, and a genuinely
+// unreachable endpoint fails in `RemoteSignerClient::new()`'s eager
+// `Channel::connect()` before ever reaching the retry logic. Calling
+// `fetch_with_retry()` with a synthetic `op` exercises the exact retry
+// engine both public methods share, without any network dependency. A
+// true end-to-end check against a live signer service lives in
+// `integration_tests` below.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A `SignerServiceClient` over a lazily-connecting channel: no TCP
+    /// connection is attempted until a request is actually sent, so this is
+    /// safe to construct without a listener at the address.
+    fn unconnected_client() -> SignerServiceClient<Channel> {
+        let channel = Channel::from_shared("http://127.0.0.1:1")
+            .expect("static URI is valid")
+            .connect_lazy();
+        SignerServiceClient::new(channel)
+    }
+
+    fn fast_retry_config(max_retries: usize) -> RetryConfig {
+        RetryConfig::new(
+            max_retries,
+            Duration::from_millis(1),
+            Duration::from_millis(20),
+        )
+    }
+
+    #[tokio::test]
+    async fn fetch_with_retry_retries_status_error_then_succeeds() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_in_task = attempts.clone();
+
+        let task = move |client: SignerServiceClient<Channel>| {
+            let attempts = attempts_in_task.clone();
+            async move {
+                let call = attempts.fetch_add(1, Ordering::SeqCst);
+                let result = if call < 2 {
+                    Err(RemoteSigningError::Status(Box::new(
+                        tonic::Status::unavailable("signer temporarily unavailable"),
+                    )))
+                } else {
+                    Ok(vec![7u8; ED25519_PUBLIC_KEY_SIZE_BYTES])
+                };
+                (client, result)
+            }
+        };
+
+        let result = RemoteSignerClient::fetch_with_retry(
+            unconnected_client(),
+            fast_retry_config(5),
+            "test get public key",
+            || {},
+            task,
+        )
+        .await;
+
+        assert_eq!(
+            result.expect("should succeed once the transient Status errors stop"),
+            vec![7u8; ED25519_PUBLIC_KEY_SIZE_BYTES]
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "expected 2 retried Status failures followed by 1 successful attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_with_retry_returns_invalid_response_without_retrying() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_in_task = attempts.clone();
+
+        let task = move |client: SignerServiceClient<Channel>| {
+            let attempts = attempts_in_task.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let result: Result<Vec<u8>, RemoteSigningError> = Err(
+                    RemoteSigningError::InvalidResponse("invalid public key length".to_string()),
+                );
+                (client, result)
+            }
+        };
+
+        let result = RemoteSignerClient::fetch_with_retry(
+            unconnected_client(),
+            fast_retry_config(5),
+            "test get public key",
+            || {},
+            task,
+        )
+        .await;
+
+        match result {
+            Err(RemoteSigningError::InvalidResponse(msg)) => {
+                assert_eq!(msg, "invalid public key length");
+            }
+            other => panic!(
+                "expected the original InvalidResponse error to pass through unchanged, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a non-retryable error must not trigger any retry"
+        );
     }
 }
 
