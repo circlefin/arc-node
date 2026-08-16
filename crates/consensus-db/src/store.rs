@@ -1140,6 +1140,8 @@ impl Db {
             // Keys are sorted by (height, round, hash) ascending
             let (stale, within_range, too_far) = table
                 .iter()?
+                // Skipping unreadable keys during enumeration is deliberate here
+                // (unlike a point-lookup returning a wrong "absent").
                 .filter_map(|result| result.ok().map(|(k, _)| k.value()))
                 .fold(
                     (vec![], vec![], vec![]),
@@ -1819,6 +1821,28 @@ mod tests {
         ];
 
         ProposalParts::new(parts).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_get_certificate_returns_decode_error_on_corruption() {
+        let store = create_store().await;
+        let height = Height::new(1);
+
+        // Write corrupt bytes directly to CERTIFICATES_TABLE
+        let tx = store.db.db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(CERTIFICATES_TABLE).unwrap();
+            table.insert(height, vec![0xBA, 0xAD, 0xF0, 0x0D]).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let result = store.get_certificate(Some(height)).await;
+
+        assert!(
+            matches!(result, Err(StoreError::Decode(_))),
+            "Expected StoreError::Decode, got {:?}",
+            result
+        );
     }
 
     fn arbitrary_payload() -> ExecutionPayloadV3 {
