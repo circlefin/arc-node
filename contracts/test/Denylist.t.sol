@@ -186,6 +186,37 @@ contract DenylistTest is Test {
         assertTrue(denylist.isDenylisted(alice));
     }
 
+    function test_Fixed_DenylistedDenylisterCannotMutate() public {
+        // owner grants denylister to two accounts (compromised, rescuer)
+        address compromised = address(100);
+        address rescuer = address(101);
+
+        vm.startPrank(owner);
+        denylist.addDenylister(compromised);
+        denylist.addDenylister(rescuer);
+        vm.stopPrank();
+
+        // rescuer denylists compromised
+        address[] memory accountsToDenylist = new address[](1);
+        accountsToDenylist[0] = compromised;
+        vm.prank(rescuer);
+        denylist.denylist(accountsToDenylist);
+
+        // compromised tries to un-denylist themselves
+        address[] memory accountsToUnDenylist = new address[](1);
+        accountsToUnDenylist[0] = compromised;
+        vm.prank(compromised);
+        vm.expectRevert(Denylist.CallerIsDenylisted.selector);
+        denylist.unDenylist(accountsToUnDenylist);
+
+        // compromised also cannot denylist anyone else
+        address[] memory otherAccounts = new address[](1);
+        otherAccounts[0] = alice;
+        vm.prank(compromised);
+        vm.expectRevert(Denylist.CallerIsDenylisted.selector);
+        denylist.denylist(otherAccounts);
+    }
+
     // ============ Add / Remove denylisters (onlyOwner) ============
 
     function test_AddDenylister_OnlyOwner_Success() public {
