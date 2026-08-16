@@ -106,10 +106,10 @@ fn decode_child_call(inputs: &CallInputs) -> Result<(CallInputs, u64), SubcallEr
     let target = decoded.target;
     let calldata = decoded.data;
 
-    if let CallValue::Transfer(v) = inputs.value {
-        if v > U256::ZERO {
-            return Err(SubcallError::UnexpectedValue);
-        }
+    // Defense-in-depth: the EVM gate (`ArcEvm::frame_init`) already rejects value transfers
+    // to subcall precompiles. We check it here to document the invariant.
+    if inputs.transfers_value() {
+        return Err(SubcallError::UnexpectedValue);
     }
 
     // init_subcall overhead: fixed base + per-word charge for the dynamic `bytes data`.
@@ -127,6 +127,13 @@ fn decode_child_call(inputs: &CallInputs) -> Result<(CallInputs, u64), SubcallEr
     #[allow(clippy::arithmetic_side_effects)]
     let child_gas_limit = available - (available / 64);
 
+    // Defense-in-depth: the EVM gate (`ArcEvm::frame_init`) already rejects static calls
+    // to subcall precompiles. We enforce the invariant here as well for symmetry with
+    // the value transfer check.
+    if inputs.is_static {
+        return Err(SubcallError::StaticCallNotAllowed);
+    }
+
     let child_inputs = CallInputs {
         scheme: CallScheme::Call,
         target_address: target,
@@ -135,7 +142,7 @@ fn decode_child_call(inputs: &CallInputs) -> Result<(CallInputs, u64), SubcallEr
         value: CallValue::Transfer(U256::ZERO),
         input: CallInput::Bytes(calldata),
         gas_limit: child_gas_limit,
-        is_static: inputs.is_static,
+        is_static: false,
         caller: sender,
         return_memory_offset: 0..0,
     };
@@ -287,5 +294,69 @@ mod tests {
             trace_result.is_static, init_child.is_static,
             "is_static mismatch"
         );
+    }
+
+    #[test]
+    fn decode_child_call_rejects_value_transfer() {
+        use revm::interpreter::interpreter_action::{CallInput, CallScheme, CallValue};
+        use alloy_primitives::{address, U256};
+        use alloy_sol_types::SolCall;
+
+        let sender = address!("e000000000000000000000000000000000000001");
+        let target = address!("c000000000000000000000000000000000000002");
+        let calldata = ICallFrom::callFromCall {
+            sender,
+            target,
+            data: vec![].into(),
+        }
+        .abi_encode();
+
+        let inputs = CallInputs {
+            scheme: CallScheme::Call,
+            target_address: CALL_FROM_ADDRESS,
+            bytecode_address: CALL_FROM_ADDRESS,
+            known_bytecode: None,
+            value: CallValue::Transfer(U256::from(1)), // Value > 0
+            input: CallInput::Bytes(calldata.into()),
+            gas_limit: 100_000,
+            is_static: false,
+            caller: address!("c000000000000000000000000000000000000001"),
+            return_memory_offset: 0..0,
+        };
+
+        let result = decode_child_call(&inputs);
+        assert!(matches!(result, Err(SubcallError::UnexpectedValue)));
+    }
+
+    #[test]
+    fn decode_child_call_rejects_static_context() {
+        use revm::interpreter::interpreter_action::{CallInput, CallScheme, CallValue};
+        use alloy_primitives::{address, U256};
+        use alloy_sol_types::SolCall;
+
+        let sender = address!("e000000000000000000000000000000000000001");
+        let target = address!("c000000000000000000000000000000000000002");
+        let calldata = ICallFrom::callFromCall {
+            sender,
+            target,
+            data: vec![].into(),
+        }
+        .abi_encode();
+
+        let inputs = CallInputs {
+            scheme: CallScheme::Call,
+            target_address: CALL_FROM_ADDRESS,
+            bytecode_address: CALL_FROM_ADDRESS,
+            known_bytecode: None,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(calldata.into()),
+            gas_limit: 100_000,
+            is_static: true, // Static context
+            caller: address!("c000000000000000000000000000000000000001"),
+            return_memory_offset: 0..0,
+        };
+
+        let result = decode_child_call(&inputs);
+        assert!(matches!(result, Err(SubcallError::StaticCallNotAllowed)));
     }
 }
