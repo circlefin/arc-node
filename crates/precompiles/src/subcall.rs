@@ -143,6 +143,10 @@ pub enum SubcallError {
     UnexpectedFrameResult,
     #[error("insufficient gas: {0}")]
     InsufficientGas(String),
+    #[error("unexpected value sent to precompile")]
+    UnexpectedValue,
+    #[error("subcall precompiles cannot be invoked in static context")]
+    StaticCallNotAllowed,
     #[error("internal error: {0}")]
     InternalError(String),
 }
