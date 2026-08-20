@@ -7,6 +7,7 @@ Each bullet is prefixed with a flag identifying the kind of breaking change:
 - `[CLI]` -- CLI flag added, renamed, removed, or made required.
 - `[Config]` -- default value, environment variable, or manifest field change.
 - `[Format]` -- log, metric label, or serialized output format change that breaks parsers.
+- `[RPC]` -- externally observable JSON-RPC behavior change that can affect applications.
 
 Entries are split by audience. A change appears under `### For Validators` when validator-mode operation must change; otherwise it appears under `### For Node Operators`. A change requiring both audiences to act appears in both sections (rare).
 
@@ -26,17 +27,18 @@ No breaking changes in this release.
 
 ### For Node Operators
 
-- **[Config] `arc-node-execution`: JSON-RPC gas cap default lowered.**
+- **[Config][RPC] `arc-node-execution`: JSON-RPC gas cap default lowered.**
   - Old (`v0.7.1`): `--rpc.gascap` default `50000000` (Reth stock default).
   - New (`v0.7.2`): `--rpc.gascap` default `30000000`.
+  - The RPC gas cap limits gas available to `eth_call` and `eth_estimateGas` simulations. It is an RPC execution limit, not the protocol maximum gas limit for an on-chain transaction.
   - `eth_call` and `eth_estimateGas` requests that need more than 30M gas now fail with a gas-cap error. Pass `--rpc.gascap 50000000` (or higher) to restore the previous budget. Operators who never set the flag and do not rely on calls above 30M gas are unaffected.
 
-- **[CLI] `arc-node-execution`: replay-unprotected (pre-EIP-155) transactions are rejected over JSON-RPC by default.**
+- **[CLI][RPC] `arc-node-execution`: replay-unprotected (pre-EIP-155) transactions are rejected over JSON-RPC by default.**
   - Old (`v0.7.1`): pre-EIP-155 (replay-unprotected) transactions were accepted over JSON-RPC.
   - New (`v0.7.2`): they are rejected by default with "only replay-protected (EIP-155) transactions allowed over RPC".
   - Adds `--arc.rpc.allow-unprotected-txs` (default `false`); set it to accept legacy unprotected transactions over RPC.
 
-- **[Config] `arc-node-execution`: JSON-RPC batch requests are capped.**
+- **[Config][RPC] `arc-node-execution`: JSON-RPC batch requests are capped.**
   - Old (`v0.7.1`): no limit on the number of entries in a JSON-RPC batch request.
   - New (`v0.7.2`): `--arc.rpc.max-batch-entries` defaults to `100`; oversized batches are rejected with JSON-RPC error `-32600` before any per-entry handler runs. A value of `0` is rejected so the cap cannot be silently disabled.
   - Operators whose tooling submits larger batches must raise `--arc.rpc.max-batch-entries <COUNT>`.
@@ -54,7 +56,7 @@ No breaking changes in this release.
 
 ### For Node Operators
 
-- **[Config] `arc-node-execution`: EL RPC connection defaults tightened.**
+- **[Config][RPC] `arc-node-execution`: EL RPC connection defaults tightened.**
   - `--rpc.max-connections` default: `500` -> `250`.
   - `--rpc.max-subscriptions-per-connection` default: `1024` -> `32`.
   - Both flags remain accepted on `arc-node-execution`; operators that need the previous behavior must pass them explicitly. The new defaults bound a WebSocket subscription fan-out memory pressure path; real-world clients typically multiplex around five subscriptions per socket and are unaffected.

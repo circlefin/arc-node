@@ -27,12 +27,26 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@0267444136ce4919088f5eae0461f736f21356de # v1
         with:
           components: rustfmt
 
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
+
+  rust-doc:
+    name: Rust Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@0267444136ce4919088f5eae0461f736f21356de # v1
+
+      - name: Build workspace documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --all-features --locked
 
   rust-deps:
     name: Rust Dependencies
@@ -41,7 +55,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@0267444136ce4919088f5eae0461f736f21356de # v1
 
       - name: Install cargo-sort
         run: cargo install cargo-sort
@@ -59,7 +73,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev zlib1g-dev
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@0267444136ce4919088f5eae0461f736f21356de # v1
         with:
           components: clippy
           cache-shared-key: rust-build
@@ -78,7 +92,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev zlib1g-dev
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@0267444136ce4919088f5eae0461f736f21356de # v1
         with:
           cache-shared-key: rust-build
 
@@ -104,7 +118,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev zlib1g-dev
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@0267444136ce4919088f5eae0461f736f21356de # v1
 
       - name: Setup Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
