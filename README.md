@@ -176,9 +176,10 @@ For an in-depth look at system design and individual components, check out the [
 
 ## Contributing
 
-We do not accept unsolicited pull requests. Please read our [Contributing Guide](CONTRIBUTING.md) before opening an issue or PR: find or open an issue, request assignment, and only submit a PR after you have been assigned.
+If you would like to contribute to the Arc Node open-source codebase, please see [CONTRIBUTING.md](./CONTRIBUTING.md).
+We invite all contributors.
 
-Once you are working on an assigned change, validate locally with:
+Once you are working on a change, validate locally with:
 
 1. **Format and lint**: `make lint`
 2. **Build**: `make build`
