@@ -1,0 +1,69 @@
+name: Auto Label Issues
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  triage:
+    if: github.repository == 'circlefin/arc-node'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check opener eligibility
+        id: check-opener
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const opener = context.payload.issue.user.login;
+            const association = context.payload.issue.author_association;
+            const allowedAssociations = ['MEMBER', 'OWNER', 'COLLABORATOR'];
+
+            if (allowedAssociations.includes(association)) {
+              console.log(`Opener ${opener} has allowed association ${association}`);
+              core.setOutput('skip_label', 'true');
+              return;
+            }
+
+            let codeownerUsernames = [];
+            try {
+              const response = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path: '.github/CODEOWNERS',
+                ref: context.payload.repository.default_branch
+              });
+              const content = Buffer.from(response.data.content, 'base64').toString('utf-8');
+              const codeowners = content.match(/@[\w-]+/g) || [];
+              codeownerUsernames = codeowners.map(c => c.substring(1).toLowerCase());
+            } catch (error) {
+              console.log(`Could not read CODEOWNERS: ${error.message}`);
+            }
+
+            if (codeownerUsernames.includes(opener.toLowerCase())) {
+              console.log(`Opener ${opener} is a codeowner`);
+              core.setOutput('skip_label', 'true');
+              return;
+            }
+
+            console.log(`Opener ${opener} needs triage label`);
+            core.setOutput('skip_label', 'false');
+
+      - name: Add need-triage label
+        if: steps.check-opener.outputs.skip_label == 'false'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: ['need-triage']
+              });
+              console.log('Successfully added `need-triage` label');
+            } catch (error) {
+              console.log('Error adding label:', error);
+            }
