@@ -457,8 +457,6 @@ describe('NativeFiatToken', () => {
         .then(ReceiptVerifier.waitSuccess)
 
       // Verify blocklist event was emitted
-      // Zero5: EIP-2929 warm/cold gas pricing
-      // +3526 gas for owner blocklist protection check
       blocklistReceipt.verifyGasUsedApproximately(61574n).verifyEvents((ev) => {
         ev.expectNativeBlocklisted({ account: targetAccount })
           .expectUSDCBlacklisted({ account: targetAccount })
@@ -504,8 +502,6 @@ describe('NativeFiatToken', () => {
         .then(ReceiptVerifier.waitSuccess)
 
       // Verify blocklist event was emitted
-      // Zero5: EIP-2929 warm/cold gas pricing
-      // +3526 gas for owner blocklist protection check
       blocklistReceipt.verifyGasUsedApproximately(61574n).verifyEvents((ev) => {
         ev.expectNativeBlocklisted({ account: sender })
           .expectUSDCBlacklisted({ account: sender })
@@ -533,6 +529,56 @@ describe('NativeFiatToken', () => {
         .then((hash: `0x${string}`) => client.waitForTransactionReceipt({ hash }))
     })
 
+    it('mempool blocklist: stuck tx evicted from pool when recipient is blocklisted', async () => {
+      const { client, operator, createRandWallet } = await clients()
+      const amount = parseEther('0.0000001')
+
+      const blocklistRecipient = await createRandWallet()
+      const nonce = await client.getTransactionCount({ address: operator.account.address })
+
+      // stuckTx: gap nonce (N+1) — enters pool but stalls waiting for nonce N
+      const stuckTxHash = await operator.sendTransaction({
+        to: blocklistRecipient.account.address,
+        value: amount,
+        nonce: nonce + 1,
+      })
+
+      // Confirm stuckTx is pending in the mempool (blockHash null = not yet mined)
+      const stuckTxPending = await client.getTransaction({ hash: stuckTxHash })
+      expect(stuckTxPending.blockHash).to.be.null
+
+      // blocklistTx: blocklist blocklistRecipient with correct nonce N — mines and fills the gap
+      // eth_getTransactionCount(operator,'pending') returns N because the gap at N prevents advancement
+      const blocklistReceipt = await USDC.attach(operator)
+        .write.blacklist([blocklistRecipient.account.address])
+        .then(ReceiptVerifier.waitSuccess)
+      // operator on-chain nonce = N+1; blocklistRecipient blocked; stuckTx now at queue front
+
+      blocklistReceipt.verifyGasUsedApproximately(61574n).verifyEvents((ev) => {
+        ev.expectNativeBlocklisted({ account: blocklistRecipient })
+          .expectUSDCBlacklisted({ account: blocklistRecipient })
+          .expectAllEventsMatched()
+      })
+
+      const balances = await balancesSnapshot(client, { blocklistRecipient: blocklistRecipient.account.address })
+
+      // stuckTx evicted: poll until next block build completes the eviction
+      let stuckTxInfo
+      for (let i = 0; i < 10; i++) {
+        stuckTxInfo = await client.request({ method: 'eth_getTransactionByHash', params: [stuckTxHash] })
+        if (stuckTxInfo === null) break
+        await new Promise((r) => setTimeout(r, 500))
+      }
+      expect(stuckTxInfo).to.be.null
+
+      // No transfer to blocklistRecipient occurred
+      await balances.verify()
+
+      await USDC.attach(operator)
+        .write.unBlacklist([blocklistRecipient.account.address])
+        .then(ReceiptVerifier.waitSuccess)
+    })
+
     it('pre-execution blocklist: blocklisted sender cannot transfer native coins', async () => {
       const { client, operator, createRandWallet, receiver } = await clients()
       const amount = parseEther('0.0000001')
@@ -544,8 +590,6 @@ describe('NativeFiatToken', () => {
         .then(ReceiptVerifier.waitSuccess)
 
       // Verify blocklist event was emitted
-      // Zero5: EIP-2929 warm/cold gas pricing
-      // +3526 gas for owner blocklist protection check
       blocklistReceipt.verifyGasUsedApproximately(61562n).verifyEvents((ev) => {
         ev.expectNativeBlocklisted({ account: sender })
           .expectUSDCBlacklisted({ account: sender })
@@ -1451,7 +1495,10 @@ describe('NativeFiatToken', () => {
     })
   })
 
-  it('draining an empty account will revert', async () => {
+  // Zero8 is active from genesis on localdev, so draining a nonce=0 & codeless account
+  // to empty is permitted and EIP-161 clears it at commit. Pre-Zero8 this reverts with
+  // ERR_CLEAR_EMPTY
+  it('draining an empty account succeeds and commits the cleared state', async () => {
     const { client, sender, operator, createRandWallet } = await clients()
     const usdcAmount = USDC.parseUnits('10')
 
@@ -1468,9 +1515,9 @@ describe('NativeFiatToken', () => {
     })
     expect(balances.state().emptyWalletNonce).to.equal(0n)
 
-    // Empty wallet signs an off-chain permit for SENDER to spend all 10 USDC
-    // This is EIP-2612 permit
-    // Sender will use this approval to transfer from empty wallet to themself
+    // Empty wallet signs an off-chain permit for SENDER to spend all 10 USDC.
+    // Sender submits it and drains via transferFrom, so emptyWallet never sends a
+    // tx — its nonce stays 0, keeping it EIP-161-clearable once fully drained.
     const signature = await signPermit({
       client,
       wallet: emptyWallet,
@@ -1487,31 +1534,26 @@ describe('NativeFiatToken', () => {
       ev.expectCount(1).expectUSDCApproval({ owner: emptyWallet, spender: sender, value: usdcAmount })
     })
 
-    // Sender drains all 10 USDC from wallet 1 to wallet 2 using transferFrom
-    // This will revert, since it is an empty account, being fully drained
-    await expect(
-      USDC.attach(sender).write.transferFrom([emptyWallet.account.address, sender.account.address, usdcAmount]),
-    ).rejectedWith(ContractFunctionExecutionError, 'Cannot clear balance of empty account')
-
-    await balances.verify()
-
-    // Now, send 1 wei of dust to the account, and try again
-    await sender
-      .sendTransaction({
-        to: emptyWallet.account.address,
-        value: 1n,
-      })
-      .then(ReceiptVerifier.waitSuccess)
-
-    // This should succeed, but leave 1 wei behind
-    await USDC.attach(sender)
+    // Sender drains all 10 USDC from emptyWallet. Under Zero8 this succeeds and
+    // is committed rather than reverting with ERR_CLEAR_EMPTY.
+    const drainReceipt = await USDC.attach(sender)
       .write.transferFrom([emptyWallet.account.address, sender.account.address, usdcAmount])
       .then(ReceiptVerifier.waitSuccess)
 
-    await balances
-      .decrease({ emptyWallet: USDC.toNative(usdcAmount) })
-      .increase({ emptyWallet: 1n })
-      .verify()
+    // Exactly the full balance left emptyWallet; its nonce is unchanged (still 0).
+    await balances.decrease({ emptyWallet: USDC.toNative(usdcAmount) }).verify(drainReceipt.transactionHash)
+
+    // The account reads fully empty at the RPC layer.
+    expect(await client.getBalance({ address: emptyWallet.account.address })).to.equal(0n)
+    expect(await client.getTransactionCount({ address: emptyWallet.account.address })).to.equal(0)
+    expect(await client.getCode({ address: emptyWallet.account.address })).to.be.undefined
+
+    // The chain keeps committing state on top of the cleared account: a later
+    // block builds on the post-drain state root without halting.
+    const followUp = await sender
+      .sendTransaction({ to: operator.account.address, value: 1n })
+      .then(ReceiptVerifier.waitSuccess)
+    expect(followUp.receipt.blockNumber > drainReceipt.receipt.blockNumber).to.be.true
   })
 
   it('transferFrom clearing an accounts balance', async () => {

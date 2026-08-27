@@ -20,6 +20,7 @@ use super::{
     helpers::fmt_hash,
 };
 use crate::cli::PreparePayloadArgs;
+use alloy_rpc_types_eth::BlockNumberOrTag;
 use arc_eth_engine::{engine::EthereumAPI, rpc::ethereum_rpc::EthereumRPC};
 use arc_execution_config::chainspec::ArcChainSpecParser;
 use eyre::{bail, Context};
@@ -83,7 +84,7 @@ async fn fetch_expected_parent(
         .checked_sub(1)
         .ok_or_else(|| eyre::eyre!("from_block must be greater than 0"))?;
     let expected_parent_block = source_rpc
-        .get_block_by_number(&format!("0x{expected_parent_block_number:x}"))
+        .get_block_by_number(BlockNumberOrTag::Number(expected_parent_block_number))
         .await
         .wrap_err_with(|| {
             format!("failed to fetch source parent block {expected_parent_block_number}")
@@ -117,7 +118,7 @@ async fn write_payload_fixture(
             .saturating_sub(1)
             .min(to);
         let block_numbers = (chunk_start..=chunk_end)
-            .map(|block_number| format!("0x{block_number:x}"))
+            .map(BlockNumberOrTag::Number)
             .collect::<Vec<_>>();
         let chunk =
             <EthereumRPC as EthereumAPI>::get_execution_payloads(source_rpc, &block_numbers)

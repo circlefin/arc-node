@@ -320,8 +320,8 @@ describe('genesis', () => {
       expect(feeParams.alpha).to.be.eq(20n)
       expect(feeParams.kRate).to.be.eq(200n)
       expect(feeParams.inverseElasticityMultiplier).to.be.eq(5000n)
-      expect(feeParams.minBaseFee).to.be.eq(1n)
-      expect(feeParams.maxBaseFee).to.be.eq(parseGwei('1000'))
+      expect(feeParams.minBaseFee).to.be.eq(parseGwei('20'))
+      expect(feeParams.maxBaseFee).to.be.eq(parseGwei('20000'))
       expect(feeParams.blockGasLimit).to.be.eq(30_000_000n)
     })
 
@@ -336,7 +336,7 @@ describe('genesis', () => {
       expect(consensusParams.timeoutPrevoteDeltaMs).to.be.eq(500)
       expect(consensusParams.timeoutPrecommitMs).to.be.eq(1000)
       expect(consensusParams.timeoutPrecommitDeltaMs).to.be.eq(500)
-      expect(consensusParams.timeoutRebroadcastMs).to.be.eq(1000)
+      expect(consensusParams.timeoutRebroadcastMs).to.be.eq(5000)
       expect(consensusParams.targetBlockTimeMs).to.be.eq(500)
     })
   })
@@ -599,6 +599,23 @@ describe('genesis', () => {
       const code = await client.getCode({ address: multicall3FromAddress })
       const artifact = readForgeArtifactSync('Multicall3From')
       expect(code).to.equal(artifact.deployedBytecode)
+    })
+  })
+
+  // Extend when adding a new Arc hardfork: add an assertion for the new field here.
+  // All Arc hardforks activate at genesis (block 0 / timestamp 0) on localdev.
+  describe('hardfork activation', () => {
+    it('all Arc hardforks active at genesis on localdev', async () => {
+      const { client } = await getClients()
+      type AdminNodeInfo = { protocols: { eth: { config: Record<string, unknown> } } }
+      const nodeInfo = (await client.request({ method: 'admin_nodeInfo' })) as unknown as AdminNodeInfo
+      const config = nodeInfo.protocols.eth.config
+
+      expect(config.zero3Block, 'Zero3').to.equal(0)
+      expect(config.zero4Block, 'Zero4').to.equal(0)
+      expect(config.zero5Block, 'Zero5').to.equal(0)
+      expect(config.zero6Block, 'Zero6').to.equal(0)
+      expect(config.zero7Time, 'Zero7').to.equal(0)
     })
   })
 

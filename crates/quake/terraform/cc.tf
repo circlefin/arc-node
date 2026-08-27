@@ -228,6 +228,7 @@ resource "terraform_data" "spammer-image" {
   provisioner "local-exec" {
     command = <<-EOT
     docker build -q \
+      --secret id=github_token,env=GITHUB_TOKEN \
       --build-arg CIRCLE_BASE_IMAGE=${var.circle_base_image} \
       --platform linux/amd64 \
       -f crates/spammer/Dockerfile \
@@ -235,6 +236,9 @@ resource "terraform_data" "spammer-image" {
     docker save spammer:latest | gzip > /tmp/spammer_latest.tar.gz
     EOT
     working_dir = local.root_dir
+    environment = {
+      GITHUB_TOKEN = var.github_token
+    }
   }
 }
 

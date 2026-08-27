@@ -13,6 +13,8 @@ services:
         CHAIN: ${CHAIN:-localdev}
         FEATURES: ${EL_FEATURES:-default js-tracer}
         ARC_IDEMPOTENT_BUILD: ${ARC_IDEMPOTENT_BUILD:-false}
+      secrets:
+        - github_token
     image: arc_execution:latest
     cap_add:
       - NET_ADMIN
@@ -66,3 +68,7 @@ services:
 
 networks:
   arc_network:
+
+secrets:
+  github_token:
+    environment: GITHUB_TOKEN

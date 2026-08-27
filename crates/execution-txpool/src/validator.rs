@@ -46,6 +46,11 @@ use tracing::{info, warn};
 /// Default capacity for the invalid transaction list when no override is provided.
 pub const ARC_INVALID_TX_LIST_DEFAULT_CAP: u32 = 100_000; // 32 bytes * 100_000 = ~3.2 MB (+ LRU overhead)
 
+/// Maximum EIP-7702 authorizations accepted in a single transaction, checked directly rather
+/// than inferred from tx size or gas limits — recovery cost is paid before the sender's balance
+/// or fee is checked, so this needs to bound the count itself, accurately.
+pub const MAX_AUTHORIZATIONS_PER_TX: usize = 100;
+
 /// Configuration for the invalid transaction list.
 #[derive(Debug, Clone)]
 pub struct InvalidTxListConfig {
@@ -226,6 +231,36 @@ where
             }
         }
 
+        if let Err(err) = self.inner.validate_stateless(origin, &transaction) {
+            return TransactionValidationOutcome::Invalid(transaction, err);
+        }
+
+        // Checked before blocklist/denylist below: a transaction over the limit is rejected
+        // here even if it would also have failed one of those checks.
+        let auth_count = transaction
+            .authorization_list()
+            .map_or(0, |list| list.len());
+        if auth_count > MAX_AUTHORIZATIONS_PER_TX {
+            warn!(
+                origin = ?origin,
+                hash = %transaction.hash(),
+                sender = %transaction.sender(),
+                count = auth_count,
+                limit = MAX_AUTHORIZATIONS_PER_TX,
+                reason = "too_many_authorizations",
+                "transaction rejected"
+            );
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::other(
+                    ArcTransactionValidatorError::TooManyAuthorizations {
+                        count: auth_count,
+                        limit: MAX_AUTHORIZATIONS_PER_TX,
+                    },
+                ),
+            );
+        }
+
         match self.inner.client().latest() {
             Ok(state_provider) => {
                 match self.check_for_blocklisted_addresses(&transaction, &state_provider) {
@@ -283,17 +318,16 @@ where
                     }
                 };
 
-                // Store the provider for the inner validator for reuse
-                *state = Some(Box::new(state_provider));
-            }
-            Err(err) => {
-                return TransactionValidationOutcome::Error(*transaction.hash(), Box::new(err));
-            }
-        }
+                let outcome = self
+                    .inner
+                    .validate_stateful(origin, transaction, &state_provider);
 
-        // If blocklist and addresses denylist validation pass, delegate to the inner validator
-        self.inner
-            .validate_one_with_state(origin, transaction, state)
+                // Store the provider for reuse across subsequent validations.
+                *state = Some(Box::new(state_provider));
+                outcome
+            }
+            Err(err) => TransactionValidationOutcome::Error(*transaction.hash(), Box::new(err)),
+        }
     }
 
     /// If the transaction has a denylisted address, returns Ok(Some(address)); otherwise Ok(None).
@@ -303,10 +337,6 @@ where
         transaction: &Tx,
         state_provider: &dyn StateProvider,
     ) -> ProviderResult<Option<Address>> {
-        if !self.addresses_denylist_config.is_enabled() {
-            return Ok(None);
-        }
-
         let auth_authorities: Vec<Address> = transaction
             .authorization_list()
             .into_iter()
@@ -415,6 +445,16 @@ mod tests {
     use serial_test::serial;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// A denylist config whose contract has no denylisted entries in the mock provider, so every
+    /// lookup returns "not denylisted". Used by tests that are not about the denylist itself.
+    fn denylist_config_empty() -> AddressesDenylistConfig {
+        AddressesDenylistConfig::new(
+            Address::from([0x36u8; 20]),
+            DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+            Vec::new(),
+        )
+    }
+
     /// Helper function
     fn create_arc_validator_for_test(
         provider: MockEthProvider,
@@ -428,7 +468,7 @@ mod tests {
         ArcTransactionValidator::new(
             eth_validator,
             Some(InvalidTxList::new(ARC_INVALID_TX_LIST_DEFAULT_CAP)),
-            AddressesDenylistConfig::Disabled,
+            denylist_config_empty(),
         )
     }
 
@@ -559,7 +599,7 @@ mod tests {
             .no_eip4844()
             .build(blob_store);
         let arc_validator =
-            ArcTransactionValidator::new(eth_validator, None, AddressesDenylistConfig::Disabled); // invalid tx list disabled
+            ArcTransactionValidator::new(eth_validator, None, denylist_config_empty()); // invalid tx list disabled
 
         let outcome = arc_validator
             .validate_one_with_state(TransactionOrigin::External, tx, &mut None)
@@ -616,8 +656,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn addresses_denylist_config_none_accepts_tx() {
-        // When addresses_denylist_config is None, no address denylist check; tx is accepted.
+    async fn denylist_contract_without_entries_accepts_tx() {
         let tx = MockTransaction::legacy()
             .with_gas_limit(21_000)
             .with_gas_price(1_000_000_000)
@@ -633,13 +672,13 @@ mod tests {
             .no_eip4844()
             .build(blob_store);
         let arc_validator =
-            ArcTransactionValidator::new(eth_validator, None, AddressesDenylistConfig::Disabled);
+            ArcTransactionValidator::new(eth_validator, None, denylist_config_empty());
         let outcome = arc_validator
             .validate_one_with_state(TransactionOrigin::External, tx, &mut None)
             .await;
         assert!(
             matches!(outcome, TransactionValidationOutcome::Valid { .. }),
-            "tx should be accepted when addresses_denylist_config is None"
+            "tx should be accepted when the denylist contract has no entries"
         );
     }
 
@@ -652,13 +691,11 @@ mod tests {
             .with_value(U256::from(200));
         let sender = tx.sender();
         let contract = Address::from([0x36u8; 20]);
-        let config = AddressesDenylistConfig::try_new(
-            true,
-            Some(contract),
-            Some(DEFAULT_DENYLIST_ERC7201_BASE_SLOT),
+        let config = AddressesDenylistConfig::new(
+            contract,
+            DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
             vec![sender],
-        )
-        .unwrap();
+        );
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         provider.add_account(sender, ExtendedAccount::new(0, U256::MAX));
@@ -687,13 +724,8 @@ mod tests {
             .with_gas_price(1_000_000_000)
             .with_value(U256::from(300));
         let contract = Address::from([0x36u8; 20]);
-        let config = AddressesDenylistConfig::try_new(
-            true,
-            Some(contract),
-            Some(DEFAULT_DENYLIST_ERC7201_BASE_SLOT),
-            Vec::new(),
-        )
-        .unwrap();
+        let config =
+            AddressesDenylistConfig::new(contract, DEFAULT_DENYLIST_ERC7201_BASE_SLOT, Vec::new());
 
         for (name, denylisted_address) in [
             ("denylisted_sender", tx.sender()),
@@ -779,9 +811,13 @@ mod tests {
     fn eip7702_tx_with_auths(
         auth_list: Vec<alloy_eips::eip7702::SignedAuthorization>,
     ) -> MockTransaction {
-        // 100_000 gas covers EIP-7702 intrinsic (21_000 + 12_500 per auth)
+        // 21_000 base + up to 25_000 per auth (PER_EMPTY_ACCOUNT_COST, since test authorities
+        // never exist in MockEthProvider state), plus margin.
+        let gas_limit = 25_000u64
+            .saturating_mul(auth_list.len() as u64)
+            .saturating_add(71_000);
         let mut tx = MockTransaction::eip7702()
-            .with_gas_limit(100_000)
+            .with_gas_limit(gas_limit)
             .with_gas_price(1_000_000_000);
         tx.set_authorization_list(auth_list);
         tx
@@ -809,13 +845,11 @@ mod tests {
     }
 
     fn denylist_config(exclusions: Vec<Address>) -> AddressesDenylistConfig {
-        AddressesDenylistConfig::try_new(
-            true,
-            Some(DENYLIST_CONTRACT),
-            Some(DEFAULT_DENYLIST_ERC7201_BASE_SLOT),
+        AddressesDenylistConfig::new(
+            DENYLIST_CONTRACT,
+            DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
             exclusions,
         )
-        .unwrap()
     }
 
     async fn validate_eip7702(
@@ -825,6 +859,23 @@ mod tests {
     ) -> TransactionValidationOutcome<MockTransaction> {
         let blob_store = InMemoryBlobStore::default();
         let eth_validator = EthTransactionValidatorBuilder::new(provider, EthEvmConfig::mainnet())
+            .no_eip4844()
+            .build(blob_store);
+        let arc_validator = ArcTransactionValidator::new(eth_validator, None, config);
+        arc_validator
+            .validate_one_with_state(TransactionOrigin::External, tx, &mut None)
+            .await
+    }
+
+    async fn validate_eip7702_with_max_tx_input_bytes(
+        tx: MockTransaction,
+        provider: MockEthProvider,
+        config: AddressesDenylistConfig,
+        max_tx_input_bytes: usize,
+    ) -> TransactionValidationOutcome<MockTransaction> {
+        let blob_store = InMemoryBlobStore::default();
+        let eth_validator = EthTransactionValidatorBuilder::new(provider, EthEvmConfig::mainnet())
+            .with_max_tx_input_bytes(max_tx_input_bytes)
             .no_eip4844()
             .build(blob_store);
         let arc_validator = ArcTransactionValidator::new(eth_validator, None, config);
@@ -898,6 +949,76 @@ mod tests {
         let tx = eip7702_tx_with_auths(vec![signed_auth]);
         let provider = provider_with_funded_accounts(&tx);
         provider.add_account(DENYLIST_CONTRACT, ExtendedAccount::new(0, U256::ZERO));
+
+        let outcome = validate_eip7702(tx, provider, denylist_config(Vec::new())).await;
+        assert_valid(&outcome);
+    }
+
+    #[tokio::test]
+    async fn oversized_eip7702_rejected_before_denylist_authority_recovery() {
+        let max_tx_input_bytes = 128;
+        let (authority, signed_auth) = create_signed_authorization(1, Address::from([0xDD; 20]), 0);
+        let mut tx = eip7702_tx_with_auths(vec![signed_auth]);
+        tx.set_size(max_tx_input_bytes + 1);
+        let provider = provider_with_funded_accounts(&tx);
+        add_denylisted_address(&provider, authority);
+
+        let outcome = validate_eip7702_with_max_tx_input_bytes(
+            tx,
+            provider,
+            denylist_config(Vec::new()),
+            max_tx_input_bytes,
+        )
+        .await;
+
+        let TransactionValidationOutcome::Invalid(_, err) = &outcome else {
+            panic!("expected oversized Invalid outcome, got {outcome:?}");
+        };
+        assert!(
+            matches!(
+                err,
+                InvalidPoolTransactionError::OversizedData { size, limit }
+                    if *size == max_tx_input_bytes + 1 && *limit == max_tx_input_bytes
+            ),
+            "expected OversizedData before denylist authority recovery, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_authorizations_rejected_before_denylist_authority_recovery() {
+        let (authority, signed_auth) = create_signed_authorization(1, Address::from([0xDD; 20]), 0);
+        let auth_list: Vec<_> =
+            std::iter::repeat_n(signed_auth, MAX_AUTHORIZATIONS_PER_TX + 1).collect();
+        let tx = eip7702_tx_with_auths(auth_list);
+        let provider = provider_with_funded_accounts(&tx);
+        add_denylisted_address(&provider, authority);
+
+        let outcome = validate_eip7702(tx, provider, denylist_config(Vec::new())).await;
+
+        let TransactionValidationOutcome::Invalid(_, err) = &outcome else {
+            panic!("expected Invalid outcome for too many authorizations, got {outcome:?}");
+        };
+        let inner: &ArcTransactionValidatorError = err
+            .downcast_other_ref::<ArcTransactionValidatorError>()
+            .unwrap();
+        assert!(
+            matches!(
+                inner,
+                ArcTransactionValidatorError::TooManyAuthorizations { count, limit }
+                    if *count == MAX_AUTHORIZATIONS_PER_TX + 1 && *limit == MAX_AUTHORIZATIONS_PER_TX
+            ),
+            "expected TooManyAuthorizations before denylist authority recovery, got {inner:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_count_at_limit_passes() {
+        let (_authority, signed_auth) =
+            create_signed_authorization(1, Address::from([0xEF; 20]), 0);
+        let auth_list: Vec<_> =
+            std::iter::repeat_n(signed_auth, MAX_AUTHORIZATIONS_PER_TX).collect();
+        let tx = eip7702_tx_with_auths(auth_list);
+        let provider = provider_with_funded_accounts(&tx);
 
         let outcome = validate_eip7702(tx, provider, denylist_config(Vec::new())).await;
         assert_valid(&outcome);

@@ -16,15 +16,9 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::time::Duration;
 use std::{fs, path::Path};
 
 use alloy_primitives::{address, Address};
-use arc_consensus_types::{
-    Config, LoggingConfig, MetricsConfig, PruningConfig, RemoteSigningConfig, RpcConfig,
-    RuntimeConfig, SigningConfig,
-};
-use arc_node_consensus::hardcoded_config;
 use arc_node_consensus_cli::args::Args;
 use arc_node_consensus_cli::cmd::start::{StartCmd, RUNTIME_SINGLE_THREADED};
 use arc_node_consensus_cli::file::save_priv_validator_key;
@@ -39,14 +33,14 @@ use serde::Serialize;
 use tracing::{debug, warn};
 use url::Url;
 
-use crate::cli_version::{apply_version_compat, supports_cli_flags};
+use crate::cli_version::apply_version_compat;
 use crate::infra::InfraType;
 use crate::manifest::{self, Subnets};
 use crate::node::{CidrBlock, NodeMetadata, NodeName, SubnetName, RETH_HTTP_BASE_PORT};
 use crate::nodekey::{self, NodekeyData};
 use crate::nodes::NodesMetadata;
 use crate::testnet::QUAKE_DIR;
-use crate::{shell, testnet, util};
+use crate::{shell, testnet};
 
 const APP_CONSENSUS_DEFAULT_PORT: usize = 27000;
 const APP_METRICS_DEFAULT_PORT: usize = 29000;
@@ -353,6 +347,10 @@ pub(crate) struct ComposeTemplateDataRemote {
     pub cl_cpu_limit: Option<f64>,
     /// Memory limit for the CL container in GiB; when None, the legacy default applies.
     pub cl_memory_limit_gb: Option<f64>,
+    /// Environment variables for the execution layer (Reth) container.
+    pub el_env: IndexMap<String, String>,
+    /// Environment variables for the consensus layer (Malachite) container.
+    pub cl_env: IndexMap<String, String>,
 }
 
 /// Generate docker compose content from the given template and data and write to the given path
@@ -508,249 +506,10 @@ pub(crate) fn generate_app_private_keys(
     Ok(())
 }
 
-//////////////////////////////////////////////////////////////////
-// TODO: Remove once the network is fully migrated to use CLI flags. I.e when
-// all scenarios use v0.5.0 or later.
-//////////////////////////////////////////////////////////////////
-
-/// Generate Malachite app config.toml files for each node.
-///
-/// This is needed for backward compatibility with older versions that still require config.toml.
-pub(crate) fn generate_app_config_files(
-    testnet_dir: &Path,
-    nodes_metadata: &NodesMetadata,
-    manifest: &manifest::Manifest,
-    force: bool,
-) -> Result<()> {
-    debug!("Generating Malachite app configuration files...");
-
-    let num_nodes = nodes_metadata.num_nodes();
-
-    for (name, node) in manifest.nodes.iter().take(num_nodes) {
-        let node_home_dir = testnet_dir.join(name).join("malachite");
-        let config_file = node_home_dir.join("config").join("config.toml");
-
-        // Skip if the configuration already exists
-        if !force && config_file.exists() {
-            debug!("⏭️ Skipping generating configuration for node {name}");
-            continue;
-        }
-
-        // Only generate config.toml for Legacy nodes (< v0.5.0).
-        // Modern nodes use CLI flags exclusively.
-        let legacy_config = match &node.cl_config {
-            manifest::NodeClConfig::Legacy(config) => config,
-            manifest::NodeClConfig::Modern(_) => continue,
-        };
-
-        debug!(node=%name, dir=%node_home_dir.display(), "Generating node configuration...");
-
-        let peers_ips: Vec<String> = if let Some(peers) = &node.cl_persistent_peers {
-            nodes_metadata.resolve_cl_persistent_peers_list_ips(name, peers)?
-        } else {
-            nodes_metadata.default_cl_persistent_peers_list_ips(name)
-        };
-
-        // Generate an initial config and merge it with the config customisations from the manifest by ser/deserializing to TOML values
-        let initial_config =
-            generate_legacy_consensus_config(name, node, legacy_config, &peers_ips)?;
-        let config = util::merge_toml_values(
-            toml::Value::try_from(initial_config)?,
-            toml::Value::try_from(legacy_config.clone())?,
-        )?
-        .try_into()?;
-
-        // Save config file
-        let args = Args {
-            home: Some(node_home_dir),
-            ..Args::default()
-        };
-        save_config(&args.get_config_file_path()?, &config)?;
-    }
-
-    debug!(dir=%testnet_dir.display(), "✅ Generated Consensus Layer configuration files");
-    Ok(())
-}
-
-/// Generate a consensus configuration for a legacy (< v0.5.0) node.
-fn generate_legacy_consensus_config(
-    name: &str,
-    node: &manifest::Node,
-    cl_config: &Config,
-    peers_ips: &[String],
-) -> Result<Config> {
-    let transport = TransportProtocol::default();
-
-    // We use IPADDR_ANY to allow nodes to listen on all subnet interfaces.
-    let listen_ip = "0.0.0.0";
-
-    let p2p_listen_addr = transport.multiaddr(listen_ip, APP_CONSENSUS_DEFAULT_PORT);
-
-    let cl_persistent_peers = peers_ips
-        .iter()
-        .map(|url| transport.multiaddr(url, APP_CONSENSUS_DEFAULT_PORT))
-        .collect();
-
-    let metrics_listen_addr = format!("{listen_ip}:{APP_METRICS_DEFAULT_PORT}")
-        .parse()
-        .context("failed to parse metrics listen address")?;
-
-    let persistent_peers_only = node.cl_persistent_peers_only;
-
-    let gossipsub_overrides = hardcoded_config::GossipSubOverrides {
-        explicit_peering: node.cl_gossipsub.explicit_peering,
-        mesh_prioritization: node.cl_gossipsub.mesh_prioritization,
-        load: hardcoded_config::GossipLoad::from_str_opt(node.cl_gossipsub.load.as_deref()),
-    };
-
-    let discovery = &cl_config.consensus.p2p.discovery;
-    let discovery_enabled = discovery.enabled;
-    let num_outbound_peers = if discovery.num_outbound_peers > 0 {
-        discovery.num_outbound_peers
-    } else {
-        20
-    };
-    let num_inbound_peers = if discovery.num_inbound_peers > 0 {
-        discovery.num_inbound_peers
-    } else {
-        20
-    };
-
-    let consensus = hardcoded_config::build_consensus_config(
-        p2p_listen_addr,
-        cl_persistent_peers,
-        persistent_peers_only,
-        discovery_enabled,
-        num_outbound_peers,
-        num_inbound_peers,
-        true,
-        gossipsub_overrides,
-    );
-
-    let value_sync = hardcoded_config::build_value_sync_config(true);
-
-    let config = Config {
-        moniker: name.to_string(),
-        consensus,
-        value_sync,
-        metrics: MetricsConfig {
-            enabled: true,
-            listen_addr: metrics_listen_addr,
-        },
-        logging: LoggingConfig::default(),
-        // Use single-threaded runtime for lower resource usage when running local devnet
-        runtime: RuntimeConfig::SingleThreaded,
-        prune: PruningConfig::default(),
-        execution: Default::default(),
-        rpc: RpcConfig {
-            enabled: true,
-            // IPADDR_ANY because we need external access to it for testing.
-            listen_addr: format!("0.0.0.0:{APP_RPC_DEFAULT_PORT}")
-                .parse()
-                .context("failed to parse RPC listen address")?,
-        },
-        signing: if node.remote_signer.is_some() {
-            SigningConfig::Remote(RemoteSigningConfig {
-                endpoint: format!("http://{name}-signer-proxy:{REMOTE_SIGNER_PROXY_PORT}"),
-                timeout: Duration::from_secs(30),
-                ..Default::default()
-            })
-        } else {
-            SigningConfig::Local
-        },
-    };
-
-    Ok(config)
-}
-
-/// Save config to a TOML file.
-fn save_config(path: &Path, config: &Config) -> Result<()> {
-    if let Some(parent_dir) = path.parent() {
-        fs::create_dir_all(parent_dir)
-            .with_context(|| format!("Failed to create directory: {}", parent_dir.display()))?;
-    }
-
-    // Serialize config to TOML string, then parse back to Value for manipulation
-    let toml_str = toml::to_string_pretty(config)
-        .with_context(|| format!("Failed to serialize config for {}", path.display()))?;
-
-    let mut config_value = toml::from_str::<toml::Value>(&toml_str)
-        .with_context(|| format!("Failed to parse config TOML for {}", path.display()))?;
-
-    // Translate [prune] field names for backward compatibility with pre-v0.5.0 nodes,
-    // which read `block_interval` / `min_height` instead of
-    // `certificates_distance` / `certificates_before`.
-    if let Some(prune) = config_value
-        .as_table_mut()
-        .and_then(|t| t.get_mut("prune"))
-        .and_then(|v| v.as_table_mut())
-    {
-        let distance = prune
-            .remove("certificates_distance")
-            .unwrap_or(toml::Value::Integer(0));
-        let before = prune
-            .remove("certificates_before")
-            .unwrap_or(toml::Value::Integer(0));
-        prune.insert("block_interval".to_string(), distance);
-        prune.insert("min_height".to_string(), before);
-    }
-
-    // Add timeout fields to the [consensus] section for backward compatibility
-    if let Some(consensus) = config_value
-        .as_table_mut()
-        .and_then(|t| t.get_mut("consensus"))
-        .and_then(|v| v.as_table_mut())
-    {
-        consensus.insert(
-            "timeout_propose".to_string(),
-            toml::Value::String("3s".to_string()),
-        );
-        consensus.insert(
-            "timeout_propose_delta".to_string(),
-            toml::Value::String("500ms".to_string()),
-        );
-        consensus.insert(
-            "timeout_prevote".to_string(),
-            toml::Value::String("1s".to_string()),
-        );
-        consensus.insert(
-            "timeout_prevote_delta".to_string(),
-            toml::Value::String("500ms".to_string()),
-        );
-        consensus.insert(
-            "timeout_precommit".to_string(),
-            toml::Value::String("1s".to_string()),
-        );
-        consensus.insert(
-            "timeout_precommit_delta".to_string(),
-            toml::Value::String("500ms".to_string()),
-        );
-        consensus.insert(
-            "timeout_rebroadcast".to_string(),
-            toml::Value::String("3s".to_string()),
-        );
-    }
-
-    // Convert back to string and write
-    let final_toml_str = toml::to_string_pretty(&config_value)
-        .with_context(|| format!("Failed to serialize final config for {}", path.display()))?;
-
-    fs::write(path, final_toml_str)
-        .with_context(|| format!("Failed to write config file: {}", path.display()))?;
-
-    Ok(())
-}
-
-//////////////////////////////////////////////////////////////////
-// END OF TODO: Remove once the network is fully migrated to use CLI flags. I.e
-// when all scenarios use v0.5.0 or later.
-//////////////////////////////////////////////////////////////////
-
 /// Generate CLI flags for a node based on its configuration.
 ///
-/// For `NodeClConfig::Modern`: builds a `StartCmd` from the manifest config +
-/// Node-level overrides + deployment-specific fields, then calls `to_cli_flags()`.
-/// For `NodeClConfig::Legacy`: returns an empty Vec (uses config.toml instead).
+/// Builds a `StartCmd` from the manifest config + Node-level overrides +
+/// deployment-specific fields, then calls `to_cli_flags()`.
 ///
 /// `follow_endpoint_urls` are pre-resolved container-accessible EL RPC URLs for follow
 /// mode (e.g. `http://validator-1_el:8545` for local, `http://10.0.0.5:8545` for remote).
@@ -766,102 +525,89 @@ pub(crate) fn generate_consensus_cli_flags(
         return generate_default_consensus_cli_flags(name, listen_ip, peers_ips, image_tag);
     };
 
-    match &node.cl_config {
-        manifest::NodeClConfig::Legacy(_) => {
-            debug!("Skipping CLI flags for legacy CL node {name}");
-            Ok(Vec::new())
-        }
-        manifest::NodeClConfig::Modern(start_cmd) => {
-            let transport = TransportProtocol::default();
+    let transport = TransportProtocol::default();
 
-            let mut cmd = start_cmd.clone();
+    let mut cmd = node.cl_config.clone();
 
-            cmd.moniker = Some(name.to_string());
-            cmd.p2p_addr = transport.multiaddr(listen_ip, APP_CONSENSUS_DEFAULT_PORT);
-            cmd.metrics = Some(
-                format!("{listen_ip}:{APP_METRICS_DEFAULT_PORT}")
-                    .parse()
-                    .context("failed to parse metrics listen address")?,
-            );
-            cmd.rpc_addr = Some(
-                format!("0.0.0.0:{APP_RPC_DEFAULT_PORT}")
-                    .parse()
-                    .context("failed to parse RPC listen address")?,
-            );
+    cmd.moniker = Some(name.to_string());
+    cmd.p2p_addr = transport.multiaddr(listen_ip, APP_CONSENSUS_DEFAULT_PORT);
+    cmd.metrics = Some(
+        format!("{listen_ip}:{APP_METRICS_DEFAULT_PORT}")
+            .parse()
+            .context("failed to parse metrics listen address")?,
+    );
+    cmd.rpc_addr = Some(
+        format!("0.0.0.0:{APP_RPC_DEFAULT_PORT}")
+            .parse()
+            .context("failed to parse RPC listen address")?,
+    );
 
-            if !peers_ips.is_empty() {
-                cmd.p2p_persistent_peers = peers_ips
-                    .iter()
-                    .map(|ip| transport.multiaddr(ip, APP_CONSENSUS_DEFAULT_PORT))
-                    .collect();
+    if !peers_ips.is_empty() {
+        cmd.p2p_persistent_peers = peers_ips
+            .iter()
+            .map(|ip| transport.multiaddr(ip, APP_CONSENSUS_DEFAULT_PORT))
+            .collect();
+    }
+
+    cmd.p2p_persistent_peers_only = node.cl_persistent_peers_only;
+    cmd.gossipsub_explicit_peering = node.cl_gossipsub.explicit_peering;
+    cmd.gossipsub_mesh_prioritization = node.cl_gossipsub.mesh_prioritization;
+    cmd.gossipsub_load = node.cl_gossipsub.load.clone();
+
+    if node.node_type == manifest::NodeType::Validator {
+        cmd.validator = true;
+    }
+
+    // `--validator` requires a non-zero `--suggested-fee-recipient`. When
+    // validator scenarios omit `cl_suggested_fee_recipient`, fall back to
+    // QUAKE_DEFAULT_FEE_RECIPIENT, which is what localdev genesis expects
+    // when `ProtocolConfig.rewardBeneficiary = 0`.
+    let effective_fee_recipient = node.cl_suggested_fee_recipient.or_else(|| {
+        (node.node_type == manifest::NodeType::Validator).then_some(QUAKE_DEFAULT_FEE_RECIPIENT)
+    });
+    if let Some(addr) = effective_fee_recipient {
+        cmd.suggested_fee_recipient = Some(addr.into());
+    }
+
+    if node.remote_signer.is_some() {
+        cmd.signing_remote = Some(format!(
+            "http://{name}-signer-proxy:{REMOTE_SIGNER_PROXY_PORT}"
+        ));
+    }
+
+    if cmd.prune_certificates_distance == 0 && cmd.prune_certificates_before == 0 {
+        if let Some(preset) = node.cl_prune_preset {
+            match preset {
+                manifest::ClPruningPreset::Full => cmd.full = true,
+                manifest::ClPruningPreset::Minimal => cmd.minimal = true,
             }
-
-            cmd.p2p_persistent_peers_only = node.cl_persistent_peers_only;
-            cmd.gossipsub_explicit_peering = node.cl_gossipsub.explicit_peering;
-            cmd.gossipsub_mesh_prioritization = node.cl_gossipsub.mesh_prioritization;
-            cmd.gossipsub_load = node.cl_gossipsub.load.clone();
-
-            if node.node_type == manifest::NodeType::Validator {
-                cmd.validator = true;
-            }
-
-            // `--validator` requires a non-zero `--suggested-fee-recipient`. When
-            // validator scenarios omit `cl_suggested_fee_recipient`, fall back to
-            // QUAKE_DEFAULT_FEE_RECIPIENT, which is what localdev genesis expects
-            // when `ProtocolConfig.rewardBeneficiary = 0`.
-            let effective_fee_recipient = node.cl_suggested_fee_recipient.or_else(|| {
-                (node.node_type == manifest::NodeType::Validator)
-                    .then_some(QUAKE_DEFAULT_FEE_RECIPIENT)
-            });
-            if let Some(addr) = effective_fee_recipient {
-                cmd.suggested_fee_recipient = Some(addr.into());
-            }
-
-            if node.remote_signer.is_some() {
-                cmd.signing_remote = Some(format!(
-                    "http://{name}-signer-proxy:{REMOTE_SIGNER_PROXY_PORT}"
-                ));
-            }
-
-            if cmd.prune_certificates_distance == 0 && cmd.prune_certificates_before == 0 {
-                if let Some(preset) = node.cl_prune_preset {
-                    match preset {
-                        manifest::ClPruningPreset::Full => cmd.full = true,
-                        manifest::ClPruningPreset::Minimal => cmd.minimal = true,
-                    }
-                }
-            }
-
-            if node.follow {
-                cmd.follow = true;
-                cmd.follow_endpoints = follow_endpoint_urls
-                    .iter()
-                    .map(|url| {
-                        url.parse()
-                            .context(format!("invalid follow endpoint URL: {url}"))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-            }
-
-            let flags = cmd.to_cli_flags();
-            validate_generated_cl_flags(&flags)?;
-            Ok(apply_version_compat(flags, image_tag))
         }
     }
+
+    if node.follow {
+        cmd.follow = true;
+        cmd.follow_endpoints = follow_endpoint_urls
+            .iter()
+            .map(|url| {
+                url.parse()
+                    .context(format!("invalid follow endpoint URL: {url}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+    }
+
+    let flags = cmd.to_cli_flags();
+    validate_generated_cl_flags(&flags)?;
+    Ok(apply_version_compat(flags, image_tag))
 }
 
 /// Generate default CLI flags when no node config is provided.
-/// Used for nodes without manifest entries that use the modern CL.
+/// Used for nodes without manifest entries.
 fn generate_default_consensus_cli_flags(
     name: &str,
     listen_ip: &str,
     peers_ips: &[String],
     image_tag: Option<&str>,
 ) -> Result<Vec<String>> {
-    if !supports_cli_flags(image_tag) {
-        return Ok(Vec::new());
-    }
-
     let transport = TransportProtocol::default();
     let cmd = StartCmd {
         moniker: Some(name.to_string()),
@@ -977,9 +723,51 @@ mod helpers {
         }
     });
 
+    // Escape a string for safe inclusion inside a YAML double-quoted scalar.
+    // Required for CLI flag values that may contain `"` (e.g. --byzantine=<JSON>).
+    // Handles `\`, `"`, and every C0 control char + DEL — a literal newline
+    // in a YAML scalar would either break the document or silently swallow
+    // the rest of the line. Callers (env vars, CLI flags) should normally
+    // be passing single-line scalars; this is defense-in-depth.
+    pub(super) fn yaml_dq_escape_str(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\0' => out.push_str("\\0"),
+                c if c.is_control() => {
+                    let n = c as u32;
+                    if n <= 0xFF {
+                        out.push_str(&format!("\\x{n:02X}"));
+                    } else if n <= 0xFFFF {
+                        out.push_str(&format!("\\u{n:04X}"));
+                    } else {
+                        out.push_str(&format!("\\U{n:08X}"));
+                    }
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+    handlebars_helper!(yaml_dq_escape: |s: str| yaml_dq_escape_str(s));
+
+    // Whether `map` is an object containing `key`. Unlike `lookup`, this tests key
+    // presence rather than value truthiness, so an explicit empty-string value still
+    // counts as present (used to suppress a built-in env var the user overrides).
+    handlebars_helper!(contains_key: |map: Json, key: str| {
+        map.as_object().is_some_and(|m| m.contains_key(key))
+    });
+
     pub fn register(handlebars: &mut Handlebars) {
         handlebars.register_helper("inc", Box::new(inc));
         handlebars.register_helper("default", Box::new(default));
+        handlebars.register_helper("yaml_dq_escape", Box::new(yaml_dq_escape));
+        handlebars.register_helper("contains_key", Box::new(contains_key));
     }
 }
 
@@ -1204,7 +992,13 @@ mod tests {
         }
         let infra_data = InfraData::new_local("testnet".to_string(), &manifest_nodes);
         let manifest = Manifest::new(Some("testnet".to_string()), &manifest_nodes, &node_subnets);
-        NodesMetadata::new(infra_data, &manifest, &BTreeSet::new()).unwrap()
+        NodesMetadata::new(
+            infra_data,
+            &manifest,
+            &manifest.images.to_local().unwrap(),
+            &BTreeSet::new(),
+        )
+        .unwrap()
     }
 
     fn create_test_nodekeys(num_nodes: usize) -> (IndexMap<NodeName, NodekeyData>, NodesMetadata) {
@@ -1215,12 +1009,121 @@ mod tests {
         (nodekeys, nodes_metadata)
     }
 
-    fn legacy_node(peers: Option<Vec<NodeName>>) -> manifest::Node {
-        manifest::Node {
-            cl_config: manifest::NodeClConfig::Legacy(Config::default()),
-            cl_persistent_peers: peers,
-            ..Default::default()
-        }
+    /// Render the remote node compose template with the given per-layer env maps.
+    fn render_remote_compose_env(el_env: serde_json::Value, cl_env: serde_json::Value) -> String {
+        let mut handlebars = handlebars::Handlebars::new();
+        handlebars
+            .register_template_string(
+                "compose",
+                include_str!("../templates/remote/compose-node.yaml.hbs"),
+            )
+            .unwrap();
+        helpers::register(&mut handlebars);
+
+        let ctx = serde_json::json!({
+            "el_container_name": "node_el",
+            "cl_container_name": "node_cl",
+            "el_env": el_env,
+            "cl_env": cl_env,
+        });
+        handlebars.render("compose", &ctx).unwrap()
+    }
+
+    /// A per-node env var that collides with a built-in replaces it (no duplicate
+    /// YAML key), while non-colliding vars are added alongside the built-ins.
+    #[test]
+    fn test_compose_env_override_suppresses_builtin() {
+        let rendered = render_remote_compose_env(
+            serde_json::json!({ "PATH": "/custom/path", "FEATURE_X": "on" }),
+            serde_json::json!({ "ARC_GENESIS_FILE_PATH": "/custom/genesis.json", "CL_CUSTOM": "1" }),
+        );
+
+        // EL: PATH override replaces the built-in default; new var is added.
+        assert!(rendered.contains(r#"PATH: "/custom/path""#));
+        assert!(!rendered.contains("PATH: /usr/local/sbin"));
+        assert!(rendered.contains(r#"FEATURE_X: "on""#));
+
+        // CL: ARC_GENESIS_FILE_PATH override replaces the built-in default.
+        assert!(rendered.contains(r#"ARC_GENESIS_FILE_PATH: "/custom/genesis.json""#));
+        assert!(!rendered.contains("ARC_GENESIS_FILE_PATH: /assets/genesis.json"));
+        assert!(rendered.contains(r#"CL_CUSTOM: "1""#));
+    }
+
+    /// Env vars that do not collide with built-ins leave the built-ins in place.
+    #[test]
+    fn test_compose_env_keeps_builtins_when_no_collision() {
+        let rendered =
+            render_remote_compose_env(serde_json::json!({ "FOO": "bar" }), serde_json::json!({}));
+
+        assert!(rendered.contains("PATH: /usr/local/sbin"));
+        assert!(rendered.contains("ARC_GENESIS_FILE_PATH: /assets/genesis.json"));
+        assert!(rendered.contains(r#"FOO: "bar""#));
+    }
+
+    /// Env values are emitted inside a double-quoted YAML scalar with `"` escaped.
+    #[test]
+    fn test_compose_env_value_is_yaml_escaped() {
+        let rendered = render_remote_compose_env(
+            serde_json::json!({ "JSON_CFG": r#"{"a":1}"# }),
+            serde_json::json!({}),
+        );
+
+        assert!(rendered.contains(r#"JSON_CFG: "{\"a\":1}""#));
+    }
+
+    /// `yaml_dq_escape` escapes every C0 control character so a stray newline
+    /// can't break the rendered compose YAML. `env_table_to_map` rejects these
+    /// at manifest-load time, but the helper is also used for CLI flags, so it
+    /// must defend itself too.
+    #[test]
+    fn test_yaml_dq_escape_handles_control_chars() {
+        let escaped = helpers::yaml_dq_escape_str("line1\nline2\tcol\rend\0\x07");
+        assert_eq!(escaped, r#"line1\nline2\tcol\rend\0\x07"#);
+        // Backslash and quote still escape correctly when mixed with controls.
+        assert_eq!(helpers::yaml_dq_escape_str("a\\b\"c\n"), r#"a\\b\"c\n"#);
+    }
+
+    /// An explicit empty-string override still counts as "present" and suppresses the
+    /// built-in, so no duplicate YAML key is emitted (key-presence, not truthiness).
+    #[test]
+    fn test_compose_env_empty_string_override_suppresses_builtin() {
+        let rendered =
+            render_remote_compose_env(serde_json::json!({ "PATH": "" }), serde_json::json!({}));
+
+        assert!(!rendered.contains("PATH: /usr/local/sbin"));
+        assert!(rendered.contains(r#"PATH: """#));
+    }
+
+    /// The local template resolves `el_env`/`cl_env` per node inside `{{#each nodes}}`;
+    /// overrides still replace the matching built-in for that node's containers.
+    #[test]
+    fn test_local_compose_env_per_node_override() {
+        let mut handlebars = handlebars::Handlebars::new();
+        handlebars
+            .register_template_string(
+                "compose",
+                include_str!("../templates/local/compose.yaml.hbs"),
+            )
+            .unwrap();
+        helpers::register(&mut handlebars);
+
+        let ctx = serde_json::json!({
+            "nodes": [{
+                "el_env": { "RUST_LOG": "trace", "FEATURE_X": "on" },
+                "cl_env": { "ARC_HALT_AT_BLOCK_HEIGHT": "5", "CL_CUSTOM": "1" },
+            }],
+        });
+        let rendered = handlebars.render("compose", &ctx).unwrap();
+
+        // EL: RUST_LOG override replaces the built-in default; new var added.
+        assert!(rendered.contains(r#"RUST_LOG: "trace""#));
+        assert!(!rendered.contains("RUST_LOG: debug,net::peers=trace"));
+        assert!(rendered.contains(r#"FEATURE_X: "on""#));
+
+        // CL: ARC_HALT_AT_BLOCK_HEIGHT override replaces the built-in default.
+        assert!(rendered.contains(r#"ARC_HALT_AT_BLOCK_HEIGHT: "5""#));
+        assert!(!rendered.contains("ARC_HALT_AT_BLOCK_HEIGHT: 0"));
+        assert!(rendered.contains(r#"CL_CUSTOM: "1""#));
     }
 
     fn assert_peer_count(
@@ -1383,92 +1286,6 @@ mod tests {
             read_key(dir.path(), "sentry-1"),
             read_key(ref_dir.path(), "ref-3"),
             "sentry-1 should get key[3]"
-        );
-    }
-
-    #[test]
-    fn generate_legacy_consensus_config_uses_shared_subnet_peer_ips() {
-        let source = "source".to_string();
-        let peer = "peer".to_string();
-        let subnet_a = "subnet-a".to_string();
-        let subnet_b = "subnet-b".to_string();
-
-        let mut manifest_nodes = IndexMap::new();
-        manifest_nodes.insert(source.clone(), legacy_node(Some(vec![peer.clone()])));
-        manifest_nodes.insert(peer.clone(), legacy_node(None));
-
-        let node_subnets = IndexMap::from([
-            (source.clone(), vec![subnet_a.clone()]),
-            (peer.clone(), vec![subnet_a.clone(), subnet_b.clone()]),
-        ]);
-        let infra_data = InfraData::new_local("testnet".to_string(), &manifest_nodes);
-        let manifest = Manifest::new(Some("testnet".to_string()), &manifest_nodes, &node_subnets);
-        let nodes_metadata = NodesMetadata::new(infra_data, &manifest, &BTreeSet::new()).unwrap();
-        let peer_metadata = nodes_metadata.get(&peer).unwrap();
-        let shared_ip = peer_metadata
-            .consensus
-            .private_ip_address_for(&subnet_a)
-            .unwrap();
-        let unshared_ip = peer_metadata
-            .consensus
-            .private_ip_address_for(&subnet_b)
-            .unwrap();
-
-        let peers_ips = nodes_metadata
-            .resolve_cl_persistent_peers_list_ips(&source, &[peer])
-            .unwrap();
-        let config = generate_legacy_consensus_config(
-            &source,
-            manifest_nodes.get(&source).unwrap(),
-            &Config::default(),
-            &peers_ips,
-        )
-        .unwrap();
-        let shared_peer = format!("/ip4/{shared_ip}/tcp/{APP_CONSENSUS_DEFAULT_PORT}");
-        let persistent_peers = config
-            .consensus
-            .p2p
-            .persistent_peers
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-
-        assert!(
-            persistent_peers.contains(&shared_peer),
-            "expected shared peer address in config: {persistent_peers:?}"
-        );
-        assert!(
-            persistent_peers
-                .iter()
-                .all(|peer| !peer.contains(&unshared_ip)),
-            "unshared peer address should not be in config: {persistent_peers:?}"
-        );
-    }
-
-    #[test]
-    fn generate_app_config_files_errors_for_unreachable_legacy_peer() {
-        let dir = tempdir().unwrap();
-        let source = "source".to_string();
-        let peer = "peer".to_string();
-
-        let mut manifest_nodes = IndexMap::new();
-        manifest_nodes.insert(source.clone(), legacy_node(Some(vec![peer.clone()])));
-        manifest_nodes.insert(peer.clone(), legacy_node(None));
-
-        let node_subnets = IndexMap::from([
-            (source.clone(), vec!["subnet-a".to_string()]),
-            (peer, vec!["subnet-b".to_string()]),
-        ]);
-        let infra_data = InfraData::new_local("testnet".to_string(), &manifest_nodes);
-        let manifest = Manifest::new(Some("testnet".to_string()), &manifest_nodes, &node_subnets);
-        let nodes_metadata = NodesMetadata::new(infra_data, &manifest, &BTreeSet::new()).unwrap();
-
-        let err =
-            generate_app_config_files(dir.path(), &nodes_metadata, &manifest, false).unwrap_err();
-
-        assert!(
-            err.to_string().contains("shares no subnet"),
-            "unexpected error: {err:?}"
         );
     }
 
@@ -1822,10 +1639,10 @@ mod tests {
     #[test]
     fn generate_consensus_cli_flags_includes_pruning_distance() {
         let node = manifest::Node {
-            cl_config: manifest::NodeClConfig::Modern(StartCmd {
+            cl_config: StartCmd {
                 prune_certificates_distance: 500,
                 ..StartCmd::default()
-            }),
+            },
             ..Default::default()
         };
         let flags =
@@ -1845,10 +1662,10 @@ mod tests {
     #[test]
     fn generate_consensus_cli_flags_includes_pruning_before() {
         let node = manifest::Node {
-            cl_config: manifest::NodeClConfig::Modern(StartCmd {
+            cl_config: StartCmd {
                 prune_certificates_before: 100,
                 ..StartCmd::default()
-            }),
+            },
             ..Default::default()
         };
         let flags =
@@ -1907,10 +1724,10 @@ mod tests {
     #[test]
     fn generate_consensus_cli_flags_prune_distance_emitted() {
         let node = manifest::Node {
-            cl_config: manifest::NodeClConfig::Modern(StartCmd {
+            cl_config: StartCmd {
                 prune_certificates_distance: 500,
                 ..StartCmd::default()
-            }),
+            },
             ..Default::default()
         };
         let flags =
@@ -1921,21 +1738,6 @@ mod tests {
             flags_str.contains("--prune.certificates.distance=500"),
             "distance should be emitted: {flags_str}"
         );
-    }
-
-    #[test]
-    fn generate_consensus_cli_flags_returns_empty_for_old_version() {
-        let flags = generate_consensus_cli_flags(
-            "validator-1",
-            None,
-            "172.19.0.5",
-            &[],
-            Some("arc_consensus:v0.4.0"),
-            &[],
-        )
-        .unwrap();
-
-        assert!(flags.is_empty());
     }
 
     #[test]
@@ -2001,10 +1803,10 @@ mod tests {
     fn generate_consensus_cli_flags_includes_no_consensus() {
         let node = manifest::Node {
             node_type: manifest::NodeType::NonValidator,
-            cl_config: manifest::NodeClConfig::Modern(StartCmd {
+            cl_config: StartCmd {
                 no_consensus: true,
                 ..StartCmd::default()
-            }),
+            },
             ..Default::default()
         };
         let flags =
@@ -2153,10 +1955,10 @@ mod tests {
     fn generate_consensus_cli_flags_prune_distance_overrides_preset() {
         let node = manifest::Node {
             cl_prune_preset: Some(manifest::ClPruningPreset::Minimal),
-            cl_config: manifest::NodeClConfig::Modern(StartCmd {
+            cl_config: StartCmd {
                 prune_certificates_distance: 500,
                 ..StartCmd::default()
-            }),
+            },
             ..Default::default()
         };
         let flags =
@@ -2292,42 +2094,6 @@ mod tests {
     }
 
     #[test]
-    fn save_config_translates_prune_field_names_for_legacy_compat() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-
-        let config = Config {
-            prune: arc_consensus_types::PruningConfig {
-                certificates_distance: 237_600,
-                certificates_before: arc_consensus_types::Height::new(500),
-            },
-            ..Default::default()
-        };
-
-        save_config(&path, &config).unwrap();
-
-        let contents = fs::read_to_string(&path).unwrap();
-        // Legacy field names must be present
-        assert!(
-            contents.contains("block_interval = 237600"),
-            "expected block_interval in config: {contents}"
-        );
-        assert!(
-            contents.contains("min_height = 500"),
-            "expected min_height in config: {contents}"
-        );
-        // New field names must not appear
-        assert!(
-            !contents.contains("certificates_distance"),
-            "certificates_distance should be translated away: {contents}"
-        );
-        assert!(
-            !contents.contains("certificates_before"),
-            "certificates_before should be translated away: {contents}"
-        );
-    }
-
-    #[test]
     fn rewrite_rpc_forwarder_for_remote_rewrites_docker_hostname() {
         let node_subnets: IndexMap<String, Vec<String>> = [
             ("arc".to_string(), vec!["default".to_string()]),
@@ -2339,7 +2105,13 @@ mod tests {
         manifest_nodes.insert("relay".to_string(), manifest::Node::default());
         let infra_data = InfraData::new_local("testnet".to_string(), &manifest_nodes);
         let manifest = Manifest::new(Some("testnet".to_string()), &manifest_nodes, &node_subnets);
-        let nodes_metadata = NodesMetadata::new(infra_data, &manifest, &BTreeSet::new()).unwrap();
+        let nodes_metadata = NodesMetadata::new(
+            infra_data,
+            &manifest,
+            &manifest.images.to_local().unwrap(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
 
         let mut flags = vec!["--rpc.forwarder=http://relay_el:8545".to_string()];
         rewrite_rpc_forwarder_for_remote(&mut flags, "arc", &nodes_metadata, &manifest.subnets);

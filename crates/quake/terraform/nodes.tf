@@ -40,6 +40,7 @@ resource "aws_instance" "node" {
     github_user             = var.github_user
     github_token            = var.github_token
     expected_secondary_enis = length(local.node_secondary_networks[var.node_names[count.index]])
+    data_on_instance_store  = var.node_data_on_instance_store
   })
 
   tags = merge(

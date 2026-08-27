@@ -108,10 +108,20 @@ In addition to standard Reth flags, `arc-node-execution` provides the following 
 | `--invalid-tx-list-enable[=<bool>]` | `true` | - | Enable the invalid transaction list feature. Opt out with `--invalid-tx-list-enable=false`. |
 | `--invalid-tx-list-cap <CAPACITY>` | `100000` | - | Maximum capacity of the invalid tx list LRU cache. Only read if `--invalid-tx-list-enable` is `true`. |
 | `--arc.rpc.max-batch-entries <N>` | `100` | - | Maximum number of entries permitted in a JSON-RPC batch request. Oversized batches are rejected with JSON-RPC error `-32600` before any per-entry handler runs. Must be `>= 1`. |
-| `--full` | - | - | Full-node pruning preset. Fully prunes sender recovery; keeps the last 237,600 blocks for all other segments. Also sets `--prune.block-interval=5000`. Mutually exclusive with `--minimal`. |
-| `--minimal` | - | - | Minimal-storage pruning preset. Fully prunes sender recovery; keeps transaction lookup for 64 blocks, receipts for 64 blocks, account/storage history for 10,064 blocks, and block bodies for 237,600 blocks. Also sets `--prune.block-interval=5000`. Mutually exclusive with `--full`. |
+| `--arc.builder.deadline <MS>` | Reth `builder.deadline` | `ARC_BUILDER_DEADLINE_MS` | Maximum transaction-selection duration in milliseconds. Overrides the equivalent Reth builder setting. |
+| `--arc.builder.wait-for-payload <BOOL>` | `true` | `ARC_BUILDER_WAIT_FOR_PAYLOAD` | Wait for in-flight payload building when `engine_getPayload` arrives early instead of racing an empty block. |
+| `--full` | - | - | Full-node pruning preset. Fully prunes sender recovery; keeps the last 237,600 blocks for all other segments. Also sets `--prune.block-interval=128`. Mutually exclusive with `--minimal`. |
+| `--minimal` | - | - | Minimal-storage pruning preset. Fully prunes sender recovery; keeps transaction lookup for 64 blocks, receipts for 64 blocks, account/storage history for 10,064 blocks, and block bodies for 237,600 blocks. Also sets `--prune.block-interval=128`. Mutually exclusive with `--full`. |
 | `--arc.expose-pending-txs` | `false` | - | Expose pending-tx RPCs. By default pending-tx subscriptions, filters, and pending-block queries are blocked — set this on trusted / internal nodes where exposing pending state is intentional. |
 | `--public-api` | `false` | - | Convenience flag for externally-exposed RPC nodes. Forces pending-tx hiding and warns if `--http.api` / `--ws.api` expose namespaces outside `{eth, net, web3, rpc}`. Conflicts with `--arc.expose-pending-txs`. |
+| `--arc.rpc.allow-unprotected-txs` | `false` | - | Accept pre-EIP-155 transactions through raw transaction submission RPC methods. |
+| `--arc.tx.relays <URLS>` | - | `ARC_TX_RELAYS` | Ordered comma-separated relay URLs for transaction failover. Conflicts with `--rpc.forwarder`. |
+| `--arc.tx.relays.timeout <DURATION>` | `10s` | `ARC_TX_RELAYS_TIMEOUT` | Timeout for each transaction relay attempt. Accepts a duration or a number of seconds. |
+| `--txpool.rebroadcast-interval <SECONDS>` | `60` | - | Interval in seconds between transaction rebroadcast attempts. Set to `0` to disable. |
+| `--pprof.addr <ADDR>` | `0.0.0.0:6061` | - | Address for the pprof HTTP server. |
+| `--pprof.heap-prof` | `false` | - | Enable heap profiling when the binary is built with the `pprof` feature. |
+
+See [Transaction Forwarding](../../docs/tx-forwarding.md) for relay ordering, timeout, and failure behavior.
 
 **Examples:**
 
@@ -178,12 +188,13 @@ Use the `--invalid-tx-list-enable` and `--invalid-tx-list-cap` flags (see Custom
 **Behavior when enabled (default):**
 - On payload builder panic, all pending transactions are added to the invalid tx list and removed from the mempool — resubmit them after investigating the panic
 - O(1) hash membership check during transaction validation
-- Metrics exposed: `arc_invalid_tx_list_size`, `arc_invalid_tx_list_hits_total`, `arc_invalid_tx_list_inserts_total`, `arc_invalid_tx_list_batch_inserts_total`
+- Metrics exposed: `reth_arc_invalid_tx_list_size`, `reth_arc_invalid_tx_list_hits_total`, `reth_arc_invalid_tx_list_inserts_total`, `reth_arc_invalid_tx_list_batch_inserts_total`
 
 **Behavior when disabled (`--invalid-tx-list-enable=false`):**
 - No invalid tx list is created
 - No metrics are exposed
-- On payload builder panic, no action is taken
+- No hash quarantine: transactions are not rejected by hash during validation
+- On payload builder panic (or an unprocessable transaction), the pending/offending transactions are still removed from the mempool — only the hash quarantine and metrics are skipped
 
 **Example:**
 ```bash
@@ -231,8 +242,22 @@ For architectural details, see the [Architecture Guide](../../docs/ARCHITECTURE.
 The execution layer exposes Prometheus metrics on the configured metrics endpoint (e.g., `http://localhost:9001/metrics`).
 
 Key metric prefixes:
-- `reth_*` - Core Reth metrics (block processing, sync, etc.)
-- `arc_*` - Arc-specific metrics (precompiles, invalid tx list, etc.)
+- `reth_*` - Metrics emitted by this Reth-based execution binary
+- `reth_arc_*` - Arc-specific execution metrics
+
+Arc-specific execution metrics:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `reth_arc_node_version_info` | Gauge | Node version information, labeled by `version` and `git_commit`. |
+| `reth_arc_payload_stage_duration_seconds` | Histogram | Payload build stage duration, labeled by `stage`. |
+| `reth_arc_payload_total_duration_seconds` | Histogram | Total payload build duration. |
+| `reth_arc_payload_build_outcome_total` | Counter | Payload build outcome count, labeled by `outcome`. |
+| `reth_arc_tx_denylist_rejection_total` | Counter | Transactions rejected during mempool validation because a transaction address is denylisted. |
+| `reth_arc_invalid_tx_list_size` | Gauge | Current number of transaction hashes in the invalid transaction list. |
+| `reth_arc_invalid_tx_list_hits_total` | Counter | Transactions rejected because their hash is in the invalid transaction list. |
+| `reth_arc_invalid_tx_list_inserts_total` | Counter | Transaction hashes inserted into the invalid transaction list. |
+| `reth_arc_invalid_tx_list_batch_inserts_total` | Counter | Batch insert operations into the invalid transaction list. |
 
 ## Development
 

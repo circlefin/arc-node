@@ -197,7 +197,7 @@ impl StartConfig {
 /// Returns the default RPC sync endpoint for the given chain ID.
 fn default_rpc_sync_endpoint(chain_id: u64) -> eyre::Result<SyncEndpointUrl> {
     let url = match chain_id {
-        TESTNET_CHAIN_ID => "https://rpc.quicknode.testnet.arc.network/",
+        TESTNET_CHAIN_ID => "https://rpc.testnet.arc.io/",
         LOCALDEV_CHAIN_ID => "http://localhost:8545",
         _ => {
             return Err(eyre!(
@@ -268,10 +268,7 @@ mod tests {
     #[test]
     fn default_rpc_sync_endpoint_testnet() {
         let endpoint = default_rpc_sync_endpoint(TESTNET_CHAIN_ID).unwrap();
-        assert_eq!(
-            endpoint.http().as_str(),
-            "https://rpc.quicknode.testnet.arc.network/"
-        );
+        assert_eq!(endpoint.http().as_str(), "https://rpc.testnet.arc.io/");
     }
 
     #[test]
@@ -317,7 +314,7 @@ mod tests {
         assert_eq!(config.rpc_sync_endpoints.len(), 1);
         assert_eq!(
             config.rpc_sync_endpoints[0].http().as_str(),
-            "https://rpc.quicknode.testnet.arc.network/"
+            "https://rpc.testnet.arc.io/"
         );
     }
 

@@ -15,11 +15,12 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use color_eyre::eyre::Result;
-use rmcp::handler::server::tool::ToolRouter;
+use reqwest::Method;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, Content, Implementation, ListResourcesResult, PaginatedRequestParams,
@@ -31,14 +32,16 @@ use rmcp::tool;
 use rmcp::{ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::infra::remote;
+use crate::node::NodeName;
 use crate::perturb::Perturbation;
 use crate::testnet::{Testnet, LAST_MANIFEST_FILENAME};
 use crate::valset::ValidatorPowerUpdate;
-use crate::{clean, rpc};
+use crate::{clean, rpc, rpc_cmd};
 
 /// Overall timeout for RPC-based observability queries. Prevents tools from
 /// hanging when the proxy or SSM tunnel is degraded in remote mode.
@@ -51,7 +54,6 @@ const SSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// MCP server that exposes observability and management tools for a running Quake testnet.
 pub(crate) struct QuakeMcpServer {
     testnet: Arc<RwLock<Testnet>>,
-    tool_router: ToolRouter<Self>,
 }
 
 #[rmcp::tool_router]
@@ -893,7 +895,7 @@ impl QuakeMcpServer {
         };
 
         match action {
-            crate::SSMSubcommand::Start => {
+            RemoteSsmAction::Start => {
                 infra.ssm_tunnels.start().await.map_err(|e| {
                     rmcp::ErrorData::internal_error(
                         format!("Failed to start SSM tunnels: {e}"),
@@ -904,7 +906,7 @@ impl QuakeMcpServer {
                     "SSM tunnels started",
                 )]))
             }
-            crate::SSMSubcommand::Stop => {
+            RemoteSsmAction::Stop => {
                 infra.ssm_tunnels.stop().await.map_err(|e| {
                     rmcp::ErrorData::internal_error(
                         format!("Failed to stop SSM tunnels: {e}"),
@@ -915,7 +917,7 @@ impl QuakeMcpServer {
                     "SSM tunnels stopped",
                 )]))
             }
-            crate::SSMSubcommand::List => {
+            RemoteSsmAction::List => {
                 let output = infra.ssm_tunnels.list_formatted().map_err(|e| {
                     rmcp::ErrorData::internal_error(
                         format!("Failed to list SSM tunnels: {e}"),
@@ -960,6 +962,180 @@ impl QuakeMcpServer {
             "Testnet files provisioned to Control Center",
         )]))
     }
+
+    // ── RPC tools ───────────────────────────────────────────────────────
+
+    /// Returns the live CL endpoint catalog (fetched from one node) plus a
+    /// link to Reth's JSON-RPC documentation for EL methods. Useful before
+    /// invoking `rpc_el` or `rpc_cl` to discover what's available.
+    #[tool(
+        name = "rpc_list",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn rpc_list(
+        &self,
+        params: Parameters<RpcListParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.ensure_ssm_tunnels().await?;
+        let p = params.0;
+        let timeout = p
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(RPC_TIMEOUT);
+
+        let testnet = self.testnet.read().await;
+        let (node, base_url) = testnet.nodes_metadata.first_consensus_rpc_url();
+        let catalog = rpc_cmd::fetch_cl_catalog(node, base_url, timeout)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("rpc_list failed: {e}"), None))?;
+
+        let cl_section = match catalog.endpoints {
+            Ok(value) => serde_json::json!({
+                "node": catalog.node,
+                "url": catalog.url.to_string(),
+                "endpoints": value,
+            }),
+            Err(err) => serde_json::json!({
+                "node": catalog.node,
+                "url": catalog.url.to_string(),
+                "error": err,
+            }),
+        };
+
+        let output = serde_json::json!({
+            "cl": cl_section,
+            "el": {
+                "docs_url": rpc_cmd::RETH_JSONRPC_DOCS_URL,
+                "note": "EL JSON-RPC methods are documented at the Reth reference.",
+            },
+        });
+
+        let text = serde_json::to_string_pretty(&output).map_err(|e| {
+            rmcp::ErrorData::internal_error(
+                format!("Failed to serialize rpc_list output: {e}"),
+                None,
+            )
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    /// Sends a JSON-RPC call to one or more EL (Reth) nodes in parallel.
+    /// Common methods: `admin_clearTxpool`, `eth_blockNumber`,
+    /// `eth_getBalance`, `txpool_status`, `debug_*`, `trace_*`. See
+    /// `rpc_list` for the docs URL.
+    ///
+    /// Targets default to all nodes. Use selectors like `["validator1"]`,
+    /// `["ALL_VALIDATORS"]`, or `["validator1","validator2"]`. Returns a
+    /// JSON array of per-node results; partial failures are reported per
+    /// node without failing the call.
+    #[tool(
+        name = "rpc_el",
+        annotations(read_only_hint = false, open_world_hint = true)
+    )]
+    async fn rpc_el(
+        &self,
+        params: Parameters<RpcElParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.ensure_ssm_tunnels().await?;
+        let p = params.0;
+        let timeout = p
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(RPC_TIMEOUT);
+        let retries = p.retries.unwrap_or(0);
+        let params_value = Value::Array(p.params.unwrap_or_default());
+
+        let testnet = self.testnet.read().await;
+        let node_urls = testnet
+            .nodes_metadata
+            .resolve_el_targets(&testnet.manifest, p.targets.as_deref())
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("rpc_el failed: {e}"), None))?;
+        let outputs = rpc_cmd::fanout_el(node_urls, &p.method, params_value, timeout, retries)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("rpc_el failed: {e}"), None))?;
+
+        fanout_tool_result(outputs)
+    }
+
+    /// Sends a REST call to one or more CL (Malachite) nodes in parallel.
+    /// Common paths: `/status`, `/consensus-state`, `/commit`,
+    /// `/network-state`, `/persistent-peers`. The leading `/` is optional.
+    /// Use `rpc_list` to discover available endpoints.
+    ///
+    /// Defaults to GET with no body; pass `http_method` and `body` for
+    /// POST/DELETE/PUT/PATCH. Returns a JSON array of per-node results.
+    #[tool(
+        name = "rpc_cl",
+        annotations(read_only_hint = false, open_world_hint = true)
+    )]
+    async fn rpc_cl(
+        &self,
+        params: Parameters<RpcClParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.ensure_ssm_tunnels().await?;
+        let p = params.0;
+        let timeout = p
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(RPC_TIMEOUT);
+        let retries = p.retries.unwrap_or(0);
+        let http_method_str = p.http_method.as_deref().unwrap_or("GET").to_uppercase();
+        let http_method = Method::from_str(&http_method_str).map_err(|_| {
+            rmcp::ErrorData::invalid_params(
+                format!("Invalid HTTP method '{http_method_str}'"),
+                None,
+            )
+        })?;
+
+        let body_string = p.body.map(|v| v.to_string());
+
+        let testnet = self.testnet.read().await;
+        let node_urls = testnet
+            .nodes_metadata
+            .resolve_cl_targets(&testnet.manifest, p.targets.as_deref())
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("rpc_cl failed: {e}"), None))?;
+        let outputs = rpc_cmd::fanout_cl(
+            node_urls,
+            &p.path,
+            &http_method,
+            body_string.as_deref(),
+            timeout,
+            retries,
+        )
+        .await
+        .map_err(|e| rmcp::ErrorData::internal_error(format!("rpc_cl failed: {e}"), None))?;
+
+        fanout_tool_result(outputs)
+    }
+}
+
+/// Render fan-out results as a pretty-printed JSON array, one element per node.
+fn format_fanout_results(
+    outputs: Vec<(NodeName, std::result::Result<Value, String>)>,
+) -> Result<String, rmcp::ErrorData> {
+    let array: Vec<Value> = outputs
+        .into_iter()
+        .map(|(node, result)| match result {
+            Ok(value) => serde_json::json!({ "node": node, "result": value }),
+            Err(err) => serde_json::json!({ "node": node, "error": err }),
+        })
+        .collect();
+    serde_json::to_string_pretty(&Value::Array(array)).map_err(|e| {
+        rmcp::ErrorData::internal_error(format!("Failed to serialize results: {e}"), None)
+    })
+}
+
+fn fanout_tool_result(
+    outputs: Vec<(NodeName, std::result::Result<Value, String>)>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let all_failed = !outputs.is_empty() && outputs.iter().all(|(_, result)| result.is_err());
+    let text = format_fanout_results(outputs)?;
+    let content = vec![Content::text(text)];
+    Ok(if all_failed {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    })
 }
 
 // ── Parameter structs ───────────────────────────────────────────────────
@@ -1069,7 +1245,62 @@ struct RemoteSshParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RemoteSsmParams {
     /// Action to perform: "start", "stop", or "list".
-    action: crate::SSMSubcommand,
+    action: RemoteSsmAction,
+}
+
+/// MCP-facing subset of SSM actions. The CLI's `keep-alive` variant is
+/// intentionally excluded — it's a long-running command meant for an
+/// interactive terminal, not an MCP tool call.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum RemoteSsmAction {
+    Start,
+    Stop,
+    List,
+}
+
+/// Parameters for the rpc_list tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RpcListParams {
+    /// Per-node request timeout in seconds. Defaults to 15.
+    timeout_secs: Option<u64>,
+}
+
+/// Parameters for the rpc_el tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RpcElParams {
+    /// JSON-RPC method name, e.g. "admin_clearTxpool", "eth_blockNumber".
+    method: String,
+    /// Target selectors. Each entry is a node name ("validator1") or a
+    /// manifest node group ("ALL_VALIDATORS", "ALL_NODES",
+    /// "ALL_NON_VALIDATORS"). Defaults to all nodes when omitted.
+    targets: Option<Vec<String>>,
+    /// JSON-RPC params array. Each entry is sent verbatim as a JSON value.
+    /// Defaults to `[]`.
+    params: Option<Vec<Value>>,
+    /// Per-node request timeout in seconds. Defaults to 15.
+    timeout_secs: Option<u64>,
+    /// Per-node retry count on transport failure. Defaults to 0.
+    retries: Option<u32>,
+}
+
+/// Parameters for the rpc_cl tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RpcClParams {
+    /// REST path; leading `/` is optional and prepended automatically.
+    /// May include a query string, e.g. "/commit?height=42".
+    path: String,
+    /// Target selectors. See `rpc_el.targets`. Defaults to all
+    /// consensus-enabled nodes when omitted.
+    targets: Option<Vec<String>>,
+    /// HTTP method (GET, POST, DELETE, PUT, PATCH). Defaults to GET.
+    http_method: Option<String>,
+    /// JSON body for POST/DELETE/PUT/PATCH. Sent verbatim as the request body.
+    body: Option<Value>,
+    /// Per-node request timeout in seconds. Defaults to 15.
+    timeout_secs: Option<u64>,
+    /// Per-node retry count on transport failure. Defaults to 0.
+    retries: Option<u32>,
 }
 
 // ── Helper methods ──────────────────────────────────────────────────────
@@ -1095,11 +1326,8 @@ fn parse_duration_str(s: &str) -> Result<Duration, rmcp::ErrorData> {
 
 impl QuakeMcpServer {
     fn new(testnet: Testnet) -> Self {
-        let testnet = Arc::new(RwLock::new(testnet));
-        let tool_router = Self::tool_router();
         Self {
-            testnet,
-            tool_router,
+            testnet: Arc::new(RwLock::new(testnet)),
         }
     }
 
@@ -1154,29 +1382,23 @@ impl QuakeMcpServer {
 #[rmcp::tool_handler]
 impl ServerHandler for QuakeMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: Default::default(),
-            capabilities: ServerCapabilities {
-                resources: Some(ResourcesCapability {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_resources_with(ResourcesCapability {
                     subscribe: None,
                     list_changed: Some(false),
-                }),
-                tools: Some(ToolsCapability {
+                })
+                .enable_tools_with(ToolsCapability {
                     list_changed: Some(false),
-                }),
-                ..Default::default()
-            },
-            server_info: Implementation {
-                name: "quake-mcp-server".to_string(),
-                title: None,
-                version: arc_version::SHORT_VERSION.to_string(),
-                description: Some(
-                    "MCP server for observing and managing Arc testnet state via Quake".to_string(),
-                ),
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some(
+                })
+                .build(),
+        )
+        .with_server_info(
+            Implementation::new("quake-mcp-server", arc_version::SHORT_VERSION).with_description(
+                "MCP server for observing and managing Arc testnet state via Quake",
+            ),
+        )
+        .with_instructions(
                 "This server provides tools for observing and managing a running Arc testnet via Quake.\n\n\
                  Observability: testnet_status (overview), list_nodes (node details), get_block_heights \
                  (chain heights), get_mempool (transaction pool), get_peers (network connectivity), \
@@ -1188,13 +1410,14 @@ impl ServerHandler for QuakeMcpServer {
                  (upgrade to new image).\n\n\
                  Testing: run_tests (E2E tests), wait_height (wait for block height), \
                  valset_update (update validator voting power).\n\n\
+                 RPC fan-out: rpc_list (discover CL endpoints and EL docs link), \
+                 rpc_el (call any Reth JSON-RPC method on one or more nodes), \
+                 rpc_cl (call any Malachite REST endpoint on one or more nodes).\n\n\
                  Remote: remote_ssh (run a command on a node or CC via SSH), \
                  remote_ssm (manage SSM tunnels: start/stop/list), \
                  remote_provision (upload config files to CC). Remote testnets only.\n\n\
                  Resources: quake://manifest (testnet TOML config), quake://nodes (node metadata JSON)."
-                    .to_string(),
-            ),
-        }
+        )
     }
 
     fn list_resources(
@@ -1247,9 +1470,10 @@ impl ServerHandler for QuakeMcpServer {
                             None,
                         )
                     })?;
-                Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::text(manifest_toml, "quake://manifest")],
-                })
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    manifest_toml,
+                    "quake://manifest",
+                )]))
             }
             "quake://nodes" => {
                 let nodes_json =
@@ -1259,9 +1483,10 @@ impl ServerHandler for QuakeMcpServer {
                             None,
                         )
                     })?;
-                Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::text(nodes_json, "quake://nodes")],
-                })
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    nodes_json,
+                    "quake://nodes",
+                )]))
             }
             other => Err(rmcp::ErrorData::invalid_params(
                 format!("Unknown resource URI: {other}"),
@@ -1272,19 +1497,7 @@ impl ServerHandler for QuakeMcpServer {
 }
 
 /// Entry point to start the MCP server.
-///
-/// Supports two transport modes:
-/// - stdio (default): for direct integration with Claude Code, Cursor, etc.
-/// - HTTP+SSE (`--http`): for remote clients over the network
-pub(crate) async fn run_server(testnet: Testnet, http: bool, port: u16) -> Result<()> {
-    if http {
-        run_http_server(testnet, port).await
-    } else {
-        run_stdio_server(testnet).await
-    }
-}
-
-async fn run_stdio_server(testnet: Testnet) -> Result<()> {
+pub(crate) async fn run_server(testnet: Testnet) -> Result<()> {
     info!("Starting MCP server on stdio transport");
 
     let server = QuakeMcpServer::new(testnet);
@@ -1304,42 +1517,57 @@ async fn run_stdio_server(testnet: Testnet) -> Result<()> {
     Ok(())
 }
 
-async fn run_http_server(testnet: Testnet, port: u16) -> Result<()> {
-    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-    use rmcp::transport::StreamableHttpService;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-    info!(port, "Starting MCP server on HTTP+SSE transport");
+    #[test]
+    fn format_fanout_results_emits_result_or_error_per_node() {
+        let outputs: Vec<(NodeName, std::result::Result<Value, String>)> = vec![
+            ("validator1".to_string(), Ok(json!(42))),
+            (
+                "validator2".to_string(),
+                Err("connection refused".to_string()),
+            ),
+        ];
+        let rendered = format_fanout_results(outputs).unwrap();
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
 
-    let testnet = Arc::new(RwLock::new(testnet));
+        assert_eq!(arr[0], json!({"node": "validator1", "result": 42}));
+        assert!(arr[0].get("error").is_none());
 
-    let config = rmcp::transport::StreamableHttpServerConfig::default();
-    let session_manager = Arc::new(LocalSessionManager::default());
+        assert_eq!(
+            arr[1],
+            json!({"node": "validator2", "error": "connection refused"})
+        );
+        assert!(arr[1].get("result").is_none());
+    }
 
-    let service = StreamableHttpService::new(
-        {
-            let testnet = Arc::clone(&testnet);
-            move || {
-                Ok(QuakeMcpServer {
-                    testnet: Arc::clone(&testnet),
-                    tool_router: QuakeMcpServer::tool_router(),
-                })
-            }
-        },
-        session_manager,
-        config,
-    );
+    #[test]
+    fn format_fanout_results_empty_input_returns_empty_array() {
+        let rendered = format_fanout_results(Vec::new()).unwrap();
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed, json!([]));
+    }
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to bind to port {port}: {e}"))?;
+    #[test]
+    fn fanout_tool_result_marks_all_node_failures_as_error() {
+        let outputs: Vec<(NodeName, std::result::Result<Value, String>)> = vec![
+            (
+                "validator1".to_string(),
+                Err("connection refused".to_string()),
+            ),
+            (
+                "validator2".to_string(),
+                Err("request timed out".to_string()),
+            ),
+        ];
 
-    info!(port, "MCP HTTP+SSE server listening");
+        let result = fanout_tool_result(outputs).unwrap();
 
-    let app = axum::Router::new().fallback_service(service);
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!("MCP HTTP server error: {e}"))?;
-
-    info!("MCP HTTP server stopped");
-    Ok(())
+        assert_eq!(result.is_error, Some(true));
+    }
 }

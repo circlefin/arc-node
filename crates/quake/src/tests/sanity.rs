@@ -106,7 +106,9 @@ pub(crate) fn build_spammer_config(
         show_pool_status: false,
         tx_latency: false,
         csv_dir: None,
+        summary_json: None,
         wait_response: false,
+        silent: false,
         reconnect_attempts: 3,
         reconnect_period: Duration::from_secs(3),
         tx_type_mix: Some(
@@ -117,6 +119,8 @@ pub(crate) fn build_spammer_config(
             .parse()
             .expect("default guzzler weights"),
         erc20_fn_weights: None,
+        state_out: None,
+        state_in: None,
     };
     let config = args.to_config(false, false);
     config.validate()?;

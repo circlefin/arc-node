@@ -12,6 +12,7 @@
   "license": "ISC",
   "description": "",
   "overrides": {
+    "axios": "1.16.0",
     "bn.js@<4.12.3": "4.12.3",
     "cookie": "0.7.0",
     "flatted": "3.4.2",

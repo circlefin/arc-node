@@ -75,7 +75,7 @@
 //! Tests are executed via the `quake test` command with glob pattern support:
 //!
 //! ## Basic Usage
-//! - `quake test` - Run all tests except excluded groups (`validation`, `health`, `validator_set`, `perf`)
+//! - `quake test` - Run all tests except excluded groups (`validation`, `health`, `validator_set`, `perf`, `infra`)
 //! - `quake test probe` - Run all tests in the probe group
 //! - `quake test probe:connectivity` - Run a single test
 //! - `quake test probe:connectivity,sync` - Run multiple specific tests
@@ -83,6 +83,7 @@
 //! - `quake test health:stability` - Run excluded groups explicitly
 //! - `quake test validator_set:malformed_key_skipped` - Run excluded groups explicitly
 //! - `quake test perf:block_time` - Run excluded groups explicitly
+//! - `quake test infra:latency_emulation` - Run excluded groups explicitly (pre-experiment readiness gate)
 //! - `quake test --dry-run` - List all available test groups and tests
 //! - `quake test probe --dry-run` - List tests in a specific group
 //!
@@ -125,6 +126,7 @@ pub(crate) mod snapshot;
 // Test modules - must come after type definitions so they can use them
 pub(crate) mod arc_node;
 mod health;
+mod infra;
 mod malformed_validator;
 mod mempool;
 pub(crate) mod mesh;
@@ -135,6 +137,7 @@ mod probe;
 pub(crate) mod sanity;
 mod sync;
 mod tx;
+mod tx_relay;
 
 /// List matched tests in a formatted way
 fn list_matched_tests(matched_tests: &std::collections::HashMap<String, Vec<String>>) {
@@ -244,19 +247,23 @@ pub(crate) async fn run_tests(
     // Match test specifications using glob patterns
     let mut matched_tests = match_test_specs(&registry, &group_pattern, test_patterns)?;
 
-    // Exclude flaky / strict / state-mutating groups from the default (empty spec) run.
+    // Exclude flaky / strict / state-mutating / substrate groups from the default (empty spec) run.
     // - `validation`: generates load that leaves pending txs, elevated metrics
     // - `health`: assertions (e.g. sync_fell_behind == 0) are too strict for CI
     // - `validator_set`: mutates persistent on-chain state (registers extra validators)
     // - `perf`: thresholds are too tight for shared CI runners; run via nightly-perf workflow
+    // - `infra`: shell-exec into every container; cost scales with node count, intended
+    //   as an operator pre-experiment readiness gate rather than a CI signal
     // Run explicitly: `quake test validation:basic`, `quake test health:stability`,
-    // `quake test validator_set:malformed_key_skipped`, `quake test perf:block_time`
+    // `quake test validator_set:malformed_key_skipped`, `quake test perf:block_time`,
+    // `quake test infra:latency_emulation`.
     // NOTE: update module-level doc comments (Basic Usage / Glob Pattern) if changing exclusions.
     if spec.is_empty() {
         matched_tests.remove("validation");
         matched_tests.remove("health");
         matched_tests.remove("validator_set");
         matched_tests.remove("perf");
+        matched_tests.remove("infra");
     }
 
     // If dry-run, just list the tests

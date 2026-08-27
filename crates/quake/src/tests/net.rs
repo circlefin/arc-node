@@ -81,81 +81,16 @@ fn cl_persistent_peers_test<'a>(
     Box::pin(async move {
         debug!("Testing persistent peer connections...");
 
-        let mut outcome = TestOutcome::new();
-
-        for (node_name, node_config) in testnet.manifest.nodes.iter() {
-            if let Some(persistent_peer_names) = &node_config.cl_persistent_peers {
-                if persistent_peer_names.is_empty() {
-                    continue;
-                }
-
-                // Get the node metadata
-                let node_metadata = match testnet.nodes_metadata.get(node_name) {
-                    Some(metadata) => metadata,
-                    None => {
-                        outcome.add_check(CheckResult::failure(
-                            node_name,
-                            "Node metadata not found".to_string(),
-                        ));
-                        continue;
-                    }
-                };
-
-                // Get the peers connected to this node
-                let client = factory.create(node_metadata.execution.http_url.clone());
-
-                let peers = match client.get_peers().await {
-                    Ok(peers) => peers,
-                    Err(e) => {
-                        outcome.add_check(CheckResult::failure(
-                            node_name,
-                            format!("Error fetching peers: {}", e),
-                        ));
-                        continue;
-                    }
-                };
-
-                // Check if all persistent peers are connected
-                let missing_peers: Vec<_> = persistent_peer_names
-                    .iter()
-                    .filter(|persistent_peer_name| {
-                        // Check if this peer name appears in any connected peer
-                        !peers.iter().any(|peer| {
-                            // Match by checking if the persistent peer name is in the enode
-                            testnet
-                                .nodes_metadata
-                                .get(persistent_peer_name)
-                                .map(|peer_meta| {
-                                    if let Ok(url) = reqwest::Url::parse(&peer.enode) {
-                                        if let Some(host) = url.host_str() {
-                                            // Check if the host is in the private IPs of the peer
-                                            let ips = peer_meta.execution.private_ip_addresses();
-                                            return ips.contains(&host.to_string());
-                                        }
-                                    }
-                                    false
-                                })
-                                .unwrap_or(false)
-                        })
-                    })
-                    .cloned()
-                    .collect();
-
-                if missing_peers.is_empty() {
-                    outcome.add_check(CheckResult::success(
-                        node_name,
-                        format!(
-                            "All {} persistent peers connected",
-                            persistent_peer_names.len()
-                        ),
-                    ));
-                } else {
-                    outcome.add_check(CheckResult::failure(
-                        node_name,
-                        format!("Missing persistent peers: {}", missing_peers.join(", ")),
-                    ));
-                }
-            }
+        // Persistent peers can take several seconds to (re)dial each other after
+        // startup — especially a validator that starts late (h100 manifests) and
+        // must rejoin the mesh — so poll until every declared connection is up
+        // rather than failing on a single snapshot.
+        let deadline = tokio::time::Instant::now() + PERSISTENT_PEERS_TIMEOUT;
+        let mut outcome = evaluate_persistent_peers(testnet, factory).await;
+        while !outcome.is_success() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(PERSISTENT_PEERS_POLL_INTERVAL).await;
+            debug!("Persistent peers not yet fully connected, retrying...");
+            outcome = evaluate_persistent_peers(testnet, factory).await;
         }
 
         if outcome.checks.is_empty() {
@@ -170,4 +105,95 @@ fn cl_persistent_peers_test<'a>(
             )
             .into_result()
     })
+}
+
+/// Maximum time to wait for all configured persistent-peer connections to
+/// establish before failing the check.
+const PERSISTENT_PEERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Delay between persistent-peer connectivity polls.
+const PERSISTENT_PEERS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Take one snapshot of persistent-peer connectivity: for every node that
+/// declares persistent peers, verify each declared peer is currently connected
+/// (present in the node's `admin_peers` list).
+async fn evaluate_persistent_peers(testnet: &Testnet, factory: &RpcClientFactory) -> TestOutcome {
+    let mut outcome = TestOutcome::new();
+
+    for (node_name, node_config) in testnet.manifest.nodes.iter() {
+        if let Some(persistent_peer_names) = &node_config.cl_persistent_peers {
+            if persistent_peer_names.is_empty() {
+                continue;
+            }
+
+            // Get the node metadata
+            let node_metadata = match testnet.nodes_metadata.get(node_name) {
+                Some(metadata) => metadata,
+                None => {
+                    outcome.add_check(CheckResult::failure(
+                        node_name,
+                        "Node metadata not found".to_string(),
+                    ));
+                    continue;
+                }
+            };
+
+            // Get the peers connected to this node
+            let client = factory.create(node_metadata.execution.http_url.clone());
+
+            let peers = match client.get_peers().await {
+                Ok(peers) => peers,
+                Err(e) => {
+                    outcome.add_check(CheckResult::failure(
+                        node_name,
+                        format!("Error fetching peers: {}", e),
+                    ));
+                    continue;
+                }
+            };
+
+            // Check if all persistent peers are connected
+            let missing_peers: Vec<_> = persistent_peer_names
+                .iter()
+                .filter(|persistent_peer_name| {
+                    // Check if this peer name appears in any connected peer
+                    !peers.iter().any(|peer| {
+                        // Match by checking if the persistent peer name is in the enode
+                        testnet
+                            .nodes_metadata
+                            .get(persistent_peer_name)
+                            .map(|peer_meta| {
+                                if let Ok(url) = reqwest::Url::parse(&peer.enode) {
+                                    if let Some(host) = url.host_str() {
+                                        // Check if the host is in the private IPs of the peer
+                                        let ips = peer_meta.execution.private_ip_addresses();
+                                        return ips.contains(&host.to_string());
+                                    }
+                                }
+                                false
+                            })
+                            .unwrap_or(false)
+                    })
+                })
+                .cloned()
+                .collect();
+
+            if missing_peers.is_empty() {
+                outcome.add_check(CheckResult::success(
+                    node_name,
+                    format!(
+                        "All {} persistent peers connected",
+                        persistent_peer_names.len()
+                    ),
+                ));
+            } else {
+                outcome.add_check(CheckResult::failure(
+                    node_name,
+                    format!("Missing persistent peers: {}", missing_peers.join(", ")),
+                ));
+            }
+        }
+    }
+
+    outcome
 }

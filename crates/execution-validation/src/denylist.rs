@@ -64,8 +64,7 @@ impl<T: StateProvider + ?Sized> DenylistStorageReader for T {
 ///
 /// Call from mempool validation with a state provider for the relevant block.
 ///
-/// - Returns `Ok(false)` if config has denylist disabled, or `address` is in
-///   `addresses_exclusions`.
+/// - Returns `Ok(false)` if `address` is in `addresses_exclusions`.
 /// - Otherwise performs one SLOAD at `(contract_address, slot)` and returns
 ///   `Ok(true)` iff the value is non-zero (denylisted).
 /// - On provider/SLOAD error returns `Err(DenylistError)`; callers may treat as fail-open (do not block).
@@ -76,23 +75,16 @@ pub fn is_denylisted<P: DenylistStorageReader + ?Sized>(
     config: &AddressesDenylistConfig,
     address: Address,
 ) -> Result<bool, DenylistError> {
-    let AddressesDenylistConfig::Enabled {
-        contract_address,
-        storage_slot,
-        ..
-    } = config
-    else {
-        return Ok(false);
-    };
-
     if config.is_address_excluded(&address) {
         trace!(%address, "address is explicitly excluded from denylist");
         return Ok(false);
     }
 
-    let storage_key =
-        alloy_primitives::StorageKey::from(compute_denylist_storage_slot(address, *storage_slot));
-    let value = provider.read_storage(*contract_address, storage_key)?;
+    let storage_key = alloy_primitives::StorageKey::from(compute_denylist_storage_slot(
+        address,
+        config.storage_slot(),
+    ));
+    let value = provider.read_storage(config.contract_address(), storage_key)?;
 
     // Non-zero means denylisted (bool true in Solidity).
     // None (uninitialized storage) equals zero (not denylisted per Solidity semantics).
@@ -111,28 +103,13 @@ mod tests {
     }
 
     #[test]
-    fn is_denylisted_returns_false_when_disabled() {
-        let config = AddressesDenylistConfig::try_new(
-            false,
-            Some(Address::ZERO),
-            Some(DEFAULT_DENYLIST_ERC7201_BASE_SLOT),
-            Vec::new(),
-        )
-        .unwrap();
-        let mock = MockDenylistStorageReader::new();
-        assert!(!is_denylisted(&mock, &config, Address::from([1u8; 20])).unwrap());
-    }
-
-    #[test]
     fn is_denylisted_returns_false_when_address_excluded() {
         let addr = Address::from([1u8; 20]);
-        let config = AddressesDenylistConfig::try_new(
-            true,
-            Some(Address::from([0x36u8; 20])),
-            Some(DEFAULT_DENYLIST_ERC7201_BASE_SLOT),
+        let config = AddressesDenylistConfig::new(
+            Address::from([0x36u8; 20]),
+            DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
             vec![addr],
-        )
-        .unwrap();
+        );
         let mock = MockDenylistStorageReader::new();
         assert!(!is_denylisted(&mock, &config, addr).unwrap());
     }
@@ -141,13 +118,8 @@ mod tests {
     fn is_denylisted_returns_true_when_storage_non_zero() {
         let addr = Address::from([1u8; 20]);
         let contract = Address::from([0x36u8; 20]);
-        let config = AddressesDenylistConfig::try_new(
-            true,
-            Some(contract),
-            Some(DEFAULT_DENYLIST_ERC7201_BASE_SLOT),
-            Vec::new(),
-        )
-        .unwrap();
+        let config =
+            AddressesDenylistConfig::new(contract, DEFAULT_DENYLIST_ERC7201_BASE_SLOT, Vec::new());
         let mut mock = MockDenylistStorageReader::new();
         mock.expect_read_storage()
             .returning(|_addr, _slot| Ok(Some(denylisted_slot_value())));
@@ -158,13 +130,8 @@ mod tests {
     fn is_denylisted_returns_false_when_storage_zero() {
         let addr = Address::from([1u8; 20]);
         let contract = Address::from([0x36u8; 20]);
-        let config = AddressesDenylistConfig::try_new(
-            true,
-            Some(contract),
-            Some(DEFAULT_DENYLIST_ERC7201_BASE_SLOT),
-            Vec::new(),
-        )
-        .unwrap();
+        let config =
+            AddressesDenylistConfig::new(contract, DEFAULT_DENYLIST_ERC7201_BASE_SLOT, Vec::new());
         let mut mock = MockDenylistStorageReader::new();
         mock.expect_read_storage()
             .returning(|_addr, _slot| Ok(None));
@@ -173,13 +140,11 @@ mod tests {
 
     #[test]
     fn is_denylisted_returns_err_on_provider_error() {
-        let config = AddressesDenylistConfig::try_new(
-            true,
-            Some(Address::from([0x36u8; 20])),
-            Some(DEFAULT_DENYLIST_ERC7201_BASE_SLOT),
+        let config = AddressesDenylistConfig::new(
+            Address::from([0x36u8; 20]),
+            DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
             Vec::new(),
-        )
-        .unwrap();
+        );
         let mut mock = MockDenylistStorageReader::new();
         mock.expect_read_storage().returning(|_addr, _slot| {
             Err(DenylistError::StorageReadFailed(

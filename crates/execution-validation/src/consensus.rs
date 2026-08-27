@@ -29,7 +29,6 @@ use std::sync::Arc;
 
 use arc_execution_config::chainspec::{BaseFeeConfigProvider, BlockGasLimitProvider};
 use arc_execution_config::gas_fee::decode_base_fee_from_bytes;
-use arc_execution_config::hardforks::{is_arc_fork_active, ArcHardfork};
 
 /// Arc Network custom consensus implementation
 #[derive(Debug, Clone)]
@@ -57,20 +56,28 @@ where
         // Perform standard header validation (gas limits, etc.)
         validate_header_gas(header.header())?;
 
-        // Validate header timestamp (independent of parent)
-        arc_validate_header_timestamp(header.header())?;
+        // NOTE(arc): The proposer clock-skew ("timestamp too far in the future")
+        // check is intentionally NOT run here. It reads the local wall clock, so it
+        // is non-deterministic; a hard Invalid at EL admission poisons reth's
+        // invalid-headers cache and is persisted, permanently stalling a
+        // clock-skewed node. The guard now runs at consensus vote time instead
+        // (arc-node-consensus `received_proposal_part` and `started_round` paths),
+        // where it downgrades only the prevote, never the persisted (execution-only)
+        // validity — so a certificate-backed block is still adopted via sync.
+        // Parent-relative timestamp monotonicity is still enforced in
+        // `validate_header_against_parent`.
 
-        // ADR-0003: Validate gas limit is within chainspec bounds (Zero5+)
+        // ADR-0003: Validate gas limit is within chainspec bounds.
         arc_validate_gas_limit_bounds(header.header(), &self.chain_spec)?;
 
-        // ADR-0004: extra_data must be exactly 8 bytes (Zero5+).
-        arc_validate_extra_data_format(header.header(), &self.chain_spec)?;
+        // ADR-0004: extra_data must be exactly 8 bytes.
+        arc_validate_extra_data_format(header.header())?;
 
-        // ADR-0004: base_fee_per_gas must be present (EIP-1559) and within absolute bounds (Zero5+).
+        // ADR-0004: base_fee_per_gas must be present (EIP-1559) and within absolute bounds.
         arc_validate_header_base_fee(header.header(), &self.chain_spec)?;
 
-        // Reject blocks with a zero beneficiary (Zero6+).
-        arc_validate_beneficiary_nonzero(header.header(), &self.chain_spec)?;
+        // Reject blocks with a zero beneficiary.
+        arc_validate_beneficiary_nonzero(header.header())?;
 
         Ok(())
     }
@@ -89,7 +96,7 @@ where
         arc_validate_against_parent_timestamp(header.header(), parent.header())?;
 
         // 3. Validate base fee using Arc's algorithm
-        arc_validate_against_parent_base_fee(header.header(), parent.header(), &self.chain_spec)?;
+        arc_validate_against_parent_base_fee(header.header(), parent.header())?;
 
         // 4. Validate blob gas fields if applicable (EIP-4844)
         if let Some(blob_params) = self.chain_spec.blob_params_at_timestamp(header.timestamp()) {
@@ -124,17 +131,12 @@ pub fn arc_validate_against_parent_timestamp<H: BlockHeader>(
 ///
 /// Decodes `nextBaseFee` from the parent's `extra_data` (written by the executor) and
 /// requires the child's `base_fee_per_gas` to match exactly. If `extra_data` is not
-/// exactly 8 bytes (e.g. pre-Zero4 blocks), validation is silently skipped.
+/// exactly 8 bytes, the block is malformed.
 ///
 /// Validation is always skipped when the parent is genesis (block 0).
 #[inline]
-pub fn arc_validate_against_parent_base_fee<ChainSpec, H>(
-    header: &H,
-    parent: &H,
-    chain_spec: &ChainSpec,
-) -> Result<(), ConsensusError>
+pub fn arc_validate_against_parent_base_fee<H>(header: &H, parent: &H) -> Result<(), ConsensusError>
 where
-    ChainSpec: EthChainSpec + EthereumHardforks + Hardforks,
     H: BlockHeader,
 {
     // Skip validation if parent is genesis block
@@ -144,21 +146,10 @@ where
 
     // Decode the expected base fee from parent's extra_data
     let Some(expected_base_fee) = decode_base_fee_from_bytes(parent.extra_data()) else {
-        // Post-Zero5 this branch should be unreachable: `arc_validate_extra_data_format`
-        // enforces that extra_data is exactly 8 bytes.
-        if is_arc_fork_active(
-            chain_spec,
-            ArcHardfork::Zero5,
-            parent.number(),
-            parent.timestamp(),
-        ) {
-            tracing::error!(
-                parent_number = parent.number(),
-                extra_data_len = parent.extra_data().len(),
-                "Unexpectedly skipped base fee validation"
-            );
-        }
-        return Ok(());
+        return Err(ConsensusError::msg(format!(
+            "invalid parent extra_data length {}: must be 8 bytes",
+            parent.extra_data().len()
+        )));
     };
 
     // Get the actual base fee from the current header
@@ -179,25 +170,13 @@ where
 
 /// Validates that the header's `extra_data` is exactly 8 bytes
 ///
-/// Post-Zero5, the executor always writes `nextBaseFee` as an 8-byte big-endian u64.
+/// The executor always writes `nextBaseFee` as an 8-byte big-endian u64.
 /// Any other length is malformed and should be rejected.
 #[inline]
-fn arc_validate_extra_data_format<H: BlockHeader, CS: Hardforks>(
-    header: &H,
-    chain_spec: &CS,
-) -> Result<(), ConsensusError> {
-    if !is_arc_fork_active(
-        chain_spec,
-        ArcHardfork::Zero5,
-        header.number(),
-        header.timestamp(),
-    ) {
-        return Ok(());
-    }
-
+fn arc_validate_extra_data_format<H: BlockHeader>(header: &H) -> Result<(), ConsensusError> {
     let len = header.extra_data().len();
     if len != 8 {
-        return Err(ConsensusError::Other(format!(
+        return Err(ConsensusError::msg(format!(
             "invalid extra_data length {len}: must be 8 bytes"
         )));
     }
@@ -207,8 +186,8 @@ fn arc_validate_extra_data_format<H: BlockHeader, CS: Hardforks>(
 
 /// Validates the header's `base_fee_per_gas`.
 ///
-/// Performs the standard EIP-1559 presence check (via Reth's `validate_header_base_fee`) and,
-/// post-Zero5, additionally enforces that the value lies within the chainspec's absolute bounds
+/// Performs the standard EIP-1559 presence check (via Reth's `validate_header_base_fee`) and
+/// enforces that the value lies within the chainspec's absolute bounds
 /// `[absolute_min_base_fee, absolute_max_base_fee]`.
 #[inline]
 fn arc_validate_header_base_fee<
@@ -220,16 +199,6 @@ fn arc_validate_header_base_fee<
 ) -> Result<(), ConsensusError> {
     // Standard EIP-1559 base_fee_per_gas presence check.
     validate_header_base_fee(header, chain_spec)?;
-
-    // Post-Zero5: enforce absolute bounds.
-    if !is_arc_fork_active(
-        chain_spec,
-        ArcHardfork::Zero5,
-        header.number(),
-        header.timestamp(),
-    ) {
-        return Ok(());
-    }
 
     let base_fee = match header.base_fee_per_gas() {
         Some(fee) => fee,
@@ -250,26 +219,17 @@ fn arc_validate_header_base_fee<
 
 /// Validates that the header's gas limit is within the chainspec bounds.
 ///
-/// This validation is only active when the Zero5 hardfork is enabled.
+/// Arc validates this both statelessly here and statefully in the executor.
 #[inline]
 fn arc_validate_gas_limit_bounds<H: BlockHeader, CS: Hardforks + BlockGasLimitProvider>(
     header: &H,
     chain_spec: &CS,
 ) -> Result<(), ConsensusError> {
-    if !is_arc_fork_active(
-        chain_spec,
-        ArcHardfork::Zero5,
-        header.number(),
-        header.timestamp(),
-    ) {
-        return Ok(());
-    }
-
     let gas_limit = header.gas_limit();
     let config = chain_spec.block_gas_limit_config(header.number());
 
     if gas_limit < config.min() || gas_limit > config.max() {
-        return Err(ConsensusError::Other(format!(
+        return Err(ConsensusError::msg(format!(
             "block gas limit {gas_limit} outside allowed bounds [{}, {}]",
             config.min(),
             config.max()
@@ -281,61 +241,15 @@ fn arc_validate_gas_limit_bounds<H: BlockHeader, CS: Hardforks + BlockGasLimitPr
 
 /// Rejects blocks whose beneficiary (coinbase) is the zero address.
 ///
-/// Post-Zero6, every block must have an explicit non-zero fee recipient set by the CL
+/// Every block must have an explicit non-zero fee recipient set by the CL
 /// via `--suggested-fee-recipient`. A zero beneficiary would burn all transaction fees
 /// irrecoverably.
 #[inline]
-fn arc_validate_beneficiary_nonzero<H: BlockHeader, CS: Hardforks>(
-    header: &H,
-    chain_spec: &CS,
-) -> Result<(), ConsensusError> {
-    if !is_arc_fork_active(
-        chain_spec,
-        ArcHardfork::Zero6,
-        header.number(),
-        header.timestamp(),
-    ) {
-        return Ok(());
-    }
-
+fn arc_validate_beneficiary_nonzero<H: BlockHeader>(header: &H) -> Result<(), ConsensusError> {
     if header.beneficiary().is_zero() {
-        return Err(ConsensusError::Other(
-            "block beneficiary must not be the zero address".into(),
+        return Err(ConsensusError::msg(
+            "block beneficiary must not be the zero address",
         ));
-    }
-
-    Ok(())
-}
-
-/// The maximum allowed clock skew for Arc proposers, in seconds.
-const ARC_PROPOSER_CLOCK_SKEW_THRESHOLD: u64 = 30; // 30 seconds
-
-/// Validates that the header's timestamp is not too far in the future
-/// compared to the local system time.
-#[inline]
-fn arc_validate_header_timestamp<H: BlockHeader>(header: &H) -> Result<(), ConsensusError> {
-    // Get the current local time in seconds since UNIX EPOCH
-    let local_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| ConsensusError::Other("System time is before UNIX EPOCH".to_string()))?
-        .as_secs();
-
-    arc_validate_header_timestamp_with_time(header, local_time)
-}
-
-/// Validates that the header's timestamp is not too far in the future
-/// compared to the local system time.
-#[inline]
-fn arc_validate_header_timestamp_with_time<H: BlockHeader>(
-    header: &H,
-    local_time: u64,
-) -> Result<(), ConsensusError> {
-    // Validate that the header's timestamp is not too far in the future
-    if header.timestamp() > local_time.saturating_add(ARC_PROPOSER_CLOCK_SKEW_THRESHOLD) {
-        return Err(ConsensusError::TimestampIsInFuture {
-            timestamp: header.timestamp(),
-            present_timestamp: local_time,
-        });
     }
 
     Ok(())
@@ -384,8 +298,7 @@ where
         reth_ethereum::consensus::validate_block_post_execution(
             block,
             self.chain_spec.as_ref(),
-            &receipts.receipts,
-            &receipts.requests,
+            receipts,
             receipt_root_bloom,
         )
     }
@@ -396,10 +309,9 @@ mod tests {
     use super::*;
     use alloy_eips::eip7685::Requests;
     use alloy_primitives::{Bloom, B256};
-    use arc_execution_config::chainspec::{
-        localdev_with_hardforks, ArcChainSpec, BlockGasLimitProvider, LOCAL_DEV,
-    };
+    use arc_execution_config::chainspec::{ArcChainSpec, BlockGasLimitProvider, LOCAL_DEV};
     use arc_execution_config::gas_fee::encode_base_fee_to_bytes;
+    use arc_execution_config::hardforks::ArcHardfork;
     use reth_chainspec::{ChainSpecBuilder, ForkCondition};
     use reth_ethereum::primitives::Header;
     use reth_ethereum_primitives::{EthPrimitives, Receipt};
@@ -456,6 +368,8 @@ mod tests {
         let parent_header = reth_ethereum::primitives::Header {
             timestamp: 1000,
             number: 1,
+            base_fee_per_gas: Some(0),
+            extra_data: encode_base_fee_to_bytes(0),
             ..Default::default()
         };
 
@@ -464,6 +378,7 @@ mod tests {
         let mut child_header = parent_header;
         child_header.number += 1;
         child_header.parent_hash = sealed_parent.hash();
+        child_header.base_fee_per_gas = Some(0);
 
         // Set same timestamp
         child_header.timestamp = 1000;
@@ -507,74 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn test_header_timestamp_just_within_skew_is_valid() {
-        let local_time = 1_730_887_500; // Some time in 2024
-        let header = Header {
-            timestamp: local_time + ARC_PROPOSER_CLOCK_SKEW_THRESHOLD,
-            ..Header::default()
-        };
-
-        let result = arc_validate_header_timestamp_with_time(&header, local_time);
-        assert!(
-            result.is_ok(),
-            "Timestamp at the exact skew threshold should be valid"
-        );
-    }
-
-    #[test]
-    fn test_header_timestamp_in_past_is_valid() {
-        let local_time = 1_730_887_500;
-        let header = Header {
-            timestamp: local_time - 100,
-            ..Header::default()
-        };
-
-        let result = arc_validate_header_timestamp_with_time(&header, local_time);
-        assert!(
-            result.is_ok(),
-            "Timestamp in the past should be valid, as this check is only for future timestamps"
-        );
-    }
-
-    #[test]
-    fn test_header_timestamp_too_far_in_future_is_invalid() {
-        let local_time = 1_730_887_500;
-        let header = Header {
-            timestamp: local_time + ARC_PROPOSER_CLOCK_SKEW_THRESHOLD + 10,
-            ..Header::default()
-        };
-
-        let result = arc_validate_header_timestamp_with_time(&header, local_time);
-        assert!(
-            matches!(
-                result,
-                Err(ConsensusError::TimestampIsInFuture {
-                    timestamp,
-                    present_timestamp,
-                }) if timestamp == header.timestamp && present_timestamp == local_time
-            ),
-            "Timestamp beyond the skew threshold should be invalid"
-        );
-    }
-
-    #[test]
-    fn test_header_timestamp_at_current_time_is_valid() {
-        let local_time = 1_730_887_500;
-        let header = Header {
-            timestamp: local_time,
-            ..Header::default()
-        };
-
-        let result = arc_validate_header_timestamp_with_time(&header, local_time);
-        assert!(
-            result.is_ok(),
-            "Timestamp equal to local time should be valid"
-        );
-    }
-
-    #[test]
     fn test_arc_base_fee_validation_with_matching_fees() {
-        let chain_spec = LOCAL_DEV.clone();
         let expected_base_fee = 160_000_000_000u64;
 
         let parent_header = reth_ethereum::primitives::Header {
@@ -592,8 +440,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            arc_validate_against_parent_base_fee(&child_header, &parent_header, &chain_spec);
+        let result = arc_validate_against_parent_base_fee(&child_header, &parent_header);
         assert!(
             result.is_ok(),
             "Base fee validation should succeed when fees match: {result:?}"
@@ -602,7 +449,6 @@ mod tests {
 
     #[test]
     fn test_arc_base_fee_validation_with_mismatched_fees() {
-        let chain_spec = LOCAL_DEV.clone();
         let expected_base_fee = 160_000_000_000u64;
 
         let parent_header = reth_ethereum::primitives::Header {
@@ -620,8 +466,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            arc_validate_against_parent_base_fee(&child_header, &parent_header, &chain_spec);
+        let result = arc_validate_against_parent_base_fee(&child_header, &parent_header);
         assert!(
             matches!(result, Err(ConsensusError::BaseFeeDiff(_))),
             "Base fee validation should fail when fees mismatch: {result:?}"
@@ -629,10 +474,8 @@ mod tests {
     }
 
     #[test]
-    fn test_arc_base_fee_validation_skips_malformed_extra_data() {
+    fn test_arc_base_fee_validation_rejects_malformed_extra_data() {
         use alloy_primitives::Bytes;
-
-        let chain_spec = LOCAL_DEV.clone();
 
         let parent_header = reth_ethereum::primitives::Header {
             number: 10,
@@ -649,18 +492,15 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            arc_validate_against_parent_base_fee(&child_header, &parent_header, &chain_spec);
+        let result = arc_validate_against_parent_base_fee(&child_header, &parent_header);
         assert!(
-            result.is_ok(),
-            "Base fee validation should skip when extra_data is malformed: {result:?}"
+            matches!(result, Err(ConsensusError::Other(_))),
+            "Base fee validation should reject malformed parent extra_data: {result:?}"
         );
     }
 
     #[test]
     fn test_arc_base_fee_validation_missing_base_fee() {
-        let chain_spec = LOCAL_DEV.clone();
-
         let parent_header = reth_ethereum::primitives::Header {
             number: 10,
             timestamp: 1000,
@@ -676,8 +516,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            arc_validate_against_parent_base_fee(&child_header, &parent_header, &chain_spec);
+        let result = arc_validate_against_parent_base_fee(&child_header, &parent_header);
         assert!(
             matches!(result, Err(ConsensusError::BaseFeeMissing)),
             "Base fee validation should fail when base_fee_per_gas is None: {result:?}"
@@ -686,8 +525,6 @@ mod tests {
 
     #[test]
     fn test_arc_base_fee_validation_skips_genesis_parent() {
-        let chain_spec = LOCAL_DEV.clone();
-
         // Parent is genesis (block 0)
         let parent_header = reth_ethereum::primitives::Header {
             number: 0,
@@ -706,8 +543,7 @@ mod tests {
         };
 
         // Should pass because parent is genesis block
-        let result =
-            arc_validate_against_parent_base_fee(&child_header, &parent_header, &chain_spec);
+        let result = arc_validate_against_parent_base_fee(&child_header, &parent_header);
         assert!(
             result.is_ok(),
             "Validation should skip when parent is genesis block: {result:?}"
@@ -954,30 +790,18 @@ mod tests {
                 Err(ConsensusError::BaseFeeDiff(_))
             ));
         }
-
-        // Pre-Zero5: bounds check is skipped entirely.
-        let pre_zero5 = localdev_with_hardforks(&[(ArcHardfork::Zero4, ForkCondition::Block(0))]);
-        let header = Header {
-            number: 1,
-            base_fee_per_gas: Some(config.absolute_min_base_fee - 1),
-            ..Default::default()
-        };
-        assert!(arc_validate_header_base_fee(&header, pre_zero5.as_ref()).is_ok());
     }
 
     #[test]
     fn test_arc_validate_extra_data_format() {
         use alloy_primitives::Bytes;
 
-        // Zero5
-        let spec = LOCAL_DEV.clone();
-
         let valid = Header {
             number: 1,
             extra_data: Bytes::from([0u8; 8].as_slice()),
             ..Default::default()
         };
-        assert!(arc_validate_extra_data_format(&valid, spec.as_ref()).is_ok());
+        assert!(arc_validate_extra_data_format(&valid).is_ok());
 
         let too_short = Header {
             number: 1,
@@ -985,7 +809,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            arc_validate_extra_data_format(&too_short, spec.as_ref()),
+            arc_validate_extra_data_format(&too_short),
             Err(ConsensusError::Other(_))
         ));
 
@@ -995,45 +819,38 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            arc_validate_extra_data_format(&too_long, spec.as_ref()),
+            arc_validate_extra_data_format(&too_long),
             Err(ConsensusError::Other(_))
         ));
-
-        // Pre-Zero5: length check is skipped entirely.
-        let pre_zero5 = localdev_with_hardforks(&[(ArcHardfork::Zero4, ForkCondition::Block(0))]);
-        let header = Header {
-            number: 1,
-            extra_data: Bytes::from([0u8; 7].as_slice()),
-            ..Default::default()
-        };
-        assert!(arc_validate_extra_data_format(&header, pre_zero5.as_ref()).is_ok());
     }
 
     #[test]
-    fn test_gas_limit_validation_skipped_before_zero5() {
-        // Create a chain spec where Zero5 activates at block 100
+    fn test_arc_validate_extra_data_format_is_unconditional() {
+        use alloy_primitives::Bytes;
+
+        let header = Header {
+            number: 99,
+            extra_data: Bytes::from([0u8; 7].as_slice()),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            arc_validate_extra_data_format(&header),
+            Err(ConsensusError::Other(_))
+        ));
+    }
+
+    #[test]
+    fn test_gas_limit_validation_enforced_before_zero5_activation() {
+        // Even if chain metadata schedules Zero5 later, Arc mainnet starts from the Zero6 baseline.
         let mut inner = ChainSpecBuilder::mainnet().build();
         inner
             .hardforks
             .insert(ArcHardfork::Zero5, ForkCondition::Block(100));
         let spec = Arc::new(ArcChainSpec::new(inner));
 
-        // Before Zero5 — any gas limit should pass
         let header = Header {
             number: 99,
-            gas_limit: 0, // would be invalid after Zero5
-            timestamp: 0,
-            ..Default::default()
-        };
-        let result = arc_validate_gas_limit_bounds(&header, spec.as_ref());
-        assert!(
-            result.is_ok(),
-            "Before Zero5, gas limit validation should be skipped: {result:?}"
-        );
-
-        // At Zero5 — now enforced
-        let header = Header {
-            number: 100,
             gas_limit: 0,
             timestamp: 0,
             ..Default::default()
@@ -1041,7 +858,7 @@ mod tests {
         let result = arc_validate_gas_limit_bounds(&header, spec.as_ref());
         assert!(
             matches!(result, Err(ConsensusError::Other(_))),
-            "At Zero5, gas limit 0 should be invalid: {result:?}"
+            "gas limit 0 should be invalid regardless of Zero5 activation: {result:?}"
         );
     }
 
@@ -1049,14 +866,12 @@ mod tests {
     fn test_beneficiary_nonzero_rejected_at_zero6() {
         use alloy_primitives::{address, Address};
 
-        let spec = LOCAL_DEV.clone();
-
         let zero_beneficiary = Header {
             number: 1,
             beneficiary: Address::ZERO,
             ..Default::default()
         };
-        let result = arc_validate_beneficiary_nonzero(&zero_beneficiary, spec.as_ref());
+        let result = arc_validate_beneficiary_nonzero(&zero_beneficiary);
         assert!(
             matches!(result, Err(ConsensusError::Other(_))),
             "Zero beneficiary should be rejected post-Zero6: {result:?}"
@@ -1067,7 +882,7 @@ mod tests {
             beneficiary: address!("0x65E0a200006D4FF91bD59F9694220dafc49dbBC1"),
             ..Default::default()
         };
-        let result = arc_validate_beneficiary_nonzero(&nonzero_beneficiary, spec.as_ref());
+        let result = arc_validate_beneficiary_nonzero(&nonzero_beneficiary);
         assert!(
             result.is_ok(),
             "Non-zero beneficiary should pass: {result:?}"
@@ -1075,24 +890,79 @@ mod tests {
     }
 
     #[test]
-    fn test_beneficiary_nonzero_skipped_before_zero6() {
+    fn test_beneficiary_nonzero_is_unconditional() {
         use alloy_primitives::Address;
-
-        let mut inner = ChainSpecBuilder::mainnet().build();
-        inner
-            .hardforks
-            .insert(ArcHardfork::Zero6, ForkCondition::Block(100));
-        let spec = Arc::new(ArcChainSpec::new(inner));
 
         let header = Header {
             number: 99,
             beneficiary: Address::ZERO,
             ..Default::default()
         };
-        let result = arc_validate_beneficiary_nonzero(&header, spec.as_ref());
+        let result = arc_validate_beneficiary_nonzero(&header);
+        assert!(
+            matches!(result, Err(ConsensusError::Other(_))),
+            "zero beneficiary should be rejected regardless of Zero6 activation: {result:?}"
+        );
+    }
+
+    // Drives the public `HeaderValidator::validate_header` path so that
+    // accidentally removing the beneficiary check from `validate_header()`
+    // would be caught at the trait boundary, not just at the helper.
+    #[test]
+    fn validate_header_rejects_zero_beneficiary() {
+        use alloy_primitives::{Address, Bytes};
+
+        let spec = LOCAL_DEV.clone();
+        let gas_limit = spec.block_gas_limit_config(1).default();
+        let base_fee = spec.base_fee_config(1).absolute_min_base_fee;
+        let consensus = ArcConsensus::new(spec);
+
+        let header = Header {
+            number: 1,
+            beneficiary: Address::ZERO,
+            gas_limit,
+            base_fee_per_gas: Some(base_fee),
+            extra_data: Bytes::from([0u8; 8].as_slice()),
+            ..Default::default()
+        };
+        let sealed = SealedHeader::new(header.clone(), header.hash_slow());
+        let result =
+            <ArcConsensus<_> as HeaderValidator<Header>>::validate_header(&consensus, &sealed);
+        assert!(
+            matches!(result, Err(ConsensusError::Other(_))),
+            "validate_header should reject zero beneficiary: {result:?}"
+        );
+    }
+
+    // The proposer clock-skew guard moved to the consensus layer, so EL header
+    // admission must no longer reject a far-future timestamp. Parent-relative
+    // monotonicity stays enforced (see `test_past_timestamp_is_invalid`).
+    #[test]
+    fn validate_header_accepts_far_future_timestamp() {
+        use alloy_primitives::{address, Bytes};
+
+        let spec = LOCAL_DEV.clone();
+        let gas_limit = spec.block_gas_limit_config(1).default();
+        let base_fee = spec.base_fee_config(1).absolute_min_base_fee;
+        let consensus = ArcConsensus::new(spec);
+
+        let header = Header {
+            number: 1,
+            beneficiary: address!("0x65E0a200006D4FF91bD59F9694220dafc49dbBC1"),
+            gas_limit,
+            base_fee_per_gas: Some(base_fee),
+            extra_data: Bytes::from([0u8; 8].as_slice()),
+            // Far beyond any plausible clock-skew tolerance.
+            timestamp: u64::MAX,
+            ..Default::default()
+        };
+        let sealed = SealedHeader::new(header.clone(), header.hash_slow());
+        let result =
+            <ArcConsensus<_> as HeaderValidator<Header>>::validate_header(&consensus, &sealed);
         assert!(
             result.is_ok(),
-            "Before Zero6, zero beneficiary should be allowed: {result:?}"
+            "validate_header must accept a far-future timestamp now that the skew \
+             guard runs at consensus vote time: {result:?}"
         );
     }
 }

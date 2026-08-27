@@ -18,6 +18,7 @@ alloy-consensus.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 arc-execution-txpool.workspace = true
+arc-precompiles.workspace = true
 eyre.workspace = true
 metrics.workspace = true
 
@@ -26,11 +27,12 @@ reth-basic-payload-builder.workspace = true
 reth-chainspec.workspace = true
 reth-consensus-common.workspace = true
 reth-errors.workspace = true
-reth-ethereum = { workspace = true, features = ["storage-api"] }
+reth-ethereum = { workspace = true, features = ["storage-api", "trie"] }
 reth-ethereum-engine-primitives.workspace = true
 reth-ethereum-payload-builder.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-evm.workspace = true
+reth-execution-cache.workspace = true
 reth-node-api.workspace = true
 reth-node-builder.workspace = true
 reth-payload-builder.workspace = true
@@ -39,12 +41,15 @@ reth-primitives-traits.workspace = true
 reth-revm.workspace = true
 reth-storage-api.workspace = true
 reth-transaction-pool.workspace = true
+reth-trie-parallel.workspace = true
 
 # revm
 revm.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+reth-evm-ethereum.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["full"] }
 tracing-test = "0.2"

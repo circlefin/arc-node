@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use malachitebft_proto::{Error as ProtoError, Protobuf};
 
-use crate::{Address, Height, ProposalData, ProposalFin, ProposalInit, ProposalPart, Round};
+use crate::{Address, Height, ProposalData, ProposalFin, ProposalInit, ProposalPart, Round, B256};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Error)]
 pub enum ProposalPartsError {
@@ -84,7 +84,7 @@ impl ProposalParts {
         self.init.round
     }
 
-    /// Return the adderss of the proposer of these proposal parts
+    /// Return the address of the proposer of these proposal parts
     pub const fn proposer(&self) -> Address {
         self.init.proposer
     }
@@ -128,6 +128,29 @@ impl ProposalParts {
         }
 
         hasher.finalize().into()
+    }
+
+    /// Storage key for the pending proposal-parts table.
+    ///
+    /// Hashes [`Self::hash`] together with the fields it omits:
+    /// `proposer`, `pol_round`, and the `Fin` signature. Streams with the same
+    /// signed hash but different unsigned fields therefore occupy distinct rows.
+    ///
+    /// ## Important
+    /// ⚠️ Not a signing hash. It must never be used to produce or verify a signature.
+    pub fn pending_key(&self) -> (Height, Round, B256) {
+        use sha3::{Digest, Keccak256};
+
+        let mut hasher = Keccak256::new();
+        hasher.update(self.hash());
+        hasher.update(self.proposer().into_inner());
+        hasher.update(self.init().pol_round.as_i64().to_be_bytes());
+        hasher.update(self.fin().signature.to_bytes());
+        (
+            self.height(),
+            self.round(),
+            B256::new(hasher.finalize().into()),
+        )
     }
 }
 

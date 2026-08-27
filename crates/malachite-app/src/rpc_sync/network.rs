@@ -59,6 +59,7 @@ use malachitebft_app_channel::app::engine::network::{
 };
 use malachitebft_app_channel::app::engine::util::output_port::OutputPort;
 use malachitebft_app_channel::NetworkMsg;
+use malachitebft_core_types::{ExtendedCommitCertificate, VoteExtensions};
 use malachitebft_peer::PeerId;
 use malachitebft_sync::{OutboundRequestId, RawDecidedValue, Response, ValueResponse};
 
@@ -161,7 +162,10 @@ async fn fetch_range(
         .into_iter()
         .map(|block| RawDecidedValue {
             value_bytes: block.value_bytes,
-            certificate: block.certificate,
+            certificate: ExtendedCommitCertificate::from_commit_certificate_and_extensions(
+                block.certificate,
+                VoteExtensions::default(),
+            ),
         })
         .collect();
 

@@ -301,8 +301,7 @@ mod integration_tests {
         let result = RemoteSignerClient::new(config).await;
 
         // With lazy connection, client creation may succeed but operations will fail
-        if result.is_ok() {
-            let client = result.unwrap();
+        if let Ok(client) = result {
             // Try to get public key - this should fail
             let public_key_result = client.get_public_key().await;
             assert!(
@@ -380,8 +379,7 @@ mod integration_tests {
         let result = RemoteSignerClient::new(config).await;
 
         // With lazy connection, client creation may succeed but operations will fail
-        if result.is_ok() {
-            let client = result.unwrap();
+        if let Ok(client) = result {
             // Try to sign a message - this should fail with retry exhaustion
             let sign_result = client.sign_message(b"test").await;
             assert!(
@@ -393,5 +391,31 @@ mod integration_tests {
                 assert_eq!(retries, 2, "Should have exhausted exactly 2 retries");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn config_builder_pattern() {
+        let config = RemoteSigningConfig::default()
+            .with_timeout(Duration::from_secs(10))
+            .with_retry_config(RetryConfig::new(
+                2,
+                Duration::from_millis(50),
+                Duration::from_secs(1),
+            ));
+
+        assert_eq!(config.endpoint, "http://0.0.0.0:10340");
+        assert_eq!(config.timeout, Duration::from_secs(10));
+        assert_eq!(config.retry_config.max_retries, 2);
+    }
+
+    #[tokio::test]
+    async fn retry_config_validation() {
+        let retry_config = RetryConfig::new(5, Duration::from_millis(100), Duration::from_secs(10))
+            .with_backoff_multiplier(1.5);
+
+        assert_eq!(retry_config.max_retries, 5);
+        assert_eq!(retry_config.initial_backoff, Duration::from_millis(100));
+        assert_eq!(retry_config.max_backoff, Duration::from_secs(10));
+        assert_eq!(retry_config.backoff_multiplier, 1.5);
     }
 }

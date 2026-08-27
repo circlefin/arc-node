@@ -24,6 +24,8 @@ It serves as a shim layer (proxy) between the execution client (EL), such as [re
   - [API Versioning](#api-versioning)
   - [Available Endpoints](#available-endpoints)
   - [Example API Usage](#example-api-usage)
+  - [Height Ranges](#height-ranges)
+  - [Response Compression](#response-compression)
   - [Deprecation Policy](#deprecation-policy)
 - [Metrics](#metrics)
 
@@ -78,11 +80,16 @@ arc-node-consensus start \
    --p2p.addr=/ip4/172.19.0.5/tcp/27000 \
    --p2p.persistent-peers=/ip4/172.19.0.6/tcp/27000,/ip4/172.19.0.7/tcp/27000 \
    --metrics=172.19.0.5:29000 \
-   --rpc.addr=0.0.0.0:31000 \
+   --rpc.addr=127.0.0.1:31000 \
    --eth-socket=/tmp/reth.ipc \
    --execution-socket=/tmp/auth.ipc \
    --minimal
 ```
+
+> [!WARNING]
+> **Deprecated.** The RPC transport is deprecated and will be removed in
+> v0.9.0. Prefer the IPC example above. See
+> [running-an-arc-node.md](../../docs/running-an-arc-node.md).
 
 **Full example with RPC** (for remote deployments):
 
@@ -95,7 +102,7 @@ arc-node-consensus start \
    --p2p.addr=/ip4/172.19.0.5/tcp/27000 \
    --p2p.persistent-peers=/ip4/172.19.0.6/tcp/27000,/ip4/172.19.0.7/tcp/27000 \
    --metrics=0.0.0.0:29000 \
-   --rpc.addr=0.0.0.0:31000 \
+   --rpc.addr=172.19.0.5:31000 \
    --eth-rpc-endpoint=http://localhost:8545 \
    --execution-endpoint=http://localhost:8551 \
    --execution-jwt=jwtsecret \
@@ -162,7 +169,8 @@ https://example.com,wss=ws.example.com:1212
 - `--discovery.num-inbound-peers` - Number of inbound peers (default: 20)
 - `--value-sync` - Enable value sync (default: true)
 - `--metrics` - Enable metrics and set listen address (e.g., "0.0.0.0:29000")
-- `--rpc.addr` - Enable RPC and set listen address (e.g., "0.0.0.0:31000")
+- `--rpc.addr` - Enable RPC and set listen address (e.g., "127.0.0.1:31000")
+- `--rpc.admin` - Enable the admin RPC routes (state-mutating persistent-peer add/remove). Disabled by default. These routes have no authentication, so they stay unreachable unless explicitly enabled, and **should only be exposed on an internal, trusted interface**.
 - `--full` - Arc full-node pruning preset; sets `--prune.certificates.distance 237600`; mutually exclusive with `--minimal` and the individual `--prune.certificates.*` flags
 - `--minimal` - Arc minimal-storage pruning preset; sets `--prune.certificates.distance 237600`; mutually exclusive with `--full` and the individual `--prune.certificates.*` flags
 - `--prune.certificates.distance` - Keep certificates for the last N heights (default: 0, disabled/archive node); mutually exclusive with `--prune.certificates.before` and `--full/--minimal` presets
@@ -211,16 +219,23 @@ arc-node-consensus download \
   --url <cl-snapshot-url>
 ```
 
-If `--url` is omitted, the latest pruned snapshot for the selected `--chain` is fetched automatically from the snapshot API.
+If `--url` is omitted, the newest storage v2 entry that carries both layers is
+selected for `--chain`, regardless of retention. The consensus archive from
+that entry is fetched without falling back to the v1 listing. The current
+selection is an archive snapshot measured at 42.29 GB, up from 15.37 GB for the
+previous v1 pruned selection.
 
 ```bash
-# Devnet — latest snapshot (recommended)
+# Testnet latest snapshot
 arc-node-consensus download \
   --home=~/.arc/consensus \
-  --chain arc-devnet
+  --chain arc-testnet
 ```
 
-> For a full node restore (EL + CL), use the `arc-snapshots` tool instead — it downloads both archives in one command. See [`crates/snapshots/README.md`](../snapshots/README.md).
+> For a paired node restore, use the `arc-snapshots` tool. Automatic resolution
+> restores a storage v2 execution manifest and its consensus archive from one
+> listing entry. Explicit URLs can still select the native archive restore. See
+> [`crates/snapshots/README.md`](../snapshots/README.md).
 
 ### Key
 
@@ -274,7 +289,9 @@ The following environment variables can be used to modify behavior:
 
 ## REST API
 
-The consensus layer exposes a REST API for monitoring and querying consensus state when `--rpc.addr` is set (e.g., `--rpc.addr=0.0.0.0:26658`).
+The consensus layer exposes a REST API for monitoring and querying consensus state when `--rpc.addr` is set (e.g., `--rpc.addr=127.0.0.1:26658`).
+
+The read-only endpoints below are always available when the RPC server is enabled. The state-mutating admin routes (`POST`/`DELETE /persistent-peers`) are gated behind `--rpc.admin` and disabled by default: they are not served and not listed in the API index unless that flag is set. They have no authentication, so **only enable them on an internal, trusted interface**.
 
 ### API Versioning
 
@@ -328,10 +345,18 @@ All endpoints support versioning:
 - `GET /` - API documentation and versioning info
 - `GET /status` - Application status
 - `GET /health` - Health check
+- `GET /ready` - Readiness probe (200 in sync, 503 catching up)
 - `GET /version` - Version information (git, cargo)
 - `GET /consensus-state` - Current consensus state
-- `GET /commit?height=N` - Commit certificate for specific height
 - `GET /network-state` - Network peer information
+- `GET /commit?height=N[&count=C]` - Commit certificate(s) for a height or range
+- `GET /misbehavior-evidence?height=N[&count=C]` - Misbehavior evidence for a height or range
+- `GET /proposal-monitor?height=N[&count=C]` - Round-0 proposal monitoring data for a height or range
+- `GET /invalid-payloads?height=N[&count=C]` - Invalid payloads for a height or range
+
+The four observability endpoints (`/commit`, `/misbehavior-evidence`,
+`/proposal-monitor`, `/invalid-payloads`) accept an optional `count` for range
+queries — see [Height Ranges](#height-ranges).
 
 #### Example API Usage
 
@@ -355,6 +380,80 @@ curl http://localhost:26658/health
 ```bash
 curl http://localhost:26658/
 ```
+
+### Height Ranges
+
+The four observability endpoints — `/commit`, `/misbehavior-evidence`,
+`/proposal-monitor`, and `/invalid-payloads` — accept an optional `count` query
+parameter to fetch a contiguous forward range of heights in one request:
+
+- `count` is the total number of heights **including** `height`. It defaults to
+  `1`. `count=1` (or omitting `count`) is identical to the single-height
+  behavior and returns a single JSON object.
+- `count > 1` returns an ordered JSON **array** of the per-height object, for
+  heights `height, height+1, …, height+count-1`. An explicit `height` is
+  required; `count > 1` without `height` is a `400 Bad Request`.
+- `count` is capped at **1000**. Requests above the cap are rejected with a
+  `400 Bad Request` (see below). The limit is fixed, not configurable.
+
+```bash
+# A single height (unchanged):
+curl "http://localhost:26658/commit?height=100" | jq
+
+# 50 contiguous heights (100..=149) as a JSON array:
+curl "http://localhost:26658/commit?height=100&count=50" | jq
+```
+
+#### Range Errors
+
+When a range cannot be fully served, the endpoint returns `400 Bad Request`
+with a structured body identifying the failing heights, uniform across all four
+endpoints, e.g., for a request that exceeds the current head:
+
+```json
+{
+  "error": "partial range unavailable",
+  "requested": { "from": 100, "to": 149 },
+  "failed_heights": [147, 148, 149],
+  "reason": "above_current_head"
+}
+```
+
+- `requested` — the inclusive `from..=to` range that was asked for.
+- `failed_heights` — the exact heights that could not be served, so a client
+  can retry only those. Omitted when empty.
+- `reason` — one of:
+  - `above_current_head` — the height is past the latest decided height.
+  - `pruned` — the height is below the earliest retained height.
+  - `not_recorded` — within range but never recorded (proposal monitor only; a
+    permanent gap, not retryable).
+  - `internal` — a record is missing or could not be decoded.
+  - `over_limit` — `count` exceeds the 1000 cap. `failed_heights` is omitted
+    (the range is never evaluated); `requested` still carries the bounds.
+
+Plain argument errors (`count=0`, `count > 1` without `height`, or a range that
+overflows `u64`) return a simpler `400 Bad Request` of the form `{"error": "..."}`.
+
+When the store holds no decided heights yet (an empty table — e.g. a freshly
+started node), a range request returns `404 Not Found` with a per-endpoint body
+(e.g., `{"error": "Certificate not found"}` on `/commit`, and the analogous message on
+the other three) rather than the structured `400` above.
+
+### Response Compression
+
+Responses are compressed when the client opts in via the standard
+`Accept-Encoding` header; the server negotiates a codec the client offered and
+sets `Content-Encoding` accordingly. The server supports `gzip`, `zstd`, `br`
+(brotli), and `deflate`. Clients that send no `Accept-Encoding` receive
+uncompressed responses unchanged.
+
+```bash
+# curl negotiates and transparently decompresses with --compressed:
+curl --compressed "http://localhost:26658/commit?height=100&count=1000" | jq
+```
+
+Very small responses (under ~32 bytes, e.g. `/health`) are sent uncompressed
+regardless.
 
 ### Deprecation Policy
 

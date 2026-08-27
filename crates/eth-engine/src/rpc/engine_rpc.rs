@@ -113,6 +113,7 @@ impl EngineRpc {
         &self,
         head_block_hash: BlockHash,
         maybe_payload_attributes: Option<PayloadAttributes>,
+        timeout: Duration,
     ) -> eyre::Result<ForkchoiceUpdated> {
         let forkchoice_state = ForkchoiceState {
             head_block_hash,
@@ -123,7 +124,7 @@ impl EngineRpc {
             .rpc_request(
                 ENGINE_FORKCHOICE_UPDATED_V3,
                 json!([forkchoice_state, maybe_payload_attributes]),
-                ENGINE_FORKCHOICE_UPDATED_TIMEOUT,
+                timeout,
                 NoRetry,
             )
             .await;
@@ -143,27 +144,19 @@ impl EngineRpc {
         &self,
         payload_id: AlloyPayloadId,
         use_v5: bool,
+        timeout: Duration,
     ) -> eyre::Result<ExecutionPayloadV3> {
+        // NoRetry so transient errors surface identically on RPC and IPC.
         let execution_payload = if use_v5 {
             let ExecutionPayloadEnvelopeV5 {
                 execution_payload, ..
             } = self
-                .rpc_request(
-                    ENGINE_GET_PAYLOAD_V5,
-                    json!([payload_id]),
-                    ENGINE_GET_PAYLOAD_TIMEOUT,
-                    NoRetry,
-                )
+                .rpc_request(ENGINE_GET_PAYLOAD_V5, json!([payload_id]), timeout, NoRetry)
                 .await?;
             execution_payload
         } else {
             let ExecutionPayloadEnvelopeV4 { envelope_inner, .. } = self
-                .rpc_request(
-                    ENGINE_GET_PAYLOAD_V4,
-                    json!([payload_id]),
-                    ENGINE_GET_PAYLOAD_TIMEOUT,
-                    NoRetry,
-                )
+                .rpc_request(ENGINE_GET_PAYLOAD_V4, json!([payload_id]), timeout, NoRetry)
                 .await?;
             envelope_inner.execution_payload
         };
@@ -183,6 +176,7 @@ impl EngineRpc {
         execution_payload: &ExecutionPayloadV3,
         versioned_hashes: Vec<B256>,
         parent_block_hash: BlockHash,
+        timeout: Duration,
     ) -> eyre::Result<PayloadStatus> {
         let empty_execution_requests: Vec<Bytes> = Vec::new();
         let params = json!([
@@ -192,12 +186,7 @@ impl EngineRpc {
             empty_execution_requests
         ]);
         let res = self
-            .rpc_request(
-                ENGINE_NEW_PAYLOAD_V4,
-                params,
-                ENGINE_NEW_PAYLOAD_TIMEOUT,
-                NoRetry,
-            )
+            .rpc_request(ENGINE_NEW_PAYLOAD_V4, params, timeout, NoRetry)
             .await;
 
         let block_hash = execution_payload.payload_inner.payload_inner.block_hash;
@@ -221,16 +210,21 @@ impl EngineAPI for EngineRpc {
         &self,
         head_block_hash: BlockHash,
         maybe_payload_attributes: Option<PayloadAttributes>,
+        timeout: Duration,
     ) -> eyre::Result<ForkchoiceUpdated> {
-        EngineRpc::forkchoice_updated(self, head_block_hash, maybe_payload_attributes.clone())
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "EngineRpc forkchoice_updated call failed; block_hash {:?}, payload_attributes {:?}",
-                    head_block_hash,
-                    maybe_payload_attributes,
-                )
-            })
+        EngineRpc::forkchoice_updated(
+            self,
+            head_block_hash,
+            maybe_payload_attributes.clone(),
+            timeout,
+        )
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "EngineRpc forkchoice_updated call failed; block_hash {:?}, payload_attributes {:?}",
+                head_block_hash, maybe_payload_attributes,
+            )
+        })
     }
 
     /// Get a payload by its ID.
@@ -238,8 +232,9 @@ impl EngineAPI for EngineRpc {
         &self,
         payload_id: AlloyPayloadId,
         use_v5: bool,
+        timeout: Duration,
     ) -> eyre::Result<ExecutionPayloadV3> {
-        EngineRpc::get_payload(self, payload_id, use_v5)
+        EngineRpc::get_payload(self, payload_id, use_v5, timeout)
             .await
             .wrap_err_with(|| format!("EngineRpc get_payload call failed; payload_id {payload_id}"))
     }
@@ -250,10 +245,17 @@ impl EngineAPI for EngineRpc {
         execution_payload: &ExecutionPayloadV3,
         versioned_hashes: Vec<B256>,
         parent_block_hash: BlockHash,
+        timeout: Duration,
     ) -> eyre::Result<PayloadStatus> {
         let payload_hash = execution_payload.payload_inner.payload_inner.block_hash;
-        EngineRpc::new_payload(self, execution_payload, versioned_hashes, parent_block_hash)
-            .await
-            .wrap_err_with(|| format!("EngineRpc new_payload call failed; block_hash {payload_hash}, parent_block_hash {parent_block_hash}"))
+        EngineRpc::new_payload(
+            self,
+            execution_payload,
+            versioned_hashes,
+            parent_block_hash,
+            timeout,
+        )
+        .await
+        .wrap_err_with(|| format!("EngineRpc new_payload call failed; block_hash {payload_hash}, parent_block_hash {parent_block_hash}"))
     }
 }

@@ -31,6 +31,7 @@ use crate::capabilities::EngineCapabilities;
 use crate::constants::*;
 use crate::engine::EngineAPI;
 use crate::ipc::ipc_builder::Ipc;
+use crate::retry::NoRetry;
 
 /// Engine API client for connecting to Engine IPC via Unix Domain Socket.
 pub struct EngineIPC {
@@ -100,6 +101,7 @@ impl EngineAPI for EngineIPC {
         &self,
         head_block_hash: BlockHash,
         maybe_payload_attributes: Option<PayloadAttributes>,
+        timeout: Duration,
     ) -> eyre::Result<ForkchoiceUpdated> {
         let forkchoice_state = ForkchoiceState {
             head_block_hash,
@@ -116,7 +118,7 @@ impl EngineAPI for EngineIPC {
         self.rpc_request(
             ENGINE_FORKCHOICE_UPDATED_V3,
             params,
-            ENGINE_FORKCHOICE_UPDATED_TIMEOUT,
+            timeout,
             ENGINE_API_RETRY_IPC.build(),
         )
         .await
@@ -128,7 +130,9 @@ impl EngineAPI for EngineIPC {
         &self,
         payload_id: AlloyPayloadId,
         use_v5: bool,
+        timeout: Duration,
     ) -> eyre::Result<ExecutionPayloadV3> {
+        // NoRetry so transient errors surface identically on RPC and IPC.
         if use_v5 {
             let ExecutionPayloadEnvelopeV5 {
                 execution_payload, ..
@@ -136,8 +140,8 @@ impl EngineAPI for EngineIPC {
                 .rpc_request(
                     ENGINE_GET_PAYLOAD_V5,
                     rpc_params![payload_id],
-                    ENGINE_GET_PAYLOAD_TIMEOUT,
-                    ENGINE_API_RETRY_IPC.build(),
+                    timeout,
+                    NoRetry,
                 )
                 .await?;
             Ok(execution_payload)
@@ -146,8 +150,8 @@ impl EngineAPI for EngineIPC {
                 .rpc_request(
                     ENGINE_GET_PAYLOAD_V4,
                     rpc_params![payload_id],
-                    ENGINE_GET_PAYLOAD_TIMEOUT,
-                    ENGINE_API_RETRY_IPC.build(),
+                    timeout,
+                    NoRetry,
                 )
                 .await?;
             Ok(envelope_inner.execution_payload)
@@ -163,6 +167,7 @@ impl EngineAPI for EngineIPC {
         execution_payload: &ExecutionPayloadV3,
         versioned_hashes: Vec<B256>,
         parent_block_hash: BlockHash,
+        timeout: Duration,
     ) -> eyre::Result<PayloadStatus> {
         let empty_execution_requests: Vec<Bytes> = Vec::new();
         let params = rpc_params![
@@ -175,7 +180,7 @@ impl EngineAPI for EngineIPC {
         self.rpc_request(
             ENGINE_NEW_PAYLOAD_V4,
             params,
-            ENGINE_NEW_PAYLOAD_TIMEOUT,
+            timeout,
             ENGINE_API_RETRY_IPC.build(),
         )
         .await

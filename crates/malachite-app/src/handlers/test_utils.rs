@@ -18,6 +18,8 @@
 
 use sha3::Digest;
 
+use malachitebft_app_channel::app::streaming::{StreamContent, StreamId, StreamMessage};
+
 use arc_consensus_types::{
     Address, Height, ProposalFin, ProposalInit, ProposalPart, ProposalParts, Round,
 };
@@ -49,4 +51,40 @@ pub(super) async fn signed_parts_without_data(
         ProposalPart::Fin(ProposalFin::new(signature)),
     ])
     .unwrap()
+}
+
+/// Same data-less proposal as [`signed_parts_without_data`], but emitted as the
+/// stream of [`StreamMessage`]s a peer would gossip, ready to feed through
+/// `on_received_proposal_part`. The completed stream assembles to zero bytes, so
+/// `assemble_block_from_parts` fails — exercising the assembly-failure path.
+pub(super) async fn signed_stream_without_data(
+    stream_id: StreamId,
+    height: Height,
+    round: Round,
+    signing_key: &PrivateKey,
+) -> Vec<StreamMessage<ProposalPart>> {
+    let proposer = Address::from_public_key(&signing_key.public_key());
+    let init = ProposalInit::new(height, round, Round::Nil, proposer);
+
+    let mut hasher = sha3::Keccak256::new();
+    hasher.update(height.as_u64().to_be_bytes());
+    hasher.update(round.as_i64().to_be_bytes());
+    let hash = hasher.finalize().to_vec();
+
+    let provider = LocalSigningProvider::new(signing_key.clone());
+    let signature = provider.sign_bytes(&hash).await.unwrap();
+
+    vec![
+        StreamMessage::new(
+            stream_id.clone(),
+            0,
+            StreamContent::Data(ProposalPart::Init(init)),
+        ),
+        StreamMessage::new(
+            stream_id.clone(),
+            1,
+            StreamContent::Data(ProposalPart::Fin(ProposalFin::new(signature))),
+        ),
+        StreamMessage::new(stream_id, 2, StreamContent::Fin),
+    ]
 }

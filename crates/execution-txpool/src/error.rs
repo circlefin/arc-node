@@ -27,6 +27,8 @@ pub enum ArcTransactionValidatorError {
     InvalidTxError,
     #[error("Address {0} is denylisted")]
     DenylistedAddressError(Address),
+    #[error("Too many EIP-7702 authorizations: {count}, limit {limit}")]
+    TooManyAuthorizations { count: usize, limit: usize },
 }
 
 impl PoolTransactionError for ArcTransactionValidatorError {
@@ -36,6 +38,8 @@ impl PoolTransactionError for ArcTransactionValidatorError {
             Self::InvalidTxError => true,
             // Node-local policy — peers can't know our denylist config
             Self::DenylistedAddressError(_) => false,
+            // Tunable Arc-side constant, not a cross-client protocol invariant
+            Self::TooManyAuthorizations { .. } => false,
         }
     }
 
@@ -72,6 +76,18 @@ mod tests {
         assert!(
             !err.is_bad_transaction(),
             "DenylistedAddressError must not be classified as bad transaction"
+        );
+    }
+
+    #[test]
+    fn too_many_authorizations_variant_is_not_bad_transaction() {
+        let err = ArcTransactionValidatorError::TooManyAuthorizations {
+            count: 200,
+            limit: 100,
+        };
+        assert!(
+            !err.is_bad_transaction(),
+            "TooManyAuthorizations must not be classified as bad transaction — the limit is a tunable Arc constant, not a cross-client protocol invariant"
         );
     }
 }

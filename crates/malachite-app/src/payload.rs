@@ -23,7 +23,8 @@ use malachitebft_app_channel::app::types::core::Validity;
 
 use alloy_rpc_types_engine::{ExecutionPayloadV3, PayloadStatusEnum};
 
-use arc_consensus_types::Address;
+use arc_consensus_types::{Address, BlockHash, Height, Round};
+use arc_eth_engine::deadline::EngineDeadline;
 use arc_eth_engine::engine::Engine;
 use arc_eth_engine::json_structures::ExecutionBlock;
 use arc_eth_engine::rpc::EngineApiRpcError;
@@ -109,6 +110,9 @@ pub trait PayloadGenerator: Send + Sync {
 
 pub struct EnginePayloadGenerator<'a> {
     pub engine: &'a Engine,
+    /// Consensus budget for the proposer's build sequence; extends the
+    /// engine's per-call timeout floors when set.
+    pub deadline: Option<EngineDeadline>,
 }
 
 impl<'a> PayloadGenerator for EnginePayloadGenerator<'a> {
@@ -119,7 +123,7 @@ impl<'a> PayloadGenerator for EnginePayloadGenerator<'a> {
         fee_recipient: &Address,
     ) -> eyre::Result<ExecutionPayloadV3> {
         self.engine
-            .generate_block(parent, timestamp, fee_recipient)
+            .generate_block(parent, timestamp, fee_recipient, self.deadline)
             .await
     }
 }
@@ -158,11 +162,30 @@ where
 pub struct EnginePayloadValidator<'a> {
     engine: &'a Engine,
     metrics: &'a AppMetrics,
+    deadline: Option<EngineDeadline>,
 }
 
 impl<'a> EnginePayloadValidator<'a> {
     pub fn new(engine: &'a Engine, metrics: &'a AppMetrics) -> Self {
-        Self { engine, metrics }
+        Self {
+            engine,
+            metrics,
+            deadline: None,
+        }
+    }
+
+    /// Validator for the proposer's self-validation path: the consensus
+    /// budget extends the engine's per-call timeout floor.
+    pub fn new_with_deadline(
+        engine: &'a Engine,
+        metrics: &'a AppMetrics,
+        deadline: EngineDeadline,
+    ) -> Self {
+        Self {
+            engine,
+            metrics,
+            deadline: Some(deadline),
+        }
     }
 }
 
@@ -171,7 +194,7 @@ impl PayloadValidator for EnginePayloadValidator<'_> {
         &self,
         payload: &ExecutionPayloadV3,
     ) -> eyre::Result<PayloadValidationResult> {
-        validate_payload(self.engine, payload, self.metrics).await
+        validate_payload(self.engine, payload, self.metrics, self.deadline).await
     }
 }
 
@@ -202,17 +225,17 @@ impl std::fmt::Display for PayloadValidationResult {
 ///
 /// # Return values
 ///
-/// - `Ok(Valid)`: the engine accepted the payload, or returned an unexpected status
-///   such as `SYNCING` or `ACCEPTED` (logged as a warning).
-/// - `Ok(Invalid { reason })`: the engine explicitly rejected the payload, either
-///   via its status response (`INVALID`) or via a JSON-RPC error
-///   (`EngineApiRpcError`).
-/// - `Err(..)`: the engine replied with status `SYNCING` or `ACCEPTED`, or an
-///   unrelated internal error occurred in the call stack.
+/// - `Ok(Valid)`: the engine accepted the payload.
+/// - `Ok(Invalid { reason })`: the engine rejected the payload, either via its
+///   status response (`INVALID`) or via a non-internal JSON-RPC error.
+/// - `Err(..)`: no verdict was obtained — the engine replied with an unexpected
+///   status (`SYNCING` or `ACCEPTED`, logged as a warning), returned a JSON-RPC
+///   internal error, or an unrelated internal error occurred in the call stack.
 async fn validate_payload(
     engine: &Engine,
     execution_payload: &ExecutionPayloadV3,
     metrics: &AppMetrics,
+    deadline: Option<EngineDeadline>,
 ) -> eyre::Result<PayloadValidationResult> {
     let block_hash = execution_payload.payload_inner.payload_inner.block_hash;
 
@@ -232,7 +255,7 @@ async fn validate_payload(
     let _guard = metrics.start_engine_api_timer("notify_new_block");
 
     match engine
-        .notify_new_block(execution_payload, versioned_hashes)
+        .notify_new_block(execution_payload, versioned_hashes, deadline)
         .await
     {
         Ok(status) => match status.status {
@@ -262,21 +285,18 @@ async fn validate_payload(
         },
         Err(e) => {
             if let Ok(engine_api_error) = EngineApiRpcError::try_from(&e) {
-                // JSON-RPC error here means that the call to
-                // `engine.newPayload` failed the preliminary structural
-                // validation of the payload.
-                // Instead of returning an error and possibly crashing the app,
-                // we mark the payload as invalid.
-                error!(
-                    %block_hash,
-                    "Invalid payload: {engine_api_error}",
-                );
-                return Ok(PayloadValidationResult::Invalid {
-                    reason: engine_api_error.to_string(),
-                });
+                if !engine_api_error.is_internal_error() {
+                    error!(
+                        %block_hash,
+                        "Invalid payload: {engine_api_error}",
+                    );
+                    return Ok(PayloadValidationResult::Invalid {
+                        reason: engine_api_error.to_string(),
+                    });
+                }
             }
 
-            // Unrelated internal error in the call stack.
+            // Internal failures provide no deterministic payload verdict.
             let msg = format!(
                 "call to EngineAPI::new_payload failed when validating block: {block_hash}",
             );
@@ -321,7 +341,7 @@ pub async fn validate_consensus_block(
             warn!(
                 height = %block.height,
                 round = %block.round,
-                block_hash = %block.block_hash(),
+                block_hash = %block.self_reported_block_hash(),
                 proposer = %block.proposer,
                 reason = %reason,
                 "Engine rejected payload, storing for forensics",
@@ -332,13 +352,170 @@ pub async fn validate_consensus_block(
                 error!(
                     height = %block.height,
                     round = %block.round,
-                    block_hash = %block.block_hash(),
+                    block_hash = %block.self_reported_block_hash(),
                     proposer = %block.proposer,
                     "Failed to persist invalid-payload forensic record: {e}",
                 );
             }
             Ok(Validity::Invalid)
         }
+    }
+}
+
+/// An execution payload that does not belong at its place in the chain.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PayloadBindingError {
+    #[error("payload block number {actual} does not match consensus height {expected}")]
+    HeightMismatch { expected: u64, actual: u64 },
+
+    #[error(
+        "payload parent hash {actual} is not the block finalized at the previous height ({expected})"
+    )]
+    ParentMismatch {
+        expected: BlockHash,
+        actual: BlockHash,
+    },
+}
+
+impl PayloadBindingError {
+    /// The counter label for this rule. A wrong block number is a property of the
+    /// payload alone. A wrong parent compares it against local state, so that label
+    /// also rises when this node holds the wrong view of the previous height.
+    pub fn invalid_payload_source(&self) -> InvalidPayloadSource {
+        match self {
+            Self::HeightMismatch { .. } => InvalidPayloadSource::PayloadHeight,
+            Self::ParentMismatch { .. } => InvalidPayloadSource::PayloadParent,
+        }
+    }
+}
+
+/// Makes sure that an execution payload belongs at the given consensus height.
+///
+/// Arc keeps one execution block per consensus height. A payload therefore
+/// carries that height as its block number, and it extends the block that the
+/// node finalized at the height before.
+///
+/// The parent rule needs the immediate predecessor. During batch value sync,
+/// `previous_block` can lag by several heights. This function therefore applies
+/// the parent rule only when `previous_block` sits one height below `height`.
+pub fn check_payload_binding(
+    payload: &ExecutionPayloadV3,
+    height: Height,
+    previous_block: Option<&ExecutionBlock>,
+) -> Result<(), PayloadBindingError> {
+    let payload = &payload.payload_inner.payload_inner;
+    let height = height.as_u64();
+
+    if payload.block_number != height {
+        return Err(PayloadBindingError::HeightMismatch {
+            expected: height,
+            actual: payload.block_number,
+        });
+    }
+
+    let Some(previous) = previous_block else {
+        return Ok(());
+    };
+
+    if previous.block_number.checked_add(1) != Some(height) {
+        return Ok(());
+    }
+
+    if payload.parent_hash != previous.block_hash {
+        return Err(PayloadBindingError::ParentMismatch {
+            expected: previous.block_hash,
+            actual: payload.parent_hash,
+        });
+    }
+
+    Ok(())
+}
+
+/// A validity verdict together with the rule that produced it.
+///
+/// A caller that reconciles a fresh verdict with a stored one needs to know
+/// which rule spoke. Only an engine verdict can differ between two runs against
+/// the same parent state, so only an engine verdict describes replay divergence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockVerdict {
+    /// The binding rules rejected the payload, and this is the rule that did. The
+    /// engine was not asked. The rule reaches the caller because the two do not
+    /// read alike: one blames the payload, the other can blame this node.
+    Unbound(PayloadBindingError),
+    /// The engine returned this verdict.
+    Engine(Validity),
+}
+
+impl BlockVerdict {
+    pub fn validity(&self) -> Validity {
+        match self {
+            Self::Unbound(_) => Validity::Invalid,
+            Self::Engine(validity) => *validity,
+        }
+    }
+}
+
+/// Establishes the validity of a block that arrived from the network.
+///
+/// The binding rules run first. The engine never sees a payload that breaks
+/// them, so such a payload never enters the block tree of the execution client.
+/// A payload that keeps the rules gets its verdict from [`validate_consensus_block`].
+pub async fn establish_block_validity(
+    payload_validator: &impl PayloadValidator,
+    block: &ConsensusBlock,
+    previous_block: Option<&ExecutionBlock>,
+    store: &impl InvalidPayloadsRepository,
+    metrics: &AppMetrics,
+) -> eyre::Result<BlockVerdict> {
+    if let Err(error) =
+        check_payload_binding(&block.execution_payload, block.height, previous_block)
+    {
+        warn!(
+            height = %block.height,
+            round = %block.round,
+            block_hash = %block.self_reported_block_hash(),
+            proposer = %block.proposer,
+            reason = %error,
+            "Payload is not bound to its place in the chain, storing for forensics",
+        );
+
+        metrics.inc_invalid_payloads_count(error.invalid_payload_source());
+
+        persist_invalid_payload_best_effort(
+            store,
+            InvalidPayload::new_from_block(block, &error.to_string()),
+            block.height,
+            block.round,
+            block.proposer,
+        )
+        .await;
+
+        return Ok(BlockVerdict::Unbound(error));
+    }
+
+    validate_consensus_block(payload_validator, block, store, metrics)
+        .await
+        .map(BlockVerdict::Engine)
+}
+
+/// Persists a forensic [`InvalidPayload`] record on a best-effort basis.
+///
+/// A persistence failure is logged at `error` and swallowed so it cannot abort the
+/// caller's primary path. For call sites where the block was never assembled, so only
+/// `height`, `round`, and `proposer` are available; [`validate_consensus_block`] logs
+/// `block_hash` too because it has the assembled block.
+pub(crate) async fn persist_invalid_payload_best_effort(
+    store: &impl InvalidPayloadsRepository,
+    invalid: InvalidPayload,
+    height: Height,
+    round: Round,
+    proposer: Address,
+) {
+    if let Err(e) = store.append(invalid).await {
+        error!(
+            %height, %round, %proposer,
+            "Failed to persist invalid-payload forensic record: {e}",
+        );
     }
 }
 
@@ -394,7 +571,7 @@ mod tests {
     #[tokio::test]
     async fn validate_payload_returns_valid_on_ok_status() {
         let mut mock = MockEngineAPI::new();
-        mock.expect_new_payload().returning(|_, _, _| {
+        mock.expect_new_payload().returning(|_, _, _, _| {
             Ok(PayloadStatus {
                 status: PayloadStatusEnum::Valid,
                 latest_valid_hash: None,
@@ -405,7 +582,7 @@ mod tests {
         let payload = test_payload(0);
         let metrics = AppMetrics::default();
 
-        let result = validate_payload(&engine, &payload, &metrics)
+        let result = validate_payload(&engine, &payload, &metrics, None)
             .await
             .expect("payload validation should succeed");
 
@@ -415,7 +592,7 @@ mod tests {
     #[tokio::test]
     async fn validate_payload_returns_invalid_on_invalid_status() {
         let mut mock = MockEngineAPI::new();
-        mock.expect_new_payload().returning(|_, _, _| {
+        mock.expect_new_payload().returning(|_, _, _, _| {
             Ok(PayloadStatus {
                 status: PayloadStatusEnum::Invalid {
                     validation_error: "validation error".to_string(),
@@ -428,7 +605,7 @@ mod tests {
         let payload = test_payload(0);
         let metrics = AppMetrics::default();
 
-        let result = validate_payload(&engine, &payload, &metrics)
+        let result = validate_payload(&engine, &payload, &metrics, None)
             .await
             .expect("payload validation should succeed");
 
@@ -441,9 +618,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_payload_returns_invalid_on_rpc_error() {
+    async fn validate_payload_returns_invalid_on_non_internal_rpc_error() {
         let mut mock = MockEngineAPI::new();
-        mock.expect_new_payload().returning(|_, _, _| {
+        mock.expect_new_payload().returning(|_, _, _, _| {
             let rpc_error = EngineApiRpcError::new(42, "engine API error", None);
             Err(eyre::Report::new(rpc_error))
         });
@@ -452,7 +629,7 @@ mod tests {
         let payload = test_payload(0);
         let metrics = AppMetrics::default();
 
-        let result = validate_payload(&engine, &payload, &metrics)
+        let result = validate_payload(&engine, &payload, &metrics, None)
             .await
             .expect("should succeed without error");
 
@@ -470,16 +647,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_payload_propagates_other_errors() {
+    async fn validate_payload_propagates_internal_rpc_error() {
         let mut mock = MockEngineAPI::new();
-        mock.expect_new_payload()
-            .returning(|_, _, _| Err(eyre::eyre!("some error")));
+        mock.expect_new_payload().returning(|_, _, _, _| {
+            let rpc_error = EngineApiRpcError::new(-32603, "Internal error", None);
+            Err(eyre::Report::new(rpc_error))
+        });
 
         let engine = Engine::new(Box::new(mock), Box::new(MockEthereumAPI::new()));
         let payload = test_payload(0);
         let metrics = AppMetrics::default();
 
-        let err = validate_payload(&engine, &payload, &metrics)
+        let err = validate_payload(&engine, &payload, &metrics, None)
+            .await
+            .expect_err("internal RPC error should not produce a payload verdict");
+
+        let engine_api_error = EngineApiRpcError::try_from(&err)
+            .expect("error chain should preserve the Engine API error");
+        assert!(engine_api_error.is_internal_error());
+        assert!(
+            err.to_string()
+                .contains("call to EngineAPI::new_payload failed"),
+            "error message should describe the failure, got: {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_payload_propagates_other_errors() {
+        let mut mock = MockEngineAPI::new();
+        mock.expect_new_payload()
+            .returning(|_, _, _, _| Err(eyre::eyre!("some error")));
+
+        let engine = Engine::new(Box::new(mock), Box::new(MockEthereumAPI::new()));
+        let payload = test_payload(0);
+        let metrics = AppMetrics::default();
+
+        let err = validate_payload(&engine, &payload, &metrics, None)
             .await
             .expect_err("payload validation should return an error");
 
@@ -497,7 +700,7 @@ mod tests {
         for status in test_cases {
             let mut mock = MockEngineAPI::new();
             let status_for_mock = status.clone();
-            mock.expect_new_payload().returning(move |_, _, _| {
+            mock.expect_new_payload().returning(move |_, _, _, _| {
                 Ok(PayloadStatus {
                     status: status_for_mock.clone(),
                     latest_valid_hash: None,
@@ -508,7 +711,7 @@ mod tests {
             let payload = test_payload(0);
             let metrics = AppMetrics::default();
 
-            let result = validate_payload(&engine, &payload, &metrics)
+            let result = validate_payload(&engine, &payload, &metrics, None)
                 .await
                 .expect_err("payload validation should return an error");
 
@@ -537,6 +740,232 @@ mod tests {
             validity: Validity::Valid,
             signature: None,
         }
+    }
+
+    /// Payload that carries `height` as its block number and `parent_hash` as its parent.
+    fn bound_payload(height: u64, parent_hash: B256) -> ExecutionPayloadV3 {
+        let mut payload = test_payload(0);
+        payload.payload_inner.payload_inner.block_number = height;
+        payload.payload_inner.payload_inner.parent_hash = parent_hash;
+        payload
+    }
+
+    fn prev_block(number: u64, block_hash: B256) -> ExecutionBlock {
+        ExecutionBlock {
+            block_hash,
+            block_number: number,
+            parent_hash: B256::ZERO,
+            timestamp: 0,
+        }
+    }
+
+    fn block_at(height: u64, payload: ExecutionPayloadV3) -> ConsensusBlock {
+        ConsensusBlock {
+            height: Height::new(height),
+            round: Round::new(0),
+            valid_round: Round::Nil,
+            proposer: Address::new([0u8; 20]),
+            execution_payload: payload,
+            validity: Validity::Valid,
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn binding_accepts_payload_at_its_height_that_extends_the_previous_block() {
+        let parent = B256::repeat_byte(0x11);
+        let payload = bound_payload(11, parent);
+
+        check_payload_binding(&payload, Height::new(11), Some(&prev_block(10, parent)))
+            .expect("a payload at its height that extends the previous block is bound");
+    }
+
+    /// A fresh block forked from an older canonical ancestor: block number 5
+    /// proposed at height 11.
+    #[test]
+    fn binding_rejects_block_number_below_the_consensus_height() {
+        let payload = bound_payload(5, B256::repeat_byte(0x44));
+
+        let error = check_payload_binding(&payload, Height::new(11), None)
+            .expect_err("block number 5 does not belong at height 11");
+
+        assert!(
+            matches!(
+                error,
+                PayloadBindingError::HeightMismatch {
+                    expected: 11,
+                    actual: 5
+                }
+            ),
+            "got {error:?}",
+        );
+    }
+
+    /// The height rule holds even when the payload extends the previous block,
+    /// which is what a payload replayed from an older height looks like.
+    #[test]
+    fn binding_rejects_block_number_above_the_consensus_height() {
+        let parent = B256::repeat_byte(0x11);
+        let payload = bound_payload(12, parent);
+
+        let error = check_payload_binding(&payload, Height::new(11), Some(&prev_block(10, parent)))
+            .expect_err("block number 12 does not belong at height 11");
+
+        assert!(
+            matches!(
+                error,
+                PayloadBindingError::HeightMismatch {
+                    expected: 11,
+                    actual: 12
+                }
+            ),
+            "got {error:?}",
+        );
+    }
+
+    #[test]
+    fn binding_rejects_parent_that_is_not_the_previous_block() {
+        let expected = B256::repeat_byte(0x11);
+        let other = B256::repeat_byte(0x22);
+        let payload = bound_payload(11, other);
+
+        let error =
+            check_payload_binding(&payload, Height::new(11), Some(&prev_block(10, expected)))
+                .expect_err("a payload that extends another block is not bound");
+
+        match error {
+            PayloadBindingError::ParentMismatch {
+                expected: e,
+                actual: a,
+            } => {
+                assert_eq!(e, expected);
+                assert_eq!(a, other);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// Batch value sync leaves `previous_block` several heights behind, so it is
+    /// not the parent of the payload under test and the parent rule cannot apply.
+    #[test]
+    fn binding_skips_the_parent_rule_when_the_previous_block_lags() {
+        let payload = bound_payload(11, B256::repeat_byte(0x22));
+
+        check_payload_binding(
+            &payload,
+            Height::new(11),
+            Some(&prev_block(7, B256::repeat_byte(0x11))),
+        )
+        .expect("the parent rule does not apply to a previous block that lags");
+    }
+
+    #[test]
+    fn binding_skips_the_parent_rule_without_a_previous_block() {
+        let payload = bound_payload(11, B256::repeat_byte(0x22));
+
+        check_payload_binding(&payload, Height::new(11), None)
+            .expect("the parent rule needs a previous block");
+    }
+
+    #[tokio::test]
+    async fn establish_block_validity_rejects_an_unbound_payload_without_asking_the_engine() {
+        let mut validator = MockPayloadValidator::new();
+        validator.expect_validate_payload().times(0);
+
+        let mut store = MockInvalidPayloadsRepository::new();
+        store
+            .expect_append()
+            .times(1)
+            .withf(|ip: &InvalidPayload| {
+                ip.height == Height::new(11)
+                    && ip.reason.contains("does not match consensus height")
+            })
+            .returning(|_| Ok(()));
+
+        let metrics = AppMetrics::default();
+        let block = block_at(11, bound_payload(5, B256::ZERO));
+
+        let verdict = establish_block_validity(&validator, &block, None, &store, &metrics)
+            .await
+            .expect("a binding error is a verdict, not a failure");
+
+        assert_eq!(
+            verdict,
+            BlockVerdict::Unbound(PayloadBindingError::HeightMismatch {
+                expected: 11,
+                actual: 5,
+            }),
+            "the caller must be able to tell which rule rejected the payload",
+        );
+        assert_eq!(verdict.validity(), Validity::Invalid);
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
+    }
+
+    /// The parent rule reaches the caller as its own variant. A caller that answers
+    /// the two rules differently reads this, and the two rules blame different
+    /// parties.
+    #[tokio::test]
+    async fn establish_block_validity_reports_which_rule_rejected_the_payload() {
+        let expected = B256::repeat_byte(0xAB);
+
+        let mut validator = MockPayloadValidator::new();
+        validator.expect_validate_payload().times(0);
+
+        let mut store = MockInvalidPayloadsRepository::new();
+        store.expect_append().times(1).returning(|_| Ok(()));
+
+        let metrics = AppMetrics::default();
+        let actual = B256::repeat_byte(0xCD);
+        let block = block_at(11, bound_payload(11, actual));
+
+        let verdict = establish_block_validity(
+            &validator,
+            &block,
+            Some(&prev_block(10, expected)),
+            &store,
+            &metrics,
+        )
+        .await
+        .expect("a binding error is a verdict, not a failure");
+
+        assert_eq!(
+            verdict,
+            BlockVerdict::Unbound(PayloadBindingError::ParentMismatch { expected, actual }),
+        );
+        assert_eq!(
+            metrics.get_invalid_payloads_count_by_source(InvalidPayloadSource::PayloadParent),
+            1,
+        );
+    }
+
+    #[tokio::test]
+    async fn establish_block_validity_asks_the_engine_about_a_bound_payload() {
+        let parent = B256::repeat_byte(0x11);
+
+        let mut validator = MockPayloadValidator::new();
+        validator
+            .expect_validate_payload()
+            .times(1)
+            .returning(|_| Ok(PayloadValidationResult::Valid));
+
+        let mut store = MockInvalidPayloadsRepository::new();
+        store.expect_append().times(0);
+
+        let metrics = AppMetrics::default();
+        let block = block_at(11, bound_payload(11, parent));
+
+        let verdict = establish_block_validity(
+            &validator,
+            &block,
+            Some(&prev_block(10, parent)),
+            &store,
+            &metrics,
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(verdict, BlockVerdict::Engine(Validity::Valid));
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
     }
 
     #[tokio::test]
@@ -644,6 +1073,22 @@ mod tests {
 
         assert_eq!(validity, Validity::Invalid);
         assert_eq!(metrics.get_invalid_payloads_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn persist_invalid_payload_best_effort_swallows_persistence_failure() {
+        let mut store = MockInvalidPayloadsRepository::new();
+        store
+            .expect_append()
+            .times(1)
+            .returning(|_| Err(std::io::Error::other("disk full")));
+
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let proposer = Address::new([0u8; 20]);
+        let invalid = InvalidPayload::new_without_payload(height, round, proposer, "bad");
+
+        persist_invalid_payload_best_effort(&store, invalid, height, round, proposer).await;
     }
 
     #[derive(Clone, Debug)]

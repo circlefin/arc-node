@@ -29,6 +29,10 @@ pub trait InvalidPayloadsRepository {
     ///
     /// Creates the underlying collection for the payload's height if one does not
     /// already exist.
+    ///
+    /// This is best-effort: the record is diagnostic-only and consensus does not
+    /// depend on it reaching disk. Callers must not let a persistence failure abort
+    /// their primary path — log the error and continue with the authoritative outcome.
     async fn append(&self, invalid_payload: InvalidPayload) -> Result<(), Self::Error>;
 }
 

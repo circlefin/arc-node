@@ -16,19 +16,29 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
+use axum::extract::DefaultBodyLimit;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use eyre::Result;
 use serde_json::json;
 use tokio::net::{TcpListener, ToSocketAddrs};
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 use tracing::{error, info};
 
 use super::middleware::extract_version;
 use super::types::{EndpointInfo, RpcState, TxConsensusReq, TxNetworkReq};
 use super::version::ApiVersion;
+use crate::metrics::AppMetrics;
 use crate::request::TxAppReq;
+
+// DoS-mitigation limits for the CL RPC server.
+const RPC_MAX_BODY_SIZE: usize = 2 * 1024;
+const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const RPC_MAX_CONCURRENT_REQUESTS: usize = 100;
 
 // List of RPC routes.
 routes![
@@ -42,36 +52,40 @@ routes![
         get,
         "/commit",
         crate::rpc::handlers::get_commit,
-        "Get the commit certificate for a specific height",
+        "Get the commit certificate for a specific height or range of heights",
         params = {
-            "height (optional)" => "The height of the commit certificate to retrieve. No height returns the latest certificate."
+            "height (optional)" => "The height of the commit certificate to retrieve. No height returns the latest certificate.",
+            "count (optional)" => "Total heights to return starting at height, inclusive (forward range). Defaults to 1 (single object). When greater than 1, height is required and the response is a JSON array; capped at 1000."
         }
     ),
     route!(
         get,
         "/misbehavior-evidence",
         crate::rpc::handlers::get_misbehavior_evidence,
-        "Get misbehavior evidence (double votes or proposals) for a specific height",
+        "Get misbehavior evidence (double votes or proposals) for a specific height or range of heights",
         params = {
-            "height (optional)" => "The height of the misbehavior evidence to retrieve. No height returns the latest."
+            "height (optional)" => "The height of the misbehavior evidence to retrieve. No height returns the latest.",
+            "count (optional)" => "Total heights to return starting at height, inclusive (forward range). Defaults to 1 (single object). When greater than 1, height is required and the response is a JSON array; capped at 1000."
         }
     ),
     route!(
         get,
         "/proposal-monitor",
         crate::rpc::handlers::get_proposal_monitor,
-        "Get round-0 proposal monitoring data (timing and success) for a specific height",
+        "Get round-0 proposal monitoring data (timing and success) for a specific height or range of heights",
         params = {
-            "height (optional)" => "The height to get monitoring data for. No height returns the latest."
+            "height (optional)" => "The height to get monitoring data for. No height returns the latest.",
+            "count (optional)" => "Total heights to return starting at height, inclusive (forward range). Defaults to 1 (single object). When greater than 1, height is required and the response is a JSON array; capped at 1000."
         }
     ),
     route!(
         get,
         "/invalid-payloads",
         crate::rpc::handlers::get_invalid_payloads,
-        "Get invalid payloads for a specific height",
+        "Get invalid payloads for a specific height or range of heights",
         params = {
-            "height (optional)" => "The height of the invalid payloads to retrieve. No height returns the latest."
+            "height (optional)" => "The height of the invalid payloads to retrieve. No height returns the latest.",
+            "count (optional)" => "Total heights to return starting at height, inclusive (forward range). Defaults to 1 (single object). When greater than 1, height is required and the response is a JSON array; capped at 1000."
         }
     ),
     route!(
@@ -105,7 +119,7 @@ routes![
         "Get the current network state (peers, topics, scores)"
     ),
     route!(
-        post,
+        admin post,
         "/persistent-peers",
         crate::rpc::handlers::add_persistent_peer,
         "Add a persistent peer at runtime.",
@@ -114,7 +128,7 @@ routes![
         }
     ),
     route!(
-        delete,
+        admin delete,
         "/persistent-peers",
         crate::rpc::handlers::remove_persistent_peer,
         "Remove a persistent peer at runtime.",
@@ -130,13 +144,45 @@ pub async fn serve(
     tx_consensus_req: TxConsensusReq,
     tx_app_req: TxAppReq,
     tx_network_req: TxNetworkReq,
+    admin_enabled: bool,
 ) {
-    if let Err(e) = inner(listen_addr, tx_consensus_req, tx_app_req, tx_network_req).await {
+    serve_with_metrics(
+        listen_addr,
+        tx_consensus_req,
+        tx_app_req,
+        tx_network_req,
+        admin_enabled,
+        AppMetrics::default(),
+    )
+    .await
+}
+
+pub(crate) async fn serve_with_metrics(
+    listen_addr: impl ToSocketAddrs,
+    tx_consensus_req: TxConsensusReq,
+    tx_app_req: TxAppReq,
+    tx_network_req: TxNetworkReq,
+    admin_enabled: bool,
+    metrics: AppMetrics,
+) {
+    if let Err(e) = inner(
+        listen_addr,
+        tx_consensus_req,
+        tx_app_req,
+        tx_network_req,
+        admin_enabled,
+        metrics,
+    )
+    .await
+    {
         error!("RPC server failed: {e}");
     }
 }
 
 /// Build the RPC router with all routes and middleware
+///
+/// Admin routes are mounted only when `admin_enabled` is true;
+/// otherwise they are neither served nor advertised in the index.
 ///
 /// This is exposed publicly for testing purposes, allowing integration tests
 /// to create a server with the actual production router.
@@ -144,14 +190,35 @@ pub fn build_router(
     tx_consensus_req: TxConsensusReq,
     tx_app_req: TxAppReq,
     tx_network_req: TxNetworkReq,
+    admin_enabled: bool,
+) -> Router {
+    build_router_with_metrics(
+        tx_consensus_req,
+        tx_app_req,
+        tx_network_req,
+        admin_enabled,
+        AppMetrics::default(),
+    )
+}
+
+pub(crate) fn build_router_with_metrics(
+    tx_consensus_req: TxConsensusReq,
+    tx_app_req: TxAppReq,
+    tx_network_req: TxNetworkReq,
+    admin_enabled: bool,
+    metrics: AppMetrics,
 ) -> Router {
     let rpc_state = RpcState {
         tx_consensus_req,
         tx_app_req,
         tx_network_req,
+        metrics,
     };
 
-    let routes = build_routes();
+    let routes = build_routes()
+        .into_iter()
+        .filter(|route| admin_enabled || !route.admin)
+        .collect::<Vec<_>>();
 
     let mut router = Router::new();
     for route in &routes {
@@ -168,9 +235,15 @@ pub fn build_router(
         router.route("/", get(move || get_index(Arc::clone(&docs))))
     };
 
-    // Apply version extraction middleware
     router
         .layer(axum::middleware::from_fn(extract_version))
+        .layer(DefaultBodyLimit::max(RPC_MAX_BODY_SIZE))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            RPC_REQUEST_TIMEOUT,
+        ))
+        .layer(ConcurrencyLimitLayer::new(RPC_MAX_CONCURRENT_REQUESTS))
+        .layer(tower_http::compression::CompressionLayer::new())
         .with_state(rpc_state)
 }
 
@@ -179,8 +252,16 @@ async fn inner(
     tx_consensus_req: TxConsensusReq,
     tx_app_req: TxAppReq,
     tx_network_req: TxNetworkReq,
+    admin_enabled: bool,
+    metrics: AppMetrics,
 ) -> Result<()> {
-    let app = build_router(tx_consensus_req, tx_app_req, tx_network_req);
+    let app = build_router_with_metrics(
+        tx_consensus_req,
+        tx_app_req,
+        tx_network_req,
+        admin_enabled,
+        metrics,
+    );
 
     let listener = TcpListener::bind(listen_addr).await?;
     let address = listener.local_addr()?;
@@ -235,11 +316,15 @@ mod tests {
     use malachitebft_network::{LocalNodeInfo, PersistentPeerError, ValidatorInfo};
 
     use super::*;
-    use crate::request::{AppRequest, CommitCertificateInfo, Status};
+    use crate::request::{AppRequest, CommitCertificateInfo, HeightRangeRequest, Status};
     use crate::rpc::types::{
         RpcAppStatus, RpcCommitCertificate, RpcConsensusStateDump, RpcNetworkStateDump,
     };
+    use crate::store::{RangeFailureReason, RangeQueryResult};
     use crate::utils::sync_state::SyncState;
+    use arc_consensus_db::invalid_payloads::StoredInvalidPayloads;
+    use arc_consensus_types::evidence::StoredMisbehaviorEvidence;
+    use arc_consensus_types::proposal_monitor::ProposalMonitor;
 
     enum MockValue {
         Present,
@@ -251,6 +336,22 @@ mod tests {
         AppGetStatus,
         AppGetSyncState(SyncState),
         AppGetCertificate(MockValue),
+        AppGetCertificateRange(
+            HeightRangeRequest,
+            Option<RangeQueryResult<CommitCertificateInfo>>,
+        ),
+        AppGetMisbehaviorEvidenceRange(
+            HeightRangeRequest,
+            Option<RangeQueryResult<StoredMisbehaviorEvidence>>,
+        ),
+        AppGetProposalMonitorDataRange(
+            HeightRangeRequest,
+            Option<RangeQueryResult<ProposalMonitor>>,
+        ),
+        AppGetInvalidPayloadsRange(
+            HeightRangeRequest,
+            Option<RangeQueryResult<StoredInvalidPayloads>>,
+        ),
         ConsensusDumpState(MockValue),
         NetworkDumpState(MockValue),
         AddPersistentPeer(Result<(), PersistentPeerError>),
@@ -347,13 +448,48 @@ mod tests {
                     let _ = reply.send(state);
                 }
                 MockConfig::AppGetCertificate(ret) => {
-                    let Some(AppRequest::GetCertificate(None, reply_port)) = msg else {
+                    let Some(AppRequest::GetCertificate {
+                        height: None,
+                        reply: reply_port,
+                        ..
+                    }) = msg
+                    else {
                         panic!("Unexpected msg");
                     };
                     let _ = reply_port.send(match ret {
                         MockValue::Present => Some(Self::a_commit_cert_info()),
                         MockValue::Absent => None,
                     });
+                }
+                MockConfig::AppGetCertificateRange(expected, ret) => {
+                    let Some(AppRequest::GetCertificateRange(range, reply_port)) = msg else {
+                        panic!("Unexpected msg");
+                    };
+                    assert_eq!(range, expected);
+                    let _ = reply_port.send(ret);
+                }
+                MockConfig::AppGetMisbehaviorEvidenceRange(expected, ret) => {
+                    let Some(AppRequest::GetMisbehaviorEvidenceRange(range, reply_port)) = msg
+                    else {
+                        panic!("Unexpected msg");
+                    };
+                    assert_eq!(range, expected);
+                    let _ = reply_port.send(ret);
+                }
+                MockConfig::AppGetProposalMonitorDataRange(expected, ret) => {
+                    let Some(AppRequest::GetProposalMonitorDataRange(range, reply_port)) = msg
+                    else {
+                        panic!("Unexpected msg");
+                    };
+                    assert_eq!(range, expected);
+                    let _ = reply_port.send(ret);
+                }
+                MockConfig::AppGetInvalidPayloadsRange(expected, ret) => {
+                    let Some(AppRequest::GetInvalidPayloadsRange(range, reply_port)) = msg else {
+                        panic!("Unexpected msg");
+                    };
+                    assert_eq!(range, expected);
+                    let _ = reply_port.send(ret);
                 }
                 _ => panic!("Unexpected config"),
             }
@@ -506,6 +642,19 @@ mod tests {
                 proposer: Address::new([0x55; 20]),
             }
         }
+
+        fn a_commit_cert_info_at(height: u64) -> CommitCertificateInfo {
+            CommitCertificateInfo {
+                certificate: CommitCertificate::new(
+                    Height::new(height),
+                    Round::new(0),
+                    ValueId::new(BlockHash::new([0xAA; 32])),
+                    vec![],
+                ),
+                certificate_type: CommitCertificateType::Minimal,
+                proposer: Address::new([0x55; 20]),
+            }
+        }
     }
 
     async fn response_to_json(resp: Response<Body>) -> serde_json::Value {
@@ -528,7 +677,8 @@ mod tests {
         tx_network_req: mpsc::Sender<NetworkRequest>,
         uri: &str,
     ) -> (StatusCode, serde_json::Value) {
-        let app = build_router(tx_consensus_req, tx_app_req, tx_network_req);
+        // Read routes are available regardless of the admin toggle.
+        let app = build_router(tx_consensus_req, tx_app_req, tx_network_req, false);
         let req = Request::builder()
             .method("GET")
             .uri(uri)
@@ -540,6 +690,144 @@ mod tests {
         (status, val)
     }
 
+    /// Like `build_router_and_request` but sets an optional `Accept-Encoding`
+    /// and returns the response headers and raw (possibly compressed) body, so
+    /// compression behavior can be asserted.
+    async fn build_router_and_raw_request(
+        tx_consensus_req: mpsc::Sender<ConsensusRequest<ArcContext>>,
+        tx_app_req: mpsc::Sender<AppRequest>,
+        tx_network_req: mpsc::Sender<NetworkRequest>,
+        uri: &str,
+        accept_encoding: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let app = build_router(tx_consensus_req, tx_app_req, tx_network_req, true);
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(encoding) = accept_encoding {
+            builder = builder.header("accept-encoding", encoding);
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, headers, bytes)
+    }
+
+    #[tokio::test]
+    async fn test_response_gzip_compressed_when_requested() {
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetCertificate(MockValue::Present));
+        let (status, headers, body) = build_router_and_raw_request(
+            tx_cons_req,
+            tx_app_req,
+            tx_nw_req,
+            "/commit",
+            Some("gzip"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-encoding").unwrap(), "gzip");
+
+        let mut decoder = flate2::read::GzDecoder::new(&body[..]);
+        let mut json = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut json).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected =
+            serde_json::to_value(RpcCommitCertificate::from(MockBackend::a_commit_cert_info()))
+                .unwrap();
+        assert_eq!(val, expected);
+    }
+
+    #[tokio::test]
+    async fn test_response_zstd_compressed_when_requested() {
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetCertificate(MockValue::Present));
+        let (status, headers, body) = build_router_and_raw_request(
+            tx_cons_req,
+            tx_app_req,
+            tx_nw_req,
+            "/commit",
+            Some("zstd"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-encoding").unwrap(), "zstd");
+
+        let mut decoder = zstd::stream::read::Decoder::new(&body[..]).unwrap();
+        let mut json = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut json).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected =
+            serde_json::to_value(RpcCommitCertificate::from(MockBackend::a_commit_cert_info()))
+                .unwrap();
+        assert_eq!(val, expected);
+    }
+
+    #[tokio::test]
+    async fn test_response_brotli_compressed_when_requested() {
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetCertificate(MockValue::Present));
+        let (status, headers, body) =
+            build_router_and_raw_request(tx_cons_req, tx_app_req, tx_nw_req, "/commit", Some("br"))
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-encoding").unwrap(), "br");
+
+        let mut decoder = brotli::Decompressor::new(&body[..], 4096);
+        let mut json = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut json).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected =
+            serde_json::to_value(RpcCommitCertificate::from(MockBackend::a_commit_cert_info()))
+                .unwrap();
+        assert_eq!(val, expected);
+    }
+
+    #[tokio::test]
+    async fn test_response_deflate_compressed_when_requested() {
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetCertificate(MockValue::Present));
+        let (status, headers, body) = build_router_and_raw_request(
+            tx_cons_req,
+            tx_app_req,
+            tx_nw_req,
+            "/commit",
+            Some("deflate"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-encoding").unwrap(), "deflate");
+
+        // tower-http emits zlib-wrapped deflate (RFC 1950) for
+        // Content-Encoding: deflate, so decode with ZlibDecoder.
+        let mut decoder = flate2::read::ZlibDecoder::new(&body[..]);
+        let mut json = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut json).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected =
+            serde_json::to_value(RpcCommitCertificate::from(MockBackend::a_commit_cert_info()))
+                .unwrap();
+        assert_eq!(val, expected);
+    }
+
+    #[tokio::test]
+    async fn test_response_uncompressed_without_accept_encoding() {
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetCertificate(MockValue::Present));
+        let (status, headers, body) =
+            build_router_and_raw_request(tx_cons_req, tx_app_req, tx_nw_req, "/commit", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.get("content-encoding").is_none());
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let expected =
+            serde_json::to_value(RpcCommitCertificate::from(MockBackend::a_commit_cert_info()))
+                .unwrap();
+        assert_eq!(val, expected);
+    }
+
     async fn build_router_and_request_with_body(
         method: &str,
         tx_consensus_req: mpsc::Sender<ConsensusRequest<ArcContext>>,
@@ -548,7 +836,8 @@ mod tests {
         uri: &str,
         body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
-        let app = build_router(tx_consensus_req, tx_app_req, tx_network_req);
+        // The mutating persistent-peer routes exist only when admin is enabled.
+        let app = build_router(tx_consensus_req, tx_app_req, tx_network_req, true);
         let req = Request::builder()
             .method(method)
             .uri(uri)
@@ -744,6 +1033,256 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_commit_count_one_is_single_object() {
+        // count=1 must take the legacy single-height path: a single object,
+        // never a 1-element array. The mock accepts only GetCertificate.
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetCertificate(MockValue::Present));
+        let (status, val) =
+            build_router_and_request(tx_cons_req, tx_app_req, tx_nw_req, "/commit?count=1").await;
+        assert_eq!(status, StatusCode::OK);
+        let expected =
+            serde_json::to_value(RpcCommitCertificate::from(MockBackend::a_commit_cert_info()))
+                .unwrap();
+        assert_eq!(val, expected);
+        assert!(!val.is_array(), "count=1 must return a single object");
+    }
+
+    #[tokio::test]
+    async fn test_commit_range_returns_ordered_array() {
+        let range = HeightRangeRequest {
+            from: Height::new(7),
+            count: 2,
+        };
+        let reply = RangeQueryResult::Complete(vec![
+            MockBackend::a_commit_cert_info_at(7),
+            MockBackend::a_commit_cert_info_at(8),
+        ]);
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetCertificateRange(range, Some(reply)));
+        let (status, val) = build_router_and_request(
+            tx_cons_req,
+            tx_app_req,
+            tx_nw_req,
+            "/commit?height=7&count=2",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let expected = serde_json::to_value(vec![
+            RpcCommitCertificate::from(MockBackend::a_commit_cert_info_at(7)),
+            RpcCommitCertificate::from(MockBackend::a_commit_cert_info_at(8)),
+        ])
+        .unwrap();
+        assert_eq!(val, expected);
+    }
+
+    #[tokio::test]
+    async fn test_misbehavior_evidence_range_returns_array() {
+        let range = HeightRangeRequest {
+            from: Height::new(1),
+            count: 3,
+        };
+        let reply = RangeQueryResult::Complete(vec![
+            StoredMisbehaviorEvidence::empty(Height::new(1)),
+            StoredMisbehaviorEvidence::empty(Height::new(2)),
+            StoredMisbehaviorEvidence::empty(Height::new(3)),
+        ]);
+        let (tx_cons_req, tx_app_req, tx_nw_req) = MockBackend::spawn_new(
+            MockConfig::AppGetMisbehaviorEvidenceRange(range, Some(reply)),
+        );
+        let (status, val) = build_router_and_request(
+            tx_cons_req,
+            tx_app_req,
+            tx_nw_req,
+            "/misbehavior-evidence?height=1&count=3",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let heights: Vec<u64> = val
+            .as_array()
+            .expect("array body")
+            .iter()
+            .map(|e| e["height"].as_u64().unwrap())
+            .collect();
+        assert_eq!(heights, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_proposal_monitor_range_returns_array() {
+        let proposer = Address::new([0x22; 20]);
+        let range = HeightRangeRequest {
+            from: Height::new(4),
+            count: 2,
+        };
+        let reply = RangeQueryResult::Complete(vec![
+            ProposalMonitor::new(Height::new(4), proposer, SystemTime::UNIX_EPOCH),
+            ProposalMonitor::new(Height::new(5), proposer, SystemTime::UNIX_EPOCH),
+        ]);
+        let (tx_cons_req, tx_app_req, tx_nw_req) = MockBackend::spawn_new(
+            MockConfig::AppGetProposalMonitorDataRange(range, Some(reply)),
+        );
+        let (status, val) = build_router_and_request(
+            tx_cons_req,
+            tx_app_req,
+            tx_nw_req,
+            "/proposal-monitor?height=4&count=2",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let heights: Vec<u64> = val
+            .as_array()
+            .expect("array body")
+            .iter()
+            .map(|e| e["height"].as_u64().unwrap())
+            .collect();
+        assert_eq!(heights, vec![4, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_payloads_range_returns_array() {
+        let range = HeightRangeRequest {
+            from: Height::new(10),
+            count: 2,
+        };
+        let reply = RangeQueryResult::Complete(vec![
+            StoredInvalidPayloads::empty(Height::new(10)),
+            StoredInvalidPayloads::empty(Height::new(11)),
+        ]);
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetInvalidPayloadsRange(range, Some(reply)));
+        let (status, val) = build_router_and_request(
+            tx_cons_req,
+            tx_app_req,
+            tx_nw_req,
+            "/invalid-payloads?height=10&count=2",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let heights: Vec<u64> = val
+            .as_array()
+            .expect("array body")
+            .iter()
+            .map(|e| e["height"].as_u64().unwrap())
+            .collect();
+        assert_eq!(heights, vec![10, 11]);
+    }
+
+    #[tokio::test]
+    async fn test_count_zero_rejected() {
+        let (status, val) = build_no_backend_router_and_request("/commit?height=5&count=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(val, json!({"error": "count must be at least 1"}));
+    }
+
+    #[tokio::test]
+    async fn test_count_greater_than_one_without_height_rejected() {
+        let (status, val) = build_no_backend_router_and_request("/commit?count=2").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            val,
+            json!({"error": "height is required when count is greater than 1"})
+        );
+    }
+
+    #[tokio::test]
+    async fn test_count_over_limit_returns_structured_400() {
+        let (status, val) =
+            build_no_backend_router_and_request("/commit?height=10&count=1001").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            val,
+            json!({
+                "error": "partial range unavailable",
+                "requested": {"from": 10, "to": 1010},
+                "reason": "over_limit"
+            })
+        );
+        assert!(
+            val.get("failed_heights").is_none(),
+            "over_limit must omit failed_heights"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_count_overflow_rejected() {
+        let (status, val) =
+            build_no_backend_router_and_request("/commit?height=18446744073709551615&count=2")
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            val,
+            json!({"error": "requested range exceeds the maximum u64 height"})
+        );
+    }
+
+    #[tokio::test]
+    async fn test_count_malformed_is_query_rejection() {
+        // axum rejects an unparseable count with a plain-text 400 (same as
+        // height=abc today), so assert only the status, not a JSON body.
+        let (tx_c, _rc) = mpsc::channel::<ConsensusRequest<ArcContext>>(1);
+        let (tx_a, _ra) = mpsc::channel::<AppRequest>(1);
+        let (tx_n, _rn) = mpsc::channel::<NetworkRequest>(1);
+        let app = build_router(tx_c, tx_a, tx_n, true);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/commit?count=abc")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_range_above_head_structured_error_body() {
+        let range = HeightRangeRequest {
+            from: Height::new(8),
+            count: 5,
+        };
+        let reply = RangeQueryResult::Unavailable {
+            reason: RangeFailureReason::AboveCurrentHead,
+            failed_heights: vec![Height::new(11), Height::new(12)],
+        };
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetCertificateRange(range, Some(reply)));
+        let (status, val) = build_router_and_request(
+            tx_cons_req,
+            tx_app_req,
+            tx_nw_req,
+            "/commit?height=8&count=5",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            val,
+            json!({
+                "error": "partial range unavailable",
+                "requested": {"from": 8, "to": 12},
+                "failed_heights": [11, 12],
+                "reason": "above_current_head"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_range_empty_store_returns_legacy_404() {
+        let range = HeightRangeRequest {
+            from: Height::new(5),
+            count: 3,
+        };
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetCertificateRange(range, None));
+        let (status, val) = build_router_and_request(
+            tx_cons_req,
+            tx_app_req,
+            tx_nw_req,
+            "/commit?height=5&count=3",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(val, json!({"error": "Certificate not found"}));
+    }
+
+    #[tokio::test]
     async fn test_consensus_state_success() {
         let (tx_cons_req, tx_app_req, tx_nw_req) =
             MockBackend::spawn_new(MockConfig::ConsensusDumpState(MockValue::Present));
@@ -932,5 +1471,121 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(val, json!({"error": "Invalid multiaddr"}));
+    }
+
+    #[tokio::test]
+    async fn test_oversized_body_is_rejected() {
+        let (tx_dummy_cons_req, _dummy_rx_c) = mpsc::channel::<ConsensusRequest<ArcContext>>(1);
+        let (tx_dummy_app_req, _dummy_rx_a) = mpsc::channel::<AppRequest>(1);
+        let (tx_dummy_nw_req, _dummy_rx_n) = mpsc::channel::<NetworkRequest>(1);
+        // Admin enabled so the mutating /persistent-peers route is mounted.
+        let app = build_router(tx_dummy_cons_req, tx_dummy_app_req, tx_dummy_nw_req, true);
+
+        // RPC_MAX_BODY_SIZE = 2 KiB; send 8 KiB of padding inside a JSON string.
+        let oversize = "a".repeat(8 * 1024);
+        let body = serde_json::to_vec(&json!({ "addr": oversize })).unwrap();
+        assert!(body.len() > RPC_MAX_BODY_SIZE);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/persistent-peers")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Send a request to a router built with no backend and the given admin
+    /// setting. Uses an invalid multiaddr body so the mutating handlers reject
+    /// at parse time (BAD_REQUEST) instead of blocking on an absent backend —
+    /// letting us tell "route mounted" (BAD_REQUEST) from "route absent" (404).
+    async fn status_no_backend(method: &str, uri: &str, admin_enabled: bool) -> StatusCode {
+        let (tx_c, _rc) = mpsc::channel::<ConsensusRequest<ArcContext>>(1);
+        let (tx_a, _ra) = mpsc::channel::<AppRequest>(1);
+        let (tx_n, _rn) = mpsc::channel::<NetworkRequest>(1);
+        let app = build_router(tx_c, tx_a, tx_n, admin_enabled);
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "addr": "not-a-valid-multiaddr" })).unwrap(),
+            ))
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    async fn index_json(admin_enabled: bool) -> serde_json::Value {
+        let (tx_c, _rc) = mpsc::channel::<ConsensusRequest<ArcContext>>(1);
+        let (tx_a, _ra) = mpsc::channel::<AppRequest>(1);
+        let (tx_n, _rn) = mpsc::channel::<NetworkRequest>(1);
+        let app = build_router(tx_c, tx_a, tx_n, admin_enabled);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        response_to_json(resp).await
+    }
+
+    #[tokio::test]
+    async fn test_persistent_peer_mutation_routes_absent_without_admin() {
+        assert_eq!(
+            status_no_backend("POST", "/persistent-peers", false).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status_no_backend("DELETE", "/persistent-peers", false).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persistent_peer_mutation_routes_present_with_admin() {
+        // Route mounted: the request reaches the handler, which rejects the
+        // invalid multiaddr (BAD_REQUEST) rather than returning 404.
+        assert_eq!(
+            status_no_backend("POST", "/persistent-peers", true).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_no_backend("DELETE", "/persistent-peers", true).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_route_available_without_admin() {
+        // A read route stays reachable in the default (admin-off) configuration.
+        assert_eq!(
+            status_no_backend("GET", "/version", false).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_excludes_admin_routes_without_admin() {
+        let val = index_json(false).await;
+        let endpoints = &val["endpoints"];
+        assert!(
+            endpoints.get("GET /status").is_some(),
+            "read routes must still be advertised"
+        );
+        assert!(
+            endpoints.get("POST /persistent-peers").is_none(),
+            "admin routes must not be advertised when admin is off"
+        );
+        assert!(endpoints.get("DELETE /persistent-peers").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_index_includes_admin_routes_with_admin() {
+        let val = index_json(true).await;
+        let endpoints = &val["endpoints"];
+        assert!(endpoints.get("POST /persistent-peers").is_some());
+        assert!(endpoints.get("DELETE /persistent-peers").is_some());
     }
 }

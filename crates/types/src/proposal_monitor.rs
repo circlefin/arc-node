@@ -27,7 +27,7 @@
 //! By design, monitoring data is only stored for round-0 proposals.
 
 use std::time::SystemTime;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::{Address, Height, ValueId};
 
@@ -118,21 +118,66 @@ impl ProposalMonitor {
     /// Record that proposal was received.
     /// Takes precedence over synced value.
     pub fn record_proposal(&mut self, value_id: ValueId) {
-        // FIXME: this log message should not be produced here.
+        // FIXME: these log messages should not be produced here.
         if let Some(first_value) = self.value_id
             && !self.synced
         {
-            warn!(
-                height = %self.height,
-                %first_value,
-                new_value = %value_id,
-                "Equivocating proposal at round 0"
-            );
+            if first_value == value_id {
+                // Same proposal seen twice at round 0 (e.g. a re-broadcast) —
+                // benign, keep the first recording.
+                debug!(
+                    height = %self.height,
+                    %value_id,
+                    "Duplicate proposal at round 0, ignoring"
+                );
+            } else {
+                warn!(
+                    height = %self.height,
+                    %first_value,
+                    new_value = %value_id,
+                    "Equivocating proposal at round 0"
+                );
+            }
             return;
         }
         self.proposal_receive_time = Some(SystemTime::now());
         self.value_id = Some(value_id);
         self.synced = false;
+    }
+
+    /// Fill in the value id for a proposal whose receive time was recorded
+    /// early, once the parts are reassembled.
+    ///
+    /// Never touches `proposal_receive_time`, so the (negative) delay is kept.
+    pub fn attach_assembled_value_id(&mut self, value_id: ValueId) {
+        if self.synced {
+            return;
+        }
+        match self.value_id {
+            None => {
+                self.value_id = Some(value_id);
+                info!(
+                    height = %self.height,
+                    %value_id,
+                    "Recorded value id for proposal received before round-0 start"
+                );
+            }
+            Some(existing) if existing == value_id => {
+                debug!(
+                    height = %self.height,
+                    %value_id,
+                    "Value id already recorded for this height, ignoring duplicate"
+                );
+            }
+            Some(existing) => {
+                warn!(
+                    height = %self.height,
+                    first_value = %existing,
+                    new_value = %value_id,
+                    "Equivocating proposal (assembled from parts) at round 0"
+                );
+            }
+        }
     }
 
     /// Check if the decided value matches the recorded proposal.
@@ -277,6 +322,81 @@ mod tests {
 
         monitor.mark_synced();
 
+        assert!(monitor.synced);
+    }
+
+    #[test]
+    fn test_record_proposal_duplicate_same_value_is_benign() {
+        // A re-broadcast of the same round-0 proposal must not be treated as equivocation
+        let mut monitor = ProposalMonitor::new(Height::new(1), test_address(), SystemTime::now());
+        let value = test_value_id(0x11);
+
+        monitor.record_proposal(value);
+        let time1 = monitor.proposal_receive_time.unwrap();
+
+        monitor.record_proposal(value);
+
+        assert_eq!(monitor.value_id, Some(value));
+        assert_eq!(monitor.proposal_receive_time, Some(time1));
+    }
+
+    #[test]
+    fn test_attach_assembled_value_id_when_unset() {
+        // Simulates the pending-parts path: receive time was set early, value
+        // id is still None, then the reassembled value is attached without
+        // disturbing the receive time.
+        let start = SystemTime::now();
+        let mut monitor = ProposalMonitor::new(Height::new(1), test_address(), start);
+        let receive = start - Duration::from_millis(120);
+        monitor.proposal_receive_time = Some(receive);
+
+        let value = test_value_id(0xA1);
+        monitor.attach_assembled_value_id(value);
+
+        assert_eq!(monitor.value_id, Some(value));
+        assert_eq!(
+            monitor.proposal_receive_time,
+            Some(receive),
+            "attach must not overwrite the (earlier) receive time",
+        );
+        assert!(!monitor.synced);
+    }
+
+    #[test]
+    fn test_attach_assembled_value_id_same_value_is_benign() {
+        let mut monitor = ProposalMonitor::new(Height::new(1), test_address(), SystemTime::now());
+        let value = test_value_id(0xA2);
+
+        monitor.attach_assembled_value_id(value);
+        monitor.attach_assembled_value_id(value);
+
+        assert_eq!(monitor.value_id, Some(value));
+    }
+
+    #[test]
+    fn test_attach_assembled_value_id_different_value_keeps_first() {
+        // Genuine round-0 equivocation: two distinct values assembled for the same height.
+        // The first recording wins; the second is flagged (logged) but does not overwrite.
+        let mut monitor = ProposalMonitor::new(Height::new(1), test_address(), SystemTime::now());
+        let first = test_value_id(0xA3);
+        let second = test_value_id(0xB3);
+
+        monitor.attach_assembled_value_id(first);
+        monitor.attach_assembled_value_id(second);
+
+        assert_eq!(monitor.value_id, Some(first));
+    }
+
+    #[test]
+    fn test_attach_assembled_value_id_noop_when_synced() {
+        // Value id and success are not meaningful for synced heights, so attach
+        // is a no-op.
+        let mut monitor = ProposalMonitor::new(Height::new(1), test_address(), SystemTime::now());
+        monitor.mark_synced();
+
+        monitor.attach_assembled_value_id(test_value_id(0xA4));
+
+        assert!(monitor.value_id.is_none());
         assert!(monitor.synced);
     }
 }

@@ -3,7 +3,7 @@
 Quake is a tool for deploying Arc testnets and running end-to-end tests.
 
 > **Quake testnets vs. the Arc Testnet:** Arc has a public, persistent
-> [Testnet](https://docs.arc.io/arc/tutorials/deploy-on-arc) open to
+> [Testnet](https://docs.arc.network/arc/tutorials/deploy-on-arc) open to
 > external developers and validators. Quake testnets are different: they are
 > private, ephemeral networks spun up on demand for development and CI, then
 > torn down when testing is complete. All mentions of "testnet" in this
@@ -38,6 +38,7 @@ __Table of contents__
       - [Upgrade](#upgrade)
       - [Chaos testing](#chaos-testing)
     - [The `valset` command](#the-valset-command)
+    - [The `rpc` command](#the-rpc-command)
     - [The `web` command](#the-web-command)
     - [The `mcp` command](#the-mcp-command)
     - [The `generate` command](#the-generate-command)
@@ -50,8 +51,10 @@ __Table of contents__
       - [Default Flags](#default-flags)
       - [Reserved Flags](#reserved-flags-do-not-override)
       - [Examples](#examples)
+    - [Environment Variables](#environment-variables)
     - [Voting Power](#voting-power)
     - [Node Groups and Persistent Peers](#node-groups-and-persistent-peers)
+    - [Per-node and per-group images](#per-node-and-per-group-images)
     - [Starting height](#starting-height)
     - [Subnets](#subnets)
     - [Latency emulation](#latency-emulation)
@@ -423,6 +426,102 @@ full details on the tracking architecture, CSV output format, and analysis tools
 Transactions that are never included in a block (dropped from mempool, rejected
 after submission) do not appear in the CSV.
 
+### The `run saturation` command
+
+`quake run saturation` orchestrates a multi-phase load experiment that ramps
+offered TPS across a configured rate list and decides when the cluster hits
+saturation. Each phase: warms the spammer state, runs the spammer at the
+target rate for a fixed window, drains the mempool, snapshots a wide set of
+Prometheus + RPC metrics, and appends a `PhaseRecord` to `experiment.json`.
+Six saturation signals (gas plateau, TPS plateau, TPS-ratio drop, latency
+spike, mempool growth, EL-CPU saturation) are evaluated between adjacent
+phases; the first phase where any signal fires is reported as the saturation
+point.
+
+The testnet must already be set up and running — the runner never starts or
+stops the cluster, only drives load against it. It works for both local
+(Docker Compose) and remote (AWS EC2) testnets transparently.
+
+```bash
+# Canonical saturation sweep against the non-validator submission tier.
+# Ramps 1000 → 2000 TPS in 100-TPS increments, 3 min per phase, with 30 s
+# warmup at the first rate and 30 s mempool drain between phases.
+./quake run saturation \
+    --targets ALL_NON_VALIDATORS \
+    --rampup 30s --cooldown 30s --phase-duration 3m \
+    --rates 1000-2000:100
+
+# Same against a remote testnet.
+./quake -f crates/quake/scenarios/examples/27nodes-saturation.toml \
+    run saturation --targets ALL_NON_VALIDATORS --rates 1000-2000:100
+
+# Discrete rate list instead of a range.
+./quake run saturation --targets ALL_NON_VALIDATORS --rates 500,1000,2000,4000
+```
+
+`--rates` accepts either a comma-separated list of single rates (`500,1000,4000`)
+or one or more inclusive ranges with a step (`1000-2000:100` → 1000, 1100, …,
+2000). The parser rejects degenerate inputs (`step > range`, `start == end`,
+non-evenly-dividing step, expansion above 256 phases) so an operator typo
+fails fast instead of producing a year-long run.
+
+Common flags (see `./quake run saturation --help` for the full list):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--rates` | `500,1000,2000,4000` | Offered-TPS sweep (singles, ranges, or a mix) |
+| `--rampup` | `90s` | Warmup phase duration at the first rate |
+| `--phase-duration` / `-d` | `5m` | Measured window per rate |
+| `--cooldown` | `90s` | Mempool drain between phases |
+| `--max-duration` | `3h` | Wall-clock hard limit |
+| `--generators` | `10` | Parallel spammer generators |
+| `--targets` | every node | Spammer submission targets (names or manifest groups) |
+| `--mix` | `transfer=35,legacy=25,erc20=25,guzzler=15` | Tx type blend |
+| `--guzzler-fn-weights` | `hash-loop=77@200,storage-write=3@1,storage-read=20@35` | Per-function weights + args for guzzler calls |
+| `--erc20-fn-weights` | `transfer=100` | Per-function weights for ERC-20 calls |
+| `--tx-input-size` | `0` | Extra random bytes appended to each transaction's input field |
+| `--output-dir` | `.quake/experiments` | Where `<experiment-id>/` is written |
+
+Each run produces an artifact directory like
+`.quake/experiments/saturation-20260626T140000Z/` containing:
+
+- `experiment.json` — full metadata, parameters, the manifest used, and every
+  phase's metric snapshot
+- `phase_<rate>/tx_latency_*.csv` — per-tx submit-to-finalized latencies
+- `metrics.tar.gz` — Prometheus snapshot for the experiment window (remote
+  testnets only)
+
+The HTML report scripts in [`scripts/`](../../scripts/) (`saturation_report.py`
+and `compare_saturation.py`) consume `experiment.json` to render
+self-contained charts and per-rate delta tables; see the "Saturation reports"
+section below for their invocation.
+
+### Saturation reports
+
+Two Python scripts in [`scripts/`](../../scripts/) render self-contained HTML
+reports from a saturation experiment's `experiment.json`. Both require
+`pip install matplotlib jinja2`.
+
+```bash
+# Single-experiment report: per-phase charts (TPS, gas/s, latency, CPU,
+# memory, mempool subpools), saturation-point callout, topology summary,
+# and a full manifest dump for reproducibility.
+python3 scripts/saturation_report.py .quake/experiments/saturation-20260626T140000Z
+
+# Side-by-side comparison of two experiments (e.g. baseline vs. a config
+# change). Writes a single HTML file with paired charts and a per-rate
+# row-by-row delta table.
+python3 scripts/compare_saturation.py \
+    .quake/experiments/saturation-20260626T140000Z-baseline \
+    .quake/experiments/saturation-20260626T140000Z-candidate \
+    /tmp/compare.html \
+    --label-a baseline --label-b candidate
+```
+
+The reports are entirely self-contained — charts are inlined as base64 PNGs
+and the manifest is embedded — so they can be attached to a Jira ticket or
+emailed without external assets.
+
 ### The `perturb` command
 Quake offers a number of perturbations that can be applied to nodes in the testnet.
 These are available as subcommands of the `perturb` command:
@@ -576,8 +675,11 @@ from the deployment YAML files will be used (namely, `arc_consensus:latest` and
 The `image_cl_upgrade` and `image_el_upgrade` fields specify which Docker image
 to use when upgrading nodes with the `upgrade` command.
 
-These are global settings that apply to all nodes, so you only need to declare them
-once. At the moment we don't support per-node tags.
+`image_cl_upgrade`/`image_el_upgrade` are global: `upgrade` switches every
+targeted node to the same upgrade image. The base `image_cl`/`image_el`, by
+contrast, can be overridden per node or per node group to boot a mixed-version
+network from genesis; see
+[Per-node and per-group images](#per-node-and-per-group-images).
 
 Usage examples:
 ```
@@ -620,6 +722,107 @@ Notes:
 - the command accepts only node names (`validator1`, `validator2`, etc.), that is,
 do not use container names (`validator1_cl`, `validator2_cl`).
 - it does not accept `*` wildcards.
+
+### The `rpc` command
+
+The `rpc` command fans an RPC request out to one or more nodes in parallel and
+prints each node's result. It targets two different protocols:
+
+| Subcommand | Layer | Protocol | Server |
+|------------|-------|----------|--------|
+| `quake rpc el`   | Execution Layer | JSON-RPC over HTTP | Reth |
+| `quake rpc cl`   | Consensus Layer | REST over HTTP | Malachite |
+| `quake rpc list` | both | shows CL endpoint catalog + Reth docs link | — |
+
+Requests run concurrently against every selected node. The process exits 0 only
+when every node succeeded; per-node errors are reported in the output without
+aborting the fan-out.
+
+#### `quake rpc el` — Execution Layer JSON-RPC
+
+```
+quake rpc el <METHOD> [TARGET] [PARAMS...] [--raw '<JSON>']
+              [--timeout SECS] [--retries N] [--format json|table|raw]
+```
+
+- `<METHOD>` is the JSON-RPC method, e.g. `admin_clearTxpool`, `eth_blockNumber`.
+- `[TARGET]` is a comma-separated list of node names or manifest groups
+  (`ALL_NODES`, `ALL_VALIDATORS`, `ALL_NON_VALIDATORS`, or any custom group).
+  When omitted, defaults to **all manifest nodes**.
+- `[PARAMS...]` are positional JSON-RPC params. Each one is auto-promoted via
+  `serde_json::from_str`: `42` becomes a number, `true` a boolean,
+  `[1,2,3]` an array, `{"a":1}` an object; anything that doesn't parse stays a
+  JSON string (so `0xabc` and `latest` pass through unchanged).
+- `--raw '<JSON>'` lets you supply the params as a literal JSON array (mutually
+  exclusive with positional params, for cases where auto-promotion is awkward).
+
+> [!IMPORTANT]
+> When you want to pass params alongside the default `ALL_NODES` target, write
+> the target slot explicitly: `quake rpc el eth_getBalance ALL_NODES 0xabc latest`.
+> The first positional after the method is always the target.
+
+Examples:
+```bash
+# Wipe every node's mempool (the original use case)
+quake rpc el admin_clearTxpool
+
+# Read the latest block number from every validator
+quake rpc el eth_blockNumber ALL_VALIDATORS
+
+# Single-node read with raw output suitable for piping
+quake rpc el eth_blockNumber validator1 --format raw
+
+# Account balance lookup against all nodes
+quake rpc el eth_getBalance ALL_NODES 0xaaaa...bbbb latest
+
+# Complex params via --raw
+quake rpc el eth_call validator1 --raw '[{"to":"0x...","data":"0x..."},"latest"]'
+```
+
+Reth's full JSON-RPC reference is at <https://reth.rs/jsonrpc/intro>.
+
+#### `quake rpc cl` — Consensus Layer REST
+
+```
+quake rpc cl <PATH> [TARGET] [--method GET|POST|DELETE|PUT|PATCH]
+              [--body '<JSON>'] [--timeout SECS] [--retries N]
+              [--format json|table|raw]
+```
+
+- `<PATH>` is the REST path. The leading `/` is optional and prepended
+  automatically (so `consensus-state` and `/consensus-state` are equivalent).
+  May include a query string (e.g. `'/commit?height=42'`).
+- `[TARGET]` mirrors the EL form; defaults to all consensus-enabled nodes.
+- `--method` defaults to `GET`. `--body` supplies a JSON body for mutating
+  verbs.
+
+Examples:
+```bash
+# Catalog of every CL endpoint (live, fetched from a running node)
+quake rpc list
+
+# Application status on every validator (leading slash optional)
+quake rpc cl /status ALL_VALIDATORS
+quake rpc cl status ALL_VALIDATORS
+
+# Latest commit certificate from one validator
+quake rpc cl /commit validator1
+
+# Commit at a specific height
+quake rpc cl '/commit?height=42' validator1
+
+# Add a persistent peer
+quake rpc cl /persistent-peers validator1 \
+  --method POST --body '{"addr":"/ip4/.../tcp/26656/p2p/12D3KooW..."}'
+```
+
+#### Output formats
+
+| `--format` | When to use |
+|------------|-------------|
+| `json` (default) | Newline-delimited JSON: `{"node":"validator1","result":...}` per line. Pipe to `jq`. |
+| `table`          | Two-column `NODE | RESULT` table sorted by node name. Best for ad-hoc inspection. |
+| `raw`            | Prints the result value only (no `node`/`result` envelope). Requires a single target node. |
 
 ### The `web` command
 
@@ -675,19 +878,13 @@ The server automatically discovers the most recently used testnet via `.quake/.l
    > Run the probe tests
    ```
 
-#### Transport modes
+#### Transport
 
-The MCP server supports two transport modes:
+The MCP server uses stdio transport. This is the standard mode used by Claude Code, Cursor, and similar clients that spawn the server as a subprocess.
 
-- **stdio** (default): The server communicates over stdin/stdout. This is the standard mode used by Claude Code, Cursor, and similar clients that spawn the server as a subprocess.
-  ```bash
-  quake mcp
-  ```
-
-- **HTTP+SSE** (`--http`): The server listens on a network port for remote MCP clients. Useful when the testnet is running on a remote machine.
-  ```bash
-  quake mcp --http --port 8080
-  ```
+```bash
+quake mcp
+```
 
 #### Available tools
 
@@ -823,7 +1020,42 @@ Monitoring services (Prometheus, Grafana, cAdvisor, Blockscout) can be controlle
 
 # Stop monitoring services and remove monitoring data
 ./quake monitoring clean
+
+# Download a Prometheus metrics snapshot + a single-node database snapshot
+./quake download
+
+# Or download just one:
+./quake download metrics
+./quake download db
 ```
+
+The `download` subcommand group queries the running Prometheus directly over
+HTTP (local Docker port for local testnets, SSM-tunnelled port for remote) and
+bundles each metric's `query_range` response into one archive. The `db`
+subcommand archives node database files (remote) or logs their on-disk paths
+(local). Common options:
+
+```bash
+# Limit to a time range
+./quake download metrics --from 2024-01-15T10:30:00Z --to 2024-01-15T12:00:00Z
+
+# Download only specific metrics (names go after `--`)
+./quake download metrics -- reth_db_size_bytes go_goroutines
+
+# Save to a custom path
+./quake download metrics -o /tmp/my-metrics.tar.gz
+
+# Download db from a specific node (default: first node in manifest)
+./quake download db -- validator1
+```
+
+Without `--from`, the start defaults to Prometheus' `headStats.minTime` (the
+current head block start, typically the last ~2 h). Without `--to`, defaults
+to now. Without `--step`, the step is auto-sized to keep the response below
+Prometheus' 11 000-point limit. Archives land in
+`.quake/metrics/<testnet>/` and `.quake/db/<testnet>/` by default; pass `-o`
+to override. `quake remote download {metrics,db}` is deprecated but kept as a
+backward-compatible alias.
 
 ## Manifest File Format
 
@@ -847,7 +1079,9 @@ Optional top-level settings:
   - for remote mode: `${IMAGE_REGISTRY_URL}/arc-consensus:<version>` and
     `${IMAGE_REGISTRY_URL}/arc-execution:<version>`, where `IMAGE_REGISTRY_URL`
     is taken from the `.env` file (see [Custom Docker images](#custom-docker-images)).
+  These are the network-wide defaults; individual nodes or node groups can override them (see [Per-node and per-group images](#per-node-and-per-group-images)).
 - **image_cl_upgrade**, **image_el_upgrade**: Docker images to use when upgrading containers with `quake perturb upgrade`. Required for upgrade scenarios; not supported in remote mode.
+- **group_images**: Per-node-group image overrides, declared as `[group_images.<group>]` with `image_cl`/`image_el` keys. See [Per-node and per-group images](#per-node-and-per-group-images).
 - **node_size**: EC2 instance type for validator/full nodes (e.g. `"m6a.4xlarge"`). Equivalent to
   the `--node-size` CLI flag. See [Instance sizing](#instance-sizing) for available options.
   **Remote mode only** — ignored in local mode (a warning is printed).
@@ -866,6 +1100,13 @@ Optional top-level settings:
   ceiling above the volume type's baseline. Only valid with `gp3`, `io1`, `io2`; range
   100–256000. Default: AMI's baseline IOPS for the chosen type. Equivalent to
   `--node-volume-iops`. **Remote mode only**.
+- **node_data_on_instance_store**: When `true`, mounts the local instance-store NVMe at
+  the node data directory so the EL/CL databases live on local disk instead of the root
+  EBS volume. Requires an instance type with local NVMe (e.g. `i4i.*`, `i3.*`, `m6id.*`);
+  multiple instance-store volumes are striped RAID0 into one device. A no-op on instance
+  types without instance store, leaving the data directory on EBS. Independent of
+  `node_volume_type`/`node_volume_iops`, which keep configuring the root EBS volume.
+  Equivalent to `--node-data-on-instance-store`. **Remote mode only**.
 - **el_cpu_limit**: Hard CPU cap for each EL container; reproduces production CPU quotas
   on the testnet. Whole or fractional CPUs (e.g. `0.5`). Maps to Docker Compose
   [`cpus`][compose-cpus]. Default: no limit (container uses all host CPUs).
@@ -894,28 +1135,12 @@ Nodes are defined as individual TOML sections with names starting with `validato
 ### Node Configuration
 
 Consensus Layer (CL) configuration is set under `cl.config.*` keys. The
-schema depends on the CL image version (`image_cl`):
-
-- **Modern CL (>= v0.5.0)**: the schema matches the `StartCmd` struct in
-  [`crates/malachite-cli/src/cmd/start.rs`](../malachite-cli/src/cmd/start.rs).
-  Keys are flat and map 1:1 to the `arc-node-consensus start` CLI flags
-  (e.g. `cl.config.log_level = "debug"` → `--log-level=debug`). Quake
-  translates the merged config into CLI flags at setup time and the node is
-  launched with no `config.toml`.
-- **Legacy CL (< v0.5.0)**: the schema matches the `Config` struct in
-  [`crates/types/src/config.rs`](../types/src/config.rs). Keys are nested
-  (e.g. `cl.config.logging.log_level = "debug"`) and the merged config is
-  written to `config.toml` at setup time. Legacy mode is scheduled for
-  deprecation.
-
-Quake detects which schema to use by parsing the `image_cl` tag; `latest`,
-missing tags, and unparsable tags are treated as Modern. The two formats
-are not interchangeable — `cl.config.log_level` on a Legacy image (and
-`cl.config.logging.log_level` on a Modern image) will fail to parse.
-Upgrading a running testnet across the legacy/modern boundary with
-`perturb upgrade` is **not supported**: the upgraded binary would start
-with no CLI flags. For upgrade scenarios, start the testnet on a Modern
-version.
+schema matches the `StartCmd` struct in
+[`crates/malachite-cli/src/cmd/start.rs`](../malachite-cli/src/cmd/start.rs).
+Keys are flat and map 1:1 to the `arc-node-consensus start` CLI flags
+(e.g. `cl.config.log_level = "debug"` → `--log-level=debug`). Quake
+translates the merged config into CLI flags at setup time; the CL does not
+read a `config.toml`.
 
 #### Matching Flags to the Target Image Version
 
@@ -936,7 +1161,7 @@ The default configuration of Reth (Execution Layer) is defined in
 [`crates/quake/src/manifest.rs`](src/manifest.rs). It can be set globally
 or for each node by prefixing the config field with `el.config.`.
 
-For example (Modern CL):
+For example:
 
 ```toml
 # Global settings that apply to all nodes
@@ -1118,6 +1343,41 @@ el.config.engine.persistence-threshold = 20
 > is automatically added to Reth's configuration. You don't need to include it
 > manually.
 
+### Environment Variables
+
+In addition to CLI flags (`el.config`/`cl.config`), you can set environment
+variables on a node's containers via the `el.env` (Execution Layer) and
+`cl.env` (Consensus Layer) tables. They follow the same precedence as config:
+global values are inherited by every node and per-node values override matching
+keys.
+
+```toml
+# Global: applies to every node's containers
+[el.env]
+RUST_LOG = "info"
+[cl.env]
+RUST_LOG = "info"
+
+[nodes.validator1.el.env]
+# Override the global value for this node's EL container only
+RUST_LOG = "debug,net::discovery=trace"
+
+[nodes.validator2.cl.env]
+# Halt this node's CL at a given height (testing graceful shutdown)
+ARC_HALT_AT_BLOCK_HEIGHT = 100
+```
+
+- `el.env` is applied to the EL (Reth) container; `cl.env` to the CL (Malachite)
+  container. Use the right table for the layer you want to affect.
+- Keys must be valid environment variable names (`^[A-Za-z_][A-Za-z0-9_]*$`).
+- Values may be strings, integers, floats, or booleans; non-scalars
+  (arrays/tables) are rejected. All values are emitted as strings.
+- Quake sets some environment variables by default (e.g. `RUST_LOG` and
+  `ARC_LOG_FILE` on the EL container, `ARC_HALT_AT_BLOCK_HEIGHT` on the CL
+  container). Setting the same key in `el.env`/`cl.env` **replaces** the default
+  rather than duplicating it.
+- Works in both local and remote deployments.
+
 ### Voting Power
 
 By default every validator in genesis receives a voting power of 20. To override this, set `cl_voting_power` on each validator node:
@@ -1197,6 +1457,50 @@ Note: A node is automatically excluded from its own persistent peers list.
 - If `cl_persistent_peers` is **specified with values**, the node will connect only to those specific peers.
 
 **`el.config.trusted_peers` (Execution Layer):** identical behavior to `cl_persistent_peers`.
+
+### Per-node and per-group images
+
+By default every node runs the global `image_cl`/`image_el` (see
+[Basic Structure](#basic-structure)). You can override the base image for
+individual nodes or whole node groups, which boots a **mixed-version network
+from genesis** without a rolling `perturb upgrade`. Useful for cross-version
+consensus testing, pre-rollout validation, and reproducing version skew.
+
+- **Per node:** set `image_cl`/`image_el` under a `[nodes.<name>]` section.
+- **Per group:** set them under `[group_images.<group>]`, keyed by any node
+  group (custom or a built-in such as `ALL_VALIDATORS`); applied to every member.
+
+Precedence, lowest to highest: **global image < node-group override < per-node
+override**. A node covered by two image-declaring groups for the same layer is
+rejected as ambiguous.
+
+```toml
+image_cl = "arc_consensus:latest"   # global base images
+image_el = "arc_execution:latest"
+
+[node_groups]
+OLDIES = ["validator4", "validator5"]
+
+# validator4 and validator5 run the pinned release instead of the global image
+[group_images.OLDIES]
+image_cl = "${IMAGE_REGISTRY_URL}/arc-consensus:0.6.0"
+image_el = "${IMAGE_REGISTRY_URL}/arc-execution:0.6.0"
+
+[nodes.validator1]
+[nodes.validator4]
+[nodes.full1]
+image_el = "${IMAGE_REGISTRY_URL}/arc-execution:0.6.0"  # inline override wins
+```
+
+**Compatibility (operator's responsibility).** Every image in a mixed network
+must agree on genesis state, the hardfork schedule, and on-disk db format. Quake
+enforces only `arc_consensus >= v0.5.0` and, in remote mode, a `ghcr.io/`
+registry for each image; genesis or db mismatches are not caught statically and
+fail loudly at startup. The base image is per-node, while the
+`image_cl_upgrade`/`image_el_upgrade` used by `perturb upgrade` stay global.
+
+A worked example ships at
+[`scenarios/mixed-version.toml`](scenarios/mixed-version.toml).
 
 ### Starting height
 
@@ -1462,6 +1766,30 @@ quake remote create --node-size t3.large --node-disk-gb 100 --cc-disk-gb 100
 quake start --remote --node-size t3.large --node-disk-gb 100
 ```
 
+#### Local NVMe vs EBS storage
+
+By default the node data directory lives on the root EBS volume. The
+`--node-data-on-instance-store` flag instead mounts the instance's local NVMe
+instance store at the data directory, so the EL/CL databases run on local disk.
+It requires an instance type that ships local NVMe (`i4i.*`, `i3.*`, `m6id.*`,
+`c6id.*`); on any other type it is a no-op and the data directory stays on EBS.
+Instance types with multiple instance-store volumes are striped RAID0 into a single
+device. The flag is independent of `--node-volume-type`/`--node-volume-iops`, which
+keep tuning the root EBS volume, so the two storage backends can be compared directly.
+
+```bash
+# Datadir on io2 EBS
+quake remote create --node-size i4i.xlarge \
+  --node-volume-type io2 --node-volume-iops 64000 --node-disk-gb 1000
+
+# Datadir on local NVMe (same instance type, only the storage backing differs)
+quake remote create --node-size i4i.xlarge --node-data-on-instance-store
+```
+
+The instance store is ephemeral: its contents are lost when the instance stops or
+terminates. That is fine for benchmarking and short-lived testnets, but never use
+it for state you need to keep.
+
 #### Node instances
 
 Each node runs an Execution Layer (EL) and a Consensus Layer (CL) container,
@@ -1644,7 +1972,7 @@ Initialize Terraform plugins and state. This step is required only once.
 
 Create EC2 instances for each node in the testnet, plus one extra for the Control Center (CC) server.
 ```bash
-./quake [-f <manifest>] remote create [--dry-run] [--yes] [--node-size <type>] [--cc-size <type>] [--node-disk-gb <GIB>] [--cc-disk-gb <GIB>]
+./quake [-f <manifest>] remote create [--dry-run] [--yes] [--node-size <type>] [--cc-size <type>] [--node-disk-gb <GIB>] [--cc-disk-gb <GIB>] [--node-data-on-instance-store]
 ```
 See [Instance sizing](#instance-sizing) for recommended instance types.
 
@@ -1656,7 +1984,11 @@ tunnels from local ports to remote ports.
 ```bash
 ./quake remote ssm start
 ```
-Note that tunnels are closed automatically after 20 minutes of inactivity.
+Note that tunnels are closed automatically after 20 minutes of inactivity. For
+long-running experiments, keep them alive in a separate terminal:
+```bash
+./quake remote ssm keep-alive 2h
+```
 
 Once the SSM session are established, we can log in via SSH to a node or CC, or
 run commands in the instances directly from the terminal:
@@ -1713,30 +2045,38 @@ run the spammer directly, remote testnets forward to the Control Center via SSH.
 All Spammer options are supported. `--targets` accepts comma-separated selectors
 including manifest node groups such as `ALL_VALIDATORS` or custom `[node_groups]`.
 
-Download diagnostic artifacts from the remote testnet:
+Download diagnostic artifacts from the testnet via the mode-agnostic
+`quake download` command group (`quake remote download
+{metrics,db}` is deprecated but kept as a backward-compatible alias):
 ```bash
-# Download all Prometheus metrics (covers the current head block, ~2h by default)
-./quake remote download metrics
+# Download both metrics and a single-node db snapshot
+./quake download
 
-# Download metrics for a specific time range
-./quake remote download metrics --from 2024-01-15T10:30:00Z --to 2024-01-15T12:00:00Z
+# Metrics only — covers the current head block (~2 h) by default
+./quake download metrics
 
-# Download specific metrics only (metric names go after --)
-./quake remote download metrics -- reth_db_size_bytes go_goroutines
+# Metrics for a specific time range
+./quake download metrics --from 2024-01-15T10:30:00Z --to 2024-01-15T12:00:00Z
 
-# Download node databases (both execution and consensus layers, all nodes)
-./quake remote download db
-
-# Download execution layer only, from specific nodes
-./quake remote download db --execution-only -- validator1 validator2
+# Specific metrics only (metric names go after --)
+./quake download metrics -- reth_db_size_bytes go_goroutines
 
 # Save to a custom output path
-./quake remote download metrics -o /tmp/my-metrics.tar.gz
-./quake remote download db -o /tmp/my-db.tar.gz
+./quake download metrics -o /tmp/my-metrics.tar.gz
+
+# Download node database (defaults to the first node in the manifest)
+./quake download db
+
+# Execution layer only, from specific nodes
+./quake download db --execution-only -- validator1 validator2
+
+# Save to a custom output path
+./quake download db -o /tmp/my-db.tar.gz
 ```
 
-Both `download` subcommands output a `.tar.gz` archive named `quake-metrics-<timestamp>.tar.gz` /
-`quake-db-<timestamp>.tar.gz` unless overridden with `-o`.
+Archives land in `.quake/metrics/<testnet>/quake-metrics-<timestamp>.tar.gz`
+and `.quake/db/<testnet>/quake-db-<timestamp>.tar.gz` by default; pass `-o`
+to override.
 
 Once finished with your tests, remember to destroy the remote infrastructure!
 ```bash
@@ -2053,6 +2393,25 @@ Configure RPC timeout for tests (default is 1 second):
 **net** - Network peer validation:
 - `peer_count` - Ensures all nodes have at least one peer connection
 - `cl_persistent_peers` - Verifies that persistent peers defined in the manifest are actually connected
+
+**infra** - Substrate-level readiness checks (excluded from the default `quake test` run):
+- `latency_emulation` - Verifies the `tc netem` rules inside each node's CL and EL containers
+  match the manifest. When `latency_emulation = true`, cross-checks each peer's expected
+  delay against `AWS_LATENCY_MATRIX` within ±10% tolerance. When `latency_emulation =
+  false`, asserts no `netem` qdiscs exist (catches stale rules left over from a prior
+  latency run).
+
+  > **Known limitation**: the check probes only the container's primary interface
+  > (`eth0`). Bridge nodes attached to multiple subnets (sentries, relayers) and
+  > local compose containers connected to `host-access` carry additional `eth*`
+  > interfaces that also receive `tc netem` rules; the check does not verify those.
+  > A node passing the check today guarantees the matrix on its primary
+  > interface only. Broken or stale rules on secondary interfaces are not caught.
+
+The `infra` group is intended as a pre-experiment readiness gate on a running
+testnet, not a CI signal. It shell-execs into every container, so cost scales
+with node count; especially relevant on remote testnets where each probe
+involves an SSH hop.
 
 ### Adding new tests
 

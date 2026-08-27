@@ -41,3 +41,4 @@ If a decision affects multiple components or has lasting implications, it likely
 | [0002](0002-block-dissemination-protocol.md) | Block Dissemination Protocol | Draft | 2026-01-13 |
 | [0003](0003-governance-configuration-and-validation.md) | Dynamic Block Gas Limit Configuration Validation | Draft | 2026-02-20 |
 | [0004](0004-base-fee-validation.md) | Base Fee Parameter Validation | Draft | 2026-03-03 |
+| [0005](0005-eip7702-authorization-list-recovery-bound.md) | EIP-7702 Authorization List Recovery Bound | Draft | 2026-07-06 |

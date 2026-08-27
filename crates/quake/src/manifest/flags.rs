@@ -51,6 +51,10 @@ static RESERVED_EL_FLAGS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     ])
 });
 
+/// reth booleans that default to true; their false value must be emitted
+/// explicitly (`--key=false`) instead of omitted.
+const EXPLICIT_BOOL_FLAGS: &[&str] = &["arc.builder.wait-for-payload", "storage.v2"];
+
 /// Flag to enable the HTTP-RPC server in the EL.
 /// Note: this is our custom key. Reth uses `--http` to enable HTTP,
 /// but in quake's manifests we use `http.enable = true` to comply with TOML syntax.
@@ -157,21 +161,13 @@ fn flatten_toml_to_flags(table: &toml::Table, prefix: String, flags: &mut Vec<St
                 flatten_toml_to_flags(nested, full_key, flags);
             }
             toml::Value::Boolean(b) => {
-                // arc.builder.wait-for-payload is the only boolean that defaults to
-                // true, so it must be explicitly set to false in the manifest for
-                // it to be disabled.
-                // For all other booleans, we follow the common convention of
-                // emitting a flag only when the value is true, and omitting it when
-                // false.
-                // NOTE: if we have more booleans with non-false defaults in the
-                // future, we may want to refactor this logic to use a list of
-                // "explicit" booleans that require `--key=true/false`, instead of
-                // hardcoding the every special case.
-                if full_key.eq("arc.builder.wait-for-payload") {
+                // EXPLICIT_BOOL_FLAGS default to true in reth, so false must be
+                // emitted as `--key=false` rather than omitted.
+                if EXPLICIT_BOOL_FLAGS.contains(&full_key.as_str()) {
                     flags.push(format!("--{}={}", full_key, b));
-                    return;
+                    continue;
                 }
-                // Other booleans: true = flag present, false = omit
+                // Other booleans: true = flag present, false = omit.
                 if *b {
                     let flag_key = match full_key.as_str() {
                         // Strip ".enable" suffix for http and ws flags only.
@@ -195,7 +191,7 @@ fn flatten_toml_to_flags(table: &toml::Table, prefix: String, flags: &mut Vec<St
                         _ => "vvv", // default to info
                     };
                     flags.push(format!("-{}", verbosity));
-                    return;
+                    continue;
                 }
                 flags.push(format!("--{}={}", full_key, s));
             }
@@ -272,6 +268,19 @@ mod tests {
 
         assert!(flags.contains(&"--txpool.nolocals".to_string()));
         assert!(!flags.iter().any(|f| f.contains("disable-discovery")));
+    }
+
+    #[test]
+    fn test_explicit_bool_flag_emits_false() {
+        use super::el_config_to_cli_flags;
+
+        // storage.v2 defaults to true in reth, so false must be emitted (not omitted)
+        // to initialize a node in v1 layout.
+        let flags = el_config_to_cli_flags(&toml::toml! { storage.v2 = false });
+        assert!(flags.contains(&"--storage.v2=false".to_string()));
+
+        let flags = el_config_to_cli_flags(&toml::toml! { storage.v2 = true });
+        assert!(flags.contains(&"--storage.v2=true".to_string()));
     }
 
     #[test]
@@ -436,6 +445,28 @@ mod tests {
                 "unexpected verbosity for log.level={level}",
             );
         }
+    }
+
+    #[test]
+    fn test_log_level_does_not_drop_sibling_flags() {
+        use super::el_config_to_cli_flags;
+
+        // `log.level` must not abort iteration over its sibling keys.
+        let mut log = toml::Table::new();
+        log.insert("level".to_string(), toml::Value::String("info".to_string()));
+        log.insert("stdout".to_string(), toml::Value::Boolean(true));
+        let mut table = toml::Table::new();
+        table.insert("log".to_string(), toml::Value::Table(log));
+
+        let flags = el_config_to_cli_flags(&table);
+        assert!(
+            flags.contains(&"-vvv".to_string()),
+            "log.level should still emit verbosity, got: {flags:?}"
+        );
+        assert!(
+            flags.contains(&"--log.stdout".to_string()),
+            "sibling flag after log.level must not be dropped, got: {flags:?}"
+        );
     }
 
     #[test]

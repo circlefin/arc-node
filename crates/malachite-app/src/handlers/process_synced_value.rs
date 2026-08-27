@@ -21,6 +21,7 @@ use eyre::Context;
 use ssz::Decode;
 use tracing::{error, warn};
 
+use malachitebft_app_channel::app::engine::host::SyncedValueOutcome;
 use malachitebft_app_channel::app::types::core::Round;
 use malachitebft_app_channel::app::types::ProposedValue;
 use malachitebft_app_channel::Reply;
@@ -28,13 +29,17 @@ use malachitebft_app_channel::Reply;
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use arc_consensus_types::{Address, ArcContext, Height};
 use arc_eth_engine::engine::Engine;
+use arc_eth_engine::json_structures::ExecutionBlock;
 use arc_eth_engine::persistence_meter::PersistenceMeter;
 
 use malachitebft_app_channel::app::types::core::Validity;
 
 use crate::block::ConsensusBlock;
 use crate::metrics::{AppMetrics, InvalidPayloadSource};
-use crate::payload::{validate_consensus_block, EnginePayloadValidator, PayloadValidator};
+use crate::payload::{
+    establish_block_validity, persist_invalid_payload_best_effort, BlockVerdict,
+    EnginePayloadValidator, PayloadValidator,
+};
 use crate::state::State;
 use crate::store::repositories::{InvalidPayloadsRepository, UndecidedBlocksRepository};
 use arc_consensus_db::invalid_payloads::InvalidPayload;
@@ -46,10 +51,14 @@ const SYNC_PERSISTENCE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// This is called when the consensus engine has received a value via sync for a given height and round.
 /// The application processes the synced value, validates it, and stores it for future use.
-/// If the value is valid, it is returned as a `ProposedValue` to the consensus engine.
-/// If the value is invalid, `None` is returned.
-/// In both cases, the block is stored in the undecided blocks store for use once consensus reaches
-/// that height.
+/// The reply tells the sync layer how the value was handled:
+/// - [`SyncedValueOutcome::Verdict`] — a validated `ProposedValue` (validity rides inside) to forward
+///   to consensus; the block is stored in the undecided blocks store for use once consensus reaches
+///   that height.
+/// - [`SyncedValueOutcome::PeerFault`] — the value is one no correct peer serves: undecodable
+///   bytes, or a self-reported hash that is not canonical. Penalize and re-request.
+/// - [`SyncedValueOutcome::LocalTransientError`] — a local/transient failure on our side (e.g. the EL
+///   being temporarily unavailable); the peer is innocent, so re-request without penalizing it.
 pub async fn handle(
     state: &mut State,
     engine: &Engine,
@@ -57,9 +66,9 @@ pub async fn handle(
     round: Round,
     proposer: Address,
     value_bytes: Bytes,
-    reply: Reply<Option<ProposedValue<ArcContext>>>,
+    reply: Reply<SyncedValueOutcome<ArcContext>>,
 ) -> Result<(), eyre::Error> {
-    let proposal = match on_process_synced_value(
+    let outcome = match on_process_synced_value(
         EnginePayloadValidator::new(engine, state.metrics()),
         state.store(),
         state.store(),
@@ -69,27 +78,25 @@ pub async fn handle(
         round,
         proposer,
         value_bytes,
+        state.previous_block,
     )
     .await
     {
-        Ok(proposal) => proposal,
+        Ok(Some(proposal)) => {
+            // Mark this height as synced for proposal monitoring.
+            if proposal.validity.is_valid() {
+                state.mark_height_synced(height);
+            }
+            SyncedValueOutcome::Verdict(proposal)
+        }
+        Ok(None) => SyncedValueOutcome::PeerFault,
         Err(e) => {
             error!(%height, %round, %proposer, "ProcessSyncedValue failed: {e:#}");
-            if let Err(send_err) = reply.send(None) {
-                error!("🔴 ProcessSyncedValue: Failed to send error reply: {send_err:?}");
-            }
-            return Err(e);
+            SyncedValueOutcome::LocalTransientError
         }
     };
 
-    // Mark this height as synced for proposal monitoring
-    if let Some(p) = &proposal
-        && p.validity.is_valid()
-    {
-        state.mark_height_synced(height);
-    }
-
-    if let Err(e) = reply.send(proposal) {
+    if let Err(e) = reply.send(outcome) {
         error!("🔴 ProcessSyncedValue: Failed to send reply: {e:?}");
     }
 
@@ -99,14 +106,18 @@ pub async fn handle(
 /// Processes a synced value received from a peer.
 ///
 /// Decodes the raw bytes into an [`ExecutionPayloadV3`], validates it via
-/// [`validate_consensus_block`], and stores the resulting [`ConsensusBlock`] as an
+/// [`establish_block_validity`], and stores the resulting [`ConsensusBlock`] as an
 /// undecided block. If the engine rejects the payload, an
 /// [`InvalidPayload`](crate::invalid_payloads::InvalidPayload) record is persisted
 /// through `store` and the block is kept with [`Validity::Invalid`] so that
 /// consensus can proceed with the correct validity information.
 ///
-/// Returns `Ok(None)` when the raw bytes cannot be SSZ-decoded (the error is logged
-/// but not propagated).
+/// Returns `Ok(None)` for bytes that do not SSZ-decode, and for a self-reported hash
+/// that is not canonical. Consensus reads that reply as a peer fault, penalizes the
+/// peer and requests the height from another one.
+///
+/// A payload that breaks a binding rule returns the `Invalid` verdict instead, so the
+/// value-id check after this reply can tell a bad peer from a real anomaly.
 #[allow(clippy::too_many_arguments)]
 async fn on_process_synced_value(
     engine: impl PayloadValidator,
@@ -118,6 +129,7 @@ async fn on_process_synced_value(
     round: Round,
     proposer: Address,
     value_bytes: Bytes,
+    previous_block: Option<ExecutionBlock>,
 ) -> eyre::Result<Option<ProposedValue<ArcContext>>> {
     let payload = match ExecutionPayloadV3::from_ssz_bytes(&value_bytes) {
         Ok(payload) => payload,
@@ -131,19 +143,22 @@ async fn on_process_synced_value(
             let invalid =
                 InvalidPayload::new_without_payload(height, round, proposer, &format!("{e:?}"));
 
-            invalid_payloads_repo.append(invalid).await.wrap_err_with(|| {
-                format!(
-                    "Failed to store invalid payload after receiving synced value (height={height}, round={round}, proposer={proposer})",
-                )
-            })?;
+            persist_invalid_payload_best_effort(
+                &invalid_payloads_repo,
+                invalid,
+                height,
+                round,
+                proposer,
+            )
+            .await;
 
             return Ok(None);
         }
     };
 
     // Build the block before validation so that
-    // `validate_consensus_block` can record an `InvalidPayload`
-    // with the full block context if the engine rejects it.
+    // `establish_block_validity` can record an `InvalidPayload`
+    // with the full block context if a rule or the engine rejects it.
     let mut block = ConsensusBlock {
         height,
         round,
@@ -154,8 +169,12 @@ async fn on_process_synced_value(
         signature: None,
     };
 
-    let validity = validate_consensus_block(
-        &engine, &block, &invalid_payloads_repo, metrics,
+    let verdict = establish_block_validity(
+        &engine,
+        &block,
+        previous_block.as_ref(),
+        &invalid_payloads_repo,
+        metrics,
     )
     .await
     .wrap_err_with(|| {
@@ -165,26 +184,52 @@ async fn on_process_synced_value(
         )
     })?;
 
+    let validity = verdict.validity();
     block.validity = validity;
 
-    let block_hash = block.block_hash();
+    let block_hash = block.self_reported_block_hash();
 
     if !validity.is_valid() {
         error!(%height, %round, %proposer, %block_hash, "❌ Received invalid payload via sync");
     }
 
+    // Don't key a non-canonical block into the undecided table; its invalid
+    // record was already persisted by `establish_block_validity`.
+    if !block.may_be_stored_as_undecided() {
+        warn!(
+            %height, %round, %proposer, %block_hash,
+            "Synced value self-reported hash is not canonical; not storing as undecided",
+        );
+        return Ok(None);
+    }
+
+    // An unbound payload keeps the `Invalid` verdict and goes to consensus, which
+    // compares the value id to the certificate after this reply. That comparison
+    // separates the two causes this code cannot: bytes no certificate covers, and a
+    // payload the network really committed. A peer fault here would be right for the
+    // first only, and would blame honest peers for a state this node holds.
+    //
+    // It skips dedup on the way: a row already stored `Valid` would otherwise answer
+    // for the fresh `Invalid` verdict and carry the payload forward.
+    let is_unbound = matches!(verdict, BlockVerdict::Unbound(_));
+
     // If a undecided block for the sync value height round and hash exists then skip `wait_for_persisted_block`
     // so consensus path is not blocked on EL persistence.
-    if let Some(existing) = undecided_blocks_repo
-        .get_by_round_and_hash(height, round, block_hash)
-        .await
-        .wrap_err_with(|| {
-            format!(
-                "Failed to query undecided blocks repo for dedup at \
-                 height={height}, round={round}, block_hash={block_hash}"
-            )
-        })?
-    {
+    let existing = if is_unbound {
+        None
+    } else {
+        undecided_blocks_repo
+            .get_by_round_and_hash(height, round, block_hash)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "Failed to query undecided blocks repo for dedup at \
+                     height={height}, round={round}, block_hash={block_hash}"
+                )
+            })?
+    };
+
+    if let Some(existing) = existing {
         debug_assert_eq!(
             existing.validity, validity,
             "dedup hit at height={height}, round={round}, block_hash={block_hash}: \
@@ -247,6 +292,252 @@ mod tests {
             .returning(|_, _, _| Ok(None));
     }
 
+    /// Builds an arbitrary payload that carries `height` as its block number.
+    fn payload_at(u: &mut Unstructured, height: Height) -> ExecutionPayloadV3 {
+        let mut payload = ExecutionPayloadV3::arbitrary(u).unwrap();
+        payload.payload_inner.payload_inner.block_number = height.as_u64();
+        payload
+    }
+
+    /// Builds a payload for `height` whose embedded `block_hash` equals the hash
+    /// recomputed from its contents.
+    fn canonical_payload(u: &mut Unstructured, height: Height) -> ExecutionPayloadV3 {
+        let mut payload = payload_at(u, height);
+        let canonical = arc_consensus_types::block::canonical_block_hash(&payload)
+            .expect("recompute canonical hash");
+        payload.payload_inner.payload_inner.block_hash = canonical;
+        payload
+    }
+
+    /// A genuine block from height 5, synced as the value for height 11. The
+    /// verdict is `Invalid` and the engine never sees the payload.
+    #[tokio::test]
+    async fn on_process_synced_value_rejects_a_payload_from_another_height() {
+        let mut u = Unstructured::new(&[0u8; 512]);
+
+        let height = Height::new(11);
+        let round = Round::new(0);
+        let proposer = Address::new([0u8; 20]);
+        let payload = canonical_payload(&mut u, Height::new(5));
+        let value_bytes = Bytes::from(payload.as_ssz_bytes());
+
+        let mut engine = MockPayloadValidator::new();
+        engine.expect_validate_payload().times(0);
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        expect_no_undecided_dedup_hit(&mut undecided);
+        undecided
+            .expect_store_undecided_block()
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid
+            .expect_append()
+            .times(1)
+            .withf(|ip: &InvalidPayload| ip.reason.contains("does not match consensus height"))
+            .returning(|_| Ok(()));
+
+        let metrics = AppMetrics::default();
+        let outcome = on_process_synced_value(
+            engine,
+            undecided,
+            invalid,
+            NoopPersistenceMeter,
+            &metrics,
+            height,
+            round,
+            proposer,
+            value_bytes,
+            None,
+        )
+        .await
+        .expect("an unbound synced value is a verdict, not a failure");
+
+        let proposal = outcome.expect("the verdict must reach consensus");
+        assert_eq!(proposal.validity, Validity::Invalid);
+        assert_eq!(
+            metrics.get_invalid_payloads_count_by_source(InvalidPayloadSource::PayloadHeight),
+            1,
+        );
+    }
+
+    /// A payload at the right height that extends some other block. This is the
+    /// parent rule reaching an ingestion path, and the reason it records.
+    #[tokio::test]
+    async fn on_process_synced_value_rejects_a_payload_that_extends_another_block() {
+        let mut u = Unstructured::new(&[0u8; 512]);
+
+        let height = Height::new(11);
+        let round = Round::new(0);
+        let proposer = Address::new([0u8; 20]);
+        let payload = canonical_payload(&mut u, height);
+        let value_bytes = Bytes::from(payload.as_ssz_bytes());
+
+        // The immediate predecessor, and not the block the payload extends.
+        let previous_block = ExecutionBlock {
+            block_hash: arc_consensus_types::B256::repeat_byte(0xAB),
+            block_number: 10,
+            parent_hash: arc_consensus_types::B256::ZERO,
+            timestamp: 0,
+        };
+
+        let mut engine = MockPayloadValidator::new();
+        engine.expect_validate_payload().times(0);
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        expect_no_undecided_dedup_hit(&mut undecided);
+        undecided
+            .expect_store_undecided_block()
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid
+            .expect_append()
+            .times(1)
+            .withf(|ip: &InvalidPayload| {
+                ip.reason
+                    .contains("is not the block finalized at the previous height")
+            })
+            .returning(|_| Ok(()));
+
+        let metrics = AppMetrics::default();
+        let outcome = on_process_synced_value(
+            engine,
+            undecided,
+            invalid,
+            NoopPersistenceMeter,
+            &metrics,
+            height,
+            round,
+            proposer,
+            value_bytes,
+            Some(previous_block),
+        )
+        .await
+        .expect("an unbound synced value is a verdict, not a failure");
+
+        let proposal = outcome.expect("the verdict must reach consensus");
+        assert_eq!(proposal.validity, Validity::Invalid);
+    }
+
+    /// A row stored `Valid` while `previous_block` lagged, re-evaluated once the
+    /// parent rule applies. Dedup must not answer for the fresh verdict: the stored
+    /// row would carry the payload forward as `Valid`.
+    #[tokio::test]
+    async fn on_process_synced_value_does_not_dedup_against_a_stored_row_after_a_binding_error() {
+        let mut u = Unstructured::new(&[0u8; 512]);
+
+        let height = Height::new(11);
+        let round = Round::new(0);
+        let proposer = Address::new([0u8; 20]);
+        let payload = canonical_payload(&mut u, height);
+        let value_bytes = Bytes::from(payload.as_ssz_bytes());
+
+        let previous_block = ExecutionBlock {
+            block_hash: arc_consensus_types::B256::repeat_byte(0xAB),
+            block_number: 10,
+            parent_hash: arc_consensus_types::B256::ZERO,
+            timestamp: 0,
+        };
+
+        let mut engine = MockPayloadValidator::new();
+        engine.expect_validate_payload().times(0);
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        // Dedup reads the stored row. A binding failure never asks for it, so a row
+        // already stored `Valid` cannot answer in place of the fresh verdict.
+        undecided.expect_get_by_round_and_hash().times(0);
+        undecided
+            .expect_store_undecided_block()
+            .times(1)
+            .withf(|b: &ConsensusBlock| b.validity == Validity::Invalid)
+            .returning(|_| Ok(()));
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(1).returning(|_| Ok(()));
+
+        let metrics = AppMetrics::default();
+        let outcome = on_process_synced_value(
+            engine,
+            undecided,
+            invalid,
+            NoopPersistenceMeter,
+            &metrics,
+            height,
+            round,
+            proposer,
+            value_bytes,
+            Some(previous_block),
+        )
+        .await
+        .expect("an unbound synced value is a verdict, not a failure");
+
+        let proposal = outcome.expect("the verdict must reach consensus");
+        assert_eq!(proposal.validity, Validity::Invalid);
+        assert_eq!(
+            metrics.get_invalid_payloads_count_by_source(InvalidPayloadSource::PayloadParent),
+            1,
+        );
+    }
+
+    /// Batch value sync delivers heights ahead of the node's previous block. That
+    /// block is not the parent of the payload, so only the engine decides here.
+    #[tokio::test]
+    async fn on_process_synced_value_skips_the_parent_rule_for_a_height_ahead() {
+        let mut u = Unstructured::new(&[0u8; 512]);
+
+        let height = Height::new(11);
+        let round = Round::new(0);
+        let proposer = Address::new([0u8; 20]);
+        let payload = canonical_payload(&mut u, height);
+        let value_bytes = Bytes::from(payload.as_ssz_bytes());
+
+        let previous_block = ExecutionBlock {
+            block_hash: arc_consensus_types::B256::repeat_byte(0xAB),
+            block_number: 7,
+            parent_hash: arc_consensus_types::B256::ZERO,
+            timestamp: 0,
+        };
+
+        let mut engine = MockPayloadValidator::new();
+        engine
+            .expect_validate_payload()
+            .times(1)
+            .returning(|_| Ok(PayloadValidationResult::Valid));
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        expect_no_undecided_dedup_hit(&mut undecided);
+        undecided
+            .expect_store_undecided_block()
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(0);
+
+        let metrics = AppMetrics::default();
+        let proposal = on_process_synced_value(
+            engine,
+            undecided,
+            invalid,
+            NoopPersistenceMeter,
+            &metrics,
+            height,
+            round,
+            proposer,
+            value_bytes,
+            Some(previous_block),
+        )
+        .await
+        .expect("should succeed")
+        .expect("the verdict reaches consensus");
+
+        assert_eq!(proposal.validity, Validity::Valid);
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
+    }
+
     async fn test_on_process_synced_value_validity(
         result: PayloadValidationResult,
         expected: Validity,
@@ -256,7 +547,7 @@ mod tests {
         let height = Height::new(1);
         let round = Round::new(0);
         let proposer = Address::new([0u8; 20]);
-        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+        let payload = canonical_payload(&mut u, height);
         let value_bytes = Bytes::from(payload.as_ssz_bytes());
 
         let mut engine = MockPayloadValidator::new();
@@ -293,6 +584,7 @@ mod tests {
             round,
             proposer,
             value_bytes,
+            None,
         )
         .await
         .expect("Failed to process synced value") else {
@@ -319,6 +611,122 @@ mod tests {
     async fn on_process_synced_value_valid_payload() {
         test_on_process_synced_value_validity(PayloadValidationResult::Valid, Validity::Valid)
             .await;
+    }
+
+    /// The value-sync path applies no clock-skew check: a value whose timestamp is
+    /// far ahead of local time still validates execution-`Valid` and is stored
+    /// `Valid`, so a clock-lagging node adopts a certificate-backed block with no
+    /// restart. The skew guard lives only on the live prevote path.
+    #[tokio::test]
+    async fn on_process_synced_value_ignores_clock_skew_for_future_timestamp() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mut u = Unstructured::new(&[0u8; 512]);
+
+        let height = Height::new(9);
+        let round = Round::new(0);
+        let proposer = Address::new([0u8; 20]);
+
+        // Stamp the payload well beyond any clock-skew tolerance ahead of now.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut payload = payload_at(&mut u, height);
+        payload.payload_inner.payload_inner.timestamp = now + 3600;
+        payload.payload_inner.payload_inner.block_hash =
+            arc_consensus_types::block::canonical_block_hash(&payload)
+                .expect("recompute canonical hash");
+        let value_bytes = Bytes::from(payload.as_ssz_bytes());
+
+        let mut engine = MockPayloadValidator::new();
+        engine
+            .expect_validate_payload()
+            .times(1)
+            .returning(|_| Ok(PayloadValidationResult::Valid));
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        expect_no_undecided_dedup_hit(&mut undecided);
+        undecided
+            .expect_store_undecided_block()
+            .withf(|b: &ConsensusBlock| b.validity == Validity::Valid)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(0);
+
+        let metrics = AppMetrics::default();
+        let proposal = on_process_synced_value(
+            engine,
+            undecided,
+            invalid,
+            NoopPersistenceMeter,
+            &metrics,
+            height,
+            round,
+            proposer,
+            value_bytes,
+            None,
+        )
+        .await
+        .expect("sync path must not fail on a future-timestamp value")
+        .expect("the verdict reaches consensus");
+
+        assert_eq!(
+            proposal.validity,
+            Validity::Valid,
+            "the value-sync path ignores clock skew and adopts the value",
+        );
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
+    }
+
+    /// A synced value whose self-reported hash does not match its payload
+    /// contents is recorded as invalid and never stored as an undecided block,
+    /// so it cannot overwrite a valid block advertised under the same hash.
+    #[tokio::test]
+    async fn on_process_synced_value_non_canonical_hash_is_not_stored() {
+        let mut u = Unstructured::new(&[0u8; 512]);
+
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let proposer = Address::new([0u8; 20]);
+
+        let mut payload = canonical_payload(&mut u, height);
+        payload.payload_inner.payload_inner.block_hash =
+            arc_consensus_types::B256::repeat_byte(0xAB);
+        let value_bytes = Bytes::from(payload.as_ssz_bytes());
+
+        let mut engine = MockPayloadValidator::new();
+        engine.expect_validate_payload().returning(|_| {
+            Ok(PayloadValidationResult::Invalid {
+                reason: "block hash mismatch".into(),
+            })
+        });
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided.expect_store_undecided_block().times(0);
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(1).returning(|_| Ok(()));
+
+        let metrics = AppMetrics::default();
+        let result = on_process_synced_value(
+            engine,
+            undecided,
+            invalid,
+            NoopPersistenceMeter,
+            &metrics,
+            height,
+            round,
+            proposer,
+            value_bytes,
+            None,
+        )
+        .await
+        .expect("Failed to process synced value");
+
+        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -349,6 +757,7 @@ mod tests {
             round,
             proposer,
             value_bytes,
+            None,
         )
         .await
         .expect("Failed to process synced value");
@@ -368,7 +777,7 @@ mod tests {
         let height = Height::new(1);
         let round = Round::new(0);
         let proposer = Address::new([0u8; 20]);
-        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+        let payload = payload_at(&mut u, height);
         let value_bytes = Bytes::from(payload.as_ssz_bytes());
 
         let mut engine = MockPayloadValidator::new();
@@ -393,6 +802,7 @@ mod tests {
             round,
             proposer,
             value_bytes,
+            None,
         )
         .await;
 
@@ -430,10 +840,15 @@ mod tests {
             round,
             proposer,
             value_bytes,
+            None,
         )
-        .await;
+        .await
+        .expect("forensics persistence failure must not propagate");
 
-        assert!(result.is_err());
+        assert!(
+            result.is_none(),
+            "an undecodable synced value yields no proposal even when the forensic record fails to persist",
+        );
         assert_eq!(metrics.get_invalid_payloads_count(), 1);
     }
 
@@ -444,7 +859,7 @@ mod tests {
         let height = Height::new(1);
         let round = Round::new(0);
         let proposer = Address::new([0u8; 20]);
-        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+        let payload = payload_at(&mut u, height);
         let value_bytes = Bytes::from(payload.as_ssz_bytes());
 
         let mut engine = MockPayloadValidator::new();
@@ -473,6 +888,7 @@ mod tests {
             round,
             proposer,
             value_bytes,
+            None,
         )
         .await;
 
@@ -488,7 +904,7 @@ mod tests {
         let height = Height::new(42);
         let round = Round::new(0);
         let proposer = Address::new([0u8; 20]);
-        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+        let payload = payload_at(&mut u, height);
         let value_bytes = Bytes::from(payload.as_ssz_bytes());
 
         let mut engine = MockPayloadValidator::new();
@@ -524,6 +940,7 @@ mod tests {
             round,
             proposer,
             value_bytes,
+            None,
         )
         .await
         .expect("should succeed");
@@ -540,7 +957,7 @@ mod tests {
         let height = Height::new(42);
         let round = Round::new(0);
         let proposer = Address::new([0u8; 20]);
-        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+        let payload = canonical_payload(&mut u, height);
         let value_bytes = Bytes::from(payload.as_ssz_bytes());
 
         let mut engine = MockPayloadValidator::new();
@@ -574,6 +991,7 @@ mod tests {
             round,
             proposer,
             value_bytes,
+            None,
         )
         .await
         .expect("should succeed");
@@ -590,7 +1008,7 @@ mod tests {
         let height = Height::new(7);
         let round = Round::new(0);
         let proposer = Address::new([0u8; 20]);
-        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+        let payload = payload_at(&mut u, height);
         let value_bytes = Bytes::from(payload.as_ssz_bytes());
 
         let mut engine = MockPayloadValidator::new();
@@ -626,6 +1044,7 @@ mod tests {
             round,
             proposer,
             value_bytes,
+            None,
         )
         .await
         .expect("should succeed even when meter fails");
@@ -653,7 +1072,7 @@ mod tests {
         let height = Height::new(42);
         let round = Round::new(0);
         let proposer = Address::new([1u8; 20]);
-        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+        let payload = payload_at(&mut u, height);
         let block_hash = payload.payload_inner.payload_inner.block_hash;
         let value_bytes = Bytes::from(payload.as_ssz_bytes());
 
@@ -702,6 +1121,7 @@ mod tests {
             round,
             proposer,
             value_bytes,
+            None,
         )
         .await
         .expect("should succeed via dedup short-circuit");

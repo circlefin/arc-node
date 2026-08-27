@@ -131,12 +131,42 @@ pub struct SpammerArgs {
     /// Can only be used when `--tx-latency` is enabled.
     #[clap(long, requires = "tx_latency", global = true)]
     pub csv_dir: Option<PathBuf>,
+    /// Path to write the run's summary JSON.
+    ///
+    /// When set, the spammer writes a `SpammerSummary` (timestamps, offered
+    /// TPS, offered bytes/s, RPC error counts) to the given path at the end
+    /// of the run. Consumed by orchestrators (e.g. `quake run saturation`)
+    /// to recover phase metrics without parsing stdout. Independent of
+    /// `--csv-dir` / `--tx-latency`.
+    #[clap(long, global = true)]
+    pub summary_json: Option<PathBuf>,
+    /// Path to write the captured `SpammerState` as JSON at the end of the run.
+    ///
+    /// Lets a later spammer invocation resume against the same accounts via
+    /// `--state-in` without re-deriving BIP32 keys or re-querying nonces.
+    /// Used by `quake run saturation` remote mode to hand state from one
+    /// phase's subprocess to the next.
+    #[clap(long, global = true)]
+    pub state_out: Option<PathBuf>,
+    /// Path to read a previously-written `SpammerState` JSON to resume from.
+    ///
+    /// When set, the spammer skips fresh account initialisation and
+    /// reconstructs its generators from the saved state. The accompanying
+    /// `--num-generators` and partition mode must match the saved state.
+    #[clap(long, global = true)]
+    pub state_in: Option<PathBuf>,
     /// Wait for the response from Reth after sending a transaction
     ///
     /// If false, the output will only show the number of transactions sent and its length in bytes.
     /// If true, the output will additionally show error messages if any, but it will slow down the execution.
     #[clap(short = 'w', long, default_value = "false", global = true)]
     pub wait_response: bool,
+    /// Suppress all log output (gates the tracing subscriber).
+    ///
+    /// Set automatically by `quake -q load`/`spam` so the remote spammer
+    /// stays quiet; can also be passed directly to the `spammer` binary.
+    #[clap(long, default_value = "false", global = true)]
+    pub silent: bool,
     /// Number of reconnection attempts when a connection fails
     #[clap(long, default_value_t = defaults::RECONNECT_ATTEMPTS, global = true)]
     pub reconnect_attempts: u32,
@@ -230,7 +260,29 @@ impl SpammerArgs {
         bool_flag!(args, "-l", self.query_latest_nonce);
         bool_flag!(args, "-p", self.show_pool_status);
         bool_flag!(args, "--tx-latency", self.tx_latency);
+        if let Some(ref dir) = self.csv_dir {
+            args.extend(["--csv-dir".to_string(), dir.to_string_lossy().into_owned()]);
+        }
+        if let Some(ref path) = self.summary_json {
+            args.extend([
+                "--summary-json".to_string(),
+                path.to_string_lossy().into_owned(),
+            ]);
+        }
+        if let Some(ref path) = self.state_out {
+            args.extend([
+                "--state-out".to_string(),
+                path.to_string_lossy().into_owned(),
+            ]);
+        }
+        if let Some(ref path) = self.state_in {
+            args.extend([
+                "--state-in".to_string(),
+                path.to_string_lossy().into_owned(),
+            ]);
+        }
         bool_flag!(args, "-w", self.wait_response);
+        bool_flag!(args, "--silent", self.silent);
 
         flag!(
             args,
@@ -373,7 +425,11 @@ mod tests {
             show_pool_status: false,
             tx_latency: false,
             csv_dir: None,
+            summary_json: None,
+            state_out: None,
+            state_in: None,
             wait_response: false,
+            silent: false,
             reconnect_attempts: defaults::RECONNECT_ATTEMPTS,
             reconnect_period: defaults::RECONNECT_PERIOD,
             tx_type_mix: None,
@@ -406,6 +462,19 @@ mod tests {
         let t_idx = cli.iter().position(|a| a == "-t").unwrap();
         assert_eq!(cli[t_idx + 1], "60");
         assert!(cli.contains(&"-i".to_string()));
+    }
+
+    #[test]
+    fn to_cli_args_silent_only_emitted_when_set() {
+        assert!(!default_args()
+            .to_cli_args()
+            .contains(&"--silent".to_string()));
+
+        let args = SpammerArgs {
+            silent: true,
+            ..default_args()
+        };
+        assert!(args.to_cli_args().contains(&"--silent".to_string()));
     }
 
     #[test]

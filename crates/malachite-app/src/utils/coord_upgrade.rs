@@ -23,8 +23,18 @@ use tracing::{info, warn};
 use crate::store::Store;
 
 #[derive(Debug, thiserror::Error)]
-#[error("Halt and wait for external termination signal")]
-pub struct HaltAndWait;
+#[error("Halt and wait for external termination signal: {reason}")]
+pub struct HaltAndWait {
+    pub reason: String,
+}
+
+impl HaltAndWait {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
 
 /// Check if the next height matches the configured halt height.
 pub async fn check_halt_height(
@@ -45,7 +55,9 @@ pub async fn check_halt_height(
             info!("Sleeping {SLEEP_BEFORE_HALT:?} before halting...");
             sleep(Duration::from_secs(10)).await;
 
-            return Err(HaltAndWait.into());
+            return Err(
+                HaltAndWait::new(format!("reached configured halt height {height}")).into(),
+            );
         }
     }
 

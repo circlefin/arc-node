@@ -14,13 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use color_eyre::eyre::{bail, Context, OptionExt, Result};
+use color_eyre::eyre::{bail, eyre, Context, OptionExt, Result};
 use indexmap::IndexMap;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -117,7 +117,7 @@ impl Region {
     }
 
     /// Get index for latency matrix
-    fn index(&self) -> usize {
+    pub(crate) fn index(&self) -> usize {
         *self as usize
     }
 
@@ -407,4 +407,219 @@ fn assign_regions(
     }
 
     Ok(node_regions)
+}
+
+/// Read `region_assignments.json` from a testnet's directory and parse each
+/// region into a [`Region`]. Used by readiness checks that need to know which
+/// region every node was assigned.
+pub(crate) fn load_region_assignments(testnet_dir: &Path) -> Result<IndexMap<String, Region>> {
+    let path = testnet_dir.join(REGION_ASSIGNMENTS_FILENAME);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(IndexMap::new()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to read {}", path.display()));
+        }
+    };
+    let parsed: IndexMap<String, String> = serde_json::from_str(&raw)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    let mut out = IndexMap::new();
+    for (node, region) in parsed {
+        let region = Region::from_str(&region).map_err(|_| {
+            eyre!(
+                "invalid region '{region}' for node '{node}' in {}",
+                path.display()
+            )
+        })?;
+        out.insert(node, region);
+    }
+    Ok(out)
+}
+
+/// For each node, build `peer_ip_hex → expected_delay_ms`.
+pub(crate) fn build_expected_delays(
+    testnet_dir: &Path,
+    nodes_metadata: &NodesMetadata,
+) -> Result<HashMap<String, HashMap<String, u32>>> {
+    let regions = &load_region_assignments(testnet_dir)?;
+
+    let mut out = HashMap::new();
+    for (node, region) in regions {
+        let mut map = HashMap::new();
+        for (peer, peer_region) in regions {
+            if peer == node {
+                continue;
+            }
+            let delay = AWS_LATENCY_MATRIX[region.index()][peer_region.index()];
+            if delay == 0 {
+                continue;
+            }
+            let mut ips = nodes_metadata.get_consensus_ip_addresses(peer);
+            ips.extend(nodes_metadata.get_execution_ip_addresses(peer));
+            for ip in ips {
+                if let Ok(hex) = ipv4_to_hex(&ip) {
+                    map.insert(hex, delay);
+                }
+            }
+        }
+        out.insert(node.clone(), map);
+    }
+    Ok(out)
+}
+
+// ── Parsers ────────────────────────────────────────────────────────────
+
+/// Extract `handle → base_delay_ms` from `tc qdisc show` output.
+///
+/// Sample line we match:
+///   `qdisc netem 11: parent 1:11 limit 1000 delay 35ms 1750us 5%`.
+pub(crate) fn parse_netem_qdiscs(out: &str) -> BTreeMap<String, u32> {
+    let mut result = BTreeMap::new();
+    for line in out.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.first() != Some(&"qdisc") || tokens.get(1) != Some(&"netem") {
+            continue;
+        }
+        let Some(handle_tok) = tokens.get(2) else {
+            continue;
+        };
+        let handle = handle_tok.trim_end_matches(':').to_string();
+        if let Some(idx) = tokens.iter().position(|t| *t == "delay") {
+            if let Some(delay_ms) = tokens.get(idx + 1).and_then(parse_delay_ms) {
+                result.insert(handle, delay_ms);
+            }
+        }
+    }
+    result
+}
+
+/// Parse a `delay <N>ms` token. Accepts integer `35ms`; rejects unit-less or
+/// non-`ms` forms so `1750us` (the jitter token) doesn't get misread as 1750ms.
+pub(crate) fn parse_delay_ms(token: &&str) -> Option<u32> {
+    token.strip_suffix("ms").and_then(|n| n.parse::<u32>().ok())
+}
+
+/// Extract `peer_ip_hex → handle` from `tc filter show` output.
+///
+/// `flowid 1:<N>` appears on the filter's leader line; the IP is on the
+/// following `match` continuation line as `<hex>/<mask> at 16`.
+pub(crate) fn parse_u32_filters(out: &str) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    let mut current_handle: Option<String> = None;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if let Some(idx) = trimmed.find("flowid 1:") {
+            let rest = &trimmed[idx + "flowid 1:".len()..];
+            let handle: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !handle.is_empty() {
+                current_handle = Some(handle);
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("match ") {
+            let mut tokens = rest.split_whitespace();
+            let token = tokens.next().unwrap_or("");
+            if tokens.next() != Some("at") || tokens.next() != Some("16") {
+                continue;
+            }
+            if let Some((hex, _mask)) = token.split_once('/') {
+                if let Some(handle) = current_handle.as_ref() {
+                    result.insert(hex.to_string(), handle.clone());
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Convert `"10.0.0.5"` → `"0a000005"` (lowercase hex, big-endian).
+fn ipv4_to_hex(ip: &str) -> Result<String> {
+    let octets: Vec<u8> = ip
+        .split('.')
+        .map(|s| {
+            s.parse::<u8>()
+                .map_err(|_| eyre!("invalid ip octet in {ip}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if octets.len() != 4 {
+        return Err(eyre!("ip {ip} is not v4"));
+    }
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        octets[0], octets[1], octets[2], octets[3]
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_to_hex_basic() {
+        assert_eq!(ipv4_to_hex("10.0.0.5").unwrap(), "0a000005");
+        assert_eq!(ipv4_to_hex("172.19.1.2").unwrap(), "ac130102");
+        assert_eq!(ipv4_to_hex("255.255.255.255").unwrap(), "ffffffff");
+    }
+
+    #[test]
+    fn ipv4_to_hex_rejects_bad_input() {
+        assert!(ipv4_to_hex("not.an.ip.address").is_err());
+        assert!(ipv4_to_hex("1.2.3").is_err());
+        assert!(ipv4_to_hex("1.2.3.4.5").is_err());
+    }
+
+    #[test]
+    fn parse_netem_qdiscs_finds_netem_and_skips_others() {
+        let out =
+            "qdisc htb 1: root refcnt 2 r2q 10 default 0x10 direct_packets_stat 0 direct_qlen 1000
+qdisc sfq 10: parent 1:10 limit 127p quantum 1514b depth 127 divisor 1024 perturb 10sec
+qdisc netem 11: parent 1:11 limit 1000 delay 35ms 1750us
+qdisc netem 12: parent 1:12 limit 1000 delay 50ms 2ms
+qdisc netem 13: parent 1:13 limit 1000 delay 120ms
+";
+        let map = parse_netem_qdiscs(out);
+        assert_eq!(map.get("11"), Some(&35));
+        assert_eq!(map.get("12"), Some(&50));
+        assert_eq!(map.get("13"), Some(&120));
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn parse_netem_qdiscs_returns_empty_on_default_qdisc() {
+        let out =
+            "qdisc pfifo_fast 0: root refcnt 2 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\n";
+        assert!(parse_netem_qdiscs(out).is_empty());
+    }
+
+    #[test]
+    fn parse_u32_filters_maps_ip_to_handle() {
+        let out = "filter parent 1: protocol ip pref 1 u32 chain 0
+filter parent 1: protocol ip pref 1 u32 chain 0 fh 800: ht divisor 1
+filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:11 not_in_hw
+  match 0a000005/ffffffff at 16
+filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::801 order 2049 key ht 800 bkt 0 flowid 1:12 not_in_hw
+  match ac130102/ffffffff at 16
+";
+        let map = parse_u32_filters(out);
+        assert_eq!(map.get("0a000005"), Some(&"11".to_string()));
+        assert_eq!(map.get("ac130102"), Some(&"12".to_string()));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn parse_u32_filters_ignores_non_destination_matches() {
+        let out = "filter parent 1: protocol ip pref 1 u32 chain 0
+filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:11 not_in_hw
+  match 0a000001/ffffffff at 12
+  match 0a000005/ffffffff at 16
+";
+        let map = parse_u32_filters(out);
+        assert_eq!(map.get("0a000005"), Some(&"11".to_string()));
+        assert!(!map.contains_key("0a000001"));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn parse_u32_filters_returns_empty_when_no_filters() {
+        assert!(parse_u32_filters("").is_empty());
+    }
 }

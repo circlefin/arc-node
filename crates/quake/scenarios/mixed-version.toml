@@ -1,0 +1,36 @@
+name = "mixed-version"
+description = "Heterogeneous-version network from genesis: most nodes on the local build, a pinned older group, and one inline-pinned node. Exercises cross-version consensus without a rolling upgrade."
+
+engine_api_connection = "ipc"
+
+# Global images: every node uses these unless it (or its group) overrides them.
+image_cl = "arc_consensus:latest"
+image_el = "arc_execution:latest"
+
+# COMPATIBILITY: all images in a mixed network must agree on genesis state, the
+# hardfork schedule, and on-disk db format. Quake only enforces CL >= v0.5.0
+# (and, for remote, a ghcr.io registry); genesis/db agreement is the operator's
+# job. Images must be shell-capable `-dev` flavors (plain release tags are
+# distroless, have no /bin/sh, and die at container startup).
+el_init_hardfork = "zero6"
+
+# A pinned older group: both members run this released version instead of the
+# global image. IMAGE_REGISTRY_URL comes from the environment or the .env file.
+[node_groups]
+OLDIES = ["validator4", "validator5"]
+
+[group_images.OLDIES]
+image_cl = "${IMAGE_REGISTRY_URL}/arc-consensus:0.7.0-dev"
+image_el = "${IMAGE_REGISTRY_URL}/arc-execution:0.7.0-dev"
+
+[nodes.validator1]
+[nodes.validator2]
+[nodes.validator3]
+
+# Group members: inherit the OLDIES override above.
+[nodes.validator4]
+[nodes.validator5]
+
+# Inline override wins over both the group and the global image.
+[nodes.full1]
+image_el = "${IMAGE_REGISTRY_URL}/arc-execution:0.7.0-dev"

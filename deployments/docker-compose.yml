@@ -1,6 +1,6 @@
 # Docker Compose for running an Arc node in follow mode.
 #
-# Start:  docker compose up -d    (first run downloads ~84 GB of snapshots)
+# Start:  docker compose up -d    (first run downloads snapshots)
 # Stop:   docker compose down
 # Logs:   docker compose logs -f
 #
@@ -12,13 +12,25 @@
 services:
   # --- Initialization (runs once, then exits) ---
 
-  # Download EL and CL snapshots (the CLI skips if data already exists)
+  # Download the newest complete v2 EL and CL pair. This runs on every
+  # `docker compose up`, not only the first, and never falls back to v1. A layer
+  # that already holds the selected snapshot is left alone, so a normal restart
+  # finishes in seconds. Two cases do not:
+  # once a newer snapshot is published a restart re-downloads the execution layer
+  # in full, and after an interrupted download this service exits non-zero and the
+  # stack does not start until --force is added below. Both are covered in
+  # docs/running-an-arc-node.md#start.
+  #
+  # Automatic resolution always selects a reth manifest. --el-profile defaults
+  # to minimal, but this service passes full to match the arc-execution pruning
+  # preset below. Omitting it would restore less history than configured.
   arc-snapshots:
     image: ${ARC_EXECUTION_IMAGE:?ARC_EXECUTION_IMAGE must be set}
     entrypoint: ["/usr/local/bin/arc-snapshots"]
     command:
       - download
       - --chain=arc-testnet
+      - --el-profile=full
       - --execution-path=/data/execution
       - --consensus-path=/data/consensus
     volumes:
@@ -67,7 +79,7 @@ services:
       - --metrics=0.0.0.0:9001
       - --disable-discovery
       - --enable-arc-rpc
-      - --rpc.forwarder=https://rpc.quicknode.testnet.arc.network/
+      - --rpc.forwarder=https://rpc.testnet.arc.io/
       - --log.file.directory=/data/execution/logs
     volumes:
       - ${ARC_HOME}/execution:/data/execution
@@ -90,9 +102,9 @@ services:
       - --execution-socket=/sockets/auth.ipc
       - --rpc.addr=0.0.0.0:31000
       - --follow
-      - --follow.endpoint=https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network
-      - --follow.endpoint=https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network
-      - --follow.endpoint=https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network/websocket
+      - --follow.endpoint=https://rpc.testnet.arc.io,wss=rpc.testnet.arc.io
+      - --follow.endpoint=https://rpc.drpc.testnet.arc.io,wss=rpc.drpc.testnet.arc.io
+      - --follow.endpoint=https://rpc.blockdaemon.testnet.arc.io,wss=rpc.blockdaemon.testnet.arc.io/websocket
       - --full
       - --execution-persistence-backpressure
       - --execution-persistence-backpressure-threshold=50

@@ -230,30 +230,40 @@ impl WsClient {
         Err(eyre::eyre!("timeout waiting for notification"))
     }
 
-    /// Non-blockingly drain one pending inbound message and return its error,
-    /// if any.
+    /// Non-blockingly drain one pending inbound message and return its
+    /// `(request_id, outcome)` pair.
     ///
-    /// Successful responses return `None` — fire-and-forget mode already counts
-    /// them at submit time, so surfacing them here would double-count.
-    /// Server-reported errors return `Some(Err(...))` so the sender can forward
-    /// them to the result tracker. Pings are answered with a pong; close frames
-    /// surface as a connection error so the sender's reconnect path engages.
-    pub(crate) async fn drain_one_result(&mut self) -> Option<Result<u64>> {
+    /// Returns `Some((request_id, Ok(())))` for a successful response so the
+    /// sender can pair the response with its in-flight account and ack the
+    /// nonce — fire-and-forget callers that *only* care about errors should
+    /// just discard the success arm. Returns `Some((request_id, Err(...)))`
+    /// for server-reported errors. Pings are answered with a pong; close
+    /// frames surface as a connection error against `request_id = 0` so the
+    /// sender's reconnect path engages without spuriously acking an unrelated
+    /// account.
+    pub(crate) async fn drain_one_result(&mut self) -> Option<(u64, Result<()>)> {
         tokio::select! {
             biased;
             msg = self.ws.next() => {
                 let msg = msg?.ok()?;
                 match classify_ws_message(msg) {
-                    Ok(WsMessageAction::Response(body)) => body
-                        .error
-                        .map(|JsonError { code, message }| {
-                            Err(eyre::eyre!("Server Error {}: {}", code, message))
-                        }),
+                    Ok(WsMessageAction::Response(body)) => {
+                        let request_id = body.id.as_u64().unwrap_or(0);
+                        match body.error {
+                            Some(JsonError { code, message }) => Some((
+                                request_id,
+                                Err(eyre::eyre!("Server Error {}: {}", code, message)),
+                            )),
+                            None => Some((request_id, Ok(()))),
+                        }
+                    }
                     Ok(WsMessageAction::Ping(p)) => {
                         let _ = self.ws.send(Message::Pong(p.into())).await;
                         None
                     }
-                    Ok(WsMessageAction::Closed) => Some(Err(WsError::ConnectionClosed.into())),
+                    Ok(WsMessageAction::Closed) => {
+                        Some((0, Err(WsError::ConnectionClosed.into())))
+                    }
                     _ => None,
                 }
             }

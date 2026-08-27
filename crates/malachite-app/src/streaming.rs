@@ -50,8 +50,18 @@ pub(crate) const CHUNK_SIZE: usize = 128 * 1024;
 /// Maximum age for a stream before it's evicted
 const MAX_STREAM_AGE: Duration = Duration::from_secs(60);
 
-/// Maximum number of evicted streams tracked in the LRU cache.
-const MAX_EVICTED_STREAMS: usize = 10_000;
+/// Maximum number of closed stream keys tracked in the LRU cache.
+///
+/// A key is closed either because its stream was evicted (stale height,
+/// oversized chunk, message-limit breach, age/global eviction) or because it
+/// completed and the assembled proposal reached a terminal disposition (stored,
+/// ignored as past-height, or rejected). Closed keys are dropped at the front
+/// of [`PartStreamsMap::insert`] so resurfaced duplicates cannot reopen a slot.
+///
+/// At sub-second finality this bound covers a wide recent window; anything
+/// resurfacing older than that is almost certainly from a past height and is
+/// caught by the staleness check (if it carries an `Init`) or the age timer.
+const MAX_CLOSED_STREAMS: usize = 10_000;
 
 /// Stream IDs are exactly 16 bytes: u64 height + u32 round + u32 nonce.
 pub(crate) const STREAM_ID_LEN: usize = size_of::<u64>() + size_of::<u32>() + size_of::<u32>();
@@ -66,6 +76,12 @@ fn max_total_streams(num_validators: usize) -> usize {
     MAX_STREAMS_PER_PEER
         .saturating_mul(num_validators)
         .max(MAX_STREAMS_PER_PEER)
+}
+
+/// Returns `true` when `sequence` is a valid Fin sequence, i.e. it can be
+/// safely cast to `usize` and `sequence + 1 <= MAX_MESSAGES_PER_STREAM`.
+fn is_valid_fin_sequence(sequence: Sequence) -> bool {
+    usize::try_from(sequence).is_ok_and(|s| s < MAX_MESSAGES_PER_STREAM)
 }
 
 /// Outcome of [`PartStreamsMap::insert`].
@@ -225,6 +241,7 @@ enum StreamInsertResult {
     Duplicate,
     Incomplete(Option<Height>),
     ExceededMaxMessages,
+    InvalidFinSequence(u64),
     ExceededMaxChunkSize(usize),
     Complete(Vec<ProposalPart>),
 }
@@ -249,6 +266,10 @@ impl StreamState {
             if data.bytes.len() > CHUNK_SIZE {
                 return StreamInsertResult::ExceededMaxChunkSize(data.bytes.len());
             }
+        }
+
+        if msg.is_fin() && !is_valid_fin_sequence(msg.sequence) {
+            return StreamInsertResult::InvalidFinSequence(msg.sequence);
         }
 
         if !self.seen_sequences.insert(msg.sequence) {
@@ -280,8 +301,8 @@ impl StreamState {
             // If we have received the fin message, we can determine when we will be done.
             // We are done if we have already received all messages from 0 to fin.sequence,
             // included. That is to say, if we have received `fin.sequence + 1` messages.
-            // Sequence is a u64 protocol field; on 64-bit targets usize == u64.
-            // The +1 cannot overflow because MAX_MESSAGES_PER_STREAM << u64::MAX.
+            // `is_valid_fin_sequence` rejected sequences >= MAX_MESSAGES_PER_STREAM,
+            // so the cast and +1 cannot truncate or overflow.
             #[allow(clippy::cast_possible_truncation, clippy::arithmetic_side_effects)]
             {
                 self.expected_messages = msg.sequence as usize + 1;
@@ -319,6 +340,8 @@ impl StreamState {
 /// - Evict streams older than [`MAX_STREAM_AGE`]
 /// - Immediately evict streams that exceed message or size limits
 /// - Immediately evict streams from previous heights
+/// - Drop messages for closed keys (evicted streams, or completed streams whose
+///   proposal reached a terminal disposition) so duplicates cannot reopen a slot
 ///
 /// Worst-case memory at full saturation:
 /// = max_total_streams * MAX_MESSAGES_PER_STREAM * CHUNK_SIZE
@@ -330,7 +353,10 @@ pub struct PartStreamsMap {
     /// [`MAX_STREAMS_PER_PEER`] during the pre-validator-set startup window.
     max_total_streams: usize,
     streams: BTreeMap<(PeerId, StreamId), StreamState>,
-    evicted: LruMap<(PeerId, StreamId), ()>,
+    /// Keys that are terminal — evicted streams, or completed streams whose
+    /// proposal was stored, ignored, or rejected. Bounded by
+    /// [`MAX_CLOSED_STREAMS`]; the oldest entry is dropped when full.
+    closed_keys: LruMap<(PeerId, StreamId), ()>,
     last_eviction: Instant,
 }
 
@@ -343,9 +369,9 @@ impl PartStreamsMap {
         Self {
             streams: BTreeMap::new(),
             last_eviction: Instant::now(),
-            // MAX_EVICTED_STREAMS (10_000) fits in u32
+            // MAX_CLOSED_STREAMS (10_000) fits in u32
             #[allow(clippy::cast_possible_truncation)]
-            evicted: LruMap::new(ByLength::new(MAX_EVICTED_STREAMS as u32)),
+            closed_keys: LruMap::new(ByLength::new(MAX_CLOSED_STREAMS as u32)),
             current_height,
             max_total_streams: max_total_streams(num_validators),
         }
@@ -354,10 +380,9 @@ impl PartStreamsMap {
     /// Update the current height, purging any tracked streams that are now
     /// stale so they stop consuming per-peer budget before the age sweep would
     /// reach them.
-    ///
     /// Height comes from the stream_id (see [`new_stream_id`]); lone non-Init
     /// streams carry no payload height. Purged streams are not added to
-    /// `evicted`: the up-front height check in [`insert`](Self::insert) is
+    /// `closed_keys`: the up-front height check in [`insert`](Self::insert) is
     /// idempotent and prevents re-creation.
     pub fn set_current_height(&mut self, height: Height) {
         self.current_height = height;
@@ -442,7 +467,7 @@ impl PartStreamsMap {
         // First, evict any streams that have exceeded MAX_STREAM_AGE
         self.evict_old_streams();
 
-        if self.evicted.peek(&key).is_some() {
+        if self.closed_keys.peek(&key).is_some() {
             return InsertResult::Pending;
         }
 
@@ -503,6 +528,19 @@ impl PartStreamsMap {
                 return InsertResult::Pending;
             }
 
+            StreamInsertResult::InvalidFinSequence(sequence) => {
+                warn!(
+                    %peer_id,
+                    %stream_id,
+                    sequence,
+                    max = MAX_MESSAGES_PER_STREAM,
+                    "Fin sequence out of range, evicting stream"
+                );
+
+                self.evict(&key);
+                return InsertResult::Pending;
+            }
+
             StreamInsertResult::ExceededMaxChunkSize(actual) => {
                 warn!(
                     %peer_id,
@@ -546,12 +584,36 @@ impl PartStreamsMap {
         }
     }
 
-    /// Evict a stream from the map and mark it as evicted.
-    /// The evicted LRU map is bounded by [`MAX_EVICTED_STREAMS`]; the oldest
+    /// Evict a stream from the map and record its key as closed.
+    /// The closed-keys LRU map is bounded by [`MAX_CLOSED_STREAMS`]; the oldest
     /// entry is automatically dropped when capacity is exceeded.
     fn evict(&mut self, key: &(PeerId, StreamId)) {
         self.streams.remove(key);
-        self.evicted.insert((key.0, key.1.clone()), ());
+        self.closed_keys.insert((key.0, key.1.clone()), ());
+    }
+
+    /// Record a key as closed after its stream completed and the assembled
+    /// proposal reached a terminal disposition (stored, ignored as past-height,
+    /// or rejected).
+    ///
+    /// Subsequent messages for this key — including resurfaced duplicates of the
+    /// already-completed stream — are dropped at the front of [`Self::insert`]
+    /// instead of reopening a slot. Callers must NOT close a key whose proposal
+    /// was only transiently declined (too far in the future, or the pending
+    /// table was full), because a later copy could still become storable.
+    ///
+    /// Shares the bounded [`MAX_CLOSED_STREAMS`] LRU with evicted streams.
+    pub fn mark_closed(&mut self, peer_id: PeerId, stream_id: StreamId) {
+        self.closed_keys.insert((peer_id, stream_id), ());
+    }
+
+    /// Test-only: whether a key has been recorded as closed (evicted or
+    /// terminally completed). Lets sibling-module tests observe `mark_closed`.
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self, peer_id: PeerId, stream_id: &StreamId) -> bool {
+        self.closed_keys
+            .peek(&(peer_id, stream_id.clone()))
+            .is_some()
     }
 
     /// Evict streams that have exceeded MAX_STREAM_AGE
@@ -1102,6 +1164,98 @@ mod tests {
     }
 
     #[test]
+    fn test_fin_sequence_max_allowed_completes() {
+        let peer = PeerId::random();
+        let stream = make_stream_id(101);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        assert!(map
+            .must_insert(peer, make_message(&stream, 0, make_init_part()))
+            .is_none());
+
+        for i in 1..(MAX_MESSAGES_PER_STREAM - 2) {
+            assert!(map
+                .must_insert(
+                    peer,
+                    make_message(&stream, i as u64, make_data_part(i as u8))
+                )
+                .is_none());
+        }
+
+        let proposal_fin_sequence = (MAX_MESSAGES_PER_STREAM - 2) as u64;
+        assert!(map
+            .must_insert(
+                peer,
+                make_message(&stream, proposal_fin_sequence, make_fin_part()),
+            )
+            .is_none());
+
+        let stream_fin_sequence = (MAX_MESSAGES_PER_STREAM - 1) as u64;
+        let result = map.must_insert(peer, make_fin_message(&stream, stream_fin_sequence));
+
+        assert!(
+            result.is_some(),
+            "Fin at the maximum allowed sequence should complete"
+        );
+        assert!(map.streams.is_empty(), "Completed stream should be removed");
+    }
+
+    #[test]
+    fn test_fin_sequence_at_max_messages_per_stream_evicts() {
+        let peer = PeerId::random();
+        let stream = make_stream_id(101);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        assert!(map
+            .must_insert(peer, make_message(&stream, 0, make_init_part()))
+            .is_none());
+
+        let result = map.must_insert(
+            peer,
+            make_fin_message(&stream, MAX_MESSAGES_PER_STREAM as u64),
+        );
+
+        assert!(result.is_none(), "Out-of-range Fin should be pending");
+        assert!(
+            map.streams.is_empty(),
+            "Stream should be evicted after out-of-range Fin"
+        );
+        assert!(
+            map.closed_keys.peek(&(peer, stream)).is_some(),
+            "Stream should be marked as evicted"
+        );
+    }
+
+    #[test]
+    fn test_fin_sequence_u64_max_evicts_without_panicking() {
+        let peer = PeerId::random();
+        let stream = make_stream_id(101);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        assert!(map
+            .must_insert(peer, make_message(&stream, 0, make_init_part()))
+            .is_none());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.insert(peer, make_fin_message(&stream, u64::MAX))
+        }));
+
+        let result = result.expect("Out-of-range Fin should not panic");
+        assert!(
+            matches!(result, InsertResult::Pending),
+            "Out-of-range Fin should be rejected as pending"
+        );
+        assert!(
+            map.streams.is_empty(),
+            "Stream should be evicted after out-of-range Fin"
+        );
+        assert!(
+            map.closed_keys.peek(&(peer, stream)).is_some(),
+            "Stream should be marked as evicted"
+        );
+    }
+
+    #[test]
     fn test_per_peer_limit_independent_across_peers() {
         let peer_1 = PeerId::random();
         let peer_2 = PeerId::random();
@@ -1566,7 +1720,7 @@ mod tests {
         ));
         assert_eq!(map.streams.len(), 0, "Mismatched stream should be evicted");
         assert!(
-            map.evicted.peek(&(peer_1, stream_1)).is_some(),
+            map.closed_keys.peek(&(peer_1, stream_1)).is_some(),
             "Mismatched stream should be marked as evicted"
         );
     }
@@ -1694,7 +1848,7 @@ mod tests {
         ));
         assert_eq!(map.streams.len(), 0, "completed stream must be removed");
         assert!(
-            map.evicted.peek(&(peer, stream)).is_some(),
+            map.closed_keys.peek(&(peer, stream)).is_some(),
             "Mismatched stream should be marked as evicted"
         );
     }
@@ -1712,7 +1866,7 @@ mod tests {
         }
 
         assert!(
-            !map.evicted.is_empty(),
+            !map.closed_keys.is_empty(),
             "Evicted set should contain entries"
         );
 
@@ -1722,7 +1876,7 @@ mod tests {
 
         // Evicted entries should be retained — the LRU is self-bounding
         assert!(
-            !map.evicted.is_empty(),
+            !map.closed_keys.is_empty(),
             "Evicted set should be retained across eviction cycles"
         );
     }
@@ -1750,7 +1904,7 @@ mod tests {
             "Stream should be evicted after oversized chunk"
         );
         assert!(
-            map.evicted.peek(&(peer, stream)).is_some(),
+            map.closed_keys.peek(&(peer, stream)).is_some(),
             "Stream should be marked as evicted"
         );
     }
@@ -1862,7 +2016,7 @@ mod tests {
         // Send many Init messages whose payload height disagrees with the
         // current-height stream ID. Each mismatch is rejected, evicted, and
         // recorded in the evicted set.
-        let count = MAX_EVICTED_STREAMS + 500;
+        let count = MAX_CLOSED_STREAMS + 500;
         for i in 0..count {
             let mut init = make_init_part();
             if let ProposalPart::Init(ref mut part) = init {
@@ -1877,17 +2031,17 @@ mod tests {
             ));
 
             assert!(
-                map.evicted.len() <= MAX_EVICTED_STREAMS,
-                "Evicted set should never exceed MAX_EVICTED_STREAMS, got {}",
-                map.evicted.len()
+                map.closed_keys.len() <= MAX_CLOSED_STREAMS,
+                "Evicted set should never exceed MAX_CLOSED_STREAMS, got {}",
+                map.closed_keys.len()
             );
         }
 
         // After the loop, evicted should have been cleared at least once
         assert!(
-            map.evicted.len() <= MAX_EVICTED_STREAMS,
+            map.closed_keys.len() <= MAX_CLOSED_STREAMS,
             "Evicted set should be bounded, got {}",
-            map.evicted.len()
+            map.closed_keys.len()
         );
 
         // Map should still function correctly after clearing.
@@ -1991,6 +2145,83 @@ mod tests {
             map.must_insert(low_volume_peer, msg_part).is_none(),
             "Follow up message on the low-volume stream should be accepted"
         );
+    }
+
+    #[test]
+    fn test_resurfaced_part_reopens_completed_stream_without_mark_closed() {
+        // Documents the gap that `mark_closed` closes: after a stream completes
+        // and is removed, a resurfaced non-`Init` straggler creates a fresh
+        // `height = None` stream that escapes the staleness check and lingers,
+        // holding a slot until the age timer reaps it.
+        let peer = PeerId::random();
+        let stream = make_stream_id(1);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        map.must_insert(peer, make_message(&stream, 0, make_init_part()));
+        map.must_insert(peer, make_message(&stream, 1, make_fin_part()));
+        assert!(map
+            .must_insert(peer, make_fin_message(&stream, 2))
+            .is_some());
+        assert_eq!(map.streams.len(), 0, "completed stream is removed");
+
+        // A resurfaced straggler (the original fin part) carries no height.
+        let resurfaced = make_message(&stream, 1, make_fin_part());
+        assert!(map.must_insert(peer, resurfaced).is_none());
+        assert_eq!(
+            map.streams.len(),
+            1,
+            "without mark_closed, a resurfaced straggler reopens a lingering stream"
+        );
+    }
+
+    #[test]
+    fn test_mark_closed_drops_resurfaced_part() {
+        // With the completed key marked closed, the same resurfaced straggler is
+        // dropped at the front of `insert` and never reopens a slot.
+        let peer = PeerId::random();
+        let stream = make_stream_id(1);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        map.must_insert(peer, make_message(&stream, 0, make_init_part()));
+        map.must_insert(peer, make_message(&stream, 1, make_fin_part()));
+        assert!(map
+            .must_insert(peer, make_fin_message(&stream, 2))
+            .is_some());
+        assert_eq!(map.streams.len(), 0, "completed stream is removed");
+
+        map.mark_closed(peer, stream.clone());
+
+        let resurfaced = make_message(&stream, 1, make_fin_part());
+        assert!(map.must_insert(peer, resurfaced).is_none());
+        assert_eq!(
+            map.streams.len(),
+            0,
+            "a closed key must not reopen a stream"
+        );
+        assert!(
+            map.closed_keys.peek(&(peer, stream)).is_some(),
+            "key should be recorded as closed"
+        );
+    }
+
+    #[test]
+    fn test_mark_closed_does_not_count_toward_per_peer_limit() {
+        // Closed keys live in the LRU, not in `streams`, so they never consume a
+        // per-peer slot.
+        let peer = PeerId::random();
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        for i in 0..MAX_STREAMS_PER_PEER as u8 {
+            map.mark_closed(peer, make_stream_id(i));
+        }
+        assert_eq!(map.peer_streams_count(peer), 0);
+
+        // A brand-new stream is still accepted despite the closed keys.
+        let fresh = make_stream_id(200);
+        assert!(map
+            .must_insert(peer, make_message(&fresh, 0, make_init_part()))
+            .is_none());
+        assert_eq!(map.streams.len(), 1);
     }
 
     // --- Property-Based Tests ---

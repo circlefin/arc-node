@@ -42,7 +42,12 @@ pub(crate) struct RpcClient {
 
 impl RpcClient {
     pub(crate) fn new(url: Url, timeout: Duration) -> Self {
-        let client = Client::new();
+        Self::with_client(Client::new(), url, timeout)
+    }
+
+    /// Reuse an externally built `reqwest::Client` (sharing its connection
+    /// pool / TLS context) across many `RpcClient` instances.
+    pub(crate) fn with_client(client: Client, url: Url, timeout: Duration) -> Self {
         Self {
             client,
             url,
@@ -198,6 +203,22 @@ impl RpcClient {
     ) -> Result<Option<serde_json::Value>> {
         let response = self
             .rpc_request::<serde_json::Value>("eth_getTransactionReceipt", json!([tx_hash]), 0)
+            .await?;
+        if response.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(response))
+        }
+    }
+
+    /// Get a transaction by hash, pending or mined.
+    /// Returns `None` if the node has no knowledge of the transaction.
+    pub async fn get_transaction_by_hash(
+        &self,
+        tx_hash: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let response = self
+            .rpc_request::<serde_json::Value>("eth_getTransactionByHash", json!([tx_hash]), 0)
             .await?;
         if response.is_null() {
             Ok(None)

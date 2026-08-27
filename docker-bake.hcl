@@ -38,6 +38,13 @@ target "meta-target" {
     certs = "./deployments/certs"
   }
 
+  # Lets the cargo-chef cook/build stages authenticate clones of private git
+  # dependencies (e.g. crcl-main/circle-chain-consensus). Sourced from the
+  # GITHUB_TOKEN env var the build workflow exports via pre_build_command.
+  secret = [
+    "id=github_token,env=GITHUB_TOKEN",
+  ]
+
   args = {
     GIT_COMMIT_HASH = GIT_COMMIT_HASH
     GIT_VERSION     = GIT_VERSION

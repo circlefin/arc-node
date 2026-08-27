@@ -23,7 +23,6 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use arc_consensus_types::Config as ClConfigOverride;
 use arc_node_consensus_cli::cmd::start::StartCmd;
 
 use crate::infra;
@@ -150,7 +149,6 @@ const EL_DEFAULT_RPC_API: &[&str] = &[
     "admin", "net", "eth", "web3", "debug", "txpool", "trace", "reth",
 ];
 const EL_DEFAULT_ENABLE_ARC_RPC: bool = true;
-const EL_DEFAULT_ARC_DENYLIST_ENABLED: bool = true;
 const EL_DEFAULT_ARC_BUILDER_DEADLINE_MS: u64 = 100;
 
 fn default_rpc_api() -> Vec<String> {
@@ -158,12 +156,25 @@ fn default_rpc_api() -> Vec<String> {
 }
 
 /// Execution layer (Reth) transaction pool configuration overrides.
+///
+/// Reth caps each sub-pool on two independent dimensions — `count` and
+/// `size in megabytes` — and treats either as binding. Quake exposes both:
+/// the `*_max_count` fields cap transaction count and the `*_max_size` fields
+/// cap the cumulative wire size in MB. Either limit alone leaves the pool
+/// subject to the other's default (10 000 txs and 20 MB respectively in Reth
+/// v1.11), so high-throughput saturation experiments typically need to lift
+/// both.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ElTxpoolConfig {
     pub pending_max_count: Option<u64>,
+    pub pending_max_size: Option<u64>,
     pub basefee_max_count: Option<u64>,
+    pub basefee_max_size: Option<u64>,
     pub queued_max_count: Option<u64>,
+    pub queued_max_size: Option<u64>,
+    pub blobpool_max_count: Option<u64>,
+    pub blobpool_max_size: Option<u64>,
     pub max_account_slots: Option<u64>,
     pub lifetime: Option<u64>,
     pub max_batch_size: Option<u64>,
@@ -174,8 +185,13 @@ impl Default for ElTxpoolConfig {
     fn default() -> Self {
         Self {
             pending_max_count: None,
+            pending_max_size: None,
             basefee_max_count: None,
+            basefee_max_size: None,
             queued_max_count: None,
+            queued_max_size: None,
+            blobpool_max_count: None,
+            blobpool_max_size: None,
             max_account_slots: None,
             lifetime: None,
             max_batch_size: None,
@@ -218,6 +234,7 @@ pub struct ElEngineConfig {
     pub persistence_threshold: u64,
     pub memory_block_buffer_target: u64,
     pub legacy_state_root: Option<bool>,
+    pub share_sparse_trie_with_payload_builder: Option<bool>,
 }
 
 /// Execution layer (Reth) storage configuration overrides.
@@ -324,23 +341,6 @@ impl Default for ElWsConfig {
     }
 }
 
-/// Execution layer denylist configuration overrides.
-///
-/// Fields correspond to `--arc.denylist.*` CLI flags.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields, default)]
-pub struct ElArcDenylistConfig {
-    pub enabled: bool,
-}
-
-impl Default for ElArcDenylistConfig {
-    fn default() -> Self {
-        Self {
-            enabled: EL_DEFAULT_ARC_DENYLIST_ENABLED,
-        }
-    }
-}
-
 /// Execution layer Arc-specific payload builder overrides.
 ///
 /// Fields correspond to `--arc.builder.*` CLI flags.
@@ -366,18 +366,29 @@ impl Default for ElArcBuilderConfig {
     }
 }
 
+/// Execution layer transaction-relay configuration overrides.
+///
+/// Maps to `--arc.tx.relays`: upstream RPC URLs raw-tx submission is
+/// relayed to, in priority order, with failover. Empty disables relaying.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ElRelayConfig {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
+}
+
 /// Execution layer Arc-specific configuration overrides.
 ///
 /// Groups overrides for `--arc.*` CLI flags.
 #[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ElArcConfig {
-    pub denylist: ElArcDenylistConfig,
     /// When true, passes `--arc.expose-pending-txs` to disable the pending-tx
     /// RPC filter. Default false (hidden); flip only on trusted/internal nodes.
     #[serde(default)]
     pub expose_pending_txs: bool,
     pub builder: ElArcBuilderConfig,
+    pub tx: ElRelayConfig,
 }
 
 /// Execution layer (Reth) pruning configuration for an individual data segment.
@@ -415,7 +426,8 @@ impl std::fmt::Display for ElPruningPreset {
 }
 
 /// CL pruning preset — emitted as `--full` or `--minimal` on the CL binary.
-/// Mutually exclusive with explicit `cl.config.prune.*` values.
+/// Mutually exclusive with explicit `cl.config.prune_certificates_distance` /
+/// `cl.config.prune_certificates_before` values.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ClPruningPreset {
@@ -543,6 +555,9 @@ pub(crate) struct Manifest {
     /// Provisioned IOPS for the node root EBS volume (remote only).
     /// Only meaningful for `gp3`, `io1`, and `io2` volume types.
     pub node_volume_iops: Option<u32>,
+    /// Place the node data directory on local instance-store NVMe instead of the root EBS
+    /// volume (remote only). Requires an instance type with local NVMe; a no-op otherwise.
+    pub node_data_on_instance_store: bool,
     /// CPU limit for the EL container (Docker `cpus`). Whole or fractional CPUs.
     pub el_cpu_limit: Option<f64>,
     /// Memory limit for the EL container, in GiB. Fractional values are allowed (e.g. 2.5).
@@ -594,45 +609,24 @@ pub struct ClGossipSubConfig {
     pub load: Option<String>,
 }
 
-/// CL configuration for a node, version-dependent.
-///
-/// - `Modern`: for CL >= v0.5.0, maps directly to CLI flags via [`StartCmd`].
-/// - `Legacy`: for CL < v0.5.0, serializes to `config.toml` via [`ClConfigOverride`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum NodeClConfig {
-    Modern(StartCmd),
-    Legacy(ClConfigOverride),
-}
-
-impl Default for NodeClConfig {
-    fn default() -> Self {
-        Self::Modern(StartCmd::default())
-    }
-}
-
-impl NodeClConfig {
-    /// Whether the consensus engine runs for this node.
-    ///
-    /// Sync-only followers disable consensus via `--no-consensus` (Modern) or
-    /// `consensus.enabled = false` (Legacy).
-    pub fn consensus_enabled(&self) -> bool {
-        match self {
-            Self::Modern(cmd) => !cmd.no_consensus,
-            Self::Legacy(cfg) => cfg.consensus.enabled,
-        }
-    }
-}
-
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Node {
     /// The type of the node
     pub node_type: NodeType,
 
-    /// Consensus layer configuration (version-dependent)
-    pub cl_config: NodeClConfig,
+    /// Consensus layer configuration. Maps directly to `arc-node-consensus start`
+    /// CLI flags via [`StartCmd`].
+    pub cl_config: StartCmd,
 
     /// Execution layer (Reth) CLI flags for this node
     pub el_config: ElConfigOverride,
+
+    /// Effective consensus layer image for this node (inline override, else the
+    /// node-group override), or `None` to use the global image. Mixed-version networks.
+    pub image_cl: Option<String>,
+
+    /// Effective execution layer image for this node. See `image_cl`.
+    pub image_el: Option<String>,
 
     /// The height to start the node at
     pub start_at: Option<u64>,
@@ -667,7 +661,8 @@ pub struct Node {
     pub cl_voting_power: Option<u64>,
 
     /// CL pruning preset — emitted as `--full` or `--minimal` on the CL binary.
-    /// Mutually exclusive with explicit `cl.config.prune.*` values.
+    /// Mutually exclusive with explicit `cl.config.prune_certificates_distance` /
+    /// `cl.config.prune_certificates_before` values.
     pub cl_prune_preset: Option<ClPruningPreset>,
 
     /// Address to receive transaction fees and block rewards (--suggested-fee-recipient).
@@ -677,6 +672,14 @@ pub struct Node {
     /// External validators are expected to be multi-hop in mesh health checks
     /// rather than fully-connected. Also applies to their dedicated sentries.
     pub external: bool,
+
+    /// Environment variables for the execution layer (Reth) container, merged
+    /// from the global `el.env` table and this node's `el.env` overrides.
+    pub el_env: IndexMap<String, String>,
+
+    /// Environment variables for the consensus layer (Malachite) container, merged
+    /// from the global `cl.env` table and this node's `cl.env` overrides.
+    pub cl_env: IndexMap<String, String>,
 }
 
 impl Node {
@@ -709,15 +712,11 @@ impl Node {
         if self.cl_prune_preset.is_some() {
             return true;
         }
-        match &self.cl_config {
-            NodeClConfig::Modern(cmd) => {
-                cmd.full
-                    || cmd.minimal
-                    || cmd.prune_certificates_distance > 0
-                    || cmd.prune_certificates_before > 0
-            }
-            NodeClConfig::Legacy(cfg) => cfg.prune.enabled(),
-        }
+        let cmd = &self.cl_config;
+        cmd.full
+            || cmd.minimal
+            || cmd.prune_certificates_distance > 0
+            || cmd.prune_certificates_before > 0
     }
 
     /// Returns the execution layer (Reth) CLI flags for this node, defined in the
@@ -743,6 +742,20 @@ impl Node {
 
         Ok(cli_flags)
     }
+
+    /// Effective `(cl, el)` images for this node: its per-node override for each
+    /// layer, else the given global image. Single source of the override-else-global
+    /// rule, shared by local and remote resolution so the two cannot drift.
+    pub fn effective_images(&self, global_cl: &str, global_el: &str) -> (String, String) {
+        (
+            self.image_cl
+                .clone()
+                .unwrap_or_else(|| global_cl.to_string()),
+            self.image_el
+                .clone()
+                .unwrap_or_else(|| global_el.to_string()),
+        )
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Clone, Default)]
@@ -761,7 +774,7 @@ impl Manifest {
         Self::from_string(&content)
     }
 
-    fn from_string(content: &str) -> Result<Self> {
+    pub(crate) fn from_string(content: &str) -> Result<Self> {
         let raw: RawManifest = toml::from_str(content).wrap_err("Failed to parse manifest")?;
         let manifest = Manifest::try_from(raw)?;
         manifest.validate()?;
@@ -835,6 +848,21 @@ impl Manifest {
         }
 
         Ok(resolved.into_iter().collect())
+    }
+
+    /// Resolve node selectors if selectors is Some, or default to all nodes if None.
+    pub(crate) fn resolve_optional_node_selectors(
+        &self,
+        selectors: Option<&[String]>,
+    ) -> Result<Vec<NodeName>> {
+        let node_names = match selectors {
+            None => self.nodes.keys().cloned().collect(),
+            Some(sel) => self.resolve_node_selectors(sel)?,
+        };
+        if node_names.is_empty() {
+            bail!("Target selector resolved to zero nodes");
+        }
+        Ok(node_names)
     }
 
     /// Collects explicit voting powers from validators, or `None` if none are set.
@@ -1030,6 +1058,17 @@ impl Manifest {
         // Check that all subnets are connected through bridge nodes.
         self.subnets.validate_topology()?;
 
+        // Validate per-node byzantine configuration.
+        #[cfg(feature = "byzantine")]
+        for (node_name, node) in self.nodes.iter() {
+            let byz = node.cl_config.byzantine.as_ref();
+            if let Some(byz) = byz {
+                byz.validate().with_context(|| {
+                    format!("Invalid byzantine configuration for node '{node_name}'")
+                })?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1152,6 +1191,14 @@ pub(crate) struct DockerImages {
     pub el_upgrade: Option<String>,
 }
 
+/// Per-node or per-node-group CL/EL image override for mixed-version networks.
+/// Absent fields fall back to the global manifest images.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
+pub(crate) struct ImageOverride {
+    pub image_cl: Option<String>,
+    pub image_el: Option<String>,
+}
+
 impl DockerImages {
     /// Resolve an explicit image or substitute env vars in a default pattern.
     fn resolve_image(explicit: &Option<String>, default: &str) -> Result<String> {
@@ -1201,15 +1248,6 @@ mod tests {
     use deranged::RangedUsize;
     use malachitebft_config::LogLevel;
     use std::env;
-
-    /// Extract the inner `ClConfigOverride` from a `NodeClConfig::Legacy` variant.
-    /// Panics if the variant is `Modern`.
-    fn unwrap_legacy(cl_config: &NodeClConfig) -> &ClConfigOverride {
-        match cl_config {
-            NodeClConfig::Legacy(cfg) => cfg,
-            NodeClConfig::Modern(_) => panic!("expected NodeClConfig::Legacy, got Modern"),
-        }
-    }
 
     // Check number of nodes, names, types, and order of declaration in the manifest
     fn validate_nodes(
@@ -1273,12 +1311,11 @@ mod tests {
         let str = r#"
         name = "testnet"
         description = "test"
-        image_cl = "arc_consensus:v0.4.0"
-        cl.config.logging.log_level = "warn"
+        cl.config.log_level = "warn"
         [nodes.validator1]
-        cl.config.logging.log_level = "info"
+        cl.config.log_level = "info"
         [nodes.validator2]
-        cl.config.consensus.p2p.rpc_max_size = "123kb"
+        cl.config.discovery_num_outbound_peers = 42
         [nodes.validator3]
         "#;
         let manifest = Manifest::from_string(str).unwrap();
@@ -1295,22 +1332,21 @@ mod tests {
         ];
         validate_nodes(&manifest.nodes, expected_node_names, expected_types);
 
-        // Check nodes individual config (Legacy variant because image_cl is v0.4.0)
-        let v1 = unwrap_legacy(&manifest.nodes["validator1"].cl_config);
-        assert_eq!(v1.logging.log_level, LogLevel::Info);
+        // Node-level config overrides the global default; unset fields fall back to global.
+        let v1 = &manifest.nodes["validator1"].cl_config;
+        assert_eq!(v1.log_level, Some(LogLevel::Info));
 
-        let v2 = unwrap_legacy(&manifest.nodes["validator2"].cl_config);
-        assert_eq!(v2.logging.log_level, LogLevel::Warn);
-        assert_eq!(v2.consensus.p2p.rpc_max_size, bytesize::ByteSize::kb(123));
+        let v2 = &manifest.nodes["validator2"].cl_config;
+        assert_eq!(v2.log_level, Some(LogLevel::Warn));
+        assert_eq!(v2.discovery_num_outbound_peers, 42);
 
-        let v3 = unwrap_legacy(&manifest.nodes["validator3"].cl_config);
-        assert_eq!(v3.logging.log_level, LogLevel::Warn);
+        let v3 = &manifest.nodes["validator3"].cl_config;
+        assert_eq!(v3.log_level, Some(LogLevel::Warn));
     }
 
     #[test]
     fn test_load_invalid_global_cl_config() {
         let str = r#"
-        image_cl = "arc_consensus:v0.4.0"
         cl.config.foo = 1
         [nodes.validator1]
         "#;
@@ -1321,12 +1357,151 @@ mod tests {
     #[test]
     fn test_load_invalid_node_config() {
         let str = r#"
-        image_cl = "arc_consensus:v0.4.0"
         [nodes.validator1]
         cl.config.foo = 1
         "#;
         let result = Manifest::from_string(str);
         assert!(result.is_err(), "Expected node config to be invalid");
+    }
+
+    #[test]
+    fn test_rejects_pre_v0_5_0_cl_image() {
+        // Pre-v0.5.0 CL releases need a config.toml that Quake no longer
+        // generates, so pinning one must fail at manifest load.
+        let str = r#"
+        image_cl = "arc_consensus:v0.4.0"
+        [nodes.validator1]
+        "#;
+        let err = Manifest::from_string(str).unwrap_err();
+        assert!(
+            err.to_string().contains("predates v0.5.0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_pre_v0_5_0_cl_upgrade_image() {
+        let str = r#"
+        image_cl = "arc_consensus:latest"
+        image_cl_upgrade = "arc_consensus:v0.4.0"
+        [nodes.validator1]
+        "#;
+        let err = Manifest::from_string(str).unwrap_err();
+        assert!(
+            err.to_string().contains("predates v0.5.0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_per_node_image_override() {
+        let str = r#"
+        image_cl = "arc_consensus:latest"
+        image_el = "arc_execution:latest"
+        [nodes.validator1]
+        image_cl = "arc_consensus:0.5.0"
+        image_el = "arc_execution:0.5.0"
+        [nodes.validator2]
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+        assert_eq!(
+            manifest.nodes["validator1"].image_cl,
+            Some("arc_consensus:0.5.0".to_string())
+        );
+        assert_eq!(
+            manifest.nodes["validator1"].image_el,
+            Some("arc_execution:0.5.0".to_string())
+        );
+        // No override stays None; the global image is applied later (nodes.rs).
+        assert!(manifest.nodes["validator2"].image_cl.is_none());
+        assert!(manifest.nodes["validator2"].image_el.is_none());
+    }
+
+    #[test]
+    fn test_group_image_override_applies_to_members_only() {
+        let str = r#"
+        [node_groups]
+        OLDIES = ["validator1"]
+        [group_images.OLDIES]
+        image_cl = "arc_consensus:0.5.0"
+        image_el = "arc_execution:0.5.0"
+        [nodes.validator1]
+        [nodes.validator2]
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+        assert_eq!(
+            manifest.nodes["validator1"].image_cl,
+            Some("arc_consensus:0.5.0".to_string())
+        );
+        assert_eq!(
+            manifest.nodes["validator1"].image_el,
+            Some("arc_execution:0.5.0".to_string())
+        );
+        assert!(manifest.nodes["validator2"].image_cl.is_none());
+    }
+
+    #[test]
+    fn test_per_node_image_overrides_group() {
+        let str = r#"
+        [node_groups]
+        OLDIES = ["validator1"]
+        [group_images.OLDIES]
+        image_cl = "arc_consensus:0.5.0"
+        [nodes.validator1]
+        image_cl = "arc_consensus:0.6.0"
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+        // The inline node override wins over the group override.
+        assert_eq!(
+            manifest.nodes["validator1"].image_cl,
+            Some("arc_consensus:0.6.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rejects_ambiguous_group_images() {
+        let str = r#"
+        [node_groups]
+        A = ["validator1"]
+        B = ["validator1"]
+        [group_images.A]
+        image_cl = "arc_consensus:0.5.0"
+        [group_images.B]
+        image_cl = "arc_consensus:0.6.0"
+        [nodes.validator1]
+        "#;
+        let err = Manifest::from_string(str).unwrap_err();
+        assert!(
+            err.to_string().contains("from groups"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_unknown_group_images_key() {
+        let str = r#"
+        [group_images.NOPE]
+        image_cl = "arc_consensus:0.5.0"
+        [nodes.validator1]
+        "#;
+        let err = Manifest::from_string(str).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown node group"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_pre_v0_5_0_per_node_cl_image() {
+        let str = r#"
+        [nodes.validator1]
+        image_cl = "arc_consensus:v0.4.0"
+        "#;
+        let err = Manifest::from_string(str).unwrap_err();
+        assert!(
+            err.to_string().contains("predates v0.5.0"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1411,17 +1586,16 @@ mod tests {
     #[test]
     fn test_node_with_empty_config_uses_global() {
         let str = r#"
-        image_cl = "arc_consensus:v0.4.0"
         [cl.config]
-        consensus.enabled = false
+        no_consensus = true
 
         [nodes.validator-0]
         cl.config = {}  # explicitly empty
     "#;
         let result = Manifest::from_string(str).unwrap();
-        // Verify the node inherited global config (Legacy variant because image_cl is v0.4.0)
-        let cfg = unwrap_legacy(&result.nodes["validator-0"].cl_config);
-        assert!(!cfg.consensus.enabled);
+        // Verify the node inherited the global config.
+        let cfg = &result.nodes["validator-0"].cl_config;
+        assert!(cfg.no_consensus);
     }
 
     #[test]
@@ -1510,6 +1684,30 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid el_trusted_peers entry 'nonexistent'"));
+    }
+
+    #[test]
+    fn test_el_cli_flags_forward_trusted_only_but_not_trusted_peers() {
+        let str = r#"
+        [nodes.validator1.el.config]
+        trusted_peers = ["validator2"]
+        trusted_only = true
+        [nodes.validator2]
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+        let node = &manifest.nodes["validator1"];
+
+        assert_eq!(node.el_trusted_peers, Some(vec!["validator2".to_string()]));
+
+        let flags = node.el_cli_flags().unwrap();
+        assert!(
+            flags.iter().any(|flag| flag == "--trusted-only"),
+            "trusted_only=true should be forwarded as --trusted-only: {flags:?}"
+        );
+        assert!(
+            !flags.iter().any(|flag| flag.starts_with("--trusted-peers")),
+            "trusted_peers is generated by Quake setup and should not be forwarded directly: {flags:?}"
+        );
     }
 
     #[test]
@@ -1715,6 +1913,103 @@ mod tests {
             .el_cli_flags()
             .unwrap()
             .contains(&"--http".to_string()));
+    }
+
+    #[test]
+    fn test_el_config_txpool_subpool_size_flags() {
+        // Setting `txpool.*_max_size` in the manifest must emit the corresponding
+        // `--txpool.*-max-size=N` Reth CLI flag for every node. Reth caps each
+        // sub-pool on both count and size in MB independently, so the size
+        // dimension must be tunable from the manifest just like count.
+        let str = r#"
+        [el.config.txpool]
+        pending_max_size = 200
+        basefee_max_size = 100
+        queued_max_size = 150
+        blobpool_max_size = 50
+        blobpool_max_count = 75
+
+        [nodes.validator1]
+        [nodes.validator2]
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+        for node_name in ["validator1", "validator2"] {
+            let flags = manifest.nodes[node_name].el_cli_flags().unwrap();
+            assert!(
+                flags.contains(&"--txpool.pending-max-size=200".to_string()),
+                "{node_name} missing pending-max-size flag: {flags:?}"
+            );
+            assert!(
+                flags.contains(&"--txpool.basefee-max-size=100".to_string()),
+                "{node_name} missing basefee-max-size flag: {flags:?}"
+            );
+            assert!(
+                flags.contains(&"--txpool.queued-max-size=150".to_string()),
+                "{node_name} missing queued-max-size flag: {flags:?}"
+            );
+            assert!(
+                flags.contains(&"--txpool.blobpool-max-size=50".to_string()),
+                "{node_name} missing blobpool-max-size flag: {flags:?}"
+            );
+            assert!(
+                flags.contains(&"--txpool.blobpool-max-count=75".to_string()),
+                "{node_name} missing blobpool-max-count flag: {flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_el_config_engine_share_sparse_trie_with_payload_builder() {
+        // `share_sparse_trie_with_payload_builder = true` must emit the bare
+        // `--engine.share-sparse-trie-with-payload-builder` flag, which reth
+        // parses as a presence flag. `false` or absent must emit nothing,
+        // since the flag defaults to false in reth.
+        let flag = "--engine.share-sparse-trie-with-payload-builder".to_string();
+
+        let enabled = r#"
+        [el.config.engine]
+        share_sparse_trie_with_payload_builder = true
+
+        [nodes.validator1]
+        [nodes.validator2]
+        "#;
+        let manifest = Manifest::from_string(enabled).unwrap();
+        for node in ["validator1", "validator2"] {
+            let flags = manifest.nodes[node].el_cli_flags().unwrap();
+            assert!(
+                flags.contains(&flag),
+                "{node}: true must emit the bare flag, got: {flags:?}"
+            );
+        }
+
+        let disabled = r#"
+        [el.config.engine]
+        share_sparse_trie_with_payload_builder = false
+
+        [nodes.validator1]
+        [nodes.validator2]
+        "#;
+        let manifest = Manifest::from_string(disabled).unwrap();
+        for node in ["validator1", "validator2"] {
+            let flags = manifest.nodes[node].el_cli_flags().unwrap();
+            assert!(
+                !flags.iter().any(|f| f.contains("share-sparse-trie")),
+                "{node}: false must emit no flag, got: {flags:?}"
+            );
+        }
+
+        let unset = r#"
+        [nodes.validator1]
+        [nodes.validator2]
+        "#;
+        let manifest = Manifest::from_string(unset).unwrap();
+        for node in ["validator1", "validator2"] {
+            let flags = manifest.nodes[node].el_cli_flags().unwrap();
+            assert!(
+                !flags.iter().any(|f| f.contains("share-sparse-trie")),
+                "{node}: absent must emit no flag, got: {flags:?}"
+            );
+        }
     }
 
     #[test]
@@ -1960,7 +2255,7 @@ mod tests {
     #[test]
     fn test_el_pruning_preset_roundtrip() {
         let toml_str = r#"
-        image_cl = "arc_consensus:v0.4.0"
+        image_cl = "arc_consensus:latest"
         el.config.prune.preset = "minimal"
         el.config.prune.bodies.distance = 100
 
@@ -2069,6 +2364,33 @@ mod tests {
             .unwrap()
             .iter()
             .any(|f| f.contains("rpc.forwarder")));
+    }
+
+    #[test]
+    fn test_arc_tx_relays_set_in_priority_order() {
+        let str = r#"
+        [nodes.full1]
+        el.config.arc.tx.relays = ["http://validator1_el:8545", "http://validator2_el:8545"]
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+
+        assert!(manifest.nodes["full1"].el_cli_flags().unwrap().contains(
+            &"--arc.tx.relays=http://validator1_el:8545,http://validator2_el:8545".to_string()
+        ));
+    }
+
+    #[test]
+    fn test_arc_tx_relays_omitted_when_unset() {
+        let str = r#"
+        [nodes.full1]
+        "#;
+        let manifest = Manifest::from_string(str).unwrap();
+
+        assert!(!manifest.nodes["full1"]
+            .el_cli_flags()
+            .unwrap()
+            .iter()
+            .any(|f| f.contains("arc.tx.relays")));
     }
 
     #[test]
@@ -2583,7 +2905,7 @@ mod tests {
     #[test]
     fn test_voting_power_roundtrip() {
         let str = r#"
-        image_cl = "arc_consensus:v0.4.0"
+        image_cl = "arc_consensus:latest"
         [nodes.validator1]
         cl_voting_power = 2000
         [nodes.validator2]

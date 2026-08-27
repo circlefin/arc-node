@@ -20,6 +20,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use tokio::net::{TcpListener, ToSocketAddrs};
+use tower_http::compression::CompressionLayer;
 use tracing::{error, info};
 
 use malachitebft_app::metrics::export;
@@ -34,7 +35,7 @@ pub async fn serve(listen_addr: impl ToSocketAddrs) {
 }
 
 async fn inner(listen_addr: impl ToSocketAddrs) -> io::Result<()> {
-    let app = Router::new().route("/metrics", get(get_metrics));
+    let app = metrics_router();
     let listener = TcpListener::bind(listen_addr).await?;
     let local_addr = listener.local_addr()?;
 
@@ -44,9 +45,81 @@ async fn inner(listen_addr: impl ToSocketAddrs) -> io::Result<()> {
     Ok(())
 }
 
+fn metrics_router() -> Router {
+    Router::new()
+        .route("/metrics", get(get_metrics))
+        .layer(CompressionLayer::new())
+}
+
 async fn get_metrics() -> impl IntoResponse {
     let mut buf = String::new();
     export(&mut buf);
 
     ([("Content-Type", CONTENT_TYPE)], buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+    use tower_http::compression::CompressionLayer;
+
+    // The global prometheus registry is empty in tests, so using metrics_router()
+    // directly would produce an empty body and skip compression. Build an
+    // equivalent router with a non-empty synthetic body to exercise the layer.
+    fn router_with_compression_and_non_empty_body() -> Router {
+        Router::new()
+            .route(
+                "/metrics",
+                get(|| async {
+                    (
+                        [("content-type", super::CONTENT_TYPE)],
+                        "# HELP test A test.\n# TYPE test counter\ntest_total 1\n# EOF\n",
+                    )
+                }),
+            )
+            .layer(CompressionLayer::new())
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_compresses_when_accept_encoding_gzip() {
+        let response = router_with_compression_and_non_empty_body()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .map(|v| v.as_bytes()),
+            Some(b"gzip".as_slice()),
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_plaintext_without_accept_encoding() {
+        let response = router_with_compression_and_non_empty_body()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    }
 }

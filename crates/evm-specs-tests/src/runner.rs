@@ -911,7 +911,7 @@ fn build_state_root_diagnostic(
         );
     }
 
-    let oracle_root = compute_state_root_from_fixture_accounts(&ctx.test.post_state);
+    let oracle_root = compute_state_root_from_fixture_accounts(ctx.test.post_state.iter());
     let expected_trie_accounts: BTreeSet<_> = ctx.test.post_state.keys().copied().collect();
     let extra_actual_accounts = actual_trie_accounts
         .difference(&expected_trie_accounts)
@@ -961,7 +961,7 @@ fn build_json_outcome(
         gas_used: exec_result
             .as_ref()
             .ok()
-            .map(|result| result.gas_used())
+            .map(|result| result.tx_gas_used())
             .unwrap_or_default(),
         error_msg: error.unwrap_or_default(),
         evm_result: format_evm_result(exec_result),
@@ -1281,7 +1281,7 @@ mod tests {
     use reth_evm::EvmEnv;
     use revm::context::result::{
         EVMError, ExecutionResult, HaltReason, InvalidTransaction, OutOfGasError, Output,
-        SuccessReason,
+        ResultGas, SuccessReason,
     };
     use revm::database::{EmptyDB, State};
     use revm::state::AccountInfo;
@@ -1293,7 +1293,7 @@ mod tests {
     };
 
     fn touched_state(addresses: &[Address]) -> State<EmptyDB> {
-        let mut cache = CacheState::new(true);
+        let mut cache = CacheState::new();
         for address in addresses {
             cache.insert_account(*address, AccountInfo::default());
         }
@@ -1344,6 +1344,7 @@ mod tests {
                 current_beacon_root: None,
                 current_withdrawals_root: None,
                 current_excess_blob_gas: None,
+                slot_number: None,
             },
             pre: alloy_primitives::map::HashMap::default(),
             post,
@@ -1377,7 +1378,7 @@ mod tests {
     ) -> TestExecutionContext<'a> {
         let factory =
             crate::adapter::build_evm_factory(crate::adapter::build_default_arc_chain_spec());
-        let cache_state = CacheState::new(true);
+        let cache_state = CacheState::new();
 
         TestExecutionContext {
             factory: Box::leak(Box::new(factory)),
@@ -1392,8 +1393,7 @@ mod tests {
     fn call_result(output: Bytes) -> ExecutionResult<HaltReason> {
         ExecutionResult::Success {
             reason: SuccessReason::Return,
-            gas_used: 21_000,
-            gas_refunded: 0,
+            gas: ResultGas::new_with_state_gas(21_000, 0, 0, 0),
             logs: Vec::new(),
             output: Output::Call(output),
         }
@@ -1401,7 +1401,8 @@ mod tests {
 
     fn revert_result(output: Bytes) -> ExecutionResult<HaltReason> {
         ExecutionResult::Revert {
-            gas_used: 21_000,
+            gas: ResultGas::new_with_state_gas(21_000, 0, 0, 0),
+            logs: Vec::new(),
             output,
         }
     }
@@ -1671,7 +1672,8 @@ mod tests {
             unit.out.as_ref(),
             &ExecutionResult::Halt {
                 reason: HaltReason::OutOfGas(OutOfGasError::Basic),
-                gas_used: 21_000,
+                gas: ResultGas::new_with_state_gas(21_000, 0, 0, 0),
+                logs: Vec::new(),
             },
         )
         .expect("halted executions do not have output to compare");
@@ -1708,7 +1710,8 @@ mod tests {
         assert_eq!(
             format_evm_result(&Ok(ExecutionResult::Halt {
                 reason: HaltReason::OutOfGas(OutOfGasError::Basic),
-                gas_used: 21_000,
+                gas: ResultGas::new_with_state_gas(21_000, 0, 0, 0),
+                logs: Vec::new(),
             })),
             "Halt: OutOfGas(Basic)"
         );

@@ -71,6 +71,13 @@ pub async fn restream_proposal(
 ) -> eyre::Result<()> {
     let (height, round) = (block.height, block.round);
 
+    if block.signature.is_none() {
+        return Err(eyre!(
+            "Refusing to restream block at height={height}, round={round} without a signature: \
+             restreaming must reuse the block's original signature, never produce a new one"
+        ));
+    }
+
     info!(
         %height, %round, valid_round = %block.valid_round,
         "Restreaming proposal, block size: {:?}, payload size: {:?}",
@@ -220,13 +227,40 @@ mod tests {
         let mut mock = MockPublishProposalPart::new();
         let stream_id = StreamId::new(Bytes::from_static(&[42; 20]));
         let signing_provider = LocalSigningProvider::new(PrivateKey::generate(&mut rng));
-        let block = create_dummy_block(Height::new(10), Round::new(2), Round::Nil);
+        let mut block = create_dummy_block(Height::new(10), Round::new(2), Round::Nil);
+
+        let (_, signature) = make_proposal_parts(&signing_provider, &block)
+            .await
+            .unwrap();
+        block.signature = Some(signature);
 
         mock.expect_publish_proposal_part().returning(|_| Ok(()));
 
         let result = restream_proposal(mock, stream_id, &signing_provider, &block).await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn restream_proposal_without_signature_fails() {
+        let mut rng = rand::thread_rng();
+
+        let mock = MockPublishProposalPart::new();
+        let stream_id = StreamId::new(Bytes::from_static(&[42; 20]));
+        let signing_provider = LocalSigningProvider::new(PrivateKey::generate(&mut rng));
+        let block = create_dummy_block(Height::new(10), Round::new(2), Round::Nil);
+        assert!(
+            block.signature.is_none(),
+            "block must start without a signature"
+        );
+
+        let result = restream_proposal(mock, stream_id, &signing_provider, &block).await;
+
+        let err = result.expect_err("restreaming a signatureless block should fail");
+        assert!(
+            err.to_string().contains("without a signature"),
+            "error should explain the missing signature, got: {err}"
+        );
     }
 
     /// Retrieve a stored block via `get_block_to_restream` and verify that proposal
@@ -267,7 +301,7 @@ mod tests {
         assert!(validate_proposal_parts(&first_parts, expected_first, &provider).await);
 
         block.signature = Some(first_sig);
-        let block_hash = block.block_hash();
+        let block_hash = block.self_reported_block_hash();
         let stored_block = block.clone();
 
         let mut mock_repo = MockUndecidedBlocksRepository::new();

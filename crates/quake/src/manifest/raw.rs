@@ -15,17 +15,16 @@
 // limitations under the License.
 
 use alloy_primitives::Address;
-use arc_consensus_types::Config as ClConfigOverride;
 use color_eyre::eyre::{bail, Result};
 use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::cli_version::supports_cli_flags;
+use crate::cli_version::ensure_cl_image_supported;
 use crate::manifest::subnets::Subnets;
 use crate::manifest::{
     default_subnet_singleton, ClGossipSubConfig, ClPruningPreset, DockerImages, ElConfigOverride,
-    EngineApiConnection, Manifest, Node, NodeClConfig, NodeType, RemoteKeyId,
+    EngineApiConnection, ImageOverride, Manifest, Node, NodeType, RemoteKeyId,
 };
 use crate::node::SubnetName;
 use crate::util::merge_toml_values;
@@ -70,31 +69,120 @@ pub struct ElConfig {
     /// Execution layer (Reth) CLI flags as a TOML table.
     /// Keys become flag names, values become flag values.
     /// e.g., `builder.deadline = 5` becomes `--builder.deadline=5`
+    #[serde(skip_serializing_if = "is_empty_table")]
     pub config: toml::Table,
+
+    /// Environment variables for the execution layer container.
+    /// Keys become env var names, scalar values become their string form.
+    /// e.g., `el.env.RUST_LOG = "debug"`.
+    #[serde(skip_serializing_if = "is_empty_table")]
+    pub env: toml::Table,
 }
 
 /// Wrapper for consensus layer configuration in TOML.
 ///
-/// Supports the `cl.config` TOML syntax where `config` is a table
-/// of Malachite configuration fields.
+/// Supports the `cl.config` TOML syntax where `config` is a table of
+/// consensus CLI-flag fields.
 ///
 /// # Example
 /// ```toml
 /// [cl.config]
-/// logging.log_level = "debug"
+/// log_level = "debug"
 /// ```
 /// or equivalently:
 /// ```toml
-/// cl.config.logging.log_level = "debug"
+/// cl.config.log_level = "debug"
 /// ```
 #[derive(Debug, Deserialize, Default, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ClConfig {
+    #[serde(skip_serializing_if = "is_empty_table")]
     pub config: toml::Table,
+
+    /// Environment variables for the consensus layer container.
+    /// Keys become env var names, scalar values become their string form.
+    /// e.g., `cl.env.ARC_HALT_AT_BLOCK_HEIGHT = 100`.
+    #[serde(skip_serializing_if = "is_empty_table")]
+    pub env: toml::Table,
 }
 
 fn is_default<T: Default + PartialEq>(v: &T) -> bool {
     *v == T::default()
+}
+
+fn is_empty_table(table: &toml::Table) -> bool {
+    table.is_empty()
+}
+
+/// Merge a global env table with a node-specific one, the node values winning on
+/// matching keys. The env tables are flat (one level of scalar values), so a flat
+/// override is sufficient — no recursive merge like CLI config tables.
+fn merge_env_tables(global: &toml::Table, node: &toml::Table) -> toml::Table {
+    let mut merged = global.clone();
+    for (key, value) in node {
+        merged.insert(key.clone(), value.clone());
+    }
+    merged
+}
+
+/// Whether `key` is a valid environment variable name: a leading letter or
+/// underscore followed by letters, digits, or underscores (`^[A-Za-z_][A-Za-z0-9_]*$`).
+/// TOML permits quoted keys with arbitrary characters, but those would render as
+/// invalid or injected YAML in the compose `environment:` block.
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Convert an env table into a string map, coercing scalar values to their string
+/// representation. Arrays and tables are rejected: an environment variable value is
+/// always a single string. Keys are validated as environment variable names.
+fn env_table_to_map(
+    table: &toml::Table,
+    node_name: &str,
+    layer: &str,
+) -> Result<IndexMap<String, String>> {
+    let mut map = IndexMap::with_capacity(table.len());
+    for (key, value) in table {
+        if !is_valid_env_key(key) {
+            bail!(
+                "{node_name}: {layer}.env key {key:?} is not a valid environment variable name \
+                 (expected ^[A-Za-z_][A-Za-z0-9_]*$)"
+            );
+        }
+        let rendered = match value {
+            toml::Value::String(s) => s.clone(),
+            toml::Value::Integer(i) => i.to_string(),
+            toml::Value::Float(f) => f.to_string(),
+            toml::Value::Boolean(b) => b.to_string(),
+            other => bail!(
+                "{node_name}: {layer}.env.{key} must be a string, integer, float, or boolean, \
+                 got {}",
+                other.type_str()
+            ),
+        };
+        if let Some(c) = rendered.chars().find(|c| c.is_control()) {
+            bail!(
+                "{node_name}: {layer}.env.{key} contains a control character (U+{:04X}); \
+                 environment variable values must be single-line, control-char-free",
+                c as u32
+            );
+        }
+        map.insert(key.clone(), rendered);
+    }
+    Ok(map)
+}
+
+/// Convert a string env map back into a TOML table of string values, for the
+/// `Manifest` → `RawManifest` round-trip.
+fn env_map_to_table(env: &IndexMap<String, String>) -> toml::Table {
+    env.iter()
+        .map(|(k, v)| (k.clone(), toml::Value::String(v.clone())))
+        .collect()
 }
 
 fn is_default_subnet(v: &Vec<String>) -> bool {
@@ -119,6 +207,15 @@ pub struct RawNode {
     /// Uses `el.config` syntax in TOML.
     #[serde(skip_serializing_if = "is_default")]
     el: ElConfig,
+
+    /// Per-node consensus layer image override (mixed-version networks).
+    /// Takes precedence over any node-group override and the global image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_cl: Option<String>,
+
+    /// Per-node execution layer image override. See `image_cl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_el: Option<String>,
 
     start_at: Option<u64>,
 
@@ -197,6 +294,10 @@ pub struct RawManifest {
     nodes: IndexMap<String, RawNode>,
     #[serde(skip_serializing_if = "is_default")]
     node_groups: IndexMap<String, Vec<String>>,
+    /// Per-node-group image overrides, keyed by an existing node-group name.
+    /// Applied to every member unless the node sets its own `image_cl`/`image_el`.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    group_images: IndexMap<String, ImageOverride>,
     el_init_hardfork: Option<String>,
     #[serde(default, alias = "image_tag_cl")]
     image_cl: Option<String>,
@@ -224,6 +325,10 @@ pub struct RawManifest {
     node_volume_type: Option<String>,
     /// Provisioned IOPS for the node root EBS volume (remote only).
     node_volume_iops: Option<u32>,
+    /// Place the node data directory on local instance-store NVMe instead of the root EBS
+    /// volume (remote only). Requires an instance type with local NVMe; a no-op otherwise.
+    #[serde(skip_serializing_if = "is_default")]
+    node_data_on_instance_store: bool,
     /// CPU limit for the EL container (Docker `cpus`). Whole or fractional CPUs.
     el_cpu_limit: Option<f64>,
     /// Memory limit for the EL container, in GiB. Fractional values are allowed.
@@ -260,6 +365,7 @@ impl Default for RawManifest {
             arc_image_registry: None,
             nodes: IndexMap::new(),
             node_groups: IndexMap::new(),
+            group_images: IndexMap::new(),
             el_init_hardfork: None,
             image_cl: None,
             image_el: None,
@@ -273,6 +379,7 @@ impl Default for RawManifest {
             block_gas_limit: None,
             node_volume_type: None,
             node_volume_iops: None,
+            node_data_on_instance_store: false,
             el_cpu_limit: None,
             el_memory_limit_gb: None,
             cl_cpu_limit: None,
@@ -281,22 +388,8 @@ impl Default for RawManifest {
     }
 }
 
-/// Collect all leaf keys from a TOML table as dot-separated paths.
-fn collect_toml_keys(table: &toml::Table, prefix: &str, out: &mut Vec<String>) {
-    for (key, value) in table {
-        let path = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
-        };
-        match value {
-            toml::Value::Table(sub) => collect_toml_keys(sub, &path, out),
-            _ => out.push(path),
-        }
-    }
-}
-
-/// Reject manifests where a node sets both `cl_prune_preset` and `cl.config.prune.*`.
+/// Reject manifests where a node sets both `cl_prune_preset` and an explicit
+/// `cl.config.prune_certificates_distance` / `cl.config.prune_certificates_before`.
 /// These are mutually exclusive: the preset is a named shortcut while explicit prune
 /// config overrides individual knobs. Allowing both would make precedence ambiguous.
 fn validate_prune_exclusivity(raw: &RawManifest) -> Result<()> {
@@ -305,18 +398,56 @@ fn validate_prune_exclusivity(raw: &RawManifest) -> Result<()> {
         let node_has_prune = has_prune_keys(&raw_node.cl.config) || global_has_prune;
         if raw_node.cl_prune_preset.is_some() && node_has_prune {
             bail!(
-                "{node_name}: cl_prune_preset and cl.config.prune.* are mutually exclusive. \
-                 Use either a preset (full/minimal) or explicit prune settings, not both."
+                "{node_name}: cl_prune_preset and explicit \
+                 cl.config.prune_certificates_distance/prune_certificates_before are \
+                 mutually exclusive. Use either a preset (full/minimal) or explicit \
+                 prune settings, not both."
             );
         }
     }
     Ok(())
 }
 
+/// Whether the table sets either explicit certificate-pruning knob.
 fn has_prune_keys(table: &toml::Table) -> bool {
-    let mut keys = Vec::new();
-    collect_toml_keys(table, "", &mut keys);
-    keys.iter().any(|k| k.starts_with("prune."))
+    table.contains_key("prune_certificates_distance")
+        || table.contains_key("prune_certificates_before")
+}
+
+/// Resolve the image override that node-groups contribute to `node_name`.
+/// Errors if more than one image-declaring group covers the node for the same
+/// layer, since the winner would otherwise be arbitrary.
+fn group_image_override(
+    node_name: &str,
+    group_images: &IndexMap<String, ImageOverride>,
+    node_groups: &IndexMap<String, Vec<String>>,
+) -> Result<ImageOverride> {
+    let mut cl: Option<(&str, &str)> = None;
+    let mut el: Option<(&str, &str)> = None;
+    for (gname, ovr) in group_images {
+        let Some(members) = node_groups.get(gname) else {
+            continue;
+        };
+        if !members.iter().any(|m| m == node_name) {
+            continue;
+        }
+        if let Some(img) = ovr.image_cl.as_deref() {
+            if let Some((prev, _)) = cl {
+                bail!("Node '{node_name}' gets image_cl from groups '{prev}' and '{gname}'; remove the overlap");
+            }
+            cl = Some((gname, img));
+        }
+        if let Some(img) = ovr.image_el.as_deref() {
+            if let Some((prev, _)) = el {
+                bail!("Node '{node_name}' gets image_el from groups '{prev}' and '{gname}'; remove the overlap");
+            }
+            el = Some((gname, img));
+        }
+    }
+    Ok(ImageOverride {
+        image_cl: cl.map(|(_, i)| i.to_string()),
+        image_el: el.map(|(_, i)| i.to_string()),
+    })
 }
 
 impl TryFrom<RawManifest> for Manifest {
@@ -329,8 +460,13 @@ impl TryFrom<RawManifest> for Manifest {
 
         validate_prune_exclusivity(&raw)?;
 
-        // Build Docker images (needed early to determine CL config format)
         let images = raw.images();
+
+        // Pre-v0.5.0 CL releases require a config.toml that Quake no longer
+        // generates. Reject them here rather than letting the container fail at
+        // startup with unrecognized CLI flags.
+        ensure_cl_image_supported(images.cl.as_deref())?;
+        ensure_cl_image_supported(images.cl_upgrade.as_deref())?;
 
         let node_names = raw.nodes.keys().cloned().collect::<Vec<_>>();
         let custom_node_groups = raw.node_groups.clone();
@@ -357,22 +493,29 @@ impl TryFrom<RawManifest> for Manifest {
             }
         }
 
+        // Validate per-group image overrides: keys must name a known group, and
+        // group CL images are subject to the same version floor as global images.
+        for (group_name, ovr) in &raw.group_images {
+            if !node_groups.contains_key(group_name) {
+                bail!("group_images references unknown node group '{group_name}'");
+            }
+            ensure_cl_image_supported(ovr.image_cl.as_deref())?;
+        }
+
         // Merge default CL and EL configs with manifest's global config.
         // Precedence: defaults < manifest global < per-node
-        // The CL default depends on the image version: Modern uses StartCmd,
-        // Legacy uses ClConfigOverride.
-        let is_modern = supports_cli_flags(images.cl.as_deref());
-        let default_cl = if is_modern {
-            toml::Value::try_from(arc_node_consensus_cli::cmd::start::StartCmd::default())?
-        } else {
-            toml::Value::try_from(ClConfigOverride::default())?
-        };
+        let default_cl =
+            toml::Value::try_from(arc_node_consensus_cli::cmd::start::StartCmd::default())?;
         let manifest_cl = toml::Value::Table(raw.cl.config.clone());
         let global_cl_config = merge_toml_values(default_cl, manifest_cl)?;
 
         let default_el = toml::Value::try_from(ElConfigOverride::default())?;
         let manifest_el = toml::Value::Table(raw.el.config.clone());
         let global_el_config = merge_toml_values(default_el, manifest_el)?;
+
+        // Global env tables, inherited by every node and overridden per-node.
+        let global_el_env = raw.el.env.clone();
+        let global_cl_env = raw.cl.env.clone();
 
         // Build nodes map from raw nodes
         let mut nodes = IndexMap::new();
@@ -397,19 +540,32 @@ impl TryFrom<RawManifest> for Manifest {
             // Merge node-specific CL config with global CL config
             let node_cl_config = toml::Value::Table(raw_node.cl.config);
             let cl_config_toml = merge_toml_values(global_cl_config.clone(), node_cl_config)?;
+            let cl_config = cl_config_toml.try_into()?;
 
-            // Version-branched deserialization
-            let cl_config = if is_modern {
-                NodeClConfig::Modern(cl_config_toml.try_into()?)
-            } else {
-                NodeClConfig::Legacy(cl_config_toml.try_into()?)
-            };
+            // Merge global env with node-specific env (node wins) for each layer.
+            let el_env = env_table_to_map(
+                &merge_env_tables(&global_el_env, &raw_node.el.env),
+                &key,
+                "el",
+            )?;
+            let cl_env = env_table_to_map(
+                &merge_env_tables(&global_cl_env, &raw_node.cl.env),
+                &key,
+                "cl",
+            )?;
 
             // Merge global el.config with node-specific el.config as TOML
             let node_el_config = toml::Value::Table(raw_node.el.config);
             let el_config = merge_toml_values(global_el_config.clone(), node_el_config)?;
 
             let mut el_config: ElConfigOverride = el_config.try_into()?;
+
+            // Effective per-node images: inline override wins over the node-group
+            // override; both fall back to the global image later (nodes.rs).
+            let group_ovr = group_image_override(&key, &raw.group_images, &node_groups)?;
+            let image_cl = raw_node.image_cl.or(group_ovr.image_cl);
+            let image_el = raw_node.image_el.or(group_ovr.image_el);
+            ensure_cl_image_supported(image_cl.as_deref())?;
 
             // Extract trusted_peers from el.config: expand group/node names, remove self,
             // and strip the key so it is not forwarded as a Reth CLI flag.
@@ -437,6 +593,8 @@ impl TryFrom<RawManifest> for Manifest {
                     node_type,
                     cl_config,
                     el_config,
+                    image_cl,
+                    image_el,
                     start_at: raw_node.start_at,
                     region: raw_node.region,
                     cl_persistent_peers,
@@ -450,6 +608,8 @@ impl TryFrom<RawManifest> for Manifest {
                     cl_prune_preset: raw_node.cl_prune_preset,
                     cl_suggested_fee_recipient: raw_node.cl_suggested_fee_recipient,
                     external: raw_node.external,
+                    el_env,
+                    cl_env,
                 },
             );
         }
@@ -478,6 +638,7 @@ impl TryFrom<RawManifest> for Manifest {
             block_gas_limit: raw.block_gas_limit,
             node_volume_type: raw.node_volume_type,
             node_volume_iops: raw.node_volume_iops,
+            node_data_on_instance_store: raw.node_data_on_instance_store,
             el_cpu_limit: raw.el_cpu_limit,
             el_memory_limit_gb: raw.el_memory_limit_gb,
             cl_cpu_limit: raw.cl_cpu_limit,
@@ -515,6 +676,9 @@ impl TryFrom<Manifest> for RawManifest {
                 })
                 .collect::<Result<_, Self::Error>>()?,
             node_groups,
+            // Group overrides are flattened onto each node during the forward
+            // conversion, so they round-trip as per-node image_cl/image_el.
+            group_images: IndexMap::new(),
             el_init_hardfork: manifest.el_init_hardfork,
             image_cl: manifest.images.cl,
             image_el: manifest.images.el,
@@ -530,6 +694,7 @@ impl TryFrom<Manifest> for RawManifest {
             block_gas_limit: manifest.block_gas_limit,
             node_volume_type: manifest.node_volume_type,
             node_volume_iops: manifest.node_volume_iops,
+            node_data_on_instance_store: manifest.node_data_on_instance_store,
             el_cpu_limit: manifest.el_cpu_limit,
             el_memory_limit_gb: manifest.el_memory_limit_gb,
             cl_cpu_limit: manifest.cl_cpu_limit,
@@ -554,28 +719,26 @@ impl RawNode {
         let node_el_table = toml::Table::try_from(el_config)?;
         let default_el_config: toml::Table = toml::Table::try_from(ElConfigOverride::default())?;
 
-        // Serialize cl_config to TOML based on variant
-        let cl_config_table = match &node.cl_config {
-            NodeClConfig::Modern(start_cmd) => {
-                let table = toml::Table::try_from(start_cmd)?;
-                let default_table =
-                    toml::Table::try_from(arc_node_consensus_cli::cmd::start::StartCmd::default())?;
-                Self::config_diff(&table, &default_table)
-            }
-            NodeClConfig::Legacy(config) => {
-                let table = toml::Table::try_from(config)?;
-                let default_table = toml::Table::try_from(ClConfigOverride::default())?;
-                Self::config_diff(&table, &default_table)
-            }
+        // Serialize cl_config to TOML, keeping only fields that differ from the
+        // StartCmd default.
+        let cl_config_table = {
+            let table = toml::Table::try_from(&node.cl_config)?;
+            let default_table =
+                toml::Table::try_from(arc_node_consensus_cli::cmd::start::StartCmd::default())?;
+            Self::config_diff(&table, &default_table)
         };
 
         Ok(Self {
             cl: ClConfig {
                 config: cl_config_table,
+                env: env_map_to_table(&node.cl_env),
             },
             el: ElConfig {
                 config: Self::config_diff(&node_el_table, &default_el_config),
+                env: env_map_to_table(&node.el_env),
             },
+            image_cl: node.image_cl,
+            image_el: node.image_el,
             start_at: node.start_at,
             region: node.region,
             cl_persistent_peers: node.cl_persistent_peers,
@@ -689,7 +852,7 @@ mod tests {
     #[test]
     fn test_el_trusted_peers_roundtrip() {
         let toml = r#"
-        image_cl = "arc_consensus:v0.4.0"
+        image_cl = "arc_consensus:latest"
         [nodes.val1.el.config]
         trusted_peers = ["val2"]
         [nodes.val2]
@@ -728,7 +891,7 @@ mod tests {
     #[test]
     fn test_el_trusted_peers_global_roundtrip() {
         let toml = r#"
-        image_cl = "arc_consensus:v0.4.0"
+        image_cl = "arc_consensus:latest"
         [el.config]
         trusted_peers = ["val2"]
         [nodes.val1]
@@ -765,7 +928,7 @@ mod tests {
     #[test]
     fn test_custom_node_groups_roundtrip() {
         let toml = r#"
-        image_cl = "arc_consensus:v0.4.0"
+        image_cl = "arc_consensus:latest"
         [node_groups]
         FULL_NODES = ["full1", "full2"]
         TRUSTED = ["ALL_VALIDATORS", "FULL_NODES", "other_node"]
@@ -833,7 +996,7 @@ mod tests {
             image_cl = "ghcr.io/org/arc-consensus:latest"
             [nodes.val1]
             cl_prune_preset = "minimal"
-            cl.config.prune.certificates_distance = 500
+            cl.config.prune_certificates_distance = 500
         "#;
         let raw: RawManifest = toml::from_str(toml_str).unwrap();
         let result = Manifest::try_from(raw);
@@ -849,7 +1012,7 @@ mod tests {
     fn test_prune_preset_and_global_cl_config_prune_are_mutually_exclusive() {
         let toml_str = r#"
             image_cl = "ghcr.io/org/arc-consensus:latest"
-            cl.config.prune.certificates_distance = 500
+            cl.config.prune_certificates_distance = 500
             [nodes.val1]
             cl_prune_preset = "minimal"
         "#;
@@ -880,42 +1043,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_collect_toml_keys() {
-        let table: toml::Table = toml::from_str(
-            r#"[logging]
-log_level = "info"
-[consensus.p2p]
-rpc_max_size = "42 Mib"
-"#,
-        )
-        .unwrap();
-
-        let mut keys = Vec::new();
-        collect_toml_keys(&table, "", &mut keys);
-        keys.sort();
-        assert_eq!(
-            keys,
-            vec!["consensus.p2p.rpc_max_size", "logging.log_level",]
-        );
-    }
-
-    #[test]
-    fn test_collect_toml_keys_empty_table() {
-        let mut keys = Vec::new();
-        collect_toml_keys(&toml::Table::new(), "", &mut keys);
-        assert!(keys.is_empty());
-    }
-
     /// Manifest serialization should not include empty/default fields.
     /// Make sure that the default fields are skipped during serialization.
     #[test]
     fn test_default_manifest_serialization() {
         let node = Node {
-            cl_config: NodeClConfig::Modern(StartCmd {
+            cl_config: StartCmd {
                 log_level: Some(LogLevel::Info),
                 ..StartCmd::default()
-            }),
+            },
             el_config: ElConfigOverride {
                 txpool: crate::manifest::ElTxpoolConfig {
                     pending_max_count: Some(2),
@@ -945,5 +1081,167 @@ rpc_max_size = "42 Mib"
             serialized,
             "[nodes.val0.cl.config]\nlog_level = \"info\"\n\n[nodes.val0.el.config.txpool]\npending_max_count = 2\n\n[nodes.val1]\n"
         );
+    }
+
+    /// node_data_on_instance_store round-trips through TOML → Manifest → RawManifest → TOML.
+    #[test]
+    fn test_node_data_on_instance_store_roundtrip() {
+        let toml = r#"
+        node_data_on_instance_store = true
+        [nodes.val1]
+        "#;
+
+        let manifest1 = Manifest::from_string(toml).unwrap();
+        assert!(manifest1.node_data_on_instance_store);
+
+        let raw = RawManifest::try_from(manifest1).unwrap();
+        let serialized = toml::to_string(&raw).unwrap();
+        assert!(serialized.contains("node_data_on_instance_store = true"));
+
+        let manifest2 = Manifest::from_string(&serialized).unwrap();
+        assert!(manifest2.node_data_on_instance_store);
+    }
+
+    /// Omitting node_data_on_instance_store defaults to false (datadir stays on root EBS).
+    #[test]
+    fn test_node_data_on_instance_store_defaults_to_false() {
+        let manifest = Manifest::from_string("[nodes.val1]\n").unwrap();
+        assert!(!manifest.node_data_on_instance_store);
+    }
+
+    /// Global `el.env`/`cl.env` are inherited by every node; per-node entries
+    /// override matching keys and add new ones.
+    #[test]
+    fn test_env_global_and_per_node_merge() {
+        let toml = r#"
+        [el.env]
+        RUST_LOG = "info"
+        SHARED = "global"
+        [cl.env]
+        ARC_HALT_AT_BLOCK_HEIGHT = 0
+
+        [nodes.val1.el.env]
+        RUST_LOG = "debug"
+        [nodes.val1.cl.env]
+        EXTRA = "x"
+        [nodes.val2]
+        "#;
+
+        let manifest = Manifest::from_string(toml).unwrap();
+
+        // val1 overrides RUST_LOG, keeps inherited SHARED, adds cl EXTRA.
+        assert_eq!(manifest.nodes["val1"].el_env["RUST_LOG"], "debug");
+        assert_eq!(manifest.nodes["val1"].el_env["SHARED"], "global");
+        assert_eq!(
+            manifest.nodes["val1"].cl_env["ARC_HALT_AT_BLOCK_HEIGHT"],
+            "0"
+        );
+        assert_eq!(manifest.nodes["val1"].cl_env["EXTRA"], "x");
+
+        // val2 inherits the global env unchanged.
+        assert_eq!(manifest.nodes["val2"].el_env["RUST_LOG"], "info");
+        assert_eq!(manifest.nodes["val2"].el_env["SHARED"], "global");
+        assert_eq!(
+            manifest.nodes["val2"].cl_env["ARC_HALT_AT_BLOCK_HEIGHT"],
+            "0"
+        );
+        assert!(!manifest.nodes["val2"].cl_env.contains_key("EXTRA"));
+    }
+
+    /// Non-string scalar env values are coerced to their string form.
+    #[test]
+    fn test_env_scalar_coercion() {
+        let toml = r#"
+        [nodes.val1.el.env]
+        COUNT = 42
+        RATIO = 1.5
+        FLAG = true
+        NAME = "hello"
+        "#;
+
+        let manifest = Manifest::from_string(toml).unwrap();
+        let env = &manifest.nodes["val1"].el_env;
+        assert_eq!(env["COUNT"], "42");
+        assert_eq!(env["RATIO"], "1.5");
+        assert_eq!(env["FLAG"], "true");
+        assert_eq!(env["NAME"], "hello");
+    }
+
+    /// Array/table env values are rejected: an env var value must be a scalar.
+    #[test]
+    fn test_env_non_scalar_value_errors() {
+        let toml = r#"
+        [nodes.val1.el.env]
+        BAD = ["a", "b"]
+        "#;
+
+        let err = Manifest::from_string(toml).unwrap_err().to_string();
+        assert!(
+            err.contains("must be a string, integer, float, or boolean"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Env keys that are not valid environment variable names are rejected, so they
+    /// cannot inject YAML-significant characters into the compose `environment:` block.
+    #[test]
+    fn test_env_invalid_key_rejected() {
+        for bad_key in ["BAD: KEY", "1LEADING_DIGIT", "has-hyphen"] {
+            let toml = format!("[nodes.val1.el.env]\n{bad_key:?} = \"x\"\n");
+            let err = Manifest::from_string(&toml).unwrap_err().to_string();
+            assert!(
+                err.contains("not a valid environment variable name"),
+                "key {bad_key:?} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    /// Env values containing control characters (newline, tab, CR) are
+    /// rejected at parse time. Multi-line env vars don't survive shell
+    /// round-tripping and would break the compose YAML. (Null bytes are
+    /// rejected earlier by the TOML parser itself — `\0` isn't a TOML escape.)
+    #[test]
+    fn test_env_control_char_value_rejected() {
+        for (label, bad_value) in [
+            ("newline", "first\nsecond"),
+            ("carriage return", "first\rsecond"),
+            ("tab", "a\tb"),
+        ] {
+            let toml = format!("[nodes.val1.el.env]\nFOO = {bad_value:?}\n");
+            let err = Manifest::from_string(&toml).unwrap_err().to_string();
+            assert!(
+                err.contains("control character"),
+                "{label} value should be rejected, got: {err}"
+            );
+        }
+    }
+
+    /// Per-node env survives the Manifest → RawManifest → TOML → Manifest round-trip.
+    /// The global env block is not retained separately, so it folds into each node.
+    #[test]
+    fn test_env_roundtrip() {
+        let toml = r#"
+        [el.env]
+        RUST_LOG = "info"
+        [nodes.val1.cl.env]
+        ARC_HALT_AT_BLOCK_HEIGHT = "100"
+        [nodes.val2]
+        "#;
+
+        let manifest1 = Manifest::from_string(toml).unwrap();
+
+        let raw = RawManifest::try_from(manifest1).unwrap();
+        let serialized = toml::to_string(&raw).unwrap();
+
+        let manifest2 = Manifest::from_string(&serialized).unwrap();
+        // val1: inherited el RUST_LOG + its own cl ARC_HALT_AT_BLOCK_HEIGHT.
+        assert_eq!(manifest2.nodes["val1"].el_env["RUST_LOG"], "info");
+        assert_eq!(
+            manifest2.nodes["val1"].cl_env["ARC_HALT_AT_BLOCK_HEIGHT"],
+            "100"
+        );
+        // val2: inherited el RUST_LOG, no cl env.
+        assert_eq!(manifest2.nodes["val2"].el_env["RUST_LOG"], "info");
+        assert!(manifest2.nodes["val2"].cl_env.is_empty());
     }
 }

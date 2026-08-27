@@ -11,6 +11,10 @@ publish.workspace = true
 name = "quake"
 path = "src/main.rs"
 
+[features]
+default = ["byzantine"]
+byzantine = ["arc-consensus-types/byzantine", "arc-node-consensus/byzantine"]
+
 [dependencies]
 
 alloy-consensus = { workspace = true }
@@ -63,6 +67,7 @@ serde_json = { workspace = true }
 spammer = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 toml = { workspace = true, features = ["preserve_order"] }
@@ -72,7 +77,6 @@ url = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 bytesize = { workspace = true }
-tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -337,12 +337,16 @@ async fn run_test<R: NodeRunner, S: Default + Send + 'static>(
         let runner = runner.clone();
         let node_id = node.id;
         join_set.spawn(async move {
-            let result = tokio::time::timeout(timeout, run_node(runner, node)).await;
-            match result {
-                Ok(outcome) => outcome,
+            match tokio::time::timeout(timeout, run_node(runner, node)).await {
+                Ok(result) => result,
                 Err(_) => {
+                    // The timed-out `run_node` future is dropped here, which
+                    // drops its handle and shuts the node down; report no handle.
                     error!(%node_id, "Node timed out after {timeout:?}");
-                    node_failure(node_id, format!("timed out after {timeout:?}"))
+                    (
+                        node_failure(node_id, format!("timed out after {timeout:?}")),
+                        None,
+                    )
                 }
             }
         });
@@ -352,10 +356,17 @@ async fn run_test<R: NodeRunner, S: Default + Send + 'static>(
 }
 
 /// Run a single node through its step sequence.
+///
+/// Returns the node's outcome together with its live handle (when one was
+/// spawned). The caller keeps the handle alive until the whole test finishes so
+/// that nodes which complete their steps early — e.g. background support
+/// validators — keep running to support any peer still recovering. The handle
+/// is `None` only when the node was never spawned (spawn failed) or its handle
+/// was consumed by a failed restart.
 async fn run_node<R: NodeRunner, S: Default + Send + 'static>(
     runner: R,
     node: TestNode<S>,
-) -> NodeOutcome {
+) -> (NodeOutcome, Option<R::Handle>) {
     let node_id = node.id;
 
     if !node.start_delay.is_zero() {
@@ -367,7 +378,7 @@ async fn run_node<R: NodeRunner, S: Default + Send + 'static>(
         Ok(h) => h,
         Err(e) => {
             error!(%node_id, error = ?e, "Failed to spawn node");
-            return node_failure(node_id, format!("spawn failed: {e:#}"));
+            return (node_failure(node_id, format!("spawn failed: {e:#}")), None);
         }
     };
 
@@ -382,7 +393,7 @@ async fn run_node<R: NodeRunner, S: Default + Send + 'static>(
             Step::WaitUntilBlock(target_height) => loop {
                 let event = match recv_or_fail(&mut rx, node_id, "waiting for block").await {
                     Ok(event) => event,
-                    Err(outcome) => return outcome,
+                    Err(outcome) => return (outcome, Some(handle)),
                 };
                 match event {
                     ArcEvent::BlockProduced { number, .. } if number >= target_height => {
@@ -403,7 +414,7 @@ async fn run_node<R: NodeRunner, S: Default + Send + 'static>(
             Step::WaitUntilDecision(target_height) => loop {
                 let event = match recv_or_fail(&mut rx, node_id, "waiting for decision").await {
                     Ok(event) => event,
-                    Err(outcome) => return outcome,
+                    Err(outcome) => return (outcome, Some(handle)),
                 };
                 if let ArcEvent::ConsensusDecided { height, .. } = event {
                     decisions += 1;
@@ -417,7 +428,7 @@ async fn run_node<R: NodeRunner, S: Default + Send + 'static>(
             Step::OnEvent(handler) => loop {
                 let event = match recv_or_fail(&mut rx, node_id, "in OnEvent handler").await {
                     Ok(event) => event,
-                    Err(outcome) => return outcome,
+                    Err(outcome) => return (outcome, Some(handle)),
                 };
                 if matches!(event, ArcEvent::ConsensusDecided { .. }) {
                     decisions += 1;
@@ -430,7 +441,10 @@ async fn run_node<R: NodeRunner, S: Default + Send + 'static>(
                         break;
                     }
                     Err(e) => {
-                        return node_failure(node_id, format!("event handler error: {e}"));
+                        return (
+                            node_failure(node_id, format!("event handler error: {e}")),
+                            Some(handle),
+                        );
                     }
                 }
             },
@@ -440,7 +454,10 @@ async fn run_node<R: NodeRunner, S: Default + Send + 'static>(
                     tokio::time::sleep(delay).await;
                 }
                 if let Err(e) = kill_layer(&handle, layer).await {
-                    return node_failure(node_id, format!("crash/kill failed: {e}"));
+                    return (
+                        node_failure(node_id, format!("crash/kill failed: {e}")),
+                        Some(handle),
+                    );
                 }
                 info!(%node_id, "Node crashed");
             }
@@ -452,7 +469,11 @@ async fn run_node<R: NodeRunner, S: Default + Send + 'static>(
                 handle = match runner.restart(node_id, handle, layer).await {
                     Ok(h) => h,
                     Err(e) => {
-                        return node_failure(node_id, format!("restart failed: {e:#}"));
+                        // `handle` was moved into `restart` and dropped on failure.
+                        return (
+                            node_failure(node_id, format!("restart failed: {e:#}")),
+                            None,
+                        );
                     }
                 };
                 rx = handle.subscribe();
@@ -461,51 +482,68 @@ async fn run_node<R: NodeRunner, S: Default + Send + 'static>(
 
             Step::Expect(expected, layer) => {
                 if let Err(e) = kill_layer(&handle, layer).await {
-                    return node_failure(
-                        node_id,
-                        format!("failed to kill node before expect: {e}"),
+                    return (
+                        node_failure(node_id, format!("failed to kill node before expect: {e}")),
+                        Some(handle),
                     );
                 }
                 if expected.check(decisions) {
                     info!(%node_id, decisions, %expected, "Expectation met");
                     info!(%node_id, "Node test passed");
-                    return NodeOutcome::Success;
+                    return (NodeOutcome::Success, Some(handle));
                 } else {
-                    return node_failure(
-                        node_id,
-                        format!("expected {expected} decisions, got {decisions}"),
+                    return (
+                        node_failure(
+                            node_id,
+                            format!("expected {expected} decisions, got {decisions}"),
+                        ),
+                        Some(handle),
                     );
                 }
             }
 
             Step::Success => {
                 info!(%node_id, "Node test passed");
-                return NodeOutcome::Success;
+                return (NodeOutcome::Success, Some(handle));
             }
 
             Step::Fail(reason) => {
-                return node_failure(node_id, reason);
+                return (node_failure(node_id, reason), Some(handle));
             }
         }
     }
 
-    node_failure(
-        node_id,
-        "step sequence ended without an explicit terminal step (use .success(), .fail(...), or .expect_decisions(...))"
-            .to_string(),
+    (
+        node_failure(
+            node_id,
+            "step sequence ended without an explicit terminal step (use .success(), .fail(...), or .expect_decisions(...))"
+                .to_string(),
+        ),
+        Some(handle),
     )
 }
 
 /// Collect results from all node tasks and fail if any node failed.
-async fn check_results(join_set: &mut JoinSet<NodeOutcome>) {
+///
+/// Node handles are kept alive until *every* task has finished. A node that
+/// completes its step sequence early (e.g. a background support validator) must
+/// keep running — serving sync requests and consensus votes — so a peer still
+/// recovering (e.g. after a crash/restart) can catch up. Dropping a handle
+/// shuts the node down, so handles are released only once all tasks complete.
+async fn check_results<H: Send + 'static>(join_set: &mut JoinSet<(NodeOutcome, Option<H>)>) {
     let mut failures = Vec::new();
+    let mut live_handles = Vec::new();
 
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(NodeOutcome::Success) => {}
-            Ok(NodeOutcome::Failed(reason)) => {
-                error!(%reason, "Node failed");
-                failures.push(reason);
+            Ok((outcome, handle)) => {
+                if let Some(handle) = handle {
+                    live_handles.push(handle);
+                }
+                if let NodeOutcome::Failed(reason) = outcome {
+                    error!(%reason, "Node failed");
+                    failures.push(reason);
+                }
             }
             Err(e) => {
                 let msg = if e.is_panic() {
@@ -524,6 +562,9 @@ async fn check_results(join_set: &mut JoinSet<NodeOutcome>) {
             }
         }
     }
+
+    // Every task has finished; tearing the nodes down is now safe.
+    drop(live_handles);
 
     if !failures.is_empty() {
         panic!(

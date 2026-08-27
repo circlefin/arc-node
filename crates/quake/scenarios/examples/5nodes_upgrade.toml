@@ -1,4 +1,4 @@
-engine_api_connection = "rpc"
+engine_api_connection = "ipc"
 
 # IMAGE_REGISTRY_URL should be defined as an environment variable or in the .env file.
 image_cl="${IMAGE_REGISTRY_URL}/arc-consensus:0.5.0-rc1"

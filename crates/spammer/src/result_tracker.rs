@@ -24,9 +24,14 @@ use tokio::time::{self, Duration, Instant};
 
 use crate::ws::{WsClient, WsClientBuilder};
 
+/// Per-submission outcome: the byte count is always known at submit time, so
+/// it's carried alongside both Ok and Err so `total_bytes` accumulates over
+/// every locally-offered transaction — not just the ones the server accepted.
+pub(crate) type TxOutcome = (u64, Result<()>);
+
 pub(crate) struct ResultTracker {
     ws_clients: Vec<WsClient>,
-    result_receiver: Receiver<Result<u64>>,
+    result_receiver: Receiver<TxOutcome>,
     finish_receiver: Receiver<()>,
     silent: bool,
     show_pool_status: bool,
@@ -47,7 +52,7 @@ pub(crate) struct ResultSummary {
 impl ResultTracker {
     pub async fn new(
         ws_client_builders: Vec<WsClientBuilder>,
-        result_receiver: Receiver<Result<u64>>,
+        result_receiver: Receiver<TxOutcome>,
         finish_receiver: Receiver<()>,
         silent: bool,
         show_pool_status: bool,
@@ -88,8 +93,10 @@ impl ResultTracker {
                 // Update counters
                 res = self.result_receiver.recv() => {
                     match res {
-                        Some(Ok(tx_length)) => stats.incr_ok(tx_length),
-                        Some(Err(error)) => stats.incr_err(&error.to_string()),
+                        Some((tx_length, Ok(()))) => stats.incr_ok(tx_length),
+                        Some((tx_length, Err(error))) => {
+                            stats.incr_err(tx_length, &error.to_string())
+                        }
                         None => break,
                     }
                 }
@@ -116,7 +123,7 @@ impl ResultTracker {
         println!("{}", stats.total_display());
         Ok(ResultSummary {
             errors: stats.total_errors,
-            total_sent: stats.total_succeed,
+            total_sent: stats.total_sent,
             total_bytes: stats.total_bytes,
             elapsed: start_time.elapsed(),
         })
@@ -149,6 +156,7 @@ struct Stats {
     succeed: u64,
     bytes: u64,
     errors_counter: HashMap<String, u64>,
+    total_sent: u64,
     total_succeed: u64,
     total_bytes: u64,
     total_errors: HashMap<String, u64>,
@@ -161,6 +169,7 @@ impl Stats {
             succeed: 0,
             bytes: 0,
             errors_counter: HashMap::new(),
+            total_sent: 0,
             total_succeed: 0,
             total_bytes: 0,
             total_errors: HashMap::new(),
@@ -170,11 +179,14 @@ impl Stats {
     fn incr_ok(&mut self, tx_length: u64) {
         self.succeed += 1;
         self.bytes += tx_length;
+        self.total_sent += 1;
         self.total_succeed += 1;
         self.total_bytes += tx_length;
     }
 
-    fn incr_err(&mut self, error: &str) {
+    fn incr_err(&mut self, tx_length: u64, error: &str) {
+        self.total_sent += 1;
+        self.total_bytes += tx_length;
         let category = categorize_error(error);
         self.errors_counter
             .entry(category.clone())
@@ -195,10 +207,12 @@ impl Stats {
     fn total_display(&self) -> String {
         let elapsed = self.start_time.elapsed().as_millis() as f64 / 1000f64;
         let mut stats = String::new();
-        let tps = self.total_succeed as f64 / elapsed; // since the start of the load
+        // Mirror `ResultSummary` semantics: "sent" means every offered tx
+        // (accepted + rejected), matching `total_bytes` on the same line.
+        let tps = self.total_sent as f64 / elapsed;
         stats += &format!(
             "{:>7.3}s: Total sent {:>5} txs ({:>6} bytes), {:>4.1} tx/s",
-            elapsed, self.total_succeed, self.total_bytes, tps
+            elapsed, self.total_sent, self.total_bytes, tps
         );
         for (error, count) in self.total_errors.iter() {
             stats += &format!("\n  - \x1b[31m{count} failed\x1b[0m with \"{error}\"");
@@ -240,7 +254,47 @@ fn categorize_error(error: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::categorize_error;
+    use super::{categorize_error, Stats};
+    use tokio::time::Instant;
+
+    #[test]
+    fn incr_ok_accumulates_sent_and_bytes() {
+        let mut stats = Stats::new(Instant::now());
+        stats.incr_ok(100);
+        stats.incr_ok(50);
+        assert_eq!(stats.total_sent, 2);
+        assert_eq!(stats.total_succeed, 2);
+        assert_eq!(stats.total_bytes, 150);
+        assert!(stats.total_errors.is_empty());
+    }
+
+    #[test]
+    fn incr_err_accumulates_sent_and_bytes_without_succeed() {
+        let mut stats = Stats::new(Instant::now());
+        stats.incr_err(80, "Server Error -32003: txpool is full");
+        stats.incr_err(0, "connection closed");
+        // total_sent counts every submission; total_bytes carries the byte
+        // count even when the submission was rejected. total_succeed stays
+        // pinned to zero because nothing was accepted.
+        assert_eq!(stats.total_sent, 2);
+        assert_eq!(stats.total_succeed, 0);
+        assert_eq!(stats.total_bytes, 80);
+        assert_eq!(stats.total_errors.values().sum::<u64>(), 2);
+    }
+
+    #[test]
+    fn mixed_ok_and_err_offered_metrics_count_everything() {
+        let mut stats = Stats::new(Instant::now());
+        stats.incr_ok(100);
+        stats.incr_err(40, "Server Error -32003: txpool is full");
+        stats.incr_ok(60);
+        stats.incr_err(0, "connection closed");
+        // 4 submissions, 2 accepted, 200 bytes attempted (100 + 40 + 60 + 0).
+        assert_eq!(stats.total_sent, 4);
+        assert_eq!(stats.total_succeed, 2);
+        assert_eq!(stats.total_bytes, 200);
+        assert_eq!(stats.total_errors.values().sum::<u64>(), 2);
+    }
 
     #[test]
     fn nonce_too_low_collapses_across_distinct_nonces() {

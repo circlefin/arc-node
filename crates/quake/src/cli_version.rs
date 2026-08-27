@@ -14,14 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Version checks and compatibility shims for `arc-node-consensus` images.
+//! Version checks and compatibility shim for `arc-node-consensus` images.
 //!
-//! Two layers:
-//!
-//! * [`check_cli_version`] / [`supports_cli_flags`] decide whether a given
-//!   target image is started with CLI flags (v0.5.0 and newer) or with a
-//!   `config.toml` file (pre-v0.5.0). These helpers go away with the legacy
-//!   `config.toml` code path once every scenario uses v0.5.0 or later.
+//! * [`ensure_cl_image_supported`] rejects images older than v0.5.0, which
+//!   required a `config.toml` that Quake no longer generates.
 //!
 //! * [`apply_version_compat`] rewrites the CLI flag list produced by the
 //!   current Quake binary so it matches the target image's `StartCmd`
@@ -30,70 +26,38 @@
 //!   is long-lived — it stays as long as Quake runs against older
 //!   released images.
 
-/// The minimum version that supports CLI flags instead of `config.toml`.
-const MIN_CLI_FLAGS_VERSION: (u64, u64, u64) = (0, 5, 0);
+use color_eyre::eyre::{bail, Result};
 
-//////////////////////////////////////////////////////////////////
-// TODO: Remove once the network is fully migrated to use CLI flags. I.e when
-// all scenarios use v0.5.0 or later.
-//////////////////////////////////////////////////////////////////
-
-/// Result of checking whether a CL image supports CLI flags.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum CliVersionCheck {
-    /// Version parsed and supports CLI flags (>= v0.5.0)
-    SupportsCli,
-    /// Version parsed and does NOT support CLI flags (< v0.5.0, needs config.toml)
-    RequiresConfigToml,
-    /// Version could not be parsed (e.g. git SHA); assumed to support CLI flags
-    Assumed,
-}
-
-/// Detailed version check for safeguard validation.
-pub(crate) fn check_cli_version(image_tag: Option<&str>) -> CliVersionCheck {
-    let Some(tag) = image_tag else {
-        return CliVersionCheck::Assumed;
-    };
-    let version_str = tag.rsplit(':').next().unwrap_or(tag);
-    if version_str == "latest" {
-        return CliVersionCheck::SupportsCli;
-    }
-    match parse_image_semver(image_tag) {
-        Some(version) if version >= MIN_CLI_FLAGS_VERSION => CliVersionCheck::SupportsCli,
-        Some(_) => CliVersionCheck::RequiresConfigToml,
-        None => CliVersionCheck::Assumed,
-    }
-}
-
-/// Check if an image tag version supports CLI flags.
-///
-/// Returns `false` only for versions definitively older than v0.5.0.
-/// Returns `true` for `latest`, `None`, versions >= v0.5.0, and unparsable tags
-/// (which are assumed to be v0.5.0+).
-///
-/// See [`check_cli_version`] for finer-grained distinction between confirmed
-/// and assumed support.
-pub(crate) fn supports_cli_flags(image_tag: Option<&str>) -> bool {
-    check_cli_version(image_tag) != CliVersionCheck::RequiresConfigToml
-}
-
-//////////////////////////////////////////////////////////////////
-// END OF TODO: Remove once the network is fully migrated to use CLI flags. I.e
-// when all scenarios use v0.5.0 or later.
-//////////////////////////////////////////////////////////////////
-
-/// Released CL versions referenced as boundaries by [`apply_version_compat`].
+/// Released CL versions referenced as boundaries by [`apply_version_compat`]
+/// and as the minimum supported version by [`ensure_cl_image_supported`].
 const V0_5_0: (u64, u64, u64) = (0, 5, 0);
 const V0_6_0: (u64, u64, u64) = (0, 6, 0);
+
+/// Reject any `arc-node-consensus` image that pins a release older than
+/// v0.5.0. Releases before v0.5.0 are driven by a `config.toml`, which Quake
+/// no longer generates, so they would start with no consensus configuration.
+/// `None`, `"latest"`, and unparsable tags are assumed current and pass.
+pub(crate) fn ensure_cl_image_supported(image_tag: Option<&str>) -> Result<()> {
+    if let Some(version) = parse_image_semver(image_tag) {
+        if version < V0_5_0 {
+            bail!(
+                "arc-node-consensus image '{}' predates v0.5.0; releases before \
+                 v0.5.0 require a config.toml that Quake no longer generates. \
+                 Pin v0.5.0 or newer.",
+                image_tag.unwrap_or_default(),
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Extract a `(major, minor, patch)` tuple from an image tag.
 ///
 /// Returns `Some` only for explicit parseable versions such as `v0.6.0`,
 /// `arc_consensus:v0.5.1-rc1`, or `0.7.0`. Returns `None` for missing tags,
 /// the `"latest"` tag, or tags that do not fit the `MAJOR.MINOR.PATCH[-...]`
-/// pattern. Callers decide how to interpret `None` — [`check_cli_version`]
-/// distinguishes `latest` from unparsable, while [`apply_version_compat`]
-/// treats every `None` uniformly as "assume the target supports every flag".
+/// pattern. [`apply_version_compat`] treats every `None` uniformly as
+/// "assume the target supports every flag".
 fn parse_image_semver(image_tag: Option<&str>) -> Option<(u64, u64, u64)> {
     let tag = image_tag?;
     let version_str = tag.rsplit(':').next().unwrap_or(tag);
@@ -214,39 +178,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn supports_cli_flags_returns_true_for_latest() {
-        assert!(supports_cli_flags(Some("arc_consensus:latest")));
-        assert!(supports_cli_flags(Some("latest")));
+    fn ensure_cl_image_supported_accepts_current_and_unparsable_tags() {
+        for tag in [
+            None,
+            Some("arc_consensus:latest"),
+            Some("latest"),
+            Some("arc_consensus:v0.5.0"),
+            Some("v0.5.0"),
+            Some("0.5.0"),
+            Some("arc_consensus:v0.6.0"),
+            Some("arc_consensus:v1.0.0"),
+            Some("v0.5.0-rc1"),
+            Some("arc_consensus:abc123"),
+        ] {
+            assert!(
+                ensure_cl_image_supported(tag).is_ok(),
+                "tag {tag:?} should be accepted"
+            );
+        }
     }
 
     #[test]
-    fn supports_cli_flags_returns_true_for_new_versions() {
-        assert!(supports_cli_flags(Some("arc_consensus:v0.5.0")));
-        assert!(supports_cli_flags(Some("arc_consensus:v0.6.0")));
-        assert!(supports_cli_flags(Some("arc_consensus:v1.0.0")));
-        assert!(supports_cli_flags(Some("v0.5.0")));
-        assert!(supports_cli_flags(Some("0.5.0")));
-    }
-
-    #[test]
-    fn supports_cli_flags_returns_false_for_old_versions() {
-        assert!(!supports_cli_flags(Some("arc_consensus:v0.4.0")));
-        assert!(!supports_cli_flags(Some("arc_consensus:v0.4.1")));
-        assert!(!supports_cli_flags(Some("arc_consensus:v0.3.0")));
-        assert!(!supports_cli_flags(Some("v0.4.0")));
-        assert!(!supports_cli_flags(Some("0.4.0")));
-    }
-
-    #[test]
-    fn supports_cli_flags_returns_true_for_none() {
-        assert!(supports_cli_flags(None));
-    }
-
-    #[test]
-    fn supports_cli_flags_handles_prerelease_versions() {
-        assert!(supports_cli_flags(Some("v0.5.0-rc1")));
-        assert!(supports_cli_flags(Some("v0.5.0-beta")));
-        assert!(!supports_cli_flags(Some("v0.4.0-rc1")));
+    fn ensure_cl_image_supported_rejects_pre_v0_5_0() {
+        for tag in [
+            "arc_consensus:v0.4.0",
+            "arc_consensus:v0.4.1",
+            "arc_consensus:v0.3.0",
+            "v0.4.0",
+            "0.4.0",
+            "v0.4.0-rc1",
+        ] {
+            let err = ensure_cl_image_supported(Some(tag))
+                .expect_err(&format!("tag {tag} should be rejected"));
+            assert!(
+                err.to_string().contains("predates v0.5.0"),
+                "unexpected error for {tag}: {err}"
+            );
+        }
     }
 
     /// Run `apply_version_compat` over `input` for the given `image_tag` and

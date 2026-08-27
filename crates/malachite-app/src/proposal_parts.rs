@@ -247,21 +247,15 @@ pub async fn validate_proposal_parts(
 
 /// Resolves the expected proposer for a set of proposal parts.
 ///
-/// When `pol_round` (proof-of-lock round) is set, the proposal is a re-stream
-/// of a locked block. The proposer embedded in the parts is the original proposer
-/// from `pol_round`, not the proposer for `parts.round()` (the restream round).
+/// Selection uses `parts.round()`, which the parts signature covers. Restreamed parts
+/// carry the round and proposer the block was stored with, so the same round resolves
+/// the original proposer.
 pub fn resolve_expected_proposer<'a>(
     proposer_selector: &dyn ProposerSelector,
     validator_set: &'a ValidatorSet,
     parts: &ProposalParts,
 ) -> &'a Validator {
-    let pol_round = parts.init().pol_round;
-    let proposer_round = if pol_round != Round::Nil {
-        pol_round
-    } else {
-        parts.round()
-    };
-    proposer_selector.select_proposer(validator_set, parts.height(), proposer_round)
+    proposer_selector.select_proposer(validator_set, parts.height(), parts.round())
 }
 
 /// Re-assemble a [`ConsensusBlock`] from its [`ProposalParts`].
@@ -365,103 +359,159 @@ mod tests {
     }
 
     #[test]
-    fn resolve_proposer_with_pol_round_uses_original_round() {
+    fn resolve_proposer_with_pol_round_still_uses_parts_round() {
         let selector = RoundRobin;
         let (_keys, validator_set) = make_validator_set(3);
 
         let height = Height::new(1);
-        let restream_round = Round::new(2);
+        let parts_round = Round::new(2);
         let pol_round = Round::new(0);
 
-        let original_proposer = selector.select_proposer(&validator_set, height, pol_round);
-        let restream_proposer = selector.select_proposer(&validator_set, height, restream_round);
+        let parts_round_proposer = selector.select_proposer(&validator_set, height, parts_round);
+        let pol_round_proposer = selector.select_proposer(&validator_set, height, pol_round);
 
         // Ensure they differ so the test is meaningful
         assert_ne!(
-            original_proposer.address, restream_proposer.address,
-            "Test requires different proposers for pol_round and restream_round"
+            parts_round_proposer.address, pol_round_proposer.address,
+            "Test requires different proposers for parts_round and pol_round"
         );
 
-        // Build parts as if restreamed: round=2, pol_round=0, proposer=original
-        let init = ProposalInit::new(height, restream_round, pol_round, original_proposer.address);
+        // Parts with non-Nil pol_round
+        let init = ProposalInit::new(height, parts_round, pol_round, pol_round_proposer.address);
         let fin = ProposalFin::new(arc_consensus_types::signing::Signature::test());
         let parts =
             ProposalParts::new(vec![ProposalPart::Init(init), ProposalPart::Fin(fin)]).unwrap();
 
         let expected = resolve_expected_proposer(&selector, &validator_set, &parts);
 
-        // Should resolve to the pol_round proposer, not the restream round proposer
-        assert_eq!(expected.address, original_proposer.address);
-        assert_ne!(expected.address, restream_proposer.address);
+        // Always resolves to the parts.round() proposer, regardless of pol_round
+        assert_eq!(expected.address, parts_round_proposer.address);
+        assert_ne!(expected.address, pol_round_proposer.address);
     }
 
-    /// End-to-end: restreamed proposal parts signed by the original proposer
-    /// pass validation when expected_proposer is resolved via pol_round.
+    /// Parts signed by the proposer for parts.round() pass validation.
     #[tokio::test]
-    async fn restreamed_parts_pass_validation_with_pol_round_proposer() {
+    async fn proposal_parts_from_correct_proposer_pass_validation() {
+        let selector = RoundRobin;
+        let (keys, validator_set) = make_validator_set(3);
+
+        let height = Height::new(1);
+        let round = Round::new(2);
+
+        let expected_proposer = selector.select_proposer(&validator_set, height, round);
+        let signing_key = keys
+            .iter()
+            .find(|k| Address::from_public_key(&k.public_key()) == expected_proposer.address)
+            .unwrap();
+
+        let parts = make_signed_parts(
+            height,
+            round,
+            Round::Nil,
+            signing_key.public_key(),
+            signing_key,
+        )
+        .await;
+
+        let resolved = resolve_expected_proposer(&selector, &validator_set, &parts);
+        let provider = LocalSigningProvider::new(signing_key.clone());
+        assert!(validate_proposal_parts(&parts, resolved, &provider).await);
+    }
+
+    /// Parts carrying a non-Nil pol_round but signed by the pol_round proposer
+    /// rather than the parts.round() proposer fail validation.
+    #[tokio::test]
+    async fn proposal_parts_signed_by_non_proposer_fail_validation() {
         let selector = RoundRobin;
         let (keys, validator_set) = make_validator_set(3);
 
         let height = Height::new(1);
         let pol_round = Round::new(0);
-        let restream_round = Round::new(2);
+        let parts_round = Round::new(2);
 
-        let original_proposer = selector.select_proposer(&validator_set, height, pol_round);
+        let pol_round_proposer = selector.select_proposer(&validator_set, height, pol_round);
+        let parts_round_proposer = selector.select_proposer(&validator_set, height, parts_round);
 
-        // Find the signing key for the original proposer
+        assert_ne!(pol_round_proposer.address, parts_round_proposer.address);
+
         let signing_key = keys
             .iter()
-            .find(|k| Address::from_public_key(&k.public_key()) == original_proposer.address)
+            .find(|k| Address::from_public_key(&k.public_key()) == pol_round_proposer.address)
             .unwrap();
 
+        // Parts with round=parts_round, pol_round set, signed by pol_round proposer
         let parts = make_signed_parts(
             height,
-            restream_round,
+            parts_round,
             pol_round,
             signing_key.public_key(),
             signing_key,
         )
         .await;
 
-        // Resolve via pol_round (the fix) — should match and verify
-        let expected = resolve_expected_proposer(&selector, &validator_set, &parts);
+        // resolve_expected_proposer uses parts_round, not pol_round
+        let resolved = resolve_expected_proposer(&selector, &validator_set, &parts);
+        assert_eq!(resolved.address, parts_round_proposer.address);
+
+        // Validation fails: parts.proposer() is pol_round proposer, but expected is parts_round proposer
         let provider = LocalSigningProvider::new(signing_key.clone());
-        assert!(validate_proposal_parts(&parts, expected, &provider).await);
+        assert!(!validate_proposal_parts(&parts, resolved, &provider).await);
     }
 
-    /// Restreamed parts would fail validation if we used parts_round instead
-    /// of pol_round to resolve the expected proposer (the old buggy behavior).
+    /// A block carrying a non-Nil valid_round validates when restreamed: the parts
+    /// keep the round and proposer the block was stored with.
     #[tokio::test]
-    async fn restreamed_parts_fail_validation_with_wrong_round_proposer() {
+    async fn restreamed_parts_with_valid_round_pass_validation() {
+        use alloy_rpc_types_engine::ExecutionPayloadV3;
+        use arbitrary::{Arbitrary, Unstructured};
+
+        let mut u = Unstructured::new(&[0u8; 512]);
+        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+
         let selector = RoundRobin;
         let (keys, validator_set) = make_validator_set(3);
 
         let height = Height::new(1);
-        let pol_round = Round::new(0);
-        let restream_round = Round::new(2);
+        let round = Round::new(2);
+        let valid_round = Round::new(0);
 
-        let original_proposer = selector.select_proposer(&validator_set, height, pol_round);
-        let wrong_proposer = selector.select_proposer(&validator_set, height, restream_round);
+        let round_proposer = selector.select_proposer(&validator_set, height, round);
+        let valid_round_proposer = selector.select_proposer(&validator_set, height, valid_round);
 
-        assert_ne!(original_proposer.address, wrong_proposer.address);
+        assert_ne!(
+            round_proposer.address, valid_round_proposer.address,
+            "Test requires different proposers for round and valid_round"
+        );
 
         let signing_key = keys
             .iter()
-            .find(|k| Address::from_public_key(&k.public_key()) == original_proposer.address)
+            .find(|k| Address::from_public_key(&k.public_key()) == round_proposer.address)
             .unwrap();
-
-        let parts = make_signed_parts(
-            height,
-            restream_round,
-            pol_round,
-            signing_key.public_key(),
-            signing_key,
-        )
-        .await;
-
-        // Using parts_round (the old bug) resolves to the wrong proposer → validation fails
         let provider = LocalSigningProvider::new(signing_key.clone());
-        assert!(!validate_proposal_parts(&parts, wrong_proposer, &provider).await);
+
+        let mut block = ConsensusBlock {
+            height,
+            round,
+            valid_round,
+            proposer: round_proposer.address,
+            validity: Validity::Valid,
+            execution_payload: payload,
+            signature: None,
+        };
+
+        // Original stream signs the block
+        let (_, signature) = make_proposal_parts(&provider, &block).await.unwrap();
+        block.signature = Some(signature);
+
+        // Restream reuses the stored signature, round and proposer
+        let (raw_parts, _) = make_proposal_parts(&provider, &block).await.unwrap();
+        let parts = ProposalParts::new(raw_parts).unwrap();
+
+        assert_eq!(parts.init().pol_round, valid_round);
+
+        let resolved = resolve_expected_proposer(&selector, &validator_set, &parts);
+        assert_eq!(resolved.address, round_proposer.address);
+        assert!(validate_proposal_parts(&parts, resolved, &provider).await);
     }
 
     /// assemble_block_from_parts must preserve pol_round as valid_round.

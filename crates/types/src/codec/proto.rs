@@ -20,9 +20,9 @@ use prost::Message;
 use malachitebft_app::engine::util::streaming::{StreamContent, StreamId, StreamMessage};
 use malachitebft_core_consensus::{LivenessMsg, ProposedValue, SignedConsensusMsg};
 use malachitebft_core_types::{
-    CommitCertificate, CommitSignature, NilOrVal, PolkaCertificate, PolkaSignature, Round,
-    RoundCertificate, RoundCertificateType, RoundSignature, SignedExtension, SignedProposal,
-    SignedVote, ValidatorProof, Validity,
+    CommitCertificate, CommitSignature, ExtendedCommitCertificate, ExtendedCommitSignature,
+    NilOrVal, PolkaCertificate, PolkaSignature, Round, RoundCertificate, RoundCertificateType,
+    RoundSignature, SignedExtension, SignedProposal, SignedVote, ValidatorProof, Validity,
 };
 use malachitebft_proto::{Error as ProtoError, Protobuf};
 use malachitebft_signing_ed25519::Signature;
@@ -602,6 +602,16 @@ pub(crate) fn decode_polka_certificate(
 pub fn decode_store_commit_certificate(
     proto: proto::store::CommitCertificate,
 ) -> Result<StoredCommitCertificate, ProtoError> {
+    if proto
+        .signatures
+        .iter()
+        .any(|signature| signature.extension.is_some())
+    {
+        return Err(ProtoError::Other(
+            "Stored CommitCertificate signatures must not contain vote extensions".to_owned(),
+        ));
+    }
+
     let certificate = decode_commit_certificate_fields(
         proto.height,
         proto.round,
@@ -639,19 +649,67 @@ pub fn encode_store_commit_certificate(
 }
 
 pub fn decode_sync_commit_certificate(
-    proto: proto::sync::CommitCertificate,
-) -> Result<CommitCertificate<ArcContext>, ProtoError> {
-    decode_commit_certificate_fields(proto.height, proto.round, proto.value_id, proto.signatures)
+    certificate: proto::sync::CommitCertificate,
+) -> Result<ExtendedCommitCertificate<ArcContext>, ProtoError> {
+    if certificate.signatures.len() > MAX_SIGNATURES_PER_CERTIFICATE {
+        return Err(ProtoError::Other(format!(
+            "ExtendedCommitCertificate signature count {} exceeds maximum {MAX_SIGNATURES_PER_CERTIFICATE}",
+            certificate.signatures.len(),
+        )));
+    }
+
+    let value_id = certificate
+        .value_id
+        .ok_or_else(|| ProtoError::missing_field::<proto::sync::CommitCertificate>("value_id"))
+        .and_then(ValueId::from_proto)?;
+
+    let commit_signatures = certificate
+        .signatures
+        .into_iter()
+        .map(
+            |sig| -> Result<ExtendedCommitSignature<ArcContext>, ProtoError> {
+                let address = sig.validator_address.ok_or_else(|| {
+                    ProtoError::missing_field::<proto::sync::CommitSignature>("validator_address")
+                })?;
+                let signature = sig.signature.ok_or_else(|| {
+                    ProtoError::missing_field::<proto::sync::CommitSignature>("signature")
+                })?;
+                let extension = sig.extension.map(decode_extension).transpose()?;
+                Ok(ExtendedCommitSignature::new(
+                    Address::from_proto(address)?,
+                    decode_signature(signature)?,
+                    extension,
+                ))
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ExtendedCommitCertificate {
+        height: Height::new(certificate.height),
+        round: Round::new(certificate.round),
+        value_id,
+        commit_signatures,
+    })
 }
 
 pub fn encode_sync_commit_certificate(
-    certificate: &CommitCertificate<ArcContext>,
+    certificate: &ExtendedCommitCertificate<ArcContext>,
 ) -> Result<proto::sync::CommitCertificate, ProtoError> {
     Ok(proto::sync::CommitCertificate {
         height: certificate.height.as_u64(),
         round: certificate.round.as_u32().expect("round should not be nil"),
         value_id: Some(certificate.value_id.to_proto()?),
-        signatures: encode_commit_signatures(&certificate.commit_signatures)?,
+        signatures: certificate
+            .commit_signatures
+            .iter()
+            .map(|sig| -> Result<proto::sync::CommitSignature, ProtoError> {
+                Ok(proto::sync::CommitSignature {
+                    validator_address: Some(sig.address.to_proto()?),
+                    signature: Some(encode_signature(&sig.signature)),
+                    extension: sig.extension.as_ref().map(encode_extension).transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
@@ -706,6 +764,7 @@ fn encode_commit_signatures(
             Ok(proto::sync::CommitSignature {
                 validator_address: Some(address),
                 signature: Some(signature),
+                extension: None,
             })
         })
         .collect()
@@ -837,7 +896,7 @@ pub fn decode_signed_proposal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Address, Height};
+    use crate::{Address, BlockHash, Height};
     use malachitebft_core_types::{NilOrVal, Round, RoundSignature, VoteType};
     use malachitebft_signing_ed25519::Signature;
 
@@ -885,6 +944,56 @@ mod tests {
             decoded_sig.signature.to_bytes(),
             original_sig.signature.to_bytes()
         );
+    }
+
+    #[test]
+    fn test_extended_commit_certificate_encode_decode() {
+        let certificate = ExtendedCommitCertificate {
+            height: Height::new(1),
+            round: Round::new(2),
+            value_id: ValueId::new(BlockHash::repeat_byte(3)),
+            commit_signatures: vec![ExtendedCommitSignature::new(
+                Address::new([4; 20]),
+                Signature::from_bytes([5; 64]),
+                Some(SignedExtension::new(
+                    Bytes::from_static(b"extension"),
+                    Signature::from_bytes([6; 64]),
+                )),
+            )],
+        };
+
+        let encoded = encode_sync_commit_certificate(&certificate).unwrap();
+        let decoded = decode_sync_commit_certificate(encoded).unwrap();
+
+        assert_eq!(decoded, certificate);
+    }
+
+    #[test]
+    fn test_extended_commit_certificate_decodes_without_extensions() {
+        let legacy = proto::sync::CommitCertificate {
+            height: 1,
+            round: 2,
+            value_id: Some(proto::ValueId {
+                block_hash: Bytes::from(vec![3; 32]),
+            }),
+            signatures: vec![proto::sync::CommitSignature {
+                validator_address: Some(proto::Address {
+                    value: Bytes::from(vec![4; 20]),
+                }),
+                signature: Some(proto::Signature {
+                    bytes: Bytes::from(vec![5; 64]),
+                }),
+                extension: None,
+            }],
+        };
+
+        // An unset optional field omits tag 3, matching bytes from the schema before it existed.
+        let encoded = legacy.encode_to_vec();
+        let proto = proto::sync::CommitCertificate::decode(encoded.as_slice()).unwrap();
+        let decoded = decode_sync_commit_certificate(proto).unwrap();
+
+        assert_eq!(decoded.commit_signatures.len(), 1);
+        assert!(decoded.commit_signatures[0].extension.is_none());
     }
 
     #[test]
@@ -966,6 +1075,67 @@ mod tests {
     }
 
     #[test]
+    fn test_store_commit_certificate_rejects_vote_extensions() {
+        let certificate = proto::store::CommitCertificate {
+            height: 1,
+            round: 0,
+            value_id: Some(proto::ValueId {
+                block_hash: Bytes::from(vec![0u8; 32]),
+            }),
+            signatures: vec![proto::sync::CommitSignature {
+                validator_address: Some(proto::Address {
+                    value: Bytes::from(vec![0u8; 20]),
+                }),
+                signature: Some(proto::Signature {
+                    bytes: Bytes::from(vec![0u8; 64]),
+                }),
+                extension: Some(proto::Extension {
+                    data: Bytes::from_static(b"extension"),
+                    signature: Some(proto::Signature {
+                        bytes: Bytes::from(vec![0u8; 64]),
+                    }),
+                }),
+            }],
+            proposer: None,
+            extended: None,
+        };
+
+        let result = decode_store_commit_certificate(certificate);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("vote extensions"));
+    }
+
+    #[test]
+    fn test_extended_commit_certificate_rejects_excessive_signatures() {
+        let oversized: Vec<proto::sync::CommitSignature> = (0..MAX_SIGNATURES_PER_CERTIFICATE + 1)
+            .map(|_| proto::sync::CommitSignature {
+                validator_address: Some(proto::Address {
+                    value: Bytes::from(vec![0u8; 20]),
+                }),
+                signature: Some(proto::Signature {
+                    bytes: Bytes::from(vec![0u8; 64]),
+                }),
+                extension: None,
+            })
+            .collect();
+
+        let certificate = proto::sync::CommitCertificate {
+            height: 1,
+            round: 0,
+            value_id: Some(proto::ValueId {
+                block_hash: Bytes::from(vec![0u8; 32]),
+            }),
+            signatures: oversized,
+        };
+
+        let result = decode_sync_commit_certificate(certificate);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
     fn test_commit_certificate_rejects_excessive_signatures() {
         let oversized: Vec<proto::sync::CommitSignature> = (0..MAX_SIGNATURES_PER_CERTIFICATE + 1)
             .map(|_| proto::sync::CommitSignature {
@@ -975,6 +1145,7 @@ mod tests {
                 signature: Some(proto::Signature {
                     bytes: Bytes::from(vec![0u8; 64]),
                 }),
+                extension: None,
             })
             .collect();
 
@@ -1085,6 +1256,7 @@ mod tests {
                 signature: Some(proto::Signature {
                     bytes: Bytes::from(vec![0u8; 64]),
                 }),
+                extension: None,
             })
             .collect();
 

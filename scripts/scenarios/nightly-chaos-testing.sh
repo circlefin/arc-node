@@ -71,9 +71,16 @@ QUAKE="./target/debug/quake"
 
 echo "[1/6] Building (genesis, Docker images, quake)..."
 make genesis
-make build-docker
-
-cargo build --bin quake
+# When QUAKE_SKIP_BUILD is set, the caller has already provided the
+# arc_execution:latest / arc_consensus:latest images and the quake binary at
+# target/debug/quake (e.g. restored from a build cache), so skip the expensive
+# node image and quake builds.
+if [[ -n "${QUAKE_SKIP_BUILD:-}" ]]; then
+  echo "QUAKE_SKIP_BUILD set: reusing prebuilt node images and quake binary, skipping build"
+else
+  make build-docker
+  cargo build --bin quake
+fi
 
 echo "[2/6] Running quake cleanup..."
 "$QUAKE" --seed "$SEED" -f "$SCENARIO" clean --all 2>/dev/null

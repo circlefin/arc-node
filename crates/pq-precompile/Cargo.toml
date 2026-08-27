@@ -1,0 +1,20 @@
+[package]
+name = "arc-pq-precompile"
+version.workspace = true
+edition.workspace = true
+readme.workspace = true
+license.workspace = true
+exclude.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+revm.workspace = true
+revm-interpreter.workspace = true
+slh-dsa.workspace = true
+
+[lints]
+workspace = true

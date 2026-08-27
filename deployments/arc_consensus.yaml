@@ -12,6 +12,8 @@ services:
         BUILD_PROFILE: ${BUILD_PROFILE:-release}
         FEATURES: ${CL_FEATURES:-}
         ARC_IDEMPOTENT_BUILD: ${ARC_IDEMPOTENT_BUILD:-false}
+      secrets:
+        - github_token
     environment:
       ARC_HALT_AT_BLOCK_HEIGHT: 0 # Set it to a non-zero value to plan a coordinated update
       # ARC_CONSENSUS_DB_CACHE_SIZE_BYTES: 1073741824 # 1 GiB (default)
@@ -26,3 +28,7 @@ services:
 
 networks:
   arc_network:
+
+secrets:
+  github_token:
+    environment: GITHUB_TOKEN

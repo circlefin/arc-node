@@ -21,15 +21,12 @@
 
 use std::path::Path;
 
-use arc_snapshots::download::{
-    consensus_snapshot_exists, fetch_latest_snapshot_urls, should_download, stream_and_extract,
-    write_snapshot_version, Chain,
-};
+use arc_snapshots::download::{fetch_latest_consensus_url, stream_restore_consensus, Chain};
 use clap::Args;
 use eyre::Result;
 use tracing::info;
 
-#[derive(Args, Clone, Debug, Default)]
+#[derive(Args, Clone, Debug)]
 pub struct DownloadCmd {
     /// URL of the CL snapshot to download.
     ///
@@ -38,10 +35,8 @@ pub struct DownloadCmd {
     pub url: Option<String>,
 
     /// Network to download a snapshot for.
-    ///
-    /// [possible values: arc-testnet, arc-devnet]
     #[arg(long, default_value = "arc-testnet")]
-    pub chain: String,
+    pub chain: Chain,
 
     /// Force re-download even if snapshot data already exists.
     #[arg(long = "force")]
@@ -50,28 +45,13 @@ pub struct DownloadCmd {
 
 impl DownloadCmd {
     pub async fn run(&self, home_dir: &Path) -> Result<()> {
-        let chain = parse_chain(&self.chain)?;
-
         let url = match &self.url {
             Some(u) => u.clone(),
             None => {
                 info!(chain = %self.chain, "Fetching latest CL snapshot URL");
-                let (_el_url, cl_url) = fetch_latest_snapshot_urls(chain).await?;
-                cl_url
+                fetch_latest_consensus_url(self.chain).await?
             }
         };
-
-        if !should_download(
-            "Consensus layer",
-            home_dir,
-            &url,
-            consensus_snapshot_exists(home_dir),
-            self.force_redownload,
-        ) {
-            return Ok(());
-        }
-
-        let tmp_dir = home_dir.join(".snapshot-tmp");
 
         info!(
             url = %url,
@@ -79,41 +59,74 @@ impl DownloadCmd {
             "Starting CL snapshot download"
         );
 
-        stream_and_extract(url.clone(), home_dir.to_path_buf(), tmp_dir).await?;
-        write_snapshot_version(home_dir, &url)?;
+        // One implementation, shared with arc-snapshots: it decides whether the
+        // restore is needed, stages the archive, and records what was restored.
+        //
+        // Staging inside the home is safe here and nowhere else: the consensus
+        // restore never removes its target, and the node reads `store.db`,
+        // `config/` and `wal/` — never `.snapshot-tmp`. Keeping it inside also
+        // keeps the archive on the volume the operator gave the home, which a
+        // parent directory is not guaranteed to be.
+        stream_restore_consensus(
+            url,
+            home_dir.to_path_buf(),
+            home_dir.join(".snapshot-tmp"),
+            self.force_redownload,
+        )
+        .await?;
 
-        info!("CL snapshot downloaded and extracted successfully");
+        info!("CL snapshot restore complete");
         Ok(())
-    }
-}
-
-fn parse_chain(name: &str) -> Result<Chain> {
-    match name {
-        "arc-testnet" => Ok(Chain::Testnet),
-        "arc-devnet" => Ok(Chain::Devnet),
-        other => Err(eyre::eyre!(
-            "Unknown chain '{}'. Valid values: arc-testnet, arc-devnet",
-            other
-        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
 
-    #[test]
-    fn parse_chain_known_values() {
-        assert!(matches!(
-            parse_chain("arc-testnet").unwrap(),
-            Chain::Testnet
-        ));
-        assert!(matches!(parse_chain("arc-devnet").unwrap(), Chain::Devnet));
+    /// Wraps the command so `--chain` can be parsed the way the real CLI parses
+    /// it, rather than through a second hand-written parser.
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        cmd: DownloadCmd,
+    }
+
+    fn parse_chain_arg(value: &str) -> Result<Chain, clap::Error> {
+        TestCli::try_parse_from(["arc-node-consensus", "--chain", value]).map(|cli| cli.cmd.chain)
     }
 
     #[test]
-    fn parse_chain_unknown_is_error() {
-        assert!(parse_chain("unknown").is_err());
+    fn chain_accepts_every_supported_network() {
+        // arc-mainnet in particular: the CL used to reject it while the
+        // execution side and the docs both advertised it.
+        assert!(matches!(
+            parse_chain_arg("arc-testnet").unwrap(),
+            Chain::Testnet
+        ));
+        assert!(matches!(
+            parse_chain_arg("arc-devnet").unwrap(),
+            Chain::Devnet
+        ));
+        assert!(matches!(
+            parse_chain_arg("arc-mainnet").unwrap(),
+            Chain::Mainnet
+        ));
+    }
+
+    #[test]
+    fn chain_rejects_unknown_and_unprefixed_values() {
+        assert!(parse_chain_arg("unknown").is_err());
+        // The bare network name is what the snapshot API uses, not the CLI.
+        assert!(parse_chain_arg("testnet").is_err());
+    }
+
+    #[test]
+    fn chain_defaults_to_testnet() {
+        let cli = TestCli::try_parse_from(["arc-node-consensus"]).unwrap();
+        assert!(matches!(cli.cmd.chain, Chain::Testnet));
     }
 
     #[tokio::test]
@@ -146,21 +159,22 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir()?;
+        let home = dir.path().join("consensus");
         let cmd = DownloadCmd {
             url: Some(format!("{}/cl.tar.lz4", server.uri())),
-            chain: "arc-devnet".into(),
+            chain: Chain::Devnet,
             force_redownload: false,
         };
 
         let url = format!("{}/cl.tar.lz4", server.uri());
-        cmd.run(dir.path()).await?;
+        cmd.run(&home).await?;
 
-        assert!(dir.path().join("store.db").exists());
+        assert!(home.join("store.db").exists());
         // Version marker should be written
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join(".snapshot-url"))?,
-            url
-        );
+        assert_eq!(std::fs::read_to_string(home.join(".snapshot-url"))?, url);
+        // Staging is cleaned up, so the ~14 GB archive does not sit in the home
+        // beside the store it was unpacked into.
+        assert!(!home.join(".snapshot-tmp").exists());
         Ok(())
     }
 
@@ -194,34 +208,25 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir()?;
+        let home = dir.path().join("consensus");
+        std::fs::create_dir_all(&home)?;
         let url = format!("{}/cl.tar.lz4", server.uri());
 
         // Pre-populate data and matching marker
-        std::fs::write(dir.path().join("store.db"), b"existing")?;
-        std::fs::write(dir.path().join(".snapshot-url"), &url)?;
+        std::fs::write(home.join("store.db"), b"existing")?;
+        std::fs::write(home.join(".snapshot-url"), &url)?;
 
         let cmd = DownloadCmd {
             url: Some(url),
-            chain: "arc-devnet".into(),
+            chain: Chain::Devnet,
             force_redownload: false,
         };
-        cmd.run(dir.path()).await?;
+        cmd.run(&home).await?;
 
         // Data should be untouched
-        assert_eq!(std::fs::read(dir.path().join("store.db"))?, b"existing");
+        assert_eq!(std::fs::read(home.join("store.db"))?, b"existing");
 
         drop(mock);
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn run_errors_on_unknown_chain() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd = DownloadCmd {
-            url: Some("http://example.com/cl.tar.lz4".into()),
-            chain: "not-a-chain".into(),
-            force_redownload: false,
-        };
-        assert!(cmd.run(dir.path()).await.is_err());
     }
 }

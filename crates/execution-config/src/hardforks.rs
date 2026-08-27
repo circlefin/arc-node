@@ -33,6 +33,7 @@ hardfork!(
         #[default]
         Zero6, // v0.6 hardfork
         Zero7, // v0.7 hardfork — batch (Multicall3From) and memo contracts
+        Zero8, // v0.8 hardfork — delegatecall rejections charge the uniform early-revert penalty
     }
 );
 
@@ -54,6 +55,8 @@ pub struct ArcGenesisInfo {
     /// Built-in network schedules are defined in `ARC_*_HARDFORKS` and may activate
     /// earlier Arc hardforks by timestamp, e.g. testnet Zero5/Zero6.
     pub zero_7_time: Option<u64>,
+    /// v0.8 hardfork timestamp for genesis-configured chains.
+    pub zero_8_time: Option<u64>,
 }
 
 impl ArcGenesisInfo {
@@ -78,6 +81,9 @@ impl ArcGenesisInfo {
         if let Some(time) = self.zero_7_time {
             hardforks.push((ArcHardfork::Zero7, ForkCondition::Timestamp(time)));
         }
+        if let Some(time) = self.zero_8_time {
+            hardforks.push((ArcHardfork::Zero8, ForkCondition::Timestamp(time)));
+        }
         hardforks
     }
 }
@@ -101,6 +107,7 @@ pub struct ArcHardforkFlags {
     zero5: bool,
     zero6: bool,
     zero7: bool,
+    zero8: bool,
 }
 
 impl ArcHardforkFlags {
@@ -111,6 +118,7 @@ impl ArcHardforkFlags {
         ArcHardfork::Zero5,
         ArcHardfork::Zero6,
         ArcHardfork::Zero7,
+        ArcHardfork::Zero8,
     ];
 
     /// Check if a specific hardfork is active.
@@ -121,6 +129,7 @@ impl ArcHardforkFlags {
             ArcHardfork::Zero5 => self.zero5,
             ArcHardfork::Zero6 => self.zero6,
             ArcHardfork::Zero7 => self.zero7,
+            ArcHardfork::Zero8 => self.zero8,
         }
     }
 
@@ -132,6 +141,7 @@ impl ArcHardforkFlags {
             ArcHardfork::Zero5 => self.zero5 = value,
             ArcHardfork::Zero6 => self.zero6 = value,
             ArcHardfork::Zero7 => self.zero7 = value,
+            ArcHardfork::Zero8 => self.zero8 = value,
         }
     }
 
@@ -278,6 +288,7 @@ pub static ARC_LOCALDEV_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
     // mixed-version peers (block-based forks declared after a timestamp fork break
     // ForkFilter's BTreeMap ordering).
     forks.insert(ArcHardfork::Zero7.boxed(), ForkCondition::Timestamp(0));
+    forks.insert(ArcHardfork::Zero8.boxed(), ForkCondition::Timestamp(0));
     forks
 });
 
@@ -290,6 +301,14 @@ pub static ARC_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
     forks.insert(EthereumHardfork::Osaka.boxed(), ForkCondition::Timestamp(0));
     forks.insert(ArcHardfork::Zero5.boxed(), ForkCondition::Block(0));
     forks.insert(ArcHardfork::Zero6.boxed(), ForkCondition::Block(0));
+    forks.insert(
+        ArcHardfork::Zero7.boxed(),
+        ForkCondition::Timestamp(ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET),
+    );
+    forks.insert(
+        ArcHardfork::Zero8.boxed(),
+        ForkCondition::Timestamp(ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET),
+    );
     forks
 });
 
@@ -319,6 +338,10 @@ pub static ARC_DEVNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
     forks.insert(
         ArcHardfork::Zero7.boxed(),
         ForkCondition::Timestamp(ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET),
+    );
+    forks.insert(
+        ArcHardfork::Zero8.boxed(),
+        ForkCondition::Timestamp(ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET),
     );
     forks
 });
@@ -353,6 +376,10 @@ pub static ARC_TESTNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
         ArcHardfork::Zero7.boxed(),
         ForkCondition::Timestamp(ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET),
     );
+    forks.insert(
+        ArcHardfork::Zero8.boxed(),
+        ForkCondition::Timestamp(ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET),
+    );
 
     forks
 });
@@ -366,6 +393,7 @@ pub const ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_DEVNET: u64 = 19491165;
 pub const ARC_ZERO4_HARDFORK_BLOCK_ACTIVATION_TESTNET: u64 = 26148086;
 /// Zero5
 pub const ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET: u64 = 32371192;
+// Zero5/Zero6 and Osaka are already activated on testnet/mainnet.
 pub const ARC_ZERO5_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET: u64 = 1779894517;
 /// Zero6
 pub const ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET: u64 = 40033853;
@@ -376,6 +404,11 @@ pub const ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET: u64 = 1779890400;
 /// Zero7
 pub const ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET: u64 = 1780495200;
 pub const ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET: u64 = 1781791200;
+pub const ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET: u64 = 1789052400;
+/// Zero8
+pub const ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET: u64 = 1787756400;
+pub const ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET: u64 = 1788447600;
+pub const ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET: u64 = 1789052400;
 
 #[cfg(test)]
 mod tests {
@@ -389,6 +422,7 @@ mod tests {
         assert_eq!(ArcHardfork::Zero5.name(), "Zero5");
         assert_eq!(ArcHardfork::Zero6.name(), "Zero6");
         assert_eq!(ArcHardfork::Zero7.name(), "Zero7");
+        assert_eq!(ArcHardfork::Zero8.name(), "Zero8");
     }
 
     #[test]
@@ -400,6 +434,7 @@ mod tests {
         assert!(!flags.is_active(ArcHardfork::Zero5));
         assert!(!flags.is_active(ArcHardfork::Zero6));
         assert!(!flags.is_active(ArcHardfork::Zero7));
+        assert!(!flags.is_active(ArcHardfork::Zero8));
 
         // Test from chain hardforks - localdev has all Arc hardforks active at genesis
         let flags = ArcHardforkFlags::from_chain_hardforks(&ARC_LOCALDEV_HARDFORKS, 0, 0);
@@ -408,6 +443,7 @@ mod tests {
         assert!(flags.is_active(ArcHardfork::Zero5));
         assert!(flags.is_active(ArcHardfork::Zero6));
         assert!(flags.is_active(ArcHardfork::Zero7));
+        assert!(flags.is_active(ArcHardfork::Zero8));
 
         // Test from chain hardforks - devnet has Zero3 and Zero4 active after their activation blocks
         let flags = ArcHardforkFlags::from_chain_hardforks(
@@ -420,6 +456,7 @@ mod tests {
         assert!(!flags.is_active(ArcHardfork::Zero5));
         assert!(!flags.is_active(ArcHardfork::Zero6));
         assert!(!flags.is_active(ArcHardfork::Zero7));
+        assert!(!flags.is_active(ArcHardfork::Zero8));
 
         // Test from chain hardforks - devnet before Zero4 activation
         let flags = ArcHardforkFlags::from_chain_hardforks(
@@ -456,9 +493,9 @@ mod tests {
         assert!(!flags.is_active(ArcHardfork::Zero3));
         assert!(!flags.is_active(ArcHardfork::Zero4));
 
-        // Test all_combinations() helper - should yield 32 combinations (2^5)
+        // Test all_combinations() helper - should yield 64 combinations (2^6)
         let combinations: Vec<_> = ArcHardforkFlags::all_combinations().collect();
-        assert_eq!(combinations.len(), 32);
+        assert_eq!(combinations.len(), 64);
 
         // Verify some key combinations are present
         assert!(combinations.contains(&ArcHardforkFlags::with(&[])));
@@ -474,12 +511,13 @@ mod tests {
             ArcHardfork::Zero5,
             ArcHardfork::Zero6,
             ArcHardfork::Zero7,
+            ArcHardfork::Zero8,
         ])));
     }
 
     #[test]
     fn test_parse_arc_hardfork_from_genesis() {
-        let s = r#"{ "config": { "zero3Block": 123123, "zero4Block": 223881, "zero5Block": 323496, "zero6Block": 423000, "zero7Time": 1800000000 } }"#;
+        let s = r#"{ "config": { "zero3Block": 123123, "zero4Block": 223881, "zero5Block": 323496, "zero6Block": 423000, "zero7Time": 1800000000, "zero8Time": 1900000000 } }"#;
 
         let genesis = serde_json::from_str::<Genesis>(s).expect("Failed to parse genesis");
         let info = ArcGenesisInfo::extract_from(&genesis.config.extra_fields)
@@ -489,6 +527,7 @@ mod tests {
         assert_eq!(info.zero_5_block, Some(323496));
         assert_eq!(info.zero_6_block, Some(423000));
         assert_eq!(info.zero_7_time, Some(1800000000));
+        assert_eq!(info.zero_8_time, Some(1900000000));
     }
 
     // Verify ethereum hardforks are supported for all networks.
@@ -531,7 +570,7 @@ mod tests {
     fn test_arc_localdev_forks() {
         let forks = ARC_LOCALDEV_HARDFORKS.clone();
         assert_base_hardforks(&forks);
-        assert_eq!(forks.len(), 23);
+        assert_eq!(forks.len(), 24);
 
         // verify hardfork zero3 block
         assert!(!forks.is_fork_active_at_timestamp(ArcHardfork::Zero3, 0));
@@ -552,13 +591,17 @@ mod tests {
         // Zero7 activates by timestamp (Arc convention from Zero7 onward).
         assert!(forks.is_fork_active_at_timestamp(ArcHardfork::Zero7, 0));
         assert!(!forks.is_fork_active_at_block(ArcHardfork::Zero7, 0));
+
+        // Zero8 activates by timestamp (Arc convention from Zero7 onward).
+        assert!(forks.is_fork_active_at_timestamp(ArcHardfork::Zero8, 0));
+        assert!(!forks.is_fork_active_at_block(ArcHardfork::Zero8, 0));
     }
 
     #[test]
     fn test_arc_devnet_forks() {
         let forks = ARC_DEVNET_HARDFORKS.clone();
         assert_base_hardforks(&forks);
-        assert_eq!(forks.len(), 23);
+        assert_eq!(forks.len(), 24);
 
         // verify hardfork zero3 block
         assert_eq!(
@@ -655,13 +698,28 @@ mod tests {
             ArcHardfork::Zero7,
             ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET
         ));
+        // verify hardfork zero8 timestamp
+        assert_eq!(
+            forks.get(ArcHardfork::Zero8),
+            Some(ForkCondition::Timestamp(
+                ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET
+            ))
+        );
+        assert!(!forks.is_fork_active_at_timestamp(
+            ArcHardfork::Zero8,
+            ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET - 1
+        ));
+        assert!(forks.is_fork_active_at_timestamp(
+            ArcHardfork::Zero8,
+            ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET
+        ));
     }
 
     #[test]
     fn test_arc_testnet_forks() {
         let forks = ARC_TESTNET_HARDFORKS.clone();
         assert_base_hardforks(&forks);
-        assert_eq!(forks.len(), 23);
+        assert_eq!(forks.len(), 24);
 
         // verify hardfork zero3 block
         assert_eq!(
@@ -757,6 +815,22 @@ mod tests {
         assert!(forks.is_fork_active_at_timestamp(
             ArcHardfork::Zero7,
             ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET
+        ));
+
+        // verify hardfork zero8 timestamp
+        assert_eq!(
+            forks.get(ArcHardfork::Zero8),
+            Some(ForkCondition::Timestamp(
+                ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET
+            ))
+        );
+        assert!(!forks.is_fork_active_at_timestamp(
+            ArcHardfork::Zero8,
+            ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET - 1
+        ));
+        assert!(forks.is_fork_active_at_timestamp(
+            ArcHardfork::Zero8,
+            ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET
         ));
     }
 

@@ -19,7 +19,9 @@ pub mod db;
 pub mod process;
 pub mod validator_set;
 
-pub use app::{AppMetrics, InvalidPayloadSource};
+pub use app::{
+    AppMetrics, BindingHaltSite, InvalidPayloadSource, SkewNilVoteSource, TransientValidationSource,
+};
 pub use db::DbMetrics;
 pub use process::ProcessMetrics;
 pub use validator_set::ValidatorSetMetrics;

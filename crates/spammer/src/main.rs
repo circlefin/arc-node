@@ -20,7 +20,7 @@
     clippy::unwrap_used
 )]
 
-use std::{collections::HashMap, fs, io::IsTerminal};
+use std::{collections::HashMap, fs, io::IsTerminal, io::Write, path::Path};
 
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
@@ -96,21 +96,25 @@ enum TargetCommand {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing
-    let level = cli.verbosity.tracing_level_filter();
-    let filter = EnvFilter::builder()
-        .with_default_directive(level.into())
-        .from_env()?
-        .add_directive("hyper_util::client=info".parse()?)
-        .add_directive("arc_node_consensus_cli::new=info".parse()?);
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_ansi(std::io::stdout().is_terminal())
-        .with_env_filter(filter)
-        .finish();
+    let silent = cli.args.silent || cli.verbosity.is_silent();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .context("Failed to set tracing subscriber")?;
+    // Initialize tracing unless running silently.
+    if !silent {
+        let level = cli.verbosity.tracing_level_filter();
+        let filter = EnvFilter::builder()
+            .with_default_directive(level.into())
+            .from_env()?
+            .add_directive("hyper_util::client=info".parse()?)
+            .add_directive("arc_node_consensus_cli::new=info".parse()?);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_ansi(std::io::stdout().is_terminal())
+            .with_env_filter(filter)
+            .finish();
+
+        tracing::subscriber::set_global_default(subscriber)
+            .context("Failed to set tracing subscriber")?;
+    }
 
     tracing::info!(
         version = arc_version::GIT_VERSION,
@@ -118,9 +122,7 @@ async fn main() -> Result<()> {
         "Spammer starting"
     );
 
-    let config = cli
-        .args
-        .to_config(cli.verbosity.is_silent(), cli.fire_and_forget);
+    let config = cli.args.to_config(silent, cli.fire_and_forget);
     config.validate()?;
 
     // Build the WebSocket URLs of the target nodes
@@ -138,9 +140,92 @@ async fn main() -> Result<()> {
         }
     };
 
-    let spammer = Spammer::new(target_ws_urls, &config).await?;
-    spammer.run().await?;
+    let summary_json_path = cli.args.summary_json.clone();
+    let state_out_path = cli.args.state_out.clone();
+    let state_in_path = cli.args.state_in.clone();
 
+    // Backpressure mode moves every TxGenerator into its TxSender, so
+    // `Spammer::run_capturing_state` returns an empty `SpammerState`.
+    // Writing that to --state-out would let a downstream --state-in
+    // "succeed" as a silent no-op run, hiding the upstream misconfig
+    // (see `new_resuming` for the matching guard).
+    if state_out_path.is_some() && !cli.fire_and_forget {
+        eyre::bail!(
+            "--state-out requires --fire-and-forget; backpressure mode cannot capture generator state"
+        );
+    }
+
+    // If `--state-in` was provided, resume from the persisted SpammerState and
+    // skip fresh account initialisation. Otherwise spin up generators normally.
+    let spammer = if let Some(path) = state_in_path {
+        let json = fs::read_to_string(&path)
+            .wrap_err_with(|| format!("Failed to read --state-in from {}", path.display()))?;
+        let state: spammer::SpammerState = serde_json::from_str(&json)
+            .wrap_err_with(|| format!("Failed to parse --state-in from {}", path.display()))?;
+        let resume_config = spammer::ResumeConfig::from(&config);
+        Spammer::new_resuming(target_ws_urls, state, &resume_config).await?
+    } else {
+        Spammer::new(target_ws_urls, &config).await?
+    };
+    let result = spammer.run_capturing_state().await?;
+
+    // Drop a JSON summary at the caller-provided path. Used by orchestrators
+    // (e.g. `quake run saturation`) to recover phase metrics without parsing
+    // spammer stdout. Independent of the latency CSV (`--csv-dir`).
+    if let Some(path) = summary_json_path {
+        let summary = spammer::SpammerSummary::from(&result);
+        let json =
+            serde_json::to_string_pretty(&summary).wrap_err("Failed to serialise summary JSON")?;
+        write_atomic(&json, &path, "summary-json")?;
+    }
+
+    // Persist the captured SpammerState so a subsequent `--state-in` invocation
+    // can resume without re-initialising accounts.
+    if let Some(path) = state_out_path {
+        let json = serde_json::to_string(&result.state)
+            .wrap_err("Failed to serialise SpammerState JSON")?;
+        write_atomic(&json, &path, "state-out")?;
+    }
+
+    Ok(())
+}
+
+/// Write `contents` to `path` atomically: stage into a tempfile in the target
+/// directory and rename on success. The `label` is included in error messages
+/// so a failed `--state-out` write isn't confused with a failed
+/// `--summary-json` write.
+fn write_atomic(contents: &str, path: &Path, label: &str) -> Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(p) = parent {
+        fs::create_dir_all(p)
+            .wrap_err_with(|| format!("Failed to create parent dir {} for {label}", p.display()))?;
+    }
+    // Tempfile must be on the same filesystem as the destination for
+    // rename to be atomic; using the parent dir guarantees that.
+    let dir = parent.unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .wrap_err_with(|| format!("Failed to create tempfile for {label} in {}", dir.display()))?;
+    tmp.write_all(contents.as_bytes())
+        .wrap_err_with(|| format!("Failed to write {label} tempfile"))?;
+    // tempfile defaults to mode 0o600 (owner-only). Remote orchestrators
+    // SCP these files as an unprivileged user from a path the spammer
+    // writes as root (inside the docker wrapper on CC), so 0o600 makes the
+    // file unreadable. Match the broader-readable default the prior
+    // non-atomic `fs::write` produced via umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))
+            .wrap_err_with(|| format!("Failed to chmod {label} tempfile"))?;
+    }
+    tmp.persist(path).map_err(|e| {
+        eyre::eyre!(
+            "Failed to persist {label} to {}: {}",
+            path.display(),
+            e.error
+        )
+    })?;
     Ok(())
 }
 

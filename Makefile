@@ -34,6 +34,7 @@ check-foundry: ## Check Foundry version
 .PHONY: fmt
 fmt: ## Format code using rustfmt
 	cargo fmt
+	cargo sort --workspace
 	npx prettier --config ./.prettierrc --write '**/*.{ts,js,mts,mjs}'
 
 .PHONY: clippy
@@ -229,8 +230,8 @@ testnet: genesis build-docker ## Start testnet as defined in QUAKE_MANIFEST file
 	$(QUAKE) -f $(QUAKE_MANIFEST) start $(QUAKE_START_ARGS)
 
 .PHONY: testnet-test
-testnet-test: ## Run tests against running testnet
-	$(QUAKE) test
+testnet-test: ## Run tests against running testnet (optionally SPEC=group:name to scope)
+	$(QUAKE) test $(SPEC)
 
 .PHONY: testnet-down
 testnet-down: ## Stop testnet

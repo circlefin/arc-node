@@ -131,3 +131,27 @@ impl std::fmt::Debug for SubcallRegistry {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::address;
+
+    #[test]
+    fn allowed_callers_unrestricted_allows_any_address() {
+        let callers = AllowedCallers::Unrestricted;
+        assert!(callers.is_allowed(&address!("0000000000000000000000000000000000000001")));
+        assert!(callers.is_allowed(&Address::ZERO));
+    }
+
+    #[test]
+    fn allowed_callers_only_allows_listed_rejects_others() {
+        let allowed = address!("1800000000000000000000000000000000000005");
+        let callers = AllowedCallers::Only(HashSet::from([allowed]));
+        assert!(callers.is_allowed(&allowed));
+        assert!(!callers.is_allowed(&address!("dead00000000000000000000000000000000beef")));
+        // Empty allowlist rejects every caller.
+        let empty = AllowedCallers::Only(HashSet::new());
+        assert!(!empty.is_allowed(&allowed));
+    }
+}

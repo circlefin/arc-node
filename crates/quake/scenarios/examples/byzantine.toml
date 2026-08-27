@@ -1,0 +1,35 @@
+# Byzantine testnet scenario
+#
+# Requires the consensus binary to be built with the `byzantine` feature.
+# Run with: CL_FEATURES=byzantine make testnet QUAKE_MANIFEST=scenarios/examples/byzantine.toml
+#
+# 7-validator testnet: one honest node per attack for observability.
+#   - validator1: honest baseline
+#   - validator2: random vote equivocation (seeded, 30% probability)
+#   - validator3: silent on votes for heights 10-50 (drop-votes)
+#   - validator4: always equivocates proposals
+#   - validator5: amnesia (ignores prevote lock) at height 25
+#   - validator6: force-precommits nil for rounds 0 and 1
+#   - validator7: drops inbound proposals at heights 40-60
+
+[nodes.validator1]
+# Honest baseline
+
+[nodes.validator2]
+cl.config.byzantine.equivocate_votes = { mode = "random", probability = 0.3 }
+cl.config.byzantine.seed = 12345
+
+[nodes.validator3]
+cl.config.byzantine.drop_votes = { mode = "height_range", from = 10, to = 50 }
+
+[nodes.validator4]
+cl.config.byzantine.equivocate_proposals = { mode = "always" }
+
+[nodes.validator5]
+cl.config.byzantine.ignore_locks = { mode = "at_heights", heights = [25] }
+
+[nodes.validator6]
+cl.config.byzantine.force_precommit_nil = { mode = "at_rounds", rounds = [0, 1] }
+
+[nodes.validator7]
+cl.config.byzantine.drop_inbound_proposals = { mode = "height_range", from = 40, to = 60 }

@@ -50,6 +50,7 @@ async fn validators_reach_height_3() {
         .await;
 }
 
+// Extra headroom: this scenario also pays for a crash, restart delay, and resync.
 #[rstest]
 #[case::both(Layer::Both)]
 #[case::cl(Layer::Consensus)]
@@ -57,7 +58,7 @@ async fn validators_reach_height_3() {
 #[tokio::test]
 async fn crash_and_restart(#[case] layer: Layer) {
     scenarios::crash_and_restart(5, 3, Duration::from_secs(1), 10, layer)
-        .run::<ArcNodeRunner>(Duration::from_secs(60))
+        .run::<ArcNodeRunner>(Duration::from_secs(90))
         .await;
 }
 

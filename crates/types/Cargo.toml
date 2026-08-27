@@ -10,12 +10,14 @@ publish.workspace = true
 [features]
 default = ["signer-local"]
 arbitrary = ["dep:arbitrary"]
+byzantine = ["dep:malachitebft-engine-byzantine"]
 signer-local = ["dep:malachitebft-signing-ed25519"]
 
 [dependencies]
 
 # alloy
 alloy-consensus = { workspace = true }
+alloy-eips = { workspace = true }
 alloy-primitives = { workspace = true, features = ["serde"], default-features = false }
 alloy-rlp = { workspace = true }
 alloy-rpc-types-engine = { workspace = true, features = ["ssz"] }
@@ -38,6 +40,7 @@ malachitebft-app-channel = { workspace = true }
 malachitebft-codec = { workspace = true }
 malachitebft-core-consensus = { workspace = true }
 malachitebft-core-types = { workspace = true, features = ["serde"] }
+malachitebft-engine-byzantine = { workspace = true, optional = true }
 malachitebft-proto = { workspace = true }
 malachitebft-signing = { workspace = true }
 malachitebft-signing-ed25519 = { workspace = true, optional = true, features = ["rand", "serde"] }

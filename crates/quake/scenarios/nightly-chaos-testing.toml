@@ -4,76 +4,67 @@ name = "nightly-chaos-testing"
 cl.config.log_level = "debug"
 
 latency_emulation = true
-engine_api_connection = "rpc"
+engine_api_connection = "ipc"
 
 # Topology:
-# 10 validators in 4 AWS regions
-# - blue, green, purple: us-east-2
-# - cyan: us-west-2
-# - red, orange, yellow: eu-central-1
-# - pink, grey, brown: ap-northeast-1
-#
-# 2 full nodes in 2 locations
-#
-# Internal full nodes:
-# - 1 full node - us-east-1
-# - 1 full node  - us-west-2
+# 10 validators across 4 geographic regions
+# 2 first-party full nodes across 2 geographic regions
 
-# us-east-2 validators
-[nodes.validator-blue]
-region = "us-east-2"
-cl_persistent_peers = ["validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
-
-[nodes.validator-green]
-region = "us-east-2"
-cl_persistent_peers = ["validator-blue", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
-
-[nodes.validator-purple]
-region = "us-east-2"
-cl_persistent_peers = ["validator-blue", "validator-green", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
-
-# us-west-2 validator
-[nodes.validator-cyan]
-region = "us-west-2"
-cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
-
-# eu-central-1 validators
-[nodes.validator-red]
-region = "eu-central-1"
-cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
-
-[nodes.validator-orange]
-region = "eu-central-1"
-cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
-
-[nodes.validator-yellow]
-region = "eu-central-1"
-cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-pink", "validator-grey", "validator-brown"]
-
-# ap-northeast-1 validators
-[nodes.validator-pink]
-region = "ap-northeast-1"
-cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-grey", "validator-brown"]
-start_at = 30
-
-[nodes.validator-grey]
-region = "ap-northeast-1"
-cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-brown"]
-start_at = 30
-
-[nodes.validator-brown]
-region = "ap-northeast-1"
-cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey"]
-start_at = 30
-
-# us-east-1 full node
-[nodes.full-stg-blue]
+# us-east-1 validators
+[nodes.validator-1]
 region = "us-east-1"
-cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
+cl_persistent_peers = ["validator-2", "validator-3", "validator-4", "validator-5", "validator-6", "validator-7", "validator-8", "validator-9", "validator-10"]
+
+[nodes.validator-2]
+region = "us-east-1"
+cl_persistent_peers = ["validator-1", "validator-3", "validator-4", "validator-5", "validator-6", "validator-7", "validator-8", "validator-9", "validator-10"]
+
+[nodes.validator-3]
+region = "us-east-1"
+cl_persistent_peers = ["validator-1", "validator-2", "validator-4", "validator-5", "validator-6", "validator-7", "validator-8", "validator-9", "validator-10"]
+
+# eu-west-2 validator
+[nodes.validator-4]
+region = "eu-west-2"
+cl_persistent_peers = ["validator-1", "validator-2", "validator-3", "validator-5", "validator-6", "validator-7", "validator-8", "validator-9", "validator-10"]
+
+# ap-south-1 validators
+[nodes.validator-5]
+region = "ap-south-1"
+cl_persistent_peers = ["validator-1", "validator-2", "validator-3", "validator-4", "validator-6", "validator-7", "validator-8", "validator-9", "validator-10"]
+
+[nodes.validator-6]
+region = "ap-south-1"
+cl_persistent_peers = ["validator-1", "validator-2", "validator-3", "validator-4", "validator-5", "validator-7", "validator-8", "validator-9", "validator-10"]
+
+[nodes.validator-7]
+region = "ap-south-1"
+cl_persistent_peers = ["validator-1", "validator-2", "validator-3", "validator-4", "validator-5", "validator-6", "validator-8", "validator-9", "validator-10"]
+
+# ca-central-1 validators
+[nodes.validator-8]
+region = "ca-central-1"
+cl_persistent_peers = ["validator-1", "validator-2", "validator-3", "validator-4", "validator-5", "validator-6", "validator-7", "validator-9", "validator-10"]
+start_at = 30
+
+[nodes.validator-9]
+region = "ca-central-1"
+cl_persistent_peers = ["validator-1", "validator-2", "validator-3", "validator-4", "validator-5", "validator-6", "validator-7", "validator-8", "validator-10"]
+start_at = 30
+
+[nodes.validator-10]
+region = "ca-central-1"
+cl_persistent_peers = ["validator-1", "validator-2", "validator-3", "validator-4", "validator-5", "validator-6", "validator-7", "validator-8", "validator-9"]
+start_at = 30
+
+# sa-east-1 full node
+[nodes.full-1]
+region = "sa-east-1"
+cl_persistent_peers = ["validator-1", "validator-2", "validator-3", "validator-4", "validator-5", "validator-6", "validator-7", "validator-8", "validator-9", "validator-10"]
 start_at = 150
 
-# us-west-2 full node
-[nodes.full-prod-teal]
-region = "us-west-2"
-cl_persistent_peers = ["validator-blue", "validator-green", "validator-purple", "validator-cyan", "validator-red", "validator-orange", "validator-yellow", "validator-pink", "validator-grey", "validator-brown"]
+# eu-west-2 full node
+[nodes.full-2]
+region = "eu-west-2"
+cl_persistent_peers = ["validator-1", "validator-2", "validator-3", "validator-4", "validator-5", "validator-6", "validator-7", "validator-8", "validator-9", "validator-10"]
 start_at = 150

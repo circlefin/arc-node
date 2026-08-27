@@ -335,10 +335,15 @@ async fn apply_kill(
     let containers_str = containers.join(", ");
     info!("💀 Killing and waiting {time_off:?}: {containers_str}");
 
-    infra.kill(containers)?;
+    // Kill every target, then always restart them; only a failed restart is fatal.
+    if let Err(err) = infra.kill(containers) {
+        warn!("Some containers could not be killed, restarting them anyway: {err:#}");
+    }
     debug!("Waiting {time_off:?} before restarting...");
     tokio::time::sleep(time_off).await;
-    infra.start(containers)?;
+    infra
+        .start(containers)
+        .wrap_err_with(|| format!("failed to restart containers after kill: {containers_str}"))?;
 
     info!("💀 Killed and restarted after {time_off:?}: {containers_str}");
     Ok(())
@@ -600,7 +605,130 @@ pub(crate) async fn save_upgraded_containers_set<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::BuildProfile;
+    use crate::node::NodeName;
+    use std::sync::Mutex;
     use std::{env, fs};
+
+    /// In-memory `InfraProvider` that records the order of `kill`/`start` calls
+    /// and returns configurable success/failure for each.
+    struct RecordingInfra {
+        kill_ok: bool,
+        start_ok: bool,
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl RecordingInfra {
+        fn new(kill_ok: bool, start_ok: bool) -> Self {
+            Self {
+                kill_ok,
+                start_ok,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl InfraProvider for RecordingInfra {
+        fn kill(&self, _containers: &[ContainerName]) -> Result<()> {
+            self.calls.lock().unwrap().push("kill");
+            if self.kill_ok {
+                Ok(())
+            } else {
+                bail!("kill failed")
+            }
+        }
+
+        fn start(&self, _targets: &[NodeOrContainerName]) -> Result<()> {
+            self.calls.lock().unwrap().push("start");
+            if self.start_ok {
+                Ok(())
+            } else {
+                bail!("start failed")
+            }
+        }
+
+        fn build(&self, _profile: BuildProfile) -> Result<()> {
+            Ok(())
+        }
+        fn is_setup(&self, _nodes: &[NodeName]) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&self, _targets: &[NodeOrContainerName]) -> Result<()> {
+            Ok(())
+        }
+        fn down(&self, _targets: &[NodeOrContainerName]) -> Result<()> {
+            Ok(())
+        }
+        fn logs(&self, _containers: &[NodeOrContainerName], _follow: bool) -> Result<()> {
+            Ok(())
+        }
+        fn disconnect(&self, _containers_subnets: &[(&Container, &[&SubnetName])]) -> Result<()> {
+            Ok(())
+        }
+        fn connect(&self, _containers_subnets: &[(&Container, &[&SubnetName])]) -> Result<()> {
+            Ok(())
+        }
+        fn pause(&self, _containers: &[ContainerName]) -> Result<()> {
+            Ok(())
+        }
+        fn unpause(&self, _containers: &[ContainerName]) -> Result<()> {
+            Ok(())
+        }
+        fn restart(&self, _containers: &[ContainerName]) -> Result<()> {
+            Ok(())
+        }
+        fn start_monitoring(&self) -> Result<()> {
+            Ok(())
+        }
+        fn stop_monitoring(&self) -> Result<()> {
+            Ok(())
+        }
+        fn clean_monitoring_data(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn run_apply_kill(infra: &RecordingInfra) -> Result<()> {
+        let mut rng = StdRng::seed_from_u64(0);
+        let containers = vec!["validator1_cl".to_string()];
+        apply_kill(
+            infra,
+            &containers,
+            Some(Duration::ZERO),
+            Duration::ZERO,
+            Duration::ZERO,
+            &mut rng,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn apply_kill_restarts_targets_when_kill_reports_errors() {
+        let infra = RecordingInfra::new(false, true);
+        let result = run_apply_kill(&infra).await;
+        assert!(result.is_ok());
+        assert_eq!(infra.calls(), vec!["kill", "start"]);
+    }
+
+    #[tokio::test]
+    async fn apply_kill_fails_when_restart_fails() {
+        let infra = RecordingInfra::new(true, false);
+        let result = run_apply_kill(&infra).await;
+        assert!(result.is_err());
+        assert_eq!(infra.calls(), vec!["kill", "start"]);
+    }
+
+    #[tokio::test]
+    async fn apply_kill_succeeds_when_kill_and_restart_succeed() {
+        let infra = RecordingInfra::new(true, true);
+        let result = run_apply_kill(&infra).await;
+        assert!(result.is_ok());
+        assert_eq!(infra.calls(), vec!["kill", "start"]);
+    }
 
     #[test]
     fn filter_upgraded_containers_all_upgraded() {

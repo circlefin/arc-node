@@ -103,24 +103,49 @@ A **snapshot** is needed to bootstrap the node:
 ```sh
 arc-snapshots download \
   --chain=arc-testnet \
+  --el-profile=full \
   --execution-path "$ARC_EXECUTION" \
   --consensus-path "$ARC_CONSENSUS"
 ```
 
-The `arc-snapshots` binary is part of the Arc node installation.
-The command above fetches the latest snapshots for `arc-testnet` chain from
-https://snapshots.arc.network and extracts them into the
-`$ARC_CONSENSUS` and `$ARC_EXECUTION` data directories.
-The command is safe to rerun; existing snapshot data is detected unless you
-pass the command's `--force` option.
+Published snapshots use reth's storage v2 format. Rather than shipping the
+execution layer as one compressed archive, it publishes a manifest listing each
+database component on its own, which is what lets `--el-profile` fetch part of a
+snapshot instead of all of it. The consensus layer is still a single `.tar.lz4`
+archive. Everything below simply calls these snapshots.
 
-> **Download sizes:** At the time of writing, the most recent snapshot sizes
-> (tagged `20260408`) are: **~68 GB** for EL and **~16 GB** for CL.
-> These are the sizes of the downloaded compressed snapshots; when extracted,
-> the sizes are ~103 GB for EL and ~36 GB for CL.
->
-> On a fast connection (~100 Mbps) the download takes roughly 10-15 minutes;
-> on slower or metered connections it can take hours.
+The `arc-snapshots` binary is part of the Arc node installation. It queries
+https://snapshots.arc.network for the newest snapshot that has both layers
+published, whatever its retention, and restores them into `$ARC_EXECUTION` and
+`$ARC_CONSENSUS`. The execution artifact is a reth manifest, which
+`arc-snapshots` restores by invoking `arc-node-execution` (also part of the
+installation), which must be on `PATH` or named by `ARC_EXECUTION_BINARY`.
+
+`--el-profile` chooses how much execution-layer history to fetch: `minimal`,
+`full`, or `archive`. It defaults to `minimal`, including for an explicit
+manifest URL. The example passes `full` because the execution layer below starts
+with `--full`. An archive node must pass `--el-profile=archive`; omitting the
+flag produces a minimal restore. An explicit `.tar.lz4` execution URL still
+selects the native archive restore and ignores this flag.
+
+Automatically resolved manifest URLs carry no query string, and they must not.
+Reth derives each component's URL by dropping the manifest's filename and
+appending the component's as plain string concatenation, so a signed URL keeps
+its query through that step and the component filename lands on the end of the
+query string instead of the path. Every component is then fetched from an
+address that does not exist. Do not pass a presigned manifest URL by hand.
+
+A rerun without `--force` leaves a layer alone if it already holds the requested
+snapshot. If it resolves a *newer* snapshot, the layer is replaced rather than
+merged into, so expect a full download. And if a layer holds data that no restore
+recorded — a node synced from genesis, or an earlier restore that did not finish —
+the command stops and asks for `--force` rather than guessing which it is.
+`--force` replaces both layers regardless of what they hold. See
+[`crates/snapshots/README.md`](../crates/snapshots/README.md#restore-behavior)
+for the exact rules.
+
+> **Download sizes:** At the moment of writing the combined execution and consensus
+layers uncompressed data is about 250GB.
 
 ### Initialize consensus layer
 
@@ -143,17 +168,11 @@ arc-node-execution node \
   --auth-ipc --auth-ipc.path $ARC_RUN/auth.ipc \
   --http --http.addr 127.0.0.1 --http.port 8545 \
   --http.api eth,net,web3,txpool,trace,debug \
-  --rpc.forwarder https://rpc.quicknode.testnet.arc.network/ \
+  --rpc.forwarder https://rpc.testnet.arc.io/ \
   --metrics 127.0.0.1:9001 \
   --disable-discovery \
   --enable-arc-rpc
 ```
-
-> **Note on `--full` and snapshots:** The `--full` flag is required on the
-> first start when bootstrapping from a pruned snapshot. It reconciles internal
-> database tables that would otherwise fail a consistency check. After the
-> initial startup completes, you may restart without `--full` if you prefer to
-> run without pruning.
 
 The `--chain` parameter configures the genesis file.
 By using `--chain arc-testnet`, the genesis configuration bundled in the binary is adopted.
@@ -189,9 +208,9 @@ arc-node-consensus start \
   --execution-socket $ARC_RUN/auth.ipc \
   --rpc.addr 127.0.0.1:31000 \
   --follow \
-  --follow.endpoint https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network \
-  --follow.endpoint https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network \
-  --follow.endpoint https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network/websocket \
+  --follow.endpoint https://rpc.testnet.arc.io,wss=rpc.testnet.arc.io \
+  --follow.endpoint https://rpc.drpc.testnet.arc.io,wss=rpc.drpc.testnet.arc.io \
+  --follow.endpoint https://rpc.blockdaemon.testnet.arc.io,wss=rpc.blockdaemon.testnet.arc.io/websocket \
   --execution-persistence-backpressure \
   --execution-persistence-backpressure-threshold=50 \
   --metrics 127.0.0.1:29000
@@ -297,13 +316,42 @@ docker compose up -d
 
 On the first run, init containers automatically:
 
-1. Download the latest testnet snapshots (~84 GB compressed — see
-   [download sizes](#download-snapshots) for details)
+1. Download the latest complete testnet snapshot pair. See
+   [download sizes](#download-snapshots) for a measured minimal restore.
 2. Initialize the consensus layer private key
 3. Prepare the shared IPC socket volume
 
-Subsequent runs detect that initialization is already complete and start
-immediately.
+The init containers run again on every `docker compose up`. Normally they finish in
+seconds, because each layer already holds the snapshot it was given. Two situations
+are exceptions.
+
+**A newer snapshot has been published.** With no URLs in the command, the
+service asks the API for the latest snapshot on every run, and a newer one
+usually exists within hours. It restores that one instead, which costs a second
+full download and moves the node back to the snapshot's block, discarding
+whatever it had synced since.
+
+**A previous restore did not finish.** A layer is marked as restored only after
+its download and extraction have both finished, so an interrupted run leaves
+data behind with no mark on it. On the next run the service cannot tell that
+half-written snapshot apart from a directory you filled yourself, by syncing
+from genesis or by running a validator, so it stops with an error rather than
+delete someone else's data. Nothing else starts either, because the rest of the
+stack waits on this container. Add `--force` to let it overwrite the layer,
+bring the stack up once, then take the flag out again:
+
+```yaml
+    command:
+      - download
+      - --chain=arc-testnet
+      - --el-profile=minimal
+      - --force
+      - --execution-path=/data/execution
+      - --consensus-path=/data/consensus
+```
+
+`FORCE_SNAPSHOT_RESTORE=true` has no effect on this stack. `arc-snapshots` does not
+read it; `--force` is how a clean restore is requested.
 
 > The init container runs as root so it can set file ownership for the
 > main services (UID 999). No manual `chown` is needed.
@@ -355,6 +403,13 @@ rm -rf ~/.arc
 
 ## Separated hosts
 
+> [!WARNING]
+> Running EL and CL on separate hosts requires the RPC/HTTP Engine API transport,
+> which will be deprecated in `v0.8.0` and will be removed in `v0.9.0`.
+> Run both layers on the same host and use IPC instead (see the
+> [Binaries](#binaries) section).
+> The consensus layer logs a startup warning when any RPC option is set.
+
 The [Binaries](#binaries) section describes the setup of the execution
 (EL) and consensus (CL) layers running in the same host.
 The two processes interact via Inter-Process Communication (IPC),
@@ -377,21 +432,39 @@ Generate it in one host and securely copy it into the other host.
 
 ### Execution layer
 
-From the [Start execution layer](#start-execution-layer) instructions, two changes are required:
+From the [Start execution layer](#start-execution-layer) instructions, three
+changes are required:
 
-1. Remove all flags related to IPC communication: `--ipcpath`, `--auth-ipc`, `--auth-ipc.path`;
-2. Add the following parameters to configure the RPC interaction:
+1. Remove all flags related to IPC communication: `--ipcpath`, `--auth-ipc`,
+   `--auth-ipc.path`;
+2. Rebind the eth JSON-RPC off loopback so the consensus layer's host can reach
+   it: change `--http.addr 127.0.0.1` to an interface the consensus layer can
+   reach. The consensus layer runs a startup connectivity check against this endpoint
+   and will not start if it is unreachable.
+3. Add the following parameters to configure the authenticated Engine API:
 ```sh
   --authrpc.addr 0.0.0.0 \
   --authrpc.port 8551 \
   --authrpc.jwtsecret "$ARC_HOME/jwtsecret"
 ```
 
-**Important:** with this setup, port 8551 is exposed via all network
-interfaces (`0.0.0.0`).
-Make sure to configure the firewall to restrict the access to this port to the
-consensus layer's host.
-The Engine API controls block production — do not expose it to the public internet.
+If the consensus layer runs persistence backpressure — the base
+[Start consensus layer](#start-consensus-layer) example enables it — the
+execution layer must also run a WebSocket server exposing the `reth` namespace,
+or backpressure stays inactive (the consensus layer still starts and retries the
+connection in the background). The consensus layer derives the WebSocket address
+from `--eth-rpc-endpoint` (http→ws, port + 1), i.e. port `8546`:
+
+```sh
+  --ws --ws.addr 0.0.0.0 --ws.port 8546 --ws.api reth
+```
+
+> [!IMPORTANT]
+> With this setup, ports 8545 (eth JSON-RPC), 8546 (WebSocket, when
+> backpressure is enabled), and 8551 (Engine API) are exposed on all network
+> interfaces (`0.0.0.0`). Configure the firewall to restrict access to these ports
+> to the consensus layer's host. The Engine API (8551) controls block production —
+> **never** expose it to the public internet.
 
 ### Consensus layer
 
@@ -697,18 +770,39 @@ Check out [reth system requirements](https://reth.rs/run/system-requirements/) f
 
 **Note**: during periods of sustained high load, such as during startup or extended sync if the node is far behind, the execution layer memory may surge on some hardware. This should not be an issue if running with the suggested System Requirements. However, if you do observe this, you can enable backpressure to throttle the pace of execution according to the speed of disk writes, which will constrain memory growth.
 
-To enable this, the `reth_` namespace should enabled on the **execution layer**:
-
-```sh
---http.api eth,net,web3,txpool,trace,debug,reth
-```
-
-And on the **consensus layer** backpressure must be activated:
+Backpressure works by having the consensus layer subscribe to the execution
+layer's `reth_subscribePersistedBlock` notification and pause block replay until
+the execution layer's persisted height catches up.
+Activate it on the consensus layer:
 
 ```sh
 --execution-persistence-backpressure \
 --execution-persistence-backpressure-threshold=10
 ```
+
+No `--http.api` change is needed on the execution layer.
+How the notification reaches the consensus layer depends on the transport:
+
+- **IPC (recommended):** automatic. Reth serves the `reth` namespace on the
+  `--ipcpath` socket by default, so the [primary setup](#start-execution-layer)
+  above works as-is.
+- **HTTP/RPC transport (deprecated):** the notification is a subscription,
+  which plain HTTP JSON-RPC cannot carry. The execution layer must also run a
+  WebSocket server that exposes the `reth` namespace:
+
+  ```sh
+  --ws --ws.addr 127.0.0.1 --ws.port 8546 --ws.api reth
+  ```
+
+  The consensus layer derives the WebSocket URL from `--eth-rpc-endpoint`
+  (http→ws, port + 1), or takes it from `--execution-ws-endpoint`.
+  Bind `--ws.addr` to an interface the consensus layer can reach: `127.0.0.1` works
+  only when both layers share a host.
+  On [separated hosts](#separated-hosts) use a reachable interface and firewall
+  port 8546 to the consensus layer's host.
+  If the consensus layer cannot reach the WebSocket server it still starts —
+  backpressure just never engages.
+  Adding `reth` to `--http.api` does **not** enable the subscription.
 
 Note: arc-node is alpha software and this performance issue is actively being worked on.
 
@@ -748,7 +842,7 @@ ExecStart=/usr/local/bin/arc-node-execution node \
   --http.api eth,net,web3,txpool,trace,debug \
   --metrics 127.0.0.1:9001 \
   --enable-arc-rpc \
-  --rpc.forwarder https://rpc.quicknode.testnet.arc.network/
+  --rpc.forwarder https://rpc.testnet.arc.io/
 
 Restart=always
 RestartSec=10
@@ -786,9 +880,9 @@ ExecStart=/usr/local/bin/arc-node-consensus start \
   --execution-socket /run/arc/auth.ipc \
   --rpc.addr 127.0.0.1:31000 \
   --follow \
-  --follow.endpoint https://rpc.drpc.testnet.arc.network,wss=rpc.drpc.testnet.arc.network \
-  --follow.endpoint https://rpc.quicknode.testnet.arc.network,wss=rpc.quicknode.testnet.arc.network \
-  --follow.endpoint https://rpc.blockdaemon.testnet.arc.network,wss=rpc.blockdaemon.testnet.arc.network/websocket \
+  --follow.endpoint https://rpc.testnet.arc.io,wss=rpc.testnet.arc.io \
+  --follow.endpoint https://rpc.drpc.testnet.arc.io,wss=rpc.drpc.testnet.arc.io \
+  --follow.endpoint https://rpc.blockdaemon.testnet.arc.io,wss=rpc.blockdaemon.testnet.arc.io/websocket \
   --execution-persistence-backpressure \
   --execution-persistence-backpressure-threshold=50 \
   --metrics 127.0.0.1:29000
@@ -846,13 +940,41 @@ For production monitoring, scrape the Prometheus metrics endpoints with Grafana:
 
 ### Pruning
 
-The `--full` flag is accepted by both the CL and EL and will enable pruning.
-When bootstrapping from a pruned snapshot, `--full` is **required** on the
-first EL start to reconcile the database (see the note in
-[Start execution layer](#start-execution-layer)). After that initial run you
-can restart without `--full`.
+The `--full` and `--minimal` flags are accepted by both the CL and EL and will enable pruning.
 
 > **Caution:** EL pruning increases memory usage and may cause out-of-memory
 > issues on constrained machines. If you encounter memory pressure, enable
 > backpressure (see [System Requirements](#system-requirements) section) and remove
 > `--full` after the first successful start.
+
+`--full` and `--minimal` are the execution layer's two pruning presets:
+`--full` retains more history (the last 237,600 blocks for most data),
+`--minimal` far less (for example, 64 blocks of receipts); running with neither
+keeps everything (archive). Run `arc-node-execution --help`, or see the
+[execution binary reference](../crates/node/README.md), for the exact
+per-preset retention. Published snapshots are in `archive` format (i.e., not
+pruned), while `--el-profile` decides how much execution data to restore. Use
+the profile corresponding to how the node will run: `minimal` with `--minimal`,
+`full` with `--full`, or `archive` with neither preset. Starting `--minimal`
+against a datadir restored with `--el-profile=full` or `--el-profile=archive`
+still needs the offline procedure below:
+
+> [!IMPORTANT]
+> **Switching to `--minimal` after a snapshot restore.** Starting directly
+> with `--minimal` against a datadir restored from a `--full` or archive
+> snapshot makes the online pruner delete the whole difference between the two
+> presets while racing to tip — the node can get stuck in sync. Prune offline
+> first:
+>
+> 1. Stop `arc-node-execution` and `arc-node-consensus`.
+> 2. Delete `$ARC_EXECUTION/reth.toml`.
+> 3. Briefly start the EL with `--minimal` (plus your steady-state flags)
+>    until the `Saving prune config to toml file` log line, then stop it. The
+>    `prune` subcommand reads its target profile from `reth.toml`, not from
+>    `--minimal`, so this step is what writes it.
+> 4. Confirm `$ARC_EXECUTION/reth.toml` contains `prune.profile = "minimal"`.
+> 5. Run `arc-node-execution prune --datadir $ARC_EXECUTION`.
+> 6. Start both layers with `--minimal`.
+>
+> To change preset later (`--minimal` ↔ `--full`, or to/from archive), delete
+> `reth.toml` and restart with the preset flag you want.

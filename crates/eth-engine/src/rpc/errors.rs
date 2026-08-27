@@ -18,7 +18,7 @@ use std::fmt;
 
 use crate::rpc::json_structs::JsonError;
 use eyre::Report;
-use jsonrpsee_types::error::ErrorObject;
+use jsonrpsee_types::error::{ErrorObject, INTERNAL_ERROR_CODE};
 use thiserror::Error;
 
 /// Error codes taken from reth's code.
@@ -57,6 +57,7 @@ impl EngineApiRpcError {
     /// Classifies the error into a specific kind.
     pub fn kind(&self) -> EngineRpcErrorKind {
         match self.code {
+            INTERNAL_ERROR_CODE => EngineRpcErrorKind::Internal,
             UNKNOWN_PAYLOAD_CODE => EngineRpcErrorKind::UnknownPayload,
             UNSUPPORTED_FORK_CODE => EngineRpcErrorKind::UnsupportedFork,
             _ => EngineRpcErrorKind::Other,
@@ -71,6 +72,11 @@ impl EngineApiRpcError {
     /// Checks if the error is of kind `UnsupportedFork`.
     pub fn is_unsupported_fork(&self) -> bool {
         self.kind() == EngineRpcErrorKind::UnsupportedFork
+    }
+
+    /// Checks if the engine returned no payload verdict because of an internal error.
+    pub fn is_internal_error(&self) -> bool {
+        self.kind() == EngineRpcErrorKind::Internal
     }
 }
 
@@ -130,6 +136,8 @@ impl TryFrom<Report> for EngineApiRpcError {
 /// Can easily be extended with additional kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineRpcErrorKind {
+    /// The engine could not process the request and returned no payload verdict.
+    Internal,
     /// reth thinks that the payload does not exist or is not available locally.
     UnknownPayload,
     /// reth does not support the requested Engine API version for the current fork.
@@ -161,10 +169,13 @@ mod tests {
         let unknown = EngineApiRpcError::new(UNKNOWN_PAYLOAD_CODE, "Unknown payload", None);
         assert_eq!(unknown.kind(), EngineRpcErrorKind::UnknownPayload);
         assert!(unknown.is_unknown_payload());
+    }
 
-        let other = EngineApiRpcError::new(-32603, "Internal error", None);
-        assert_eq!(other.kind(), EngineRpcErrorKind::Other);
-        assert!(!other.is_unknown_payload());
+    #[test]
+    fn internal_error() {
+        let internal = EngineApiRpcError::new(-32603, "Internal error", None);
+        assert_eq!(internal.kind(), EngineRpcErrorKind::Internal);
+        assert!(internal.is_internal_error());
     }
 
     #[test]
@@ -196,6 +207,19 @@ mod tests {
     }
 
     #[test]
+    fn from_json_internal_error() {
+        let json_err = JsonError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(json!("engine unavailable")),
+        };
+
+        let err = EngineApiRpcError::from(json_err);
+        assert_eq!(err.kind(), EngineRpcErrorKind::Internal);
+        assert!(err.is_internal_error());
+    }
+
+    #[test]
     fn from_error_object() {
         use jsonrpsee_types::error::ErrorObjectOwned;
 
@@ -204,5 +228,16 @@ mod tests {
 
         assert_eq!(err.to_string(), "Code 42: some error: \"root cause\"");
         assert_eq!(err.kind(), EngineRpcErrorKind::Other);
+    }
+
+    #[test]
+    fn from_internal_error_object() {
+        use jsonrpsee_types::error::ErrorObjectOwned;
+
+        let owned = ErrorObjectOwned::owned(-32603, "Internal error", Some("engine unavailable"));
+        let err = EngineApiRpcError::from(owned);
+
+        assert_eq!(err.kind(), EngineRpcErrorKind::Internal);
+        assert!(err.is_internal_error());
     }
 }

@@ -28,6 +28,7 @@ use crate::node::{Container, ContainerName, IpAddress, NodeName, SubnetName};
 use crate::nodes::NodeOrContainerName;
 
 pub(crate) mod docker;
+pub(crate) mod exec;
 pub(crate) mod export;
 pub(crate) mod local;
 pub(crate) mod remote;

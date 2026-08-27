@@ -15,10 +15,13 @@ integration = ["arc-evm/integration"]
 
 [dependencies]
 alloy-consensus = { workspace = true, features = ["serde"] }
+alloy-eips.workspace = true
 alloy-network.workspace = true
 alloy-primitives.workspace = true
+alloy-rpc-client.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-eth.workspace = true
+alloy-transport.workspace = true
 arc-consensus-types.workspace = true
 arc-evm.workspace = true
 arc-execution-config.workspace = true
@@ -30,6 +33,7 @@ async-trait.workspace = true
 backon.workspace = true
 eyre.workspace = true
 jsonrpsee.workspace = true
+metrics.workspace = true
 reqwest.workspace = true
 reth-chainspec.workspace = true
 reth-engine-primitives.workspace = true
@@ -62,7 +66,12 @@ tower.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+alloy-rlp.workspace = true
+alloy-rpc-types-engine = { workspace = true, features = ["ssz"] }
 arc-execution-config = { path = "../execution-config", features = ["test-utils"] }
+bytesize.workspace = true
+ethereum_ssz.workspace = true
+reth-consensus-common.workspace = true
 revm-primitives.workspace = true
 
 [lints]

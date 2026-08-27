@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use eyre::eyre;
 
 use malachitebft_core_types::{
-    Context, SignedExtension, SignedProposal, SignedVote, ValidatorProof,
+    Context, SignedExtension, SignedProposal, SignedVote, ValidatorProof, VoteExtensionScope,
 };
 use malachitebft_signing::{Error as SigningError, Signer, VerificationResult, Verifier};
 
@@ -154,6 +154,7 @@ impl Signer<ArcContext> for RemoteSigningProvider {
 
     async fn sign_vote_extension(
         &self,
+        _scope: VoteExtensionScope<ArcContext>,
         _extension: <ArcContext as Context>::Extension,
     ) -> Result<SignedExtension<ArcContext>, SigningError> {
         unreachable!("Vote extensions are not supported in Arc");
@@ -194,6 +195,7 @@ impl Verifier<ArcContext> for RemoteSigningProvider {
 
     async fn verify_signed_vote_extension(
         &self,
+        _scope: &VoteExtensionScope<ArcContext>,
         _extension: &<ArcContext as Context>::Extension,
         _signature: &ConsensusSignature,
         _public_key: &PublicKey,
@@ -356,18 +358,14 @@ mod integration_tests {
         let config = RemoteSigningConfig::new("http://localhost:9999".to_string());
         let result = RemoteSigningProvider::new(config).await;
 
-        // With lazy connection, provider creation may succeed but operations will fail
-        if result.is_ok() {
-            let provider = result.unwrap();
-            // Try to get public key - this should fail
+        // With lazy connection, provider creation may succeed but operations will fail.
+        // If it failed outright, that is also acceptable.
+        if let Ok(provider) = result {
             let public_key_result = provider.public_key().await;
             assert!(
                 public_key_result.is_err(),
                 "Public key retrieval should fail with bad endpoint"
             );
-        } else {
-            // If provider creation failed, that's also acceptable
-            assert!(result.is_err());
         }
     }
 

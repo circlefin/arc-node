@@ -20,12 +20,13 @@ alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-trace.workspace = true
+alloy-serde.workspace = true
+alloy-signer-local.workspace = true
 alloy-sol-types.workspace = true
 arc-evm-node = { path = "../evm-node" }
 # Arc crates
 arc-execution-config = { path = "../execution-config", features = ["test-utils"] }
 arc-execution-txpool = { path = "../execution-txpool" }
-arc-precompiles = { path = "../precompiles" }
 
 # Error handling
 eyre.workspace = true
@@ -56,7 +57,7 @@ tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 
 [dev-dependencies]
-arc-precompiles = { path = "../precompiles", features = ["test-utils"] }
+arc-precompiles = { path = "../precompiles", features = ["integration", "test-utils"] }
 reth-tracing.workspace = true
 revm-bytecode.workspace = true
 rstest.workspace = true

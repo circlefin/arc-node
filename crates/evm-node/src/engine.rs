@@ -84,6 +84,16 @@ where
             ));
         }
 
+        if payload
+            .payload
+            .withdrawals()
+            .is_some_and(|withdrawals| !withdrawals.is_empty())
+        {
+            return Err(NewPayloadError::Other(
+                "Withdrawals are not supported".into(),
+            ));
+        }
+
         self.inner
             .ensure_well_formed_payload(payload)
             .map_err(Into::into)
@@ -152,14 +162,21 @@ where
 mod tests {
     use super::*;
     use alloy_primitives::{hex, Address, Bytes, B256, U256};
+    use alloy_rlp::Encodable;
     use alloy_rpc_types_engine::{
         CancunPayloadFields, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV1,
         ExecutionPayloadV2, ExecutionPayloadV3, PraguePayloadFields,
     };
+    use bytesize::ByteSize;
     use reth_chainspec::ChainSpecBuilder;
+    use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
     use reth_ethereum::primitives::Header;
     use reth_ethereum_engine_primitives::{EthEngineTypes, EthPayloadTypes};
     use revm_primitives::hex::FromHex;
+    use ssz::Encode;
+
+    /// Mirrors `value_sync::MAX_RESPONSE_SIZE` in `crates/malachite-app/src/hardcoded_config.rs`.
+    const VALUE_SYNC_MAX_RESPONSE_SIZE: ByteSize = ByteSize::mib(10);
 
     fn create_validator() -> ArcEngineValidator {
         let chain_spec = Arc::new(ChainSpecBuilder::mainnet().build());
@@ -192,6 +209,19 @@ mod tests {
         }
     }
 
+    fn execution_data_v3(payload: ExecutionPayloadV3) -> ExecutionData {
+        ExecutionData {
+            payload: ExecutionPayload::V3(payload),
+            sidecar: ExecutionPayloadSidecar::v4(
+                CancunPayloadFields::new(
+                    hex!("a5ddd3f286f429458a39cafc13ffe89295a7efa8eb363cf89a1a4887dbcf272b").into(),
+                    vec![],
+                ),
+                PraguePayloadFields::default(),
+            ),
+        }
+    }
+
     #[test]
     fn validate_payload_attributes_against_header_valid() {
         let validator = create_validator();
@@ -208,6 +238,7 @@ mod tests {
             suggested_fee_recipient: Address::ZERO,
             withdrawals: None,
             parent_beacon_block_root: None,
+            slot_number: None,
         };
 
         assert!(<ArcEngineValidator<_> as PayloadValidator<EthEngineTypes>>::validate_payload_attributes_against_header(
@@ -223,6 +254,7 @@ mod tests {
             suggested_fee_recipient: Address::ZERO,
             withdrawals: None,
             parent_beacon_block_root: None,
+            slot_number: None,
         };
 
         assert!(<ArcEngineValidator<_> as PayloadValidator<EthEngineTypes>>::validate_payload_attributes_against_header(
@@ -247,6 +279,7 @@ mod tests {
             suggested_fee_recipient: Address::ZERO,
             withdrawals: None,
             parent_beacon_block_root: None,
+            slot_number: None,
         };
 
         assert!(matches!(<ArcEngineValidator<_> as PayloadValidator<EthEngineTypes>>::validate_payload_attributes_against_header(
@@ -315,6 +348,54 @@ mod tests {
         match result {
             Err(NewPayloadError::Other(msg)) => {
                 assert_eq!(msg.to_string(), "Blob transactions are not supported");
+            }
+            _ => panic!("Unexpected result: {:?}", result),
+        }
+    }
+
+    #[test]
+    fn ensure_well_formed_payload_rejects_non_empty_withdrawals() {
+        let validator = create_validator();
+        let mut new_payload = create_test_payload_v3(0);
+        new_payload.payload_inner.withdrawals = vec![Default::default()];
+
+        let result =
+            <ArcEngineValidator as PayloadValidator<EthPayloadTypes>>::ensure_well_formed_payload(
+                &validator,
+                execution_data_v3(new_payload),
+            );
+
+        match result {
+            Err(NewPayloadError::Other(msg)) => {
+                assert_eq!(msg.to_string(), "Withdrawals are not supported");
+            }
+            _ => panic!("Unexpected result: {:?}", result),
+        }
+    }
+
+    #[test]
+    fn ensure_well_formed_payload_rejects_withdrawals_payload_over_value_sync_limit() {
+        const WITHDRAWALS_COUNT: usize = 238_500;
+
+        let validator = create_validator();
+        let mut new_payload = create_test_payload_v3(0);
+        new_payload.payload_inner.withdrawals = vec![Default::default(); WITHDRAWALS_COUNT];
+
+        let rlp_len = new_payload.clone().into_block_raw().unwrap().length();
+        let ssz_len = new_payload.ssz_bytes_len();
+
+        assert!(rlp_len <= MAX_RLP_BLOCK_SIZE);
+        assert!(ByteSize::b(ssz_len as u64) > VALUE_SYNC_MAX_RESPONSE_SIZE);
+
+        let result =
+            <ArcEngineValidator as PayloadValidator<EthPayloadTypes>>::ensure_well_formed_payload(
+                &validator,
+                execution_data_v3(new_payload),
+            );
+
+        match result {
+            Err(NewPayloadError::Other(msg)) => {
+                assert_eq!(msg.to_string(), "Withdrawals are not supported");
             }
             _ => panic!("Unexpected result: {:?}", result),
         }

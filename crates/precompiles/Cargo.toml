@@ -24,6 +24,7 @@ alloy-evm.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 arc-execution-config.workspace = true
+arc-pq-precompile.workspace = true
 
 # local crates
 reth-ethereum = { workspace = true, features = ["evm"] }

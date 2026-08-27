@@ -44,7 +44,7 @@
 //! | `circle-validator`      | Validator without `external = true`            | `FullyConnected` (multi-hop ok if externals exist) |
 //! | `external-validator`    | Validator with `external = true`               | Not `NotConnected`                                 |
 //! | `consensus-participant` | Non-validator, consensus enabled               | Not `NotConnected`                                 |
-//! | `excluded`              | `follow = true` or `consensus.enabled = false` | Skipped                                            |
+//! | `excluded`              | `follow = true` or `no_consensus = true`       | Skipped                                            |
 //!
 //! The key insight is that external validators are **expected** to be
 //! `MultiHop` — they sit behind dedicated sentries and never have direct
@@ -85,7 +85,7 @@ pub(crate) enum NodeCategory {
     /// Must not be `NotConnected` in strict mode.
     ConsensusParticipant,
 
-    /// Node with `consensus.enabled = false` or `follow = true`.
+    /// Node with `no_consensus = true` or `follow = true`.
     /// Skipped entirely — no mesh expectations.
     Excluded,
 }

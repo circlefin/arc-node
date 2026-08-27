@@ -21,9 +21,29 @@ use arc_consensus_types::signing::{SignedExtension, SignedProposal, SignedVote, 
 use arc_consensus_types::signing::{Signer, SigningProvider, VerificationResult, Verifier};
 
 use crate::{ArcContext, Proposal, Vote};
-use malachitebft_core_types::ValidatorProof;
+use malachitebft_core_types::{NilOrVal, ValidatorProof, VoteExtensionScope};
 
 pub use malachitebft_signing_ed25519::*;
+
+const VOTE_EXTENSION_DOMAIN: &[u8] = b"malachitebft/vote-extension/v1\0";
+
+fn vote_extension_sign_bytes(scope: &VoteExtensionScope<ArcContext>, extension: &Bytes) -> Vec<u8> {
+    let precommit = Vote::new_precommit(
+        scope.height,
+        scope.round,
+        NilOrVal::Val(scope.value_id),
+        scope.validator_address,
+    );
+    let precommit_bytes = precommit.to_sign_bytes();
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(VOTE_EXTENSION_DOMAIN);
+    buf.extend_from_slice(&(precommit_bytes.len() as u64).to_be_bytes());
+    buf.extend_from_slice(&precommit_bytes);
+    buf.extend_from_slice(&(extension.len() as u64).to_be_bytes());
+    buf.extend_from_slice(extension);
+    buf
+}
 
 #[derive(Clone)]
 pub struct LocalSigningProvider {
@@ -89,9 +109,11 @@ impl Signer<ArcContext> for LocalSigningProvider {
 
     async fn sign_vote_extension(
         &self,
+        scope: VoteExtensionScope<ArcContext>,
         extension: Bytes,
     ) -> Result<SignedExtension<ArcContext>, SigningError> {
-        let signature = self.private_key.sign(extension.as_ref());
+        let preimage = vote_extension_sign_bytes(&scope, &extension);
+        let signature = self.private_key.sign(&preimage);
         Ok(SignedExtension::new(extension, signature))
     }
 
@@ -134,12 +156,14 @@ impl Verifier<ArcContext> for LocalSigningProvider {
 
     async fn verify_signed_vote_extension(
         &self,
+        scope: &VoteExtensionScope<ArcContext>,
         extension: &Bytes,
         signature: &Signature,
         public_key: &PublicKey,
     ) -> Result<VerificationResult, SigningError> {
+        let preimage = vote_extension_sign_bytes(scope, extension);
         Ok(VerificationResult::from_bool(
-            public_key.verify(extension.as_ref(), signature).is_ok(),
+            public_key.verify(&preimage, signature).is_ok(),
         ))
     }
 
@@ -181,9 +205,21 @@ impl SigningProvider<ArcContext> for LocalSigningProvider {
 mod tests {
     use super::*;
 
+    use arc_consensus_types::{Address, BlockHash, Height, ValueId};
+    use malachitebft_core_types::Round;
+
     fn test_provider() -> LocalSigningProvider {
         let private_key = PrivateKey::generate(rand::thread_rng());
         LocalSigningProvider::new(private_key)
+    }
+
+    fn test_scope(validator_byte: u8) -> VoteExtensionScope<ArcContext> {
+        VoteExtensionScope::new(
+            Height::new(7),
+            Round::new(2),
+            ValueId::new(BlockHash::repeat_byte(0xAB)),
+            Address::repeat_byte(validator_byte),
+        )
     }
 
     #[test]
@@ -207,5 +243,53 @@ mod tests {
         let data = b"test message";
         let signature = other.sign(data);
         assert!(!provider.verify(data, &signature, &provider.public_key()));
+    }
+
+    #[tokio::test]
+    async fn vote_extension_sign_verify_roundtrip() {
+        let provider = test_provider();
+        let scope = test_scope(0x01);
+        let extension = Bytes::from_static(b"test extension");
+
+        let signed = provider
+            .sign_vote_extension(scope.clone(), extension.clone())
+            .await
+            .unwrap();
+        assert_eq!(signed.message, extension);
+
+        let result = provider
+            .verify_signed_vote_extension(
+                &scope,
+                &signed.message,
+                &signed.signature,
+                &provider.public_key(),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_valid());
+    }
+
+    // A signature produced for one scope must not verify against a different
+    // scope; this guards the domain separation in `vote_extension_sign_bytes`.
+    #[tokio::test]
+    async fn vote_extension_signature_is_bound_to_scope() {
+        let provider = test_provider();
+        let extension = Bytes::from_static(b"test extension");
+
+        let signed = provider
+            .sign_vote_extension(test_scope(0x01), extension.clone())
+            .await
+            .unwrap();
+
+        let result = provider
+            .verify_signed_vote_extension(
+                &test_scope(0x02),
+                &signed.message,
+                &signed.signature,
+                &provider.public_key(),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_valid());
     }
 }

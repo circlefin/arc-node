@@ -19,8 +19,8 @@ use alloy_eips::eip7840::BlobParams;
 use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_genesis::Genesis;
 #[cfg(any(feature = "test-utils", test))]
-use alloy_primitives::{address, b256};
-use alloy_primitives::{Address, U256};
+use alloy_primitives::b256;
+use alloy_primitives::{address, Address, U256};
 use eyre::Result;
 use once_cell::sync::Lazy as LazyLock;
 use reth_chainspec::{
@@ -39,6 +39,7 @@ use crate::hardforks::ArcHardfork;
 #[cfg(any(feature = "test-utils", test))]
 use crate::native_coin_control::compute_is_blocklisted_storage_slot;
 use crate::{
+    addresses_denylist::DENYLIST_ADDRESS_LOCALDEV,
     gas_fee::decode_base_fee_from_bytes,
     hardforks::{
         ArcGenesisInfo, ArcHardforkFlags, ARC_DEVNET_HARDFORKS, ARC_LOCALDEV_HARDFORKS,
@@ -267,6 +268,20 @@ impl<T: BaseFeeConfigProvider + ?Sized> BaseFeeConfigProvider for &T {
     }
 }
 
+/// Denylist proxy address on devnet. Deployed post-genesis, so it is absent from
+/// `assets/devnet/genesis.json`. Mirrors `denylistAddressByNetwork.devnet` in
+/// `scripts/genesis/addresses.ts`.
+const DENYLIST_ADDRESS_DEVNET: Address = address!("0x36061d38f2d939249A947f1254097e0FFC9e2993");
+
+/// Denylist proxy address on testnet. Deployed post-genesis, so it is absent from
+/// `assets/testnet/genesis.json`. Mirrors `denylistAddressByNetwork.testnet` in
+/// `scripts/genesis/addresses.ts`.
+const DENYLIST_ADDRESS_TESTNET: Address = address!("0x360b451bb0490637F52fa1794961455615777757");
+
+/// Denylist proxy address on mainnet — the next system-contract slot, deployed in genesis.
+/// Mirrors `denylistAddressByNetwork.mainnet` in `scripts/genesis/addresses.ts`.
+const DENYLIST_ADDRESS_MAINNET: Address = address!("0x3600000000000000000000000000000000000004");
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArcChainSpec {
     pub inner: ChainSpec,
@@ -275,6 +290,26 @@ pub struct ArcChainSpec {
 impl ArcChainSpec {
     pub fn new(inner: ChainSpec) -> Self {
         Self { inner }
+    }
+
+    /// Denylist contract address for this chain, or `None` if the chain has no Arc denylist.
+    ///
+    /// Hardcoded per network rather than operator-configurable: the denylist is a protocol
+    /// requirement, so disabling it or repointing it at a different list must require a source
+    /// change and a rebuild, not a CLI flag. Localdev's address is a mined CREATE2 address owned
+    /// by the genesis builder (see [`DENYLIST_ADDRESS_LOCALDEV`]); the deployed networks use
+    /// fixed addresses recorded above.
+    ///
+    /// Unrecognised chain IDs return `None`. There is no denylist-free node: the caller must
+    /// reject such a chain spec at startup rather than run without denylist checks.
+    pub fn denylist_address(&self) -> Option<Address> {
+        match self.chain().id() {
+            LOCALDEV_CHAIN_ID => Some(DENYLIST_ADDRESS_LOCALDEV),
+            DEVNET_CHAIN_ID => Some(DENYLIST_ADDRESS_DEVNET),
+            TESTNET_CHAIN_ID => Some(DENYLIST_ADDRESS_TESTNET),
+            MAINNET_CHAIN_ID => Some(DENYLIST_ADDRESS_MAINNET),
+            _ => None,
+        }
     }
 
     /// Get the hardfork flags for a given (block height, timestamp).
@@ -397,6 +432,9 @@ pub fn localdev_with_hardforks(hardforks: &[(ArcHardfork, ForkCondition)]) -> Ar
             ArcHardfork::Zero7 => inner
                 .hardforks
                 .insert(ArcHardfork::Zero7.boxed(), condition),
+            ArcHardfork::Zero8 => inner
+                .hardforks
+                .insert(ArcHardfork::Zero8.boxed(), condition),
         };
     }
 
@@ -439,7 +477,7 @@ pub fn localdev_with_denylisted_addresses(
     denylisted_addresses: impl IntoIterator<Item = Address>,
 ) -> Arc<ArcChainSpec> {
     use crate::addresses_denylist::{
-        compute_denylist_storage_slot, DEFAULT_DENYLIST_ADDRESS, DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+        compute_denylist_storage_slot, DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
     };
 
     const DENYLISTED_STATUS: B256 =
@@ -451,7 +489,7 @@ pub fn localdev_with_denylisted_addresses(
 
     let denylist_account = genesis
         .alloc
-        .get_mut(&DEFAULT_DENYLIST_ADDRESS)
+        .get_mut(&DENYLIST_ADDRESS_LOCALDEV)
         .expect("LOCAL_DEV genesis missing Denylist account");
     let storage = denylist_account
         .storage
@@ -818,6 +856,89 @@ impl EthExecutorSpec for ArcChainSpec {
 
 // Test Arc LocalDev chain spec parsing
 #[cfg(test)]
+mod denylist_address_tests {
+    use super::*;
+
+    /// Every network Arc recognises, paired with the address the genesis builder assigns it in
+    /// `scripts/genesis/addresses.ts` (`denylistAddressByNetwork`). Hardcoded here on purpose: if
+    /// the builder table changes, this test must be updated deliberately rather than silently
+    /// tracking it.
+    const EXPECTED: [(u64, &str, &str); 4] = [
+        (
+            LOCALDEV_CHAIN_ID,
+            "localdev",
+            "0x36059b615370eB999e8eC0c9401835B407834221",
+        ),
+        (
+            DEVNET_CHAIN_ID,
+            "devnet",
+            "0x36061d38f2d939249A947f1254097e0FFC9e2993",
+        ),
+        (
+            TESTNET_CHAIN_ID,
+            "testnet",
+            "0x360b451bb0490637F52fa1794961455615777757",
+        ),
+        (
+            MAINNET_CHAIN_ID,
+            "mainnet",
+            "0x3600000000000000000000000000000000000004",
+        ),
+    ];
+
+    /// Guards against the denylist address drifting from the genesis builder. A mismatch means
+    /// nodes would read denylist storage from an address that holds no Denylist contract, which
+    /// reads as "nobody is denylisted" rather than as an error.
+    #[test]
+    fn denylist_address_matches_genesis_builder_for_every_network() {
+        for (chain_id, name, expected) in EXPECTED {
+            let spec = bundled_chainspec_for_chain_id(chain_id)
+                .unwrap_or_else(|| panic!("no bundled chain spec for {name}"));
+            assert_eq!(
+                spec.denylist_address(),
+                Some(expected.parse::<Address>().unwrap()),
+                "denylist address for {name} does not match scripts/genesis/addresses.ts"
+            );
+        }
+    }
+
+    /// Localdev and mainnet deploy the Denylist in genesis, so the resolved address must hold
+    /// code there. Devnet and testnet deploy it post-genesis (see `scripts/genesis/genesis.ts`),
+    /// so they are intentionally excluded.
+    #[test]
+    fn denylist_contract_present_in_genesis_where_expected() {
+        for (chain_id, name) in [
+            (LOCALDEV_CHAIN_ID, "localdev"),
+            (MAINNET_CHAIN_ID, "mainnet"),
+        ] {
+            let spec = bundled_chainspec_for_chain_id(chain_id).unwrap();
+            let address = spec.denylist_address().unwrap();
+            let account = spec
+                .inner
+                .genesis()
+                .alloc
+                .get(&address)
+                .unwrap_or_else(|| panic!("{name} genesis has no account at {address}"));
+            assert!(
+                account.code.as_ref().is_some_and(|c| !c.is_empty()),
+                "{name} genesis account at {address} has no code"
+            );
+        }
+    }
+
+    /// A custom chain spec has no Arc denylist to point at. The node rejects it at startup
+    /// (see `build_addresses_denylist_config`) rather than running without denylist checks.
+    #[test]
+    fn unknown_chain_id_has_no_denylist() {
+        let mut genesis: Genesis =
+            serde_json::from_str(include_str!("../../../assets/localdev/genesis.json")).unwrap();
+        genesis.config.chain_id = 999999;
+        let spec = ArcChainSpec::new(ChainSpec::from_genesis(genesis));
+        assert_eq!(spec.denylist_address(), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -832,8 +953,29 @@ mod tests {
         ARC_ZERO5_HARDFORK_BLOCK_ACTIVATION_DEVNET,
         ARC_ZERO5_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET,
         ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET,
-        ARC_ZERO6_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET, BASE_FORKS,
+        ARC_ZERO6_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET,
+        ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET,
+        ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET,
+        ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET,
+        ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET, BASE_FORKS,
     };
+
+    #[test]
+    fn chain_names_used_by_the_snapshot_tooling_are_still_supported() {
+        // `arc-snapshots` passes these to `arc-node-execution download --chain`
+        // when it restores the execution layer from a reth manifest, and it does
+        // that after deleting the datadir. Renaming one here would leave that
+        // restore failing on an operator's node with the old data already gone, so
+        // the names are restated and checked. They come from
+        // `Chain::arc_chain_arg` in `crates/snapshots/src/download.rs`.
+        for chain in ["arc-devnet", "arc-testnet", "arc-mainnet"] {
+            assert!(
+                ArcChainSpecParser::SUPPORTED_CHAINS.contains(&chain),
+                "{chain} is no longer a supported --chain value; \
+                 update Chain::arc_chain_arg in crates/snapshots to match"
+            );
+        }
+    }
 
     fn assert_arc_chainspec_evm_hardforks(spec: &ArcChainSpec) {
         // ---- Block-gated forks (chronological) ----
@@ -951,7 +1093,7 @@ mod tests {
             .expect("Failed to parse arc-localdev");
         assert_eq!(spec.chain().id(), LOCALDEV_CHAIN_ID);
         assert_arc_chainspec_evm_hardforks(&spec);
-        assert_eq!(spec.forks_iter().count(), 23);
+        assert_eq!(spec.forks_iter().count(), 24);
         assert!(spec.is_osaka_active_at_timestamp(0));
 
         // verify zero3 hardfork block
@@ -980,12 +1122,18 @@ mod tests {
             spec.is_fork_active_at_timestamp(ArcHardfork::Zero7, 0),
             "Zero7 should be active at timestamp 0 in hardfork.rs, and load by chainspec"
         );
+        // Zero8 activates by timestamp (Arc convention from Zero7 onward).
+        assert!(
+            spec.is_fork_active_at_timestamp(ArcHardfork::Zero8, 0),
+            "Zero8 should be active at timestamp 0 in hardfork.rs, and load by chainspec"
+        );
         let flags = spec.get_hardfork_flags(0, 0);
         assert!(flags.is_active(ArcHardfork::Zero3));
         assert!(flags.is_active(ArcHardfork::Zero4));
         assert!(flags.is_active(ArcHardfork::Zero5));
         assert!(flags.is_active(ArcHardfork::Zero6));
         assert!(flags.is_active(ArcHardfork::Zero7));
+        assert!(flags.is_active(ArcHardfork::Zero8));
     }
 
     #[test]
@@ -994,7 +1142,7 @@ mod tests {
         assert_eq!(spec.chain().id(), LOCALDEV_CHAIN_ID);
         assert_arc_chainspec_evm_hardforks(&spec);
         assert!(spec.is_osaka_active_at_timestamp(0));
-        assert_eq!(spec.forks_iter().count(), 23);
+        assert_eq!(spec.forks_iter().count(), 24);
 
         // verify zero3 hardfork block
         assert!(!spec.is_fork_active_at_timestamp(ArcHardfork::Zero3, 1762732800));
@@ -1011,12 +1159,16 @@ mod tests {
         // Zero7 activates by timestamp (Arc convention from Zero7 onward).
         assert!(spec.is_fork_active_at_timestamp(ArcHardfork::Zero7, 0));
         assert!(!spec.is_fork_active_at_block(ArcHardfork::Zero7, 0));
+        // Zero8 activates by timestamp (Arc convention from Zero7 onward).
+        assert!(spec.is_fork_active_at_timestamp(ArcHardfork::Zero8, 0));
+        assert!(!spec.is_fork_active_at_block(ArcHardfork::Zero8, 0));
         let flags = spec.get_hardfork_flags(0, 0);
         assert!(flags.is_active(ArcHardfork::Zero3));
         assert!(flags.is_active(ArcHardfork::Zero4));
         assert!(flags.is_active(ArcHardfork::Zero5));
         assert!(flags.is_active(ArcHardfork::Zero6));
         assert!(flags.is_active(ArcHardfork::Zero7));
+        assert!(flags.is_active(ArcHardfork::Zero8));
         assert_eq!(
             spec.display_hardforks().to_string(),
             r#"Pre-merge hard forks (block based):
@@ -1044,7 +1196,8 @@ Post-merge hard forks (timestamp based):
 - Cancun                           @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Prague                           @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Osaka                            @0          blob: (target: 6, max: 9, fraction: 5007716)
-- Zero7                            @0          blob: (target: 6, max: 9, fraction: 5007716)"#
+- Zero7                            @0          blob: (target: 6, max: 9, fraction: 5007716)
+- Zero8                            @0          blob: (target: 6, max: 9, fraction: 5007716)"#
         );
     }
 
@@ -1064,15 +1217,41 @@ Post-merge hard forks (timestamp based):
 
         assert_arc_chainspec_evm_hardforks(&spec);
         assert!(spec.is_osaka_active_at_timestamp(0));
-        assert_eq!(spec.forks_iter().count(), 22);
+        assert_eq!(spec.forks_iter().count(), 24);
 
-        // Mainnet launches at Zero6: Zero3..Zero6 active at block 0; Zero7 is not scheduled on mainnet.
+        // Mainnet launches at Zero6: Zero3..Zero6 active at block 0; Zero7/Zero8 activate
+        // later by timestamp.
         let flags = spec.get_hardfork_flags(0, 0);
         assert!(flags.is_active(ArcHardfork::Zero3));
         assert!(flags.is_active(ArcHardfork::Zero4));
         assert!(flags.is_active(ArcHardfork::Zero5));
         assert!(flags.is_active(ArcHardfork::Zero6));
         assert!(!flags.is_active(ArcHardfork::Zero7));
+        assert!(!flags.is_active(ArcHardfork::Zero8));
+
+        let flags_before_zero7 =
+            spec.get_hardfork_flags(0, ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET - 1);
+        assert!(!flags_before_zero7.is_active(ArcHardfork::Zero7));
+
+        let flags_at_zero7 =
+            spec.get_hardfork_flags(0, ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET);
+        assert!(flags_at_zero7.is_active(ArcHardfork::Zero7));
+        assert_eq!(
+            spec.fork(ArcHardfork::Zero7),
+            ForkCondition::Timestamp(ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET)
+        );
+
+        let flags_before_zero8 =
+            spec.get_hardfork_flags(0, ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET - 1);
+        assert!(!flags_before_zero8.is_active(ArcHardfork::Zero8));
+
+        let flags_at_zero8 =
+            spec.get_hardfork_flags(0, ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET);
+        assert!(flags_at_zero8.is_active(ArcHardfork::Zero8));
+        assert_eq!(
+            spec.fork(ArcHardfork::Zero8),
+            ForkCondition::Timestamp(ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET)
+        );
 
         assert_eq!(
             spec.display_hardforks().to_string(),
@@ -1100,7 +1279,9 @@ Post-merge hard forks (timestamp based):
 - Shanghai                         @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Cancun                           @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Prague                           @0          blob: (target: 6, max: 9, fraction: 5007716)
-- Osaka                            @0          blob: (target: 6, max: 9, fraction: 5007716)"#
+- Osaka                            @0          blob: (target: 6, max: 9, fraction: 5007716)
+- Zero7                            @1789052400          blob: (target: 6, max: 9, fraction: 5007716)
+- Zero8                            @1789052400          blob: (target: 6, max: 9, fraction: 5007716)"#
         );
     }
 
@@ -1167,6 +1348,7 @@ Post-merge hard forks (timestamp based):
             (ArcHardfork::Zero5, true),
             (ArcHardfork::Zero6, true),
             (ArcHardfork::Zero7, false), // deferred — not active at launch
+            (ArcHardfork::Zero8, false), // deferred — not active at launch
         ];
         let paths: [(&str, &ArcChainSpec); 3] = [
             ("parser", &from_parser),
@@ -1200,7 +1382,7 @@ Post-merge hard forks (timestamp based):
             "0x41c417868fee948f58602b01a84ce0ddb5ffe2184f7e9ab43b9c8d7e5eb47067",
             "the genesis hash of assets/devnet/genesis.json changed unexpectedly"
         );
-        assert_eq!(spec.forks_iter().count(), 23);
+        assert_eq!(spec.forks_iter().count(), 24);
         assert_arc_chainspec_evm_hardforks(&spec);
         assert!(!spec.is_osaka_active_at_timestamp(0));
         assert!(spec.is_osaka_active_at_timestamp(ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET));
@@ -1248,6 +1430,19 @@ Post-merge hard forks (timestamp based):
         assert!(flags_at_zero6.is_active(ArcHardfork::Zero4));
         assert!(flags_at_zero6.is_active(ArcHardfork::Zero5));
         assert!(flags_at_zero6.is_active(ArcHardfork::Zero6));
+        assert!(!flags_at_zero6.is_active(ArcHardfork::Zero8));
+
+        let flags_before_zero8 = spec.get_hardfork_flags(
+            ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET,
+            ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET - 1,
+        );
+        assert!(!flags_before_zero8.is_active(ArcHardfork::Zero8));
+
+        let flags_at_zero8 = spec.get_hardfork_flags(
+            ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET,
+            ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET,
+        );
+        assert!(flags_at_zero8.is_active(ArcHardfork::Zero8));
 
         assert_eq!(
             spec.display_hardforks().to_string(),
@@ -1276,7 +1471,8 @@ Post-merge hard forks (timestamp based):
 - Cancun                           @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Prague                           @0          blob: (target: 6, max: 9, fraction: 5007716)
 - Osaka                            @1775483400          blob: (target: 6, max: 9, fraction: 5007716)
-- Zero7                            @1780495200          blob: (target: 6, max: 9, fraction: 5007716)"#
+- Zero7                            @1780495200          blob: (target: 6, max: 9, fraction: 5007716)
+- Zero8                            @1787756400          blob: (target: 6, max: 9, fraction: 5007716)"#
         );
         assert_eq!(
             spec.fork(ArcHardfork::Zero3),
@@ -1294,6 +1490,10 @@ Post-merge hard forks (timestamp based):
             spec.fork(ArcHardfork::Zero6),
             ForkCondition::Block(ARC_ZERO6_HARDFORK_BLOCK_ACTIVATION_DEVNET)
         );
+        assert_eq!(
+            spec.fork(ArcHardfork::Zero8),
+            ForkCondition::Timestamp(ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_DEVNET)
+        );
     }
 
     #[test]
@@ -1310,7 +1510,7 @@ Post-merge hard forks (timestamp based):
         assert_arc_chainspec_evm_hardforks(&spec);
         assert!(!spec.is_osaka_active_at_timestamp(0));
         assert!(spec.is_osaka_active_at_timestamp(ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET));
-        assert_eq!(spec.forks_iter().count(), 23);
+        assert_eq!(spec.forks_iter().count(), 24);
 
         // Zero3
         let flags_before_zero3 =
@@ -1379,6 +1579,23 @@ Post-merge hard forks (timestamp based):
             ForkCondition::Timestamp(ARC_ZERO6_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET)
         );
 
+        // Zero8 — activates by timestamp on testnet.
+        let flags_before_zero8 = spec.get_hardfork_flags(
+            post_zero4_block,
+            ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET - 1,
+        );
+        assert!(!flags_before_zero8.is_active(ArcHardfork::Zero8));
+
+        let flags_at_zero8 = spec.get_hardfork_flags(
+            post_zero4_block,
+            ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET,
+        );
+        assert!(flags_at_zero8.is_active(ArcHardfork::Zero8));
+        assert_eq!(
+            spec.fork(ArcHardfork::Zero8),
+            ForkCondition::Timestamp(ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET)
+        );
+
         assert_eq!(
             spec.fork(EthereumHardfork::Osaka),
             ForkCondition::Timestamp(ARC_OSAKA_HARDFORK_TIMESTAMP_ACTIVATION_TESTNET)
@@ -1411,7 +1628,8 @@ Post-merge hard forks (timestamp based):
 - Osaka                            @1779890400          blob: (target: 6, max: 9, fraction: 5007716)
 - Zero5                            @1779894517          blob: (target: 6, max: 9, fraction: 5007716)
 - Zero6                            @1779894517          blob: (target: 6, max: 9, fraction: 5007716)
-- Zero7                            @1781791200          blob: (target: 6, max: 9, fraction: 5007716)"#
+- Zero7                            @1781791200          blob: (target: 6, max: 9, fraction: 5007716)
+- Zero8                            @1788447600          blob: (target: 6, max: 9, fraction: 5007716)"#
         );
     }
 

@@ -26,12 +26,14 @@ use arc_eth_engine::json_structures::ExecutionBlock;
 
 use crate::block::ConsensusBlock;
 use crate::finalize::{BlockFinalizer, EngineBlockFinalizer};
-use crate::metrics::AppMetrics;
+use crate::metrics::{AppMetrics, BindingHaltSite};
+use crate::payload::check_payload_binding;
 use crate::state::{Decision, NextHeightInfo, State};
 use crate::stats::Stats;
 use crate::store::repositories::{DecidedBlocksRepository, UndecidedBlocksRepository};
 use crate::store::services::{ProdPruningService, PruningService};
 use crate::utils::sync_state::{sync_state, SyncState};
+use crate::utils::HaltAndWait;
 
 /// Handles the `Decided` message from the consensus engine.
 ///
@@ -64,6 +66,7 @@ pub async fn handle(
 
     store_proposal_monitor_on_decision(state, decided_height, &decided_value_id).await;
 
+    let previous_block = state.previous_block;
     let (store, metrics, stats) = (state.store(), state.metrics(), state.stats());
 
     let block_finalizer = EngineBlockFinalizer::new(engine, stats, metrics);
@@ -78,6 +81,7 @@ pub async fn handle(
         stats,
         metrics,
         commit_ack,
+        previous_block.as_ref(),
     )
     .await;
 
@@ -99,6 +103,13 @@ pub async fn handle(
                 prepare_next_height(decided_height, block, new_sync_state, engine).await?;
 
             state.decision = Some(Decision::Success(Box::new(next_height_info)));
+        }
+        // A chain anomaly shuts the node down. `state.decision` stays unset because
+        // the `Finalized` message that reads it never arrives.
+        Err(e) if e.downcast_ref::<HaltAndWait>().is_some() => {
+            error!("🔴 Decided: chain anomaly, halting: {e:#}");
+
+            return Err(e);
         }
         Err(e) => {
             error!("🔴 Failed to process decided value: {e:#}");
@@ -148,6 +159,7 @@ async fn decide(
     stats: &Stats,
     metrics: &AppMetrics,
     commit_ack: Reply<()>,
+    previous_block: Option<&ExecutionBlock>,
 ) -> eyre::Result<ExecutionBlock> {
     let height = certificate.height;
     let round = certificate.round;
@@ -171,6 +183,32 @@ async fn decide(
             ));
         }
     };
+
+    // Binding before the stored verdict. Every ingestion path rejects an unbound
+    // payload before consensus votes on it, so reaching this point means an
+    // invariant broke. A restart cannot change the certificate, so the node stops
+    // here whatever the row reads, rather than repeating the height with no reason.
+    if let Err(error) = check_payload_binding(&block.execution_payload, height, previous_block) {
+        error!(
+            %height, %round, %value_id,
+            "🛑 Chain anomaly: decided payload is not bound to its place in the chain; halting",
+        );
+
+        metrics.inc_binding_halt_count(BindingHaltSite::Decided);
+
+        return Err(HaltAndWait::new(format!(
+            "decided payload is not bound to its place in the chain at height={height}, \
+             round={round}, value_id={value_id}: {error}"
+        ))
+        .into());
+    }
+
+    // Only finalize a block the engine marked valid.
+    if !block.validity.is_valid() {
+        return Err(eyre!(
+            "Refusing to finalize undecided block marked invalid for certificate with height={height}, round={round}, value_id={value_id}"
+        ));
+    }
 
     debug!(
         "🎁 Block size: {:?}, payload size: {:?}",
@@ -286,14 +324,13 @@ async fn prepare_next_height(
 ) -> eyre::Result<NextHeightInfo> {
     let next_height = decided_height.increment();
 
-    // Fetch the validator set for the next height
-    // NOTE: Validator set is fetched at the decided height for the next height
+    // Fetch the signing validator set for the next consensus height.
     let validator_set = engine
         .eth
-        .get_active_validator_set(decided_height.as_u64())
+        .get_signing_validator_set(next_height.as_u64())
         .await
         .wrap_err_with(|| {
-            format!("Failed to fetch validator set at height {decided_height} for next height {next_height}")
+            format!("Failed to fetch signing validator set for next height {next_height}")
         })?;
 
     // Fetch the consensus params for the next height
@@ -496,12 +533,279 @@ mod tests {
             &stats,
             &metrics,
             dummy_commit_ack(),
+            None,
         )
         .await;
 
         let block = result.unwrap();
         assert_eq!(block.block_number, height);
         assert_eq!(block.timestamp, timestamp);
+    }
+
+    /// Mocks that assert the decision never reaches the store or the engine.
+    fn expect_no_commit() -> (
+        MockDecidedBlocksRepository,
+        MockBlockFinalizer,
+        MockPruningService,
+    ) {
+        let mut decided_blocks = MockDecidedBlocksRepository::new();
+        decided_blocks.expect_store().times(0);
+
+        let mut block_finalizer = MockBlockFinalizer::new();
+        block_finalizer.expect_finalize_decided_block().times(0);
+
+        (decided_blocks, block_finalizer, MockPruningService::new())
+    }
+
+    /// A payload that reports a block number below its certificate height: a
+    /// fresh block forked from an older ancestor, or an older payload re-proposed.
+    #[tokio::test]
+    async fn decide_halts_when_the_decided_payload_reports_another_height() {
+        let height = 11u64;
+        let round = 0u32;
+        let block_hash = B256::repeat_byte((height % 256) as u8);
+        let certificate = test_commit_certificate(height, round, block_hash);
+
+        let mut consensus_block = test_consensus_block(height, round, 1000);
+        consensus_block
+            .execution_payload
+            .payload_inner
+            .payload_inner
+            .block_number = 5;
+
+        let mut undecided_blocks = MockUndecidedBlocksRepository::new();
+        undecided_blocks
+            .expect_get_by_hash()
+            .with(eq(Height::new(height)), eq(block_hash))
+            .return_once(move |_, _| Ok(Some(consensus_block.clone())));
+
+        let (decided_blocks, block_finalizer, pruning_service) = expect_no_commit();
+        let metrics = test_metrics();
+        let stats = test_stats();
+
+        let error = decide(
+            block_finalizer,
+            undecided_blocks,
+            decided_blocks,
+            pruning_service,
+            certificate,
+            &stats,
+            &metrics,
+            dummy_commit_ack(),
+            Some(&test_execution_block(height - 1, 900)),
+        )
+        .await
+        .expect_err("an unbound payload must not be finalized");
+
+        assert!(
+            error.downcast_ref::<HaltAndWait>().is_some(),
+            "expected a fail-stop, got: {error:#}",
+        );
+        assert!(
+            format!("{error:#}").contains("does not match consensus height"),
+            "the halt must name the broken rule, got: {error:#}",
+        );
+        assert_eq!(metrics.get_binding_halt_count(BindingHaltSite::Decided), 1);
+    }
+
+    #[tokio::test]
+    async fn decide_halts_when_the_decided_payload_does_not_extend_the_previous_block() {
+        let height = 11u64;
+        let round = 0u32;
+        let block_hash = B256::repeat_byte((height % 256) as u8);
+        let certificate = test_commit_certificate(height, round, block_hash);
+
+        let mut consensus_block = test_consensus_block(height, round, 1000);
+        consensus_block
+            .execution_payload
+            .payload_inner
+            .payload_inner
+            .parent_hash = B256::repeat_byte(0xAB);
+
+        let mut undecided_blocks = MockUndecidedBlocksRepository::new();
+        undecided_blocks
+            .expect_get_by_hash()
+            .with(eq(Height::new(height)), eq(block_hash))
+            .return_once(move |_, _| Ok(Some(consensus_block.clone())));
+
+        let (decided_blocks, block_finalizer, pruning_service) = expect_no_commit();
+        let metrics = test_metrics();
+        let stats = test_stats();
+
+        let error = decide(
+            block_finalizer,
+            undecided_blocks,
+            decided_blocks,
+            pruning_service,
+            certificate,
+            &stats,
+            &metrics,
+            dummy_commit_ack(),
+            Some(&test_execution_block(height - 1, 900)),
+        )
+        .await
+        .expect_err("a payload that extends another block must not be finalized");
+
+        assert!(
+            error.downcast_ref::<HaltAndWait>().is_some(),
+            "expected a fail-stop, got: {error:#}",
+        );
+        assert!(
+            format!("{error:#}").contains("is not the block finalized at the previous height"),
+            "the halt must name the broken rule, got: {error:#}",
+        );
+        assert_eq!(metrics.get_binding_halt_count(BindingHaltSite::Decided), 1);
+    }
+
+    /// The reachable path: the ingestion rules already marked the row `Invalid`,
+    /// so the binding must be read before the stored verdict. Otherwise the plain
+    /// verdict error restarts the height and the anomaly carries no signal.
+    #[tokio::test]
+    async fn decide_halts_on_an_unbound_payload_whose_row_is_already_invalid() {
+        let height = 11u64;
+        let round = 0u32;
+        let block_hash = B256::repeat_byte((height % 256) as u8);
+        let certificate = test_commit_certificate(height, round, block_hash);
+
+        let mut consensus_block = test_consensus_block(height, round, 1000);
+        consensus_block.validity = Validity::Invalid;
+        consensus_block
+            .execution_payload
+            .payload_inner
+            .payload_inner
+            .block_number = 5;
+
+        let mut undecided_blocks = MockUndecidedBlocksRepository::new();
+        undecided_blocks
+            .expect_get_by_hash()
+            .return_once(move |_, _| Ok(Some(consensus_block.clone())));
+
+        let (decided_blocks, block_finalizer, pruning_service) = expect_no_commit();
+        let metrics = test_metrics();
+        let stats = test_stats();
+
+        let error = decide(
+            block_finalizer,
+            undecided_blocks,
+            decided_blocks,
+            pruning_service,
+            certificate,
+            &stats,
+            &metrics,
+            dummy_commit_ack(),
+            Some(&test_execution_block(height - 1, 900)),
+        )
+        .await
+        .expect_err("an unbound payload must not be finalized");
+
+        assert!(
+            error.downcast_ref::<HaltAndWait>().is_some(),
+            "the binding must be read before the stored verdict, got: {error:#}",
+        );
+    }
+
+    /// A bound payload whose row reads `Invalid` keeps the ordinary verdict error,
+    /// so the reordering above did not turn every rejection into a fail-stop.
+    #[tokio::test]
+    async fn decide_does_not_halt_on_a_bound_payload_marked_invalid() {
+        let height = 11u64;
+        let round = 0u32;
+        let block_hash = B256::repeat_byte((height % 256) as u8);
+        let certificate = test_commit_certificate(height, round, block_hash);
+
+        let mut consensus_block = test_consensus_block(height, round, 1000);
+        consensus_block.validity = Validity::Invalid;
+
+        let mut undecided_blocks = MockUndecidedBlocksRepository::new();
+        undecided_blocks
+            .expect_get_by_hash()
+            .return_once(move |_, _| Ok(Some(consensus_block.clone())));
+
+        let (decided_blocks, block_finalizer, pruning_service) = expect_no_commit();
+        let metrics = test_metrics();
+        let stats = test_stats();
+
+        let error = decide(
+            block_finalizer,
+            undecided_blocks,
+            decided_blocks,
+            pruning_service,
+            certificate,
+            &stats,
+            &metrics,
+            dummy_commit_ack(),
+            Some(&test_execution_block(height - 1, 900)),
+        )
+        .await
+        .expect_err("a block marked invalid must not be finalized");
+
+        assert!(
+            error.downcast_ref::<HaltAndWait>().is_none(),
+            "an engine rejection is not a chain anomaly, got: {error:#}",
+        );
+        assert!(
+            error.to_string().contains("marked invalid"),
+            "got: {error:#}",
+        );
+    }
+
+    /// The same payload and previous block, with the binding intact: the
+    /// decision proceeds, so the tests above pin the binding and nothing else.
+    #[tokio::test]
+    async fn decide_commits_a_payload_that_extends_the_previous_block() {
+        let height = 11u64;
+        let round = 0u32;
+        let timestamp = 1000u64;
+        let block_hash = B256::repeat_byte((height % 256) as u8);
+        let certificate = test_commit_certificate(height, round, block_hash);
+        let consensus_block = test_consensus_block(height, round, timestamp);
+
+        let mut undecided_blocks = MockUndecidedBlocksRepository::new();
+        undecided_blocks
+            .expect_get_by_hash()
+            .return_once(move |_, _| Ok(Some(consensus_block.clone())));
+
+        let mut decided_blocks = MockDecidedBlocksRepository::new();
+        decided_blocks
+            .expect_store()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let mut block_finalizer = MockBlockFinalizer::new();
+        block_finalizer
+            .expect_finalize_decided_block()
+            .times(1)
+            .return_once(move |_, _| Ok((test_execution_block(height, timestamp), block_hash)));
+
+        let mut pruning_service = MockPruningService::new();
+        pruning_service
+            .expect_clean_stale_consensus_data()
+            .return_once(|_| Ok(()));
+        pruning_service
+            .expect_prune_historical_certs()
+            .return_once(|_| Ok(vec![]));
+        pruning_service
+            .expect_prune_decided_blocks()
+            .return_once(|| Ok(vec![]));
+
+        let metrics = test_metrics();
+        let stats = test_stats();
+
+        let block = decide(
+            block_finalizer,
+            undecided_blocks,
+            decided_blocks,
+            pruning_service,
+            certificate,
+            &stats,
+            &metrics,
+            dummy_commit_ack(),
+            Some(&test_execution_block(height - 1, 900)),
+        )
+        .await
+        .expect("a bound payload is finalized");
+
+        assert_eq!(block.block_number, height);
     }
 
     // Block not found in undecided blocks
@@ -533,11 +837,56 @@ mod tests {
             &stats,
             &metrics,
             dummy_commit_ack(),
+            None,
         )
         .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Cannot find undecided block"));
+    }
+
+    // A stored block marked invalid must never be finalized.
+    #[tokio::test]
+    async fn test_decide_rejects_invalid_block() {
+        let height = 5u64;
+        let round = 2u32;
+        let timestamp = 1000u64;
+        let block_hash = B256::repeat_byte((height % 256) as u8);
+        let certificate = test_commit_certificate(height, round, block_hash);
+        let mut consensus_block = test_consensus_block(height, round, timestamp);
+        consensus_block.validity = Validity::Invalid;
+
+        let mut undecided_blocks = MockUndecidedBlocksRepository::new();
+        undecided_blocks
+            .expect_get_by_hash()
+            .with(eq(Height::new(height)), eq(block_hash))
+            .return_once(move |_, _| Ok(Some(consensus_block.clone())));
+
+        // Finalization and decided-block storage must not be reached.
+        let mut block_finalizer = MockBlockFinalizer::new();
+        block_finalizer.expect_finalize_decided_block().times(0);
+        let mut decided_blocks = MockDecidedBlocksRepository::new();
+        decided_blocks.expect_store().times(0);
+        let pruning_service = MockPruningService::new();
+
+        let metrics = test_metrics();
+        let stats = test_stats();
+
+        let result = decide(
+            block_finalizer,
+            undecided_blocks,
+            decided_blocks,
+            pruning_service,
+            certificate,
+            &stats,
+            &metrics,
+            dummy_commit_ack(),
+            None,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("marked invalid"));
     }
 
     // Repository error when fetching undecided block
@@ -569,6 +918,7 @@ mod tests {
             &stats,
             &metrics,
             dummy_commit_ack(),
+            None,
         )
         .await;
 
@@ -611,6 +961,7 @@ mod tests {
             &stats,
             &metrics,
             dummy_commit_ack(),
+            None,
         )
         .await;
 

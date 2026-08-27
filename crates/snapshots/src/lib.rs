@@ -17,3 +17,4 @@
 //! arc-snapshots library — download and extract Arc node snapshots.
 
 pub mod download;
+pub mod manifest;

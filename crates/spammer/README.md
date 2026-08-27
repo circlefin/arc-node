@@ -251,6 +251,8 @@ The following parameters are shared across both `spammer ws` and `spammer nodes`
           Output the status of all Reth tx-pools (number of pending and queued transactions) [aliases: --pools]
   -w, --wait-response
           Wait for the response from Reth after sending a transaction
+      --silent
+          Suppress all log output (gates the tracing subscriber)
 ```
 
 ### GasGuzzler workload

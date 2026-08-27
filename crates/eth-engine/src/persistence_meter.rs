@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_eips::BlockNumHash;
+use alloy_rpc_types::BlockNumberOrTag;
 use async_trait::async_trait;
 use eyre::{eyre, Context};
 use jsonrpsee::{
@@ -484,7 +485,7 @@ pub async fn create_with_fallback(
 /// startup before blocks accumulate, since `eth_getBlockByNumber("latest")`
 /// may return un-persisted heights during steady-state operation.
 pub async fn seed_from_latest_block(meter: &dyn PersistenceMeter, eth: &dyn EthereumAPI) {
-    match eth.get_block_by_number("latest").await {
+    match eth.get_block_by_number(BlockNumberOrTag::Latest).await {
         Ok(Some(block)) => {
             meter.seed(block.block_number);
         }

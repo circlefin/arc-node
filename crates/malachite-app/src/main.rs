@@ -20,9 +20,11 @@
 /// Approximately 33 hours at 0.5 s/block (237600 × 0.5 s ≈ 33 h).
 const PRESETS_PRUNE_CERTIFICATES_DISTANCE: u64 = 237_600;
 
+use std::net::{IpAddr, SocketAddr};
+
 use bytesize::ByteSize;
 use eyre::{eyre, Result};
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 use arc_consensus_types::{
     Config, ExecutionConfig, Height, MetricsConfig, PruningConfig, RpcConfig, RuntimeConfig,
@@ -173,8 +175,17 @@ fn build_config_from_cli(cmd: &StartCmd, logging: config::LoggingConfig) -> Resu
         enabled: cmd.rpc_addr.is_some(),
         listen_addr: cmd
             .rpc_addr
-            .unwrap_or_else(|| "0.0.0.0:31000".parse().expect("valid socket address")),
+            .unwrap_or_else(|| "127.0.0.1:31000".parse().expect("valid socket address")),
+        admin: cmd.rpc_admin,
     };
+
+    if rpc.enabled && rpc.admin && admin_bind_is_routable(rpc.listen_addr) {
+        warn!(
+            listen_addr = %rpc.listen_addr,
+            "admin RPC enabled on a routable address; ensure this interface is \
+             isolated at the network layer (firewall / NetworkPolicy / allowlist)"
+        );
+    }
 
     let certificates_distance = if cmd.full || cmd.minimal {
         PRESETS_PRUNE_CERTIFICATES_DISTANCE
@@ -191,6 +202,9 @@ fn build_config_from_cli(cmd: &StartCmd, logging: config::LoggingConfig) -> Resu
         persistence_backpressure_threshold: cmd.execution_persistence_backpressure_threshold,
     };
 
+    #[cfg(feature = "byzantine")]
+    let byzantine = cmd.byzantine.clone();
+
     Ok(Config {
         moniker: cmd.get_moniker(),
         logging,
@@ -202,7 +216,29 @@ fn build_config_from_cli(cmd: &StartCmd, logging: config::LoggingConfig) -> Resu
         rpc,
         execution,
         signing: build_signing_config(cmd)?,
+        #[cfg(feature = "byzantine")]
+        byzantine,
     })
+}
+
+/// Whether an admin-enabled RPC server bound to `addr` would be reachable from
+/// outside the host. Loopback, private (10/8, 172.16/12, 192.168/16) and
+/// link-local addresses are treated as local; an unspecified address (`0.0.0.0`
+/// / `::`) binds every interface and is always routable.
+fn admin_bind_is_routable(addr: SocketAddr) -> bool {
+    let ip = addr.ip();
+    if ip.is_unspecified() {
+        return true;
+    }
+    let is_local = match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local (fc00::/7)
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local (fe80::/10)
+        }
+    };
+    !is_local
 }
 
 fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<()> {
@@ -212,6 +248,14 @@ fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<
 
     // Build configuration from CLI arguments
     let config = build_config_from_cli(cmd, logging)?;
+
+    // Validate the assembled config. `StartCmd::validate` only checks CLI-arg
+    // shape; `Config::validate` is where `ByzantineConfig::validate` is reached,
+    // so without this call an ad-hoc `--byzantine=<JSON>` would bypass
+    // semantic checks (mutually-exclusive triggers, malformed ranges).
+    config
+        .validate()
+        .map_err(|error| eyre!("Invalid configuration: {error}"))?;
 
     let rt = runtime::build_runtime(config.runtime)?;
 
@@ -496,6 +540,27 @@ mod tests {
     }
 
     #[test]
+    fn admin_bind_is_routable_flags_only_reachable_addresses() {
+        let routable = |s: &str| admin_bind_is_routable(s.parse::<SocketAddr>().unwrap());
+
+        // Local / unreachable from outside the host: no warning.
+        assert!(!routable("127.0.0.1:31000"));
+        assert!(!routable("10.0.0.5:31000"));
+        assert!(!routable("172.16.1.1:31000"));
+        assert!(!routable("192.168.1.1:31000"));
+        assert!(!routable("169.254.0.1:31000"));
+        assert!(!routable("[::1]:31000"));
+        assert!(!routable("[fd00::1]:31000"));
+        assert!(!routable("[fe80::1]:31000"));
+
+        // Unspecified binds every interface; public addresses are reachable.
+        assert!(routable("0.0.0.0:31000"));
+        assert!(routable("[::]:31000"));
+        assert!(routable("8.8.8.8:31000"));
+        assert!(routable("[2001:db8::1]:31000"));
+    }
+
+    #[test]
     fn build_signing_config_defaults_to_local() {
         let cmd = minimal_start_cmd();
         let config = build_signing_config(&cmd).unwrap();
@@ -680,8 +745,8 @@ mod tests {
         let config = build_config_from_cli(&cmd, logging).unwrap();
 
         assert!(!config.rpc.enabled);
-        // Default address is still set even when disabled
-        assert_eq!(config.rpc.listen_addr.to_string(), "0.0.0.0:31000");
+        // Default address is still set even when disabled, and binds to loopback.
+        assert_eq!(config.rpc.listen_addr.to_string(), "127.0.0.1:31000");
     }
 
     #[test]

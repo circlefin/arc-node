@@ -1,0 +1,25 @@
+name = "tx-relay-failover"
+description = "Full node relays tx submission to validators with failover; kill the primary relay target and confirm the full node still accepts and mines transactions."
+
+# 4 validators: killing the primary relay target (validator1) must leave the
+# rest of the network able to keep producing blocks. 3/4 = 75% voting power
+# stays online, safely above the >2/3 BFT quorum threshold. 3 validators would
+# leave exactly 2/3 online, which is not strictly greater than 2/3 and risks a
+# stalled/flaky test.
+[nodes.validator1]
+cl_suggested_fee_recipient = "0x1111111111111111111111111111111111111111"
+
+[nodes.validator2]
+cl_suggested_fee_recipient = "0x2222222222222222222222222222222222222222"
+
+[nodes.validator3]
+cl_suggested_fee_recipient = "0x3333333333333333333333333333333333333333"
+
+[nodes.validator4]
+cl_suggested_fee_recipient = "0x4444444444444444444444444444444444444444"
+
+# Relays raw tx submission to validator1 (primary) with failover to
+# validator2 (backup). Local Docker Compose service DNS resolves these
+# hostnames directly.
+[nodes.full1]
+el.config.arc.tx.relays = ["http://validator1_el:8545", "http://validator2_el:8545"]

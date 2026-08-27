@@ -16,18 +16,18 @@
 
 //! Setup configuration for Arc e2e tests.
 
-use crate::environment::{ArcEnvironment, BlockInfo};
 use arc_evm_node::node::ArcNode;
-use arc_execution_config::addresses_denylist::AddressesDenylistConfig;
+use arc_execution_config::addresses_denylist::{
+    AddressesDenylistConfig, DEFAULT_DENYLIST_ERC7201_BASE_SLOT, DENYLIST_ADDRESS_LOCALDEV,
+};
 use arc_execution_config::chainspec::{ArcChainSpec, LOCAL_DEV};
 use arc_execution_txpool::InvalidTxListConfig;
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::NodeHelperType;
-use reth_ethereum_engine_primitives::EthPayloadBuilderAttributes;
+use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_node_builder::{EngineNodeLauncher, Node, NodeBuilder, NodeConfig, NodeHandle};
 use reth_node_core::args::{DiscoveryArgs, NetworkArgs, RpcServerArgs};
 use reth_provider::providers::BlockchainProvider;
-use reth_provider::HeaderProvider;
 use reth_rpc_server_types::RpcModuleSelection;
 use reth_tasks::Runtime;
 use std::sync::Arc;
@@ -40,6 +40,7 @@ pub struct ArcSetup {
     addresses_denylist_config: Option<AddressesDenylistConfig>,
     invalid_tx_list_config: Option<InvalidTxListConfig>,
     rpc_gas_cap: Option<u64>,
+    share_sparse_trie: bool,
 }
 
 impl Default for ArcSetup {
@@ -58,6 +59,7 @@ impl ArcSetup {
             addresses_denylist_config: None,
             invalid_tx_list_config: None,
             rpc_gas_cap: None,
+            share_sparse_trie: false,
         }
     }
 
@@ -93,26 +95,43 @@ impl ArcSetup {
         self
     }
 
-    /// Applies the setup to create the test environment.
+    /// Enables Reth's shared sparse-trie payload-builder path
+    /// (`--engine.share-sparse-trie-with-payload-builder`) for this node.
     ///
-    /// This creates a single Arc node and initializes the environment with
-    /// the genesis block information.
-    pub async fn apply(self, env: &mut ArcEnvironment) -> eyre::Result<()> {
-        let mut arc_node = ArcNode::default();
-        if let Some(cfg) = self.addresses_denylist_config {
-            arc_node.addresses_denylist_config = cfg;
-        }
+    /// Off by default: the harness disables the parallel state-root machinery so
+    /// concurrent CI nodes stay within the runner's memory budget (see
+    /// `launch_node`). Turning this on opts back into parallelism and shares the
+    /// engine's sparse-trie task with the payload builder, so the build path
+    /// reuses the precomputed root. Enable it only in tests that specifically
+    /// exercise that path (e.g. the sparse-trie state-root regression test).
+    pub fn with_share_sparse_trie(mut self, enabled: bool) -> Self {
+        self.share_sparse_trie = enabled;
+        self
+    }
+
+    /// Launches the configured single-node test environment.
+    pub async fn launch(
+        self,
+    ) -> eyre::Result<(NodeHelperType<ArcNode>, reth_e2e_test_utils::wallet::Wallet)> {
+        let denylist_config = self.addresses_denylist_config.clone().unwrap_or_else(|| {
+            AddressesDenylistConfig::new(
+                DENYLIST_ADDRESS_LOCALDEV,
+                DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+                Vec::new(),
+            )
+        });
+        let mut arc_node = ArcNode::with_denylist_config(denylist_config);
         if let Some(cfg) = self.invalid_tx_list_config {
             arc_node.invalid_tx_list_cfg = cfg;
         }
 
-        let (node, wallet, genesis_block) =
-            Self::launch_node(self.chain_spec, arc_node, self.rpc_gas_cap).await?;
-
-        env.set_node(node);
-        env.set_wallet(wallet);
-        env.set_current_block(genesis_block);
-        Ok(())
+        Self::launch_node(
+            self.chain_spec,
+            arc_node,
+            self.rpc_gas_cap,
+            self.share_sparse_trie,
+        )
+        .await
     }
 
     /// Launches a single Arc test node with the given chain spec and node configuration.
@@ -120,16 +139,12 @@ impl ArcSetup {
         chain_spec: Arc<ArcChainSpec>,
         arc_node: ArcNode,
         rpc_gas_cap: Option<u64>,
-    ) -> eyre::Result<(
-        NodeHelperType<ArcNode>,
-        reth_e2e_test_utils::wallet::Wallet,
-        BlockInfo,
-    )> {
-        let attributes_generator = |_timestamp: u64| -> EthPayloadBuilderAttributes {
-            EthPayloadBuilderAttributes::default()
-        };
+        share_sparse_trie: bool,
+    ) -> eyre::Result<(NodeHelperType<ArcNode>, reth_e2e_test_utils::wallet::Wallet)> {
+        let attributes_generator =
+            |_timestamp: u64| -> EthPayloadAttributes { EthPayloadAttributes::default() };
 
-        let runtime = Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
+        let runtime = Runtime::test();
         let network_config = NetworkArgs {
             discovery: DiscoveryArgs {
                 disable_discovery: true,
@@ -137,8 +152,28 @@ impl ArcSetup {
             },
             ..NetworkArgs::default()
         };
-        let tree_config =
-            reth_node_api::TreeConfig::default().with_cross_block_cache_size(1024 * 1024);
+        // Each e2e test spawns a full in-process node, and the workspace CI shard runs
+        // several concurrently against a fixed 30 GiB container. reth 2.2 sizes the parallel
+        // proof/sparse-trie/multiproof machinery to the host's core count, so every node
+        // grabs as if it owns the 16-core runner — N concurrent nodes then blow the budget.
+        // Disable that machinery per node (sequential state root, identical results) and keep
+        // the cross-block cache tiny. Tests assert correctness, not build throughput.
+        let tree_config = if share_sparse_trie {
+            // Opt back into the parallel state-root machinery and share the
+            // engine's sparse-trie task with the payload builder, so the build
+            // path exercises `--engine.share-sparse-trie-with-payload-builder`.
+            // Used by the sparse-trie state-root regression test. Keep
+            // legacy_state_root disabled (the default) so `use_state_root_task()`
+            // is true and the shared task actually runs.
+            reth_node_api::TreeConfig::default()
+                .with_cross_block_cache_size(1024 * 1024)
+                .with_has_enough_parallelism(true)
+                .with_share_sparse_trie_with_payload_builder(true)
+        } else {
+            reth_node_api::TreeConfig::default()
+                .with_cross_block_cache_size(1024 * 1024)
+                .with_has_enough_parallelism(false)
+        };
         let mut rpc_args = RpcServerArgs::default()
             .with_unused_ports()
             .with_http()
@@ -179,18 +214,11 @@ impl ArcSetup {
         let genesis = node.block_hash(genesis_number);
         node.update_forkchoice(genesis, genesis).await?;
 
-        let genesis_header = node
-            .inner
-            .provider()
-            .header_by_number(genesis_number)?
-            .ok_or_else(|| eyre::eyre!("Genesis header not found"))?;
-        let genesis_block = BlockInfo::new(genesis, 0, genesis_header.timestamp);
-
         // Generate 10 wallets to match localdev genesis allocations.
         // Index 7 is the operator (minter role on NativeFiatToken).
         let wallet =
             reth_e2e_test_utils::wallet::Wallet::new(10).with_chain_id(chain_spec.chain().id());
 
-        Ok((node, wallet, genesis_block))
+        Ok((node, wallet))
     }
 }

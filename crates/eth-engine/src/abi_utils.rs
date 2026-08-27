@@ -151,6 +151,7 @@ pub fn abi_decode_consensus_params(result: Vec<u8>) -> eyre::Result<ConsensusPar
             precommit: Duration::from_millis(contract_params.timeoutPrecommitMs as u64),
             precommit_delta: Duration::from_millis(contract_params.timeoutPrecommitDeltaMs as u64),
             rebroadcast: Duration::from_millis(contract_params.timeoutRebroadcastMs as u64),
+            ..LinearTimeouts::default()
         },
     );
 

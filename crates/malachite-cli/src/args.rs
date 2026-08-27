@@ -16,9 +16,6 @@
 
 //! Command-line interface arguments for a basic implementation.
 //!
-//! Read configuration from the configuration files found in the directory
-//! provided with the `--home` global parameter.
-//!
 //! The command-line parameters are stored in the `Args` structure.
 //! `clap` parses the command-line parameters into this structure.
 
@@ -37,7 +34,6 @@ use crate::cmd::start::StartCmd;
 use crate::error::Error;
 
 const APP_FOLDER: &str = ".arc/consensus";
-const CONFIG_FILE: &str = "config.toml";
 const GENESIS_FILE: &str = "genesis.json";
 const PRIV_VALIDATOR_KEY_FILE: &str = "priv_validator_key.json";
 
@@ -117,12 +113,6 @@ impl Args {
     /// get_config_dir returns the configuration folder based on the home folder.
     pub fn get_config_dir(&self) -> Result<PathBuf, Error> {
         Ok(self.get_home_dir()?.join("config"))
-    }
-
-    /// get_config_file_path returns the configuration file path based on the command-line arguments
-    /// and the configuration folder.
-    pub fn get_config_file_path(&self) -> Result<PathBuf, Error> {
-        Ok(self.get_config_dir()?.join(CONFIG_FILE))
     }
 
     /// get_genesis_file_path returns the genesis file path based on the command-line arguments and

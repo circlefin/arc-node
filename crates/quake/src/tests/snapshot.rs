@@ -129,7 +129,9 @@ pub(crate) async fn restore_from_snapshot(
         std::fs::remove_file(&reth_toml).wrap_err("Failed to remove reth.toml from snapshot")?;
     }
 
-    // Replace CL store.db, preserving config/ (contains priv_validator_key.json)
+    // Replace CL store.db, preserving config/ (contains priv_validator_key.json).
+    // The WAL goes as well. A real restore keeps it, but this node is rewound onto
+    // another node's store and never restarts the height its own log holds.
     let wal_dir = node_malachite.join("wal");
     if wal_dir.exists() {
         std::fs::remove_dir_all(&wal_dir).wrap_err("Failed to remove malachite wal")?;

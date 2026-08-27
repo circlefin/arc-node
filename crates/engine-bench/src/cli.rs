@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -35,6 +35,16 @@ pub enum Command {
     PreparePayload(PreparePayloadArgs),
     /// Replay historical blocks into a target Arc node with newPayload + forkchoiceUpdated.
     NewPayloadFcu(NewPayloadFcuArgs),
+    /// Build payloads via forkchoiceUpdated-with-attributes -> getPayload, advancing
+    /// the chain on recorded blocks. Benchmarks the payload-builder path.
+    BuildPayload(BuildPayloadArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum GetPayloadVersion {
+    Auto,
+    V5,
+    V4,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -91,4 +101,63 @@ pub struct NewPayloadFcuArgs {
     /// Payload fixture directory containing genesis.json, metadata.json, and payloads.jsonl.
     #[arg(long, value_name = "PAYLOAD_DIR")]
     pub payload: PathBuf,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct BuildPayloadArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// Target node's regular Ethereum RPC endpoint (eth_sendRawTransaction + head checks).
+    #[arg(long, value_name = "TARGET_ETH_RPC_URL")]
+    pub target_eth_rpc_url: String,
+
+    /// Fixture directory (genesis.json, metadata.json, payloads.jsonl).
+    #[arg(long, value_name = "PAYLOAD_DIR")]
+    pub payload: PathBuf,
+
+    /// Milliseconds to wait between forkchoiceUpdated-with-attributes and getPayload.
+    /// The build window; hold constant across variants.
+    #[arg(long, value_name = "MILLISECONDS", default_value_t = 200, value_parser = clap::value_parser!(u64).range(1..))]
+    pub build_window_ms: u64,
+
+    /// getPayload version: auto (try V5, fall back to V4), v5, or v4.
+    #[arg(long, value_enum, default_value_t = GetPayloadVersion::Auto)]
+    pub get_payload_version: GetPayloadVersion,
+
+    /// Bail when eth_sendRawTransaction rejects a tx. By default rejections are tolerated
+    /// (logged + counted in txs_rejected), since recorded txs are routinely rejected
+    /// (already-known, base-fee too low, nonce gaps).
+    #[arg(long)]
+    pub disallow_tx_rejections: bool,
+}
+
+#[cfg(test)]
+mod build_payload_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_build_payload_with_ipc() {
+        let cli = Cli::parse_from([
+            "arc-engine-bench",
+            "build-payload",
+            "--engine-ipc",
+            "/tmp/reth.ipc",
+            "--target-eth-rpc-url",
+            "http://127.0.0.1:7545",
+            "--payload",
+            "/data/fixture",
+            "--build-window-ms",
+            "250",
+        ]);
+        match cli.command {
+            Command::BuildPayload(a) => {
+                assert_eq!(a.build_window_ms, 250);
+                assert_eq!(a.payload.to_str().unwrap(), "/data/fixture");
+                assert!(matches!(a.get_payload_version, GetPayloadVersion::Auto));
+            }
+            _ => panic!("expected BuildPayload"),
+        }
+    }
 }

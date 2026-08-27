@@ -47,7 +47,15 @@ const build = async (options: z.infer<typeof localBuilderOptionsSchema>) => {
     network: 'localdev',
     chainId: 1337,
   })
-  const { outputControllersConfig, outputGenesisConfig, validatorNames, hardforks, extraAccountBalance, blockGasLimit, ...accountOptions } = options
+  const {
+    outputControllersConfig,
+    outputGenesisConfig,
+    validatorNames,
+    hardforks,
+    extraAccountBalance,
+    blockGasLimit,
+    ...accountOptions
+  } = options
   const accountCreator = new LocalDevAccountCreator(accountOptions)
 
   // Default account for hardhat environment.
@@ -94,7 +102,10 @@ const build = async (options: z.infer<typeof localBuilderOptionsSchema>) => {
       .concat([one.address])
       .concat(controllers.map((x) => x.address))
       .concat(accountCreator.extraPrefundAccounts().map((x) => x.address))
-      .map((address) => ({ address: address, balance: extraAccountBalance !== undefined ? parseEther(extraAccountBalance.toString()) : parseEther('1000000') })),
+      .map((address) => ({
+        address: address,
+        balance: extraAccountBalance !== undefined ? parseEther(extraAccountBalance.toString()) : parseEther('1000000'),
+      })),
 
     NativeFiatToken: {
       proxy: { admin: proxyAdmin.address },
@@ -118,8 +129,8 @@ const build = async (options: z.infer<typeof localBuilderOptionsSchema>) => {
         alpha: 20n, // 20%
         kRate: 200n, // 2%
         inverseElasticityMultiplier: 5000n, // 50%
-        minBaseFee: 1n,
-        maxBaseFee: parseGwei('1000'),
+        minBaseFee: parseGwei('20'),
+        maxBaseFee: parseGwei('20000'),
         blockGasLimit: blockGasLimit ?? 30_000_000n,
       },
       consensusParams: {
@@ -129,7 +140,7 @@ const build = async (options: z.infer<typeof localBuilderOptionsSchema>) => {
         timeoutPrevoteDeltaMs: 500n,
         timeoutPrecommitMs: 1000n,
         timeoutPrecommitDeltaMs: 500n,
-        timeoutRebroadcastMs: 1000n,
+        timeoutRebroadcastMs: 5000n,
         targetBlockTimeMs: 500n,
       },
     },

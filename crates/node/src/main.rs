@@ -32,8 +32,7 @@ pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\
 use arc_evm_node::node::{ArcNode, ArcRpcConfig};
 use arc_evm_node::ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT;
 use arc_execution_config::addresses_denylist::{
-    AddressesDenylistConfig, AddressesDenylistConfigError, DEFAULT_DENYLIST_ADDRESS,
-    DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+    AddressesDenylistConfig, DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
 };
 use arc_execution_config::chainspec::{ArcChainSpec, ArcChainSpecParser};
 use arc_execution_config::defaults;
@@ -43,7 +42,8 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser};
 use directories::BaseDirs;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum::cli::interface::{Cli as RethCli, Commands};
-use reth_node_core::version::default_extra_data;
+use reth_ethereum::cli::parse_duration_from_secs_or_ms;
+use reth_node_core::version::default_extra_data_bytes;
 use reth_rpc_builder::config::RethRpcServerConfig;
 use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection};
 use tracing::info;
@@ -83,7 +83,7 @@ impl ArcCli {
         if let Commands::Node(ref node_cmd) = self.inner.command {
             // Reject --builder.extradata if user explicitly set it.
             // Arc uses the extra_data field to store the next block's base fee.
-            if node_cmd.builder.extra_data != default_extra_data() {
+            if node_cmd.builder.extra_data != default_extra_data_bytes() {
                 return Err("--builder.extradata is not supported");
             }
 
@@ -240,30 +240,6 @@ struct ArcExtraCli {
     )]
     wait_for_payload: bool,
 
-    /// Enable denylist checks. When false, no denylist lookups.
-    #[arg(
-        long = "arc.denylist.enabled",
-        default_value_t = false,
-        help_heading = "Arc denylist"
-    )]
-    arc_denylist_enabled: bool,
-
-    /// Denylist address (0x-prefixed). Required when --arc.denylist.enabled is true.
-    #[arg(
-        long = "arc.denylist.address",
-        value_name = "ADDRESS",
-        help_heading = "Arc denylist"
-    )]
-    arc_denylist_address: Option<String>,
-
-    /// ERC-7201 base storage slot (0x-prefixed 32 bytes). Required when --arc.denylist.enabled is true.
-    #[arg(
-        long = "arc.denylist.storage-slot",
-        value_name = "SLOT",
-        help_heading = "Arc denylist"
-    )]
-    arc_denylist_storage_slot: Option<String>,
-
     /// Comma-separated addresses to exclude from denylist checks (e.g. for ops recovery).
     #[arg(
         long = "arc.denylist.addresses-exclusions",
@@ -318,6 +294,35 @@ struct ArcExtraCli {
     )]
     arc_rpc_allow_unprotected_txs: bool,
 
+    /// Comma-separated upstream RPC URLs for transaction relay, in priority order.
+    ///
+    /// Follow nodes relay raw-transaction submission (`eth_sendRawTransaction`
+    /// and `eth_sendRawTransactionSync`) to these upstreams with failover.
+    /// Conflicts with Reth's `--rpc.forwarder`.
+    #[arg(
+        long = "arc.tx.relays",
+        env = "ARC_TX_RELAYS",
+        value_delimiter = ',',
+        value_name = "URLS",
+        conflicts_with = "rpc_forwarder",
+        help_heading = "Arc RPC"
+    )]
+    arc_tx_relays: Vec<String>,
+
+    /// Transaction relay timeout: `10s`, `500ms`, or a bare number of seconds.
+    ///
+    /// Bounds each relay attempt; when it elapses the relay advances to the next
+    /// upstream.
+    #[arg(
+        long = "arc.tx.relays.timeout",
+        env = "ARC_TX_RELAYS_TIMEOUT",
+        value_parser = parse_duration_from_secs_or_ms,
+        value_name = "DURATION",
+        default_value = "10s",
+        help_heading = "Arc RPC"
+    )]
+    arc_tx_relays_timeout: std::time::Duration,
+
     /// Interval in seconds between transaction rebroadcast rounds.
     ///
     /// Pending transactions are periodically re-announced to all peers to recover
@@ -352,28 +357,16 @@ struct ArcExtraCli {
     pprof_heap_prof: bool,
 }
 
-/// Build [`AddressesDenylistConfig`] from CLI flags.
-/// When enabled, address and storage slot default to genesis constants if not provided.
-fn build_addresses_denylist_config(ext: &ArcExtraCli) -> eyre::Result<AddressesDenylistConfig> {
-    use alloy_primitives::{Address, B256};
-
-    let contract_address = ext
-        .arc_denylist_address
-        .as_deref()
-        .map(|s| s.parse::<Address>())
-        .transpose()
-        .map_err(|e| eyre::eyre!("invalid --arc.denylist.address: {}", e))?
-        .or(ext.arc_denylist_enabled.then_some(DEFAULT_DENYLIST_ADDRESS));
-
-    let storage_slot = ext
-        .arc_denylist_storage_slot
-        .as_deref()
-        .map(|s| s.parse::<B256>())
-        .transpose()
-        .map_err(|e| eyre::eyre!("invalid --arc.denylist.storage-slot: {}", e))?
-        .or(ext
-            .arc_denylist_enabled
-            .then_some(DEFAULT_DENYLIST_ERC7201_BASE_SLOT));
+/// Build [`AddressesDenylistConfig`] for the chain being run.
+///
+/// The contract address and storage slot come from the chain spec, not from CLI flags: the
+/// denylist is a protocol requirement, so it is not operator-configurable. Only the
+/// ops-recovery exclusions remain operator-supplied.
+fn build_addresses_denylist_config(
+    chain_spec: &ArcChainSpec,
+    ext: &ArcExtraCli,
+) -> eyre::Result<AddressesDenylistConfig> {
+    use alloy_primitives::Address;
 
     let addresses_exclusions: Vec<Address> = ext
         .arc_denylist_addresses_exclusions
@@ -382,21 +375,36 @@ fn build_addresses_denylist_config(ext: &ArcExtraCli) -> eyre::Result<AddressesD
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| eyre::eyre!("invalid --arc.denylist.addresses-exclusions: {}", e))?;
 
-    let config = AddressesDenylistConfig::try_new(
-        ext.arc_denylist_enabled,
-        contract_address,
-        storage_slot,
-        addresses_exclusions,
-    )
-    .map_err(|e| match e {
-        AddressesDenylistConfigError::MissingContractAddress => {
-            eyre::eyre!("--arc.denylist.enabled is set but --arc.denylist.address is missing")
-        }
-        AddressesDenylistConfigError::MissingStorageSlot => {
-            eyre::eyre!("--arc.denylist.enabled is set but --arc.denylist.storage-slot is missing")
-        }
+    // No denylist-free node: an unrecognised chain spec is refused rather than run unchecked.
+    let contract_address = chain_spec.denylist_address().ok_or_else(|| {
+        eyre::eyre!(
+            "no Arc denylist is defined for chain id {}; refusing to start without denylist checks",
+            chain_spec.chain().id()
+        )
     })?;
-    Ok(config)
+
+    Ok(AddressesDenylistConfig::new(
+        contract_address,
+        DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+        addresses_exclusions,
+    ))
+}
+
+/// Validates `--arc.tx.relays` and returns the upstream URLs in priority order.
+///
+/// An empty list disables relaying. A non-empty list must contain only valid
+/// URLs; any unparseable entry is a startup error.
+fn build_tx_relays(ext: &ArcExtraCli) -> eyre::Result<Vec<String>> {
+    ext.arc_tx_relays
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            url::Url::parse(s)
+                .map(|_| s.to_string())
+                .map_err(|e| eyre::eyre!("invalid --arc.tx.relays entry {s:?}: {e}"))
+        })
+        .collect()
 }
 
 /// Namespaces considered safe on a `--public-api` node.
@@ -455,12 +463,12 @@ fn parse_max_batch_entries(s: &str) -> Result<usize, String> {
 const PRESETS_PRUNE_DISTANCE: u64 = 237_600;
 const FLAG_FULL: &str = "--full";
 const FLAG_MINIMAL: &str = "--minimal";
-const FLAG_BLOCK_INTERVAL: &str = "--prune.block-interval=5000";
+const FLAG_BLOCK_INTERVAL: &str = "--prune.block-interval=128";
 const FLAG_DATADIR: &str = "--datadir";
 
 /// Registers Arc-specific `DefaultPruningValues` with Reth's global static, then injects
 /// Arc defaults into argv:
-/// - `--prune.block-interval=5000` whenever `--full` or `--minimal` is present
+/// - `--prune.block-interval=128` whenever `--full` or `--minimal` is present
 /// - `--datadir=~/.arc/execution` unless the user already supplied `--datadir`
 fn init_arc_pruning<I, S>(argv: I) -> Vec<std::ffi::OsString>
 where
@@ -494,8 +502,10 @@ where
     // Collect argv so we can inspect it before rewriting.
     let mut args: Vec<std::ffi::OsString> = argv.into_iter().map(Into::into).collect();
 
-    // Inject --prune.block-interval=5000 when --full or --minimal is present,
-    // unless the user already supplied one.
+    // Inject --prune.block-interval=128 for `node` when --full or --minimal is
+    // present, unless already supplied. Other subcommands (e.g. `download`) reuse
+    // --full/--minimal with a different meaning and reject --prune.block-interval.
+    let has_node_subcommand = args.get(1).and_then(|a| a.to_str()) == Some("node");
     let has_preset = args
         .iter()
         .any(|a| matches!(a.to_str(), Some(FLAG_FULL) | Some(FLAG_MINIMAL)));
@@ -503,7 +513,7 @@ where
         a.to_str()
             .is_some_and(|s| s.starts_with("--prune.block-interval"))
     });
-    if has_preset && !has_explicit_block_interval {
+    if has_node_subcommand && has_preset && !has_explicit_block_interval {
         args.push(std::ffi::OsString::from(FLAG_BLOCK_INTERVAL));
     }
 
@@ -558,17 +568,13 @@ fn main() {
         std::process::exit(1);
     }
 
-    let addresses_denylist_config = match &cli.inner.command {
-        Commands::Node(cmd) => build_addresses_denylist_config(&cmd.ext).unwrap_or_else(|e| {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }),
-        _ => AddressesDenylistConfig::default(),
-    };
     if let Err(err) = cli.inner.run_with_components::<ArcNode>(
         arc_components,
         |mut builder: WithLaunchContext<NodeBuilder<DatabaseEnv, ArcChainSpec>>,
          ext: ArcExtraCli| async move {
+            // Resolved from the chain spec, so this must happen after the spec is parsed.
+            let addresses_denylist_config =
+                build_addresses_denylist_config(builder.config().chain.as_ref(), &ext)?;
             let arc_rpc_cfg =
                 ArcRpcConfig::new(ext.enable_arc_rpc, ext.arc_rpc_upstream_url.clone());
             let invalid_tx_list_cfg =
@@ -601,6 +607,8 @@ fn main() {
             let allow_unprotected_txs = ext.arc_rpc_allow_unprotected_txs;
             let max_response_body_size = builder.config().rpc.rpc_max_response_size_bytes();
             let max_batch_entries = ext.arc_rpc_max_batch_entries;
+            let tx_relays = build_tx_relays(&ext)?;
+            let tx_relay_timeout = ext.arc_tx_relays_timeout;
             let rebroadcast_interval =
                 std::time::Duration::from_secs(ext.txpool_rebroadcast_interval);
             let handle = builder
@@ -615,6 +623,8 @@ fn main() {
                     max_response_body_size,
                     max_batch_entries,
                     rebroadcast_interval,
+                    tx_relays,
+                    tx_relay_timeout,
                 ))
                 .launch_with_debug_capabilities()
                 .await?;
@@ -725,7 +735,7 @@ fn spawn_pprof_server(_bind_address: std::net::SocketAddr, _heap_prof: bool) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{address, b256};
+    use alloy_primitives::address;
 
     /// Parse CLI args with `patch_node_command_defaults` applied (mirrors production).
     fn parse_with_arc_defaults<I>(argv: I) -> ArcCli
@@ -1000,228 +1010,195 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_arc_denylist_flags_default_values() {
-        let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
-        if let Commands::Node(node_cmd) = cli.inner.command {
-            assert!(!node_cmd.ext.arc_denylist_enabled);
-            assert!(node_cmd.ext.arc_denylist_address.is_none());
-            assert!(node_cmd.ext.arc_denylist_storage_slot.is_none());
-            assert!(node_cmd.ext.arc_denylist_addresses_exclusions.is_empty());
-        } else {
-            panic!("Expected Node command");
+    fn tx_relays_from_args(args: &[&str]) -> eyre::Result<Vec<String>> {
+        let mut argv = vec!["arc-node-execution", "node"];
+        argv.extend_from_slice(args);
+        let cli = ArcCli::try_parse_from(argv).unwrap();
+        match &cli.inner.command {
+            Commands::Node(cmd) => build_tx_relays(&cmd.ext),
+            _ => panic!("Expected Node command"),
         }
     }
 
     #[test]
-    fn test_arc_denylist_flags_custom_values() {
-        let cli = ArcCli::try_parse_from([
+    fn test_build_tx_relays_default_empty() {
+        assert!(tx_relays_from_args(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_build_tx_relays_parses_csv_in_order() {
+        let relays =
+            tx_relays_from_args(&["--arc.tx.relays", "http://a:8545,http://b:8545"]).unwrap();
+        assert_eq!(
+            relays,
+            vec!["http://a:8545".to_string(), "http://b:8545".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_tx_relays_trims_and_skips_blank_entries() {
+        let relays = tx_relays_from_args(&["--arc.tx.relays", " http://a:8545 , "]).unwrap();
+        assert_eq!(relays, vec!["http://a:8545".to_string()]);
+    }
+
+    #[test]
+    fn test_build_tx_relays_rejects_invalid_url() {
+        let err = tx_relays_from_args(&["--arc.tx.relays", "not-a-url"]).unwrap_err();
+        assert!(err.to_string().contains("invalid --arc.tx.relays entry"));
+    }
+
+    #[test]
+    fn test_tx_relays_conflicts_with_forwarder() {
+        let result = ArcCli::try_parse_from([
             "arc-node-execution",
             "node",
+            "--arc.tx.relays",
+            "http://a:8545",
+            "--rpc.forwarder",
+            "http://b:8545",
+        ]);
+        assert!(
+            result.is_err(),
+            "--arc.tx.relays must conflict with --rpc.forwarder"
+        );
+    }
+
+    fn tx_relay_timeout_from_args(args: &[&str]) -> std::time::Duration {
+        let mut argv = vec!["arc-node-execution", "node"];
+        argv.extend_from_slice(args);
+        let cli = ArcCli::try_parse_from(argv).unwrap();
+        match &cli.inner.command {
+            Commands::Node(cmd) => cmd.ext.arc_tx_relays_timeout,
+            _ => panic!("Expected Node command"),
+        }
+    }
+
+    #[test]
+    fn test_tx_relay_timeout_default_matches_const() {
+        assert_eq!(
+            tx_relay_timeout_from_args(&[]),
+            arc_evm_node::DEFAULT_TX_RELAY_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn test_tx_relay_timeout_parses_suffixed_durations() {
+        assert_eq!(
+            tx_relay_timeout_from_args(&["--arc.tx.relays.timeout", "500ms"]),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            tx_relay_timeout_from_args(&["--arc.tx.relays.timeout", "15s"]),
+            std::time::Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn test_tx_relay_timeout_bare_number_is_seconds() {
+        assert_eq!(
+            tx_relay_timeout_from_args(&["--arc.tx.relays.timeout", "15"]),
+            std::time::Duration::from_secs(15)
+        );
+    }
+
+    fn ext_from_args<'a>(args: impl IntoIterator<Item = &'a str>) -> ArcExtraCli {
+        let cli = ArcCli::try_parse_from(
+            ["arc-node-execution", "node"]
+                .into_iter()
+                .chain(args)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        match cli.inner.command {
+            Commands::Node(cmd) => cmd.ext,
+            _ => panic!("Expected Node command"),
+        }
+    }
+
+    /// The denylist must not be operator-configurable: disabling it or repointing it at a
+    /// different list has to require a source change and rebuild, not a CLI flag.
+    #[test]
+    fn test_arc_denylist_configuration_flags_are_rejected() {
+        for flag in [
             "--arc.denylist.enabled",
             "--arc.denylist.address",
-            "0x3600000000000000000000000000000000000001",
             "--arc.denylist.storage-slot",
-            "0x0000000000000000000000000000000000000000000000000000000000000001",
-            "--arc.denylist.addresses-exclusions",
-            "0x1000000000000000000000000000000000000001,0x1000000000000000000000000000000000000002",
-        ])
-        .unwrap();
-        if let Commands::Node(node_cmd) = cli.inner.command {
-            assert!(node_cmd.ext.arc_denylist_enabled);
-            assert_eq!(
-                node_cmd.ext.arc_denylist_address.as_deref(),
-                Some("0x3600000000000000000000000000000000000001")
+        ] {
+            assert!(
+                ArcCli::try_parse_from(["arc-node-execution", "node", flag]).is_err(),
+                "{flag} must not be accepted"
             );
-            assert_eq!(
-                node_cmd.ext.arc_denylist_storage_slot.as_deref(),
-                Some("0x0000000000000000000000000000000000000000000000000000000000000001")
-            );
-            assert_eq!(node_cmd.ext.arc_denylist_addresses_exclusions.len(), 2);
-        } else {
-            panic!("Expected Node command");
         }
     }
 
     #[test]
-    fn test_build_addresses_denylist_config_default() {
-        let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
-        let ext = match &cli.inner.command {
-            Commands::Node(cmd) => &cmd.ext,
-            _ => panic!("Expected Node command"),
-        };
-        let cfg = build_addresses_denylist_config(ext).unwrap();
-        assert!(!cfg.is_enabled());
+    fn test_arc_denylist_exclusions_flag_defaults_empty() {
+        assert!(ext_from_args([])
+            .arc_denylist_addresses_exclusions
+            .is_empty());
     }
 
     #[test]
-    fn test_build_addresses_denylist_config_enabled_uses_default_address_and_slot() {
-        let cli = ArcCli::try_parse_from(["arc-node-execution", "node", "--arc.denylist.enabled"])
-            .unwrap();
-        let ext = match &cli.inner.command {
-            Commands::Node(cmd) => &cmd.ext,
-            _ => panic!("Expected Node command"),
-        };
-        let cfg = build_addresses_denylist_config(ext).unwrap();
+    fn test_build_addresses_denylist_config_uses_chain_spec_address() {
+        use arc_execution_config::chainspec::{DEVNET, LOCAL_DEV, MAINNET, TESTNET};
 
-        if let AddressesDenylistConfig::Enabled {
-            contract_address,
-            storage_slot,
-            addresses_exclusions,
-        } = &cfg
-        {
-            assert_eq!(*contract_address, DEFAULT_DENYLIST_ADDRESS);
-            assert_eq!(*storage_slot, DEFAULT_DENYLIST_ERC7201_BASE_SLOT);
-            assert!(addresses_exclusions.is_empty());
-        } else {
-            panic!("Expected Enabled variant");
+        for spec in [&*LOCAL_DEV, &*DEVNET, &*TESTNET, &*MAINNET] {
+            let cfg = build_addresses_denylist_config(spec, &ext_from_args([])).unwrap();
+            assert_eq!(cfg.contract_address(), spec.denylist_address().unwrap());
+            assert_eq!(cfg.storage_slot(), DEFAULT_DENYLIST_ERC7201_BASE_SLOT);
+            assert!(cfg.addresses_exclusions().is_empty());
         }
     }
 
     #[test]
-    fn test_build_addresses_denylist_config_enabled_with_address_uses_default_slot() {
-        let cli = ArcCli::try_parse_from([
-            "arc-node-execution",
-            "node",
-            "--arc.denylist.enabled",
-            "--arc.denylist.address",
-            "0x3600000000000000000000000000000000000001",
-        ])
-        .unwrap();
-        let ext = match &cli.inner.command {
-            Commands::Node(cmd) => &cmd.ext,
-            _ => panic!("Expected Node command"),
-        };
-        let cfg = build_addresses_denylist_config(ext).unwrap();
+    fn test_build_addresses_denylist_config_applies_exclusions() {
+        use arc_execution_config::chainspec::MAINNET;
 
-        if let AddressesDenylistConfig::Enabled {
-            contract_address,
-            storage_slot,
-            addresses_exclusions,
-        } = &cfg
-        {
-            assert_eq!(
-                *contract_address,
-                address!("0x3600000000000000000000000000000000000001")
-            );
-            assert_eq!(*storage_slot, DEFAULT_DENYLIST_ERC7201_BASE_SLOT);
-            assert!(addresses_exclusions.is_empty());
-        } else {
-            panic!("Expected Enabled variant");
-        }
-    }
-
-    #[test]
-    fn test_build_addresses_denylist_config_enabled_with_both_succeeds() {
-        let cli = ArcCli::try_parse_from([
-            "arc-node-execution",
-            "node",
-            "--arc.denylist.enabled",
-            "--arc.denylist.address",
-            "0x3600000000000000000000000000000000000001",
-            "--arc.denylist.storage-slot",
-            "0x0000000000000000000000000000000000000000000000000000000000000001",
-        ])
-        .unwrap();
-        let ext = match &cli.inner.command {
-            Commands::Node(cmd) => &cmd.ext,
-            _ => panic!("Expected Node command"),
-        };
-        let cfg = build_addresses_denylist_config(ext).unwrap();
-
-        if let AddressesDenylistConfig::Enabled {
-            contract_address,
-            storage_slot,
-            addresses_exclusions,
-        } = &cfg
-        {
-            assert_eq!(
-                *contract_address,
-                address!("0x3600000000000000000000000000000000000001")
-            );
-            assert_eq!(
-                *storage_slot,
-                b256!("0x0000000000000000000000000000000000000000000000000000000000000001")
-            );
-            assert!(addresses_exclusions.is_empty());
-        } else {
-            panic!("Expected Enabled variant");
-        }
-    }
-
-    #[test]
-    fn test_build_addresses_denylist_config_invalid_address_rejected() {
-        let cli = ArcCli::try_parse_from([
-            "arc-node-execution",
-            "node",
-            "--arc.denylist.address",
-            "not-an-address",
-        ])
-        .unwrap();
-        let ext = match &cli.inner.command {
-            Commands::Node(cmd) => &cmd.ext,
-            _ => panic!("Expected Node command"),
-        };
-        let err = build_addresses_denylist_config(ext).unwrap_err();
-        assert!(err.to_string().contains("invalid --arc.denylist.address"));
-    }
-
-    #[test]
-    fn test_build_addresses_denylist_config_invalid_storage_slot_rejected() {
-        let cli = ArcCli::try_parse_from([
-            "arc-node-execution",
-            "node",
-            "--arc.denylist.storage-slot",
-            "0x1234", // too short for 32 bytes
-        ])
-        .unwrap();
-        let ext = match &cli.inner.command {
-            Commands::Node(cmd) => &cmd.ext,
-            _ => panic!("Expected Node command"),
-        };
-        let err = build_addresses_denylist_config(ext).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("invalid --arc.denylist.storage-slot"));
-    }
-
-    #[test]
-    fn test_build_addresses_denylist_config_enabled_with_exclusions_succeeds() {
-        let cli = ArcCli::try_parse_from([
-            "arc-node-execution",
-            "node",
-            "--arc.denylist.enabled",
+        let ext = ext_from_args([
             "--arc.denylist.addresses-exclusions",
             "0x3600000000000000000000000000000000000001,0x3600000000000000000000000000000000000002",
-        ])
-        .unwrap();
+        ]);
+        let cfg = build_addresses_denylist_config(&MAINNET, &ext).unwrap();
 
-        let ext = match &cli.inner.command {
-            Commands::Node(cmd) => &cmd.ext,
-            _ => panic!("Expected Node command"),
-        };
-        let cfg = build_addresses_denylist_config(ext).unwrap();
+        // Exclusions are ops recovery only; they must not move the contract address.
+        assert_eq!(cfg.contract_address(), MAINNET.denylist_address().unwrap());
+        assert_eq!(
+            cfg.addresses_exclusions(),
+            &[
+                address!("0x3600000000000000000000000000000000000001"),
+                address!("0x3600000000000000000000000000000000000002"),
+            ]
+        );
+    }
 
-        if let AddressesDenylistConfig::Enabled {
-            contract_address,
-            storage_slot,
-            addresses_exclusions,
-        } = &cfg
-        {
-            assert_eq!(*contract_address, DEFAULT_DENYLIST_ADDRESS);
-            assert_eq!(*storage_slot, DEFAULT_DENYLIST_ERC7201_BASE_SLOT);
-            assert_eq!(addresses_exclusions.len(), 2);
-            assert_eq!(
-                addresses_exclusions[0],
-                address!("0x3600000000000000000000000000000000000001")
-            );
-            assert_eq!(
-                addresses_exclusions[1],
-                address!("0x3600000000000000000000000000000000000002")
-            );
-        } else {
-            panic!("Expected Enabled variant");
-        }
+    #[test]
+    fn test_build_addresses_denylist_config_rejects_unknown_chain() {
+        use alloy_genesis::Genesis;
+        use arc_execution_config::chainspec::ArcChainSpec;
+        use reth_chainspec::ChainSpec;
+
+        let mut genesis: Genesis =
+            serde_json::from_str(include_str!("../../../assets/localdev/genesis.json")).unwrap();
+        genesis.config.chain_id = 999999;
+        let spec = ArcChainSpec::new(ChainSpec::from_genesis(genesis));
+
+        let err = build_addresses_denylist_config(&spec, &ext_from_args([])).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no Arc denylist is defined for chain id 999999"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_addresses_denylist_config_invalid_exclusion_rejected() {
+        use arc_execution_config::chainspec::MAINNET;
+
+        let ext = ext_from_args(["--arc.denylist.addresses-exclusions", "not-an-address"]);
+        let err = build_addresses_denylist_config(&MAINNET, &ext).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid --arc.denylist.addresses-exclusions"));
     }
 
     #[test]
@@ -1355,7 +1332,7 @@ mod tests {
         }
     }
 
-    /// --full gets --prune.block-interval=5000 injected.
+    /// --full gets --prune.block-interval=128 injected.
     #[test]
     fn test_full_preset_argv_translation() {
         let argv = init_arc_pruning(["arc-node", "node", "--full"]);
@@ -1373,7 +1350,7 @@ mod tests {
         );
     }
 
-    /// --minimal gets --prune.block-interval=5000 injected.
+    /// --minimal gets --prune.block-interval=128 injected.
     #[test]
     fn test_minimal_preset_argv_translation() {
         let argv = init_arc_pruning(["arc-node", "node", "--minimal"]);
@@ -1410,6 +1387,43 @@ mod tests {
         assert!(
             !translated.contains(&FLAG_BLOCK_INTERVAL.to_owned()),
             "must not inject default block interval when user supplied one"
+        );
+    }
+
+    /// `download --full` must not get --prune.block-interval injected; the flag
+    /// is a restore profile there, not a node pruning preset.
+    #[test]
+    fn test_download_full_does_not_inject_block_interval() {
+        let argv = init_arc_pruning(["arc-node", "download", "--full"]);
+        let translated: Vec<_> = argv
+            .iter()
+            .map(|s| s.to_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            translated.contains(&"--full".to_owned()),
+            "must retain --full"
+        );
+        assert!(
+            !translated.iter().any(|s| s == FLAG_BLOCK_INTERVAL),
+            "must not inject --prune.block-interval on download"
+        );
+    }
+
+    /// `download --minimal` must not get --prune.block-interval injected either.
+    #[test]
+    fn test_download_minimal_does_not_inject_block_interval() {
+        let argv = init_arc_pruning(["arc-node", "download", "--minimal"]);
+        let translated: Vec<_> = argv
+            .iter()
+            .map(|s| s.to_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            translated.contains(&"--minimal".to_owned()),
+            "must retain --minimal"
+        );
+        assert!(
+            !translated.iter().any(|s| s == FLAG_BLOCK_INTERVAL),
+            "must not inject --prune.block-interval on download"
         );
     }
 

@@ -112,8 +112,10 @@ where
 #[cfg(test)]
 mod tests {
     use crate::ArcTransactionValidator;
-    use alloy_primitives::{B256, U256};
-    use arc_execution_config::addresses_denylist::AddressesDenylistConfig;
+    use alloy_primitives::{Address, B256, U256};
+    use arc_execution_config::addresses_denylist::{
+        AddressesDenylistConfig, DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+    };
     use reth_evm_ethereum::EthEvmConfig;
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_transaction_pool::{
@@ -148,8 +150,13 @@ mod tests {
         }
 
         let eth_validator = builder.build(blob_store.clone());
-        let arc_validator =
-            ArcTransactionValidator::new(eth_validator, None, AddressesDenylistConfig::Disabled);
+        // Denylist contract with no entries in the mock provider: nothing is denylisted.
+        let denylist_config = AddressesDenylistConfig::new(
+            Address::from([0x36u8; 20]),
+            DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+            Vec::new(),
+        );
+        let arc_validator = ArcTransactionValidator::new(eth_validator, None, denylist_config);
 
         (arc_validator, blob_store)
     }

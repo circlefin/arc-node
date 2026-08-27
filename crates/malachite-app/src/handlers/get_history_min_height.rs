@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use alloy_rpc_types_eth::BlockNumberOrTag;
 use eyre::Context;
 use tracing::{debug, error, warn};
 
@@ -48,7 +49,11 @@ pub async fn handle(state: &State, engine: &Engine, reply: Reply<Height>) -> eyr
         .wrap_err("Failed to get latest height from the store")?
         .unwrap_or_default();
 
-    let el_earliest_height = match engine.eth.get_block_by_number("earliest").await {
+    let el_earliest_height = match engine
+        .eth
+        .get_block_by_number(BlockNumberOrTag::Earliest)
+        .await
+    {
         Ok(Some(block)) => Height::new(block.block_number),
         Ok(None) => {
             warn!("EL returned no block for 'earliest', falling back to CL-only");

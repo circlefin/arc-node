@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use color_eyre::eyre::{bail, Result};
 use indexmap::IndexMap;
 use serde::Serialize;
 use std::ops::{Deref, DerefMut};
@@ -233,6 +234,9 @@ pub(crate) struct ConsensusContainer {
     /// CLI flags for starting the upgraded consensus layer
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cli_flags_upgraded: Vec<String>,
+
+    /// Effective consensus layer image for this node's base container.
+    pub image: String,
 }
 
 impl ConsensusContainer {
@@ -260,12 +264,13 @@ impl ConsensusContainer {
             metrics_url,
             cli_flags: Vec::new(),
             cli_flags_upgraded: Vec::new(),
+            image: String::new(),
         }
     }
 
     /// Create a new ConsensusContainer with explicit network IPs (remote mode)
     pub fn new_remote(node: &NodeName, subnets: &SubnetIps) -> Self {
-        let rpc_url = Url::parse(&format!("http://127.0.0.1:{RPC_PROXY_SSM_PORT}/{node}/cl"))
+        let rpc_url = Url::parse(&format!("http://127.0.0.1:{RPC_PROXY_SSM_PORT}/{node}/cl/"))
             .expect("Failed to parse RPC URL");
         let metrics_url = Url::parse(&format!(
             "http://127.0.0.1:{RPC_PROXY_SSM_PORT}/{node}/cl/metrics"
@@ -281,6 +286,7 @@ impl ConsensusContainer {
             metrics_url,
             cli_flags: Vec::new(),
             cli_flags_upgraded: Vec::new(),
+            image: String::new(),
         }
     }
 
@@ -318,6 +324,9 @@ pub(crate) struct ExecutionContainer {
     /// Execution layer (Reth) CLI flags for this container
     pub(crate) cli_flags: Vec<String>,
 
+    /// Effective execution layer image for this node's base container.
+    pub image: String,
+
     /// Exposed ports
     pub http_port: usize,
     pub ws_port: usize,
@@ -352,6 +361,7 @@ impl ExecutionContainer {
             http_url: Url::parse(http_url).expect("Failed to parse HTTP URL"),
             ws_url: Url::parse(ws_url).expect("Failed to parse WS URL"),
             cli_flags,
+            image: String::new(),
         }
     }
 
@@ -373,6 +383,7 @@ impl ExecutionContainer {
             http_url: Url::parse(http_url).expect("Failed to parse HTTP URL"),
             ws_url: Url::parse(ws_url).expect("Failed to parse WS URL"),
             cli_flags,
+            image: String::new(),
         }
     }
 }
@@ -418,6 +429,12 @@ pub(crate) struct NodeMetadata {
     /// Whether consensus is enabled for this node (default true)
     /// When false, the node only syncs and doesn't participate in consensus
     pub consensus_enabled: bool,
+
+    /// Environment variables for the execution layer (Reth) container.
+    pub el_env: IndexMap<String, String>,
+
+    /// Environment variables for the consensus layer (Malachite) container.
+    pub cl_env: IndexMap<String, String>,
 }
 
 impl NodeMetadata {
@@ -452,6 +469,8 @@ impl NodeMetadata {
             follow,
             follow_endpoints,
             consensus_enabled,
+            el_env: IndexMap::new(),
+            cl_env: IndexMap::new(),
         }
     }
 
@@ -490,6 +509,8 @@ impl NodeMetadata {
             follow,
             follow_endpoints,
             consensus_enabled,
+            el_env: IndexMap::new(),
+            cl_env: IndexMap::new(),
         }
     }
 
@@ -499,10 +520,19 @@ impl NodeMetadata {
     }
 
     /// The names of the running CL and EL containers
-    pub fn container_names(&self) -> Vec<ContainerName> {
+    pub fn running_container_names(&self) -> Vec<ContainerName> {
         vec![
             self.consensus.name().to_string(),
             self.execution.name().to_string(),
         ]
+    }
+
+    /// Resolve the name of this node's running CL or EL container by suffix
+    pub fn running_container_name(&self, suffix: &str) -> Result<&ContainerName> {
+        match suffix {
+            CONSENSUS_SUFFIX => Ok(self.consensus.name()),
+            EXECUTION_SUFFIX => Ok(self.execution.name()),
+            _ => bail!("unsupported container suffix '{suffix}'"),
+        }
     }
 }

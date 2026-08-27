@@ -54,8 +54,9 @@ impl TestServer {
             .expect("Failed to bind to random port");
         let addr = listener.local_addr().expect("Failed to get local address");
 
-        // Build the actual production router
-        let router = arc_node_consensus::rpc::build_router(consensus_tx, app_tx, network_tx);
+        // Build the actual production router, with admin routes enabled so the
+        // integration suite can exercise the full endpoint surface.
+        let router = arc_node_consensus::rpc::build_router(consensus_tx, app_tx, network_tx, true);
 
         // Spawn the server
         let server_handle = tokio::spawn(async move {

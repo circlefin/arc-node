@@ -44,6 +44,7 @@ reth-primitives-traits.workspace = true
 # revm
 revm.workspace = true
 revm-context-interface.workspace = true
+revm-handler.workspace = true
 revm-interpreter.workspace = true
 revm-primitives.workspace = true
 

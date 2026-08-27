@@ -168,10 +168,11 @@ impl Hasher for KeccakHasher {
     }
 }
 
-pub fn compute_state_root_from_fixture_accounts(
-    accounts: &alloy_primitives::map::HashMap<Address, FixtureAccountInfo>,
-) -> B256 {
-    state_root_unhashed(accounts.iter().map(|(address, account)| {
+pub fn compute_state_root_from_fixture_accounts<'a, I>(accounts: I) -> B256
+where
+    I: IntoIterator<Item = (&'a Address, &'a FixtureAccountInfo)>,
+{
+    state_root_unhashed(accounts.into_iter().map(|(address, account)| {
         let storage_root = if account.storage.is_empty() {
             EMPTY_ROOT_HASH
         } else {
@@ -252,7 +253,7 @@ mod tests {
     #[test]
     fn revm_state_root_ignores_zero_storage_slots() {
         let address = address!("2000000000000000000000000000000000000002");
-        let mut cache = CacheState::new(true);
+        let mut cache = CacheState::new();
         cache.insert_account_with_storage(
             address,
             AccountInfo::default(),
@@ -264,21 +265,20 @@ mod tests {
 
         let root = state_merkle_trie_root(cache.trie_account());
 
-        let expected =
-            compute_state_root_from_fixture_accounts(&alloy_primitives::map::HashMap::from_iter([
-                (
-                    address,
-                    FixtureAccountInfo {
-                        balance: U256::ZERO,
-                        code: Bytes::default(),
-                        nonce: 0,
-                        storage: alloy_primitives::map::HashMap::from_iter([(
-                            U256::from(2),
-                            U256::from(22),
-                        )]),
-                    },
-                ),
-            ]));
+        let expected_accounts: alloy_primitives::map::HashMap<Address, FixtureAccountInfo> =
+            alloy_primitives::map::HashMap::from_iter([(
+                address,
+                FixtureAccountInfo {
+                    balance: U256::ZERO,
+                    code: Bytes::default(),
+                    nonce: 0,
+                    storage: alloy_primitives::map::HashMap::from_iter([(
+                        U256::from(2),
+                        U256::from(22),
+                    )]),
+                },
+            )]);
+        let expected = compute_state_root_from_fixture_accounts(&expected_accounts);
 
         assert_eq!(root, expected);
     }
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn state_root_ignores_empty_accounts() {
         let address = address!("3000000000000000000000000000000000000003");
-        let mut cache = CacheState::new(true);
+        let mut cache = CacheState::new();
         cache.insert_account(address, AccountInfo::default());
 
         assert_eq!(
@@ -325,7 +325,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut cache_with_arc = CacheState::new(true);
+        let mut cache_with_arc = CacheState::new();
         for arc in ARC_SYSTEM_ADDRESSES {
             cache_with_arc.insert_account(
                 *arc,
@@ -345,7 +345,7 @@ mod tests {
                 .filter(|(address, _)| !is_arc_system_address(address)),
         );
 
-        let mut cache_user_only = CacheState::new(true);
+        let mut cache_user_only = CacheState::new();
         cache_user_only.insert_account(user_address, user_info);
         let expected_root = state_merkle_trie_root(cache_user_only.trie_account());
 
@@ -355,7 +355,8 @@ mod tests {
 
     #[test]
     fn fixture_state_root_matches_expected_fixture_accounts() {
-        let mut accounts = alloy_primitives::map::HashMap::default();
+        let mut accounts: alloy_primitives::map::HashMap<Address, FixtureAccountInfo> =
+            alloy_primitives::map::HashMap::default();
         accounts.insert(
             address!("1000000000000000000000000000000000000001"),
             FixtureAccountInfo {

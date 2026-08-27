@@ -33,7 +33,7 @@ use tracing::{debug, error, info, warn};
 use arc_consensus_types::evidence::StoredMisbehaviorEvidence;
 use arc_consensus_types::{
     Address, ArcContext, BlockHash, CommitCertificateType, Height, ProposalParts,
-    StoredCommitCertificate, B256,
+    StoredCommitCertificate,
 };
 use malachitebft_app_channel::app::types::core::{CommitCertificate, Round};
 use malachitebft_core_types::Height as _;
@@ -97,6 +97,33 @@ impl StoreError {
     {
         StoreError::Other(error.into())
     }
+}
+
+/// Why one or more heights in a range read from the RPC APIs could not be served.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RangeFailureReason {
+    /// The height is above the latest decided height.
+    AboveCurrentHead,
+    /// The height is below the earliest retained certificate.
+    Pruned,
+    /// The height is within the available window but was never recorded.
+    NotRecorded,
+    /// The record is missing or undecodable within the available window.
+    Internal,
+}
+
+/// Result of a multi-height read resolved against one database snapshot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RangeQueryResult<T> {
+    /// Every height produced an item, in ascending height order.
+    Complete(Vec<T>),
+    /// One or more heights failed.
+    Unavailable {
+        /// Failure class of the lowest failed height.
+        reason: RangeFailureReason,
+        /// All failed heights of that class, in ascending order.
+        failed_heights: Vec<Height>,
+    },
 }
 
 /// Per-table deletion counts from a rollback operation.
@@ -794,6 +821,154 @@ impl Db {
         Ok(())
     }
 
+    /// Read heights `from..=from+count-1` from `table`, classifying each
+    /// height against the available window.
+    ///
+    /// The window `[earliest, head]` comes from the certificates table in
+    /// the same read transaction, so the window and the data rows are one
+    /// consistent snapshot.
+    ///
+    /// `on_missing` decides what an absent row inside the window means for
+    /// the queried table: a synthesized item or a failure.
+    fn read_height_range<T>(
+        &self,
+        table: redb::TableDefinition<HeightKey, Vec<u8>>,
+        from: Height,
+        count: u64,
+        decode: impl Fn(&[u8]) -> Result<T, DecodeError>,
+        on_missing: impl Fn(Height) -> Result<T, RangeFailureReason>,
+    ) -> Result<Option<RangeQueryResult<T>>, StoreError> {
+        let start = Instant::now();
+        let mut read_bytes = 0usize;
+        let mut key_read_bytes = 0usize;
+
+        let to = count
+            .checked_sub(1)
+            .and_then(|offset| from.as_u64().checked_add(offset))
+            .ok_or_else(|| {
+                StoreError::other(format!("invalid height range: from={from}, count={count}"))
+            })?;
+
+        let tx = self.db.begin_read()?;
+        let (earliest, head) = {
+            // Opening CERTIFICATES_TABLE to know the height window because other tables are sparse
+            let certs = tx.open_table(CERTIFICATES_TABLE)?;
+            match (certs.first()?, certs.last()?) {
+                (Some((first, _)), Some((last, _))) => (first.value(), last.value()),
+                _ => return Ok(None),
+            }
+        };
+
+        let table = tx.open_table(table)?;
+
+        let mut items = Vec::new();
+        let mut failures: Vec<(Height, RangeFailureReason)> = Vec::new();
+
+        for h in from.as_u64()..=to {
+            let height = Height::new(h);
+
+            if height < earliest {
+                failures.push((height, RangeFailureReason::Pruned));
+                continue;
+            }
+            if height > head {
+                failures.push((height, RangeFailureReason::AboveCurrentHead));
+                continue;
+            }
+            key_read_bytes = key_read_bytes.saturating_add(size_of::<Height>());
+            match table.get(&height)? {
+                Some(value) => {
+                    let bytes = value.value();
+                    read_bytes = read_bytes.saturating_add(bytes.len());
+                    match decode(&bytes) {
+                        Ok(item) => items.push(item),
+                        Err(_) => failures.push((height, RangeFailureReason::Internal)),
+                    }
+                }
+                None => match on_missing(height) {
+                    Ok(item) => items.push(item),
+                    Err(reason) => failures.push((height, reason)),
+                },
+            }
+        }
+
+        self.update_read_metrics(read_bytes, key_read_bytes, start.elapsed());
+
+        let result = match failures.first() {
+            None => RangeQueryResult::Complete(items),
+            Some(&(_, reason)) => RangeQueryResult::Unavailable {
+                reason,
+                failed_heights: failures
+                    .iter()
+                    .filter(|(_, r)| *r == reason)
+                    .map(|(height, _)| *height)
+                    .collect(),
+            },
+        };
+
+        Ok(Some(result))
+    }
+
+    /// Get commit certificates for heights `from..=from+count-1`.
+    /// Returns `Ok(None)` when the store has no certificates at all.
+    fn get_certificate_range(
+        &self,
+        from: Height,
+        count: u64,
+    ) -> Result<Option<RangeQueryResult<StoredCommitCertificate>>, StoreError> {
+        self.read_height_range(CERTIFICATES_TABLE, from, count, decode_certificate, |_| {
+            Err(RangeFailureReason::Internal)
+        })
+    }
+
+    /// Get misbehavior evidence for heights `from..=from+count-1`.
+    /// Heights inside the window without a record yield empty evidence.
+    fn get_misbehavior_evidence_range(
+        &self,
+        from: Height,
+        count: u64,
+    ) -> Result<Option<RangeQueryResult<StoredMisbehaviorEvidence>>, StoreError> {
+        self.read_height_range(
+            MISBEHAVIOR_EVIDENCE_TABLE,
+            from,
+            count,
+            decode_misbehavior_evidence,
+            |height| Ok(StoredMisbehaviorEvidence::empty(height)),
+        )
+    }
+
+    /// Get proposal monitor data for heights `from..=from+count-1`.
+    /// Heights inside the window without a record are permanent holes.
+    fn get_proposal_monitor_data_range(
+        &self,
+        from: Height,
+        count: u64,
+    ) -> Result<Option<RangeQueryResult<ProposalMonitor>>, StoreError> {
+        self.read_height_range(
+            PROPOSAL_MONITOR_DATA_TABLE,
+            from,
+            count,
+            decode_proposal_monitor_data,
+            |_| Err(RangeFailureReason::NotRecorded),
+        )
+    }
+
+    /// Get invalid payloads for heights `from..=from+count-1`.
+    /// Heights inside the window without a record yield empty payloads.
+    fn get_invalid_payloads_range(
+        &self,
+        from: Height,
+        count: u64,
+    ) -> Result<Option<RangeQueryResult<StoredInvalidPayloads>>, StoreError> {
+        self.read_height_range(
+            INVALID_PAYLOADS_TABLE,
+            from,
+            count,
+            decode_invalid_payloads,
+            |height| Ok(StoredInvalidPayloads::empty(height)),
+        )
+    }
+
     /// Get the undecided block for the given height, round, and block hash.
     #[tracing::instrument(skip(self))]
     pub fn get_undecided_block(
@@ -929,7 +1104,7 @@ impl Db {
     ) -> Result<(), StoreError> {
         let start = Instant::now();
 
-        let key = (block.height, block.round, block.block_hash());
+        let key = (block.height, block.round, block.self_reported_block_hash());
         let value = encode_block(&block);
 
         {
@@ -949,7 +1124,7 @@ impl Db {
     ) -> Result<(), StoreError> {
         let start = Instant::now();
 
-        let key = (parts.height(), parts.round(), B256::new(parts.hash()));
+        let key = parts.pending_key();
 
         {
             let mut table = tx.open_table(PENDING_PROPOSAL_PARTS_TABLE)?;
@@ -1084,7 +1259,7 @@ impl Db {
 
         let mut inserted = false;
 
-        let key = (parts.height(), parts.round(), B256::new(parts.hash()));
+        let key = parts.pending_key();
         let value = encode_proposal_parts(&parts)?;
 
         // Insert the proposal if there is room in the table
@@ -1209,9 +1384,15 @@ impl Db {
         Ok(())
     }
 
-    /// Prune up to PRUNE_BATCH_LIMIT historical certificates below retain_height.
-    /// This should only run when pruning is enabled.
-    fn prune_historical_certs(&self, retain_height: Height) -> Result<Vec<Height>, StoreError> {
+    /// Prune up to `PRUNE_BATCH_LIMIT` entries below `retain_height` from a height-keyed table.
+    /// Reads the batch of stale keys in a read transaction, then deletes them in a short
+    /// write transaction.
+    fn prune_height_table_batch(
+        &self,
+        retain_height: Height,
+        table: redb::TableDefinition<HeightKey, Vec<u8>>,
+        label: &str,
+    ) -> Result<Vec<Height>, StoreError> {
         let start = Instant::now();
 
         let curr_height = self.max_height()?.unwrap_or_default();
@@ -1219,26 +1400,25 @@ impl Db {
 
         let keys = {
             let tx_read = self.db.begin_read()?;
-            let certificates = tx_read.open_table(CERTIFICATES_TABLE)?;
-            self.height_range(&certificates, ..retain_height, Self::PRUNE_BATCH_LIMIT)?
+            let t = tx_read.open_table(table)?;
+            self.height_range(&t, ..retain_height, Self::PRUNE_BATCH_LIMIT)?
         };
 
         if keys.is_empty() {
             if log_info {
-                info!(%retain_height, %curr_height, "No historical certificates to prune in this batch");
+                info!(%retain_height, %curr_height, table = label, "No entries to prune in this batch");
             } else {
-                debug!(%retain_height, %curr_height, "No historical certificates to prune in this batch");
+                debug!(%retain_height, %curr_height, table = label, "No entries to prune in this batch");
             }
             self.update_delete_metrics(start.elapsed());
             return Ok(keys);
         }
 
-        // Remove collected keys within a short write transaction
         let tx_write = self.db.begin_write()?;
         {
-            let mut certificates = tx_write.open_table(CERTIFICATES_TABLE)?;
+            let mut t = tx_write.open_table(table)?;
             for h in &keys {
-                let _ = certificates.remove(h)?;
+                let _ = t.remove(h)?;
             }
         }
         tx_write.commit()?;
@@ -1252,7 +1432,8 @@ impl Db {
                 current_height = %curr_height,
                 %first_pruned,
                 %last_pruned,
-                "Pruned historical certificates batch"
+                table = label,
+                "Pruned entries batch"
             );
         } else {
             debug!(
@@ -1261,7 +1442,8 @@ impl Db {
                 current_height = %curr_height,
                 %first_pruned,
                 %last_pruned,
-                "Pruned historical certificates batch"
+                table = label,
+                "Pruned entries batch"
             );
         }
 
@@ -1270,67 +1452,47 @@ impl Db {
         Ok(keys)
     }
 
-    /// Prune up to PRUNE_BATCH_LIMIT blocks below (current_height - `EL_AMNESIA_HEIGHT_COUNT`).
+    /// Prune up to PRUNE_BATCH_LIMIT historical certificates below retain_height.
+    /// This should only run when pruning is enabled.
+    fn prune_historical_certs(&self, retain_height: Height) -> Result<Vec<Height>, StoreError> {
+        self.prune_height_table_batch(retain_height, CERTIFICATES_TABLE, "certificates")
+    }
+
+    /// Prune up to PRUNE_BATCH_LIMIT blocks below (current_height - `RETH_AMNESIA_HEIGHT_COUNT`).
     /// This should run regardless of whether pruning is enabled.
     fn prune_blocks(&self) -> Result<Vec<Height>, StoreError> {
-        let start = Instant::now();
-
         let curr_height = self.max_height()?.unwrap_or_default();
-        let log_info = curr_height.as_u64() % Self::PRUNING_LOG_INFO_HEIGHTS == 0;
         let retain_height = curr_height.saturating_sub(Self::RETH_AMNESIA_HEIGHT_COUNT);
+        self.prune_height_table_batch(retain_height, DECIDED_BLOCKS_TABLE, "decided_blocks")
+    }
 
-        let keys = {
-            let tx_read = self.db.begin_read()?;
-            let decided = tx_read.open_table(DECIDED_BLOCKS_TABLE)?;
-            self.height_range(&decided, ..retain_height, Self::PRUNE_BATCH_LIMIT)?
-        };
+    /// Prune up to PRUNE_BATCH_LIMIT proposal-monitor records below retain_height.
+    /// This should only run when pruning is enabled.
+    fn prune_proposal_monitor_data(
+        &self,
+        retain_height: Height,
+    ) -> Result<Vec<Height>, StoreError> {
+        self.prune_height_table_batch(
+            retain_height,
+            PROPOSAL_MONITOR_DATA_TABLE,
+            "proposal_monitor_data",
+        )
+    }
 
-        if keys.is_empty() {
-            if log_info {
-                info!(%retain_height, %curr_height, "No decided blocks to prune in this batch");
-            } else {
-                debug!(%retain_height, %curr_height, "No decided blocks to prune in this batch");
-            }
-            self.update_delete_metrics(start.elapsed());
-            return Ok(keys);
-        }
+    /// Prune up to PRUNE_BATCH_LIMIT misbehavior-evidence records below retain_height.
+    /// This should only run when pruning is enabled.
+    fn prune_misbehavior_evidence(&self, retain_height: Height) -> Result<Vec<Height>, StoreError> {
+        self.prune_height_table_batch(
+            retain_height,
+            MISBEHAVIOR_EVIDENCE_TABLE,
+            "misbehavior_evidence",
+        )
+    }
 
-        // Remove collected keys within a short write transaction
-        let tx_write = self.db.begin_write()?;
-        {
-            let mut decided = tx_write.open_table(DECIDED_BLOCKS_TABLE)?;
-            for h in &keys {
-                let _ = decided.remove(h)?;
-            }
-        }
-        tx_write.commit()?;
-
-        let first_pruned = keys.first().expect("'keys' should not be empty").as_u64();
-        let last_pruned = keys.last().expect("'keys' should not be empty").as_u64();
-
-        if log_info {
-            info!(
-                pruned_count = keys.len(),
-                %retain_height,
-                current_height = %curr_height,
-                %first_pruned,
-                %last_pruned,
-                "Pruned decided blocks batch"
-            );
-        } else {
-            debug!(
-                pruned_count = keys.len(),
-                %retain_height,
-                current_height = %curr_height,
-                %first_pruned,
-                %last_pruned,
-                "Pruned decided blocks batch"
-            );
-        }
-
-        self.update_delete_metrics(start.elapsed());
-
-        Ok(keys)
+    /// Prune up to PRUNE_BATCH_LIMIT invalid-payload records below retain_height.
+    /// This should only run when pruning is enabled.
+    fn prune_invalid_payloads(&self, retain_height: Height) -> Result<Vec<Height>, StoreError> {
+        self.prune_height_table_batch(retain_height, INVALID_PAYLOADS_TABLE, "invalid_payloads")
     }
 
     fn limit_height(&self, min: bool) -> Result<Option<Height>, StoreError> {
@@ -1577,6 +1739,61 @@ impl Store {
         tokio::task::spawn_blocking(move || db.get_invalid_payloads(height)).await?
     }
 
+    /// Get commit certificates for heights `from..=from+count-1`, resolved
+    /// against one database snapshot.
+    ///
+    /// Returns `Ok(None)` when the store has no certificates at all.
+    pub async fn get_certificate_range(
+        &self,
+        from: Height,
+        count: u64,
+    ) -> Result<Option<RangeQueryResult<StoredCommitCertificate>>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.get_certificate_range(from, count)).await?
+    }
+
+    /// Get misbehavior evidence for heights `from..=from+count-1`, resolved
+    /// against one database snapshot. Heights inside the available window
+    /// without a record yield empty evidence.
+    ///
+    /// Returns `Ok(None)` when the store has no certificates at all.
+    pub async fn get_misbehavior_evidence_range(
+        &self,
+        from: Height,
+        count: u64,
+    ) -> Result<Option<RangeQueryResult<StoredMisbehaviorEvidence>>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.get_misbehavior_evidence_range(from, count)).await?
+    }
+
+    /// Get proposal monitor data for heights `from..=from+count-1`, resolved
+    /// against one database snapshot. Heights inside the available window
+    /// without a record fail as permanently unrecorded.
+    ///
+    /// Returns `Ok(None)` when the store has no certificates at all.
+    pub async fn get_proposal_monitor_data_range(
+        &self,
+        from: Height,
+        count: u64,
+    ) -> Result<Option<RangeQueryResult<ProposalMonitor>>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.get_proposal_monitor_data_range(from, count)).await?
+    }
+
+    /// Get invalid payloads for heights `from..=from+count-1`, resolved
+    /// against one database snapshot. Heights inside the available window
+    /// without a record yield empty payloads.
+    ///
+    /// Returns `Ok(None)` when the store has no certificates at all.
+    pub async fn get_invalid_payloads_range(
+        &self,
+        from: Height,
+        count: u64,
+    ) -> Result<Option<RangeQueryResult<StoredInvalidPayloads>>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.get_invalid_payloads_range(from, count)).await?
+    }
+
     /// Appends an invalid payload to the stored collection for its height, creating
     /// the collection if none exists yet.
     ///
@@ -1762,6 +1979,39 @@ impl Store {
         tokio::task::spawn_blocking(move || db.prune_blocks()).await?
     }
 
+    /// Prune historical proposal-monitor records.
+    /// Should only be called when pruning is enabled.
+    /// - retain_height: The minimum height to retain.
+    pub async fn prune_proposal_monitor_data(
+        &self,
+        retain_height: Height,
+    ) -> Result<Vec<Height>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.prune_proposal_monitor_data(retain_height)).await?
+    }
+
+    /// Prune historical misbehavior-evidence records.
+    /// Should only be called when pruning is enabled.
+    /// - retain_height: The minimum height to retain.
+    pub async fn prune_misbehavior_evidence(
+        &self,
+        retain_height: Height,
+    ) -> Result<Vec<Height>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.prune_misbehavior_evidence(retain_height)).await?
+    }
+
+    /// Prune historical invalid-payload records.
+    /// Should only be called when pruning is enabled.
+    /// - retain_height: The minimum height to retain.
+    pub async fn prune_invalid_payloads(
+        &self,
+        retain_height: Height,
+    ) -> Result<Vec<Height>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.prune_invalid_payloads(retain_height)).await?
+    }
+
     /// Create a savepoint in the database to ensure the allocator state table is up to date.
     /// Doing this before shutting down the database can help avoid repair on next startup.
     pub fn savepoint(&self) {
@@ -1773,12 +2023,14 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
+
     use alloy_rpc_types_engine::ExecutionPayloadV3;
     use arbitrary::Unstructured;
     use arc_consensus_types::signing::Signature;
     use arc_consensus_types::{
         Address, CommitSignature, ProposalData, ProposalFin, ProposalInit, ProposalPart, ValueId,
-        Vote,
+        Vote, B256,
     };
     use bytes::Bytes;
     use malachitebft_app_channel::app::types::core::Validity;
@@ -2050,7 +2302,7 @@ mod tests {
         store.store_undecided_block(block.clone()).await.unwrap();
 
         let retrieved = store
-            .get_undecided_block(height, round, block.block_hash())
+            .get_undecided_block(height, round, block.self_reported_block_hash())
             .await
             .unwrap();
 
@@ -2095,6 +2347,194 @@ mod tests {
 
         let counts = store.get_pending_proposal_parts_counts().await.unwrap();
         assert_eq!(counts, vec![(height_a, 3), (height_b, 2)]);
+    }
+
+    #[tokio::test]
+    async fn test_pending_parts_different_proposer_get_distinct_keys() {
+        let store = create_store().await;
+        let height = Height::new(5);
+        let round = Round::new(0);
+
+        let parts_a = create_test_proposal_parts(height, round, Address::new([1u8; 20])).await;
+        let parts_b = create_test_proposal_parts(height, round, Address::new([2u8; 20])).await;
+
+        let inserted_a = store
+            .store_pending_proposal_parts(parts_a, 100, Height::new(1))
+            .await
+            .unwrap();
+        let inserted_b = store
+            .store_pending_proposal_parts(parts_b, 100, Height::new(1))
+            .await
+            .unwrap();
+
+        assert!(inserted_a);
+        assert!(inserted_b);
+
+        let pending = store
+            .get_pending_proposal_parts(height, round)
+            .await
+            .unwrap();
+
+        let mut proposers = pending
+            .iter()
+            .map(|p| p.proposer().into_inner())
+            .collect::<Vec<_>>();
+        proposers.sort_unstable();
+        assert_eq!(proposers, vec![[1u8; 20], [2u8; 20]]);
+    }
+
+    #[tokio::test]
+    async fn test_pending_parts_different_pol_round_get_distinct_keys() {
+        let store = create_store().await;
+        let height = Height::new(5);
+        let round = Round::new(2);
+        let proposer = Address::new([1u8; 20]);
+        let signature = Signature::from_bytes([0u8; 64]);
+
+        let parts_a = ProposalParts::new(vec![
+            ProposalPart::Init(ProposalInit::new(height, round, Round::Nil, proposer)),
+            ProposalPart::Data(ProposalData::new(Bytes::from_static(b"test data"))),
+            ProposalPart::Fin(ProposalFin::new(signature)),
+        ])
+        .unwrap();
+
+        let parts_b = ProposalParts::new(vec![
+            ProposalPart::Init(ProposalInit::new(height, round, Round::new(0), proposer)),
+            ProposalPart::Data(ProposalData::new(Bytes::from_static(b"test data"))),
+            ProposalPart::Fin(ProposalFin::new(signature)),
+        ])
+        .unwrap();
+
+        let inserted_a = store
+            .store_pending_proposal_parts(parts_a, 100, Height::new(1))
+            .await
+            .unwrap();
+        let inserted_b = store
+            .store_pending_proposal_parts(parts_b, 100, Height::new(1))
+            .await
+            .unwrap();
+
+        assert!(inserted_a);
+        assert!(inserted_b);
+
+        let pending = store
+            .get_pending_proposal_parts(height, round)
+            .await
+            .unwrap();
+
+        let mut pol_rounds = pending
+            .iter()
+            .map(|p| p.init().pol_round.as_i64())
+            .collect::<Vec<_>>();
+        pol_rounds.sort_unstable();
+        assert_eq!(pol_rounds, vec![Round::Nil.as_i64(), 0]);
+    }
+
+    #[tokio::test]
+    async fn test_pending_parts_exact_duplicate_is_idempotent() {
+        let store = create_store().await;
+        let height = Height::new(5);
+        let round = Round::new(0);
+        let proposer = Address::new([1u8; 20]);
+
+        let parts = create_test_proposal_parts(height, round, proposer).await;
+
+        let inserted_first = store
+            .store_pending_proposal_parts(parts.clone(), 100, Height::new(1))
+            .await
+            .unwrap();
+        let inserted_second = store
+            .store_pending_proposal_parts(parts, 100, Height::new(1))
+            .await
+            .unwrap();
+
+        assert!(inserted_first);
+        assert!(inserted_second);
+
+        let pending = store
+            .get_pending_proposal_parts(height, round)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].proposer(), proposer);
+    }
+
+    #[tokio::test]
+    async fn test_pending_parts_different_signature_get_distinct_keys() {
+        let store = create_store().await;
+        let height = Height::new(5);
+        let round = Round::new(0);
+        let proposer = Address::new([1u8; 20]);
+
+        let build = |signature| {
+            ProposalParts::new(vec![
+                ProposalPart::Init(ProposalInit::new(height, round, Round::Nil, proposer)),
+                ProposalPart::Data(ProposalData::new(Bytes::from_static(b"test data"))),
+                ProposalPart::Fin(ProposalFin::new(signature)),
+            ])
+            .unwrap()
+        };
+
+        let parts_a = build(Signature::from_bytes([1u8; 64]));
+        let parts_b = build(Signature::from_bytes([2u8; 64]));
+
+        assert!(store
+            .store_pending_proposal_parts(parts_a, 100, Height::new(1))
+            .await
+            .unwrap());
+        assert!(store
+            .store_pending_proposal_parts(parts_b, 100, Height::new(1))
+            .await
+            .unwrap());
+
+        let pending = store
+            .get_pending_proposal_parts(height, round)
+            .await
+            .unwrap();
+
+        let mut signatures = pending
+            .iter()
+            .map(|p| p.fin().signature.to_bytes())
+            .collect::<Vec<_>>();
+        signatures.sort_unstable();
+        assert_eq!(signatures, vec![[1u8; 64], [2u8; 64]]);
+    }
+
+    /// At capacity, a later variant is declined rather than displacing the entry
+    /// already held for the same height and round.
+    #[tokio::test]
+    async fn test_pending_parts_variant_cannot_displace_entry_at_capacity() {
+        let store = create_store().await;
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let first_proposer = Address::new([1u8; 20]);
+
+        let first = create_test_proposal_parts(height, round, first_proposer).await;
+        let variant = create_test_proposal_parts(height, round, Address::new([2u8; 20])).await;
+
+        // Capacity of one: the first entry fills the table.
+        assert!(store
+            .store_pending_proposal_parts(first, 1, height)
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .store_pending_proposal_parts(variant, 1, height)
+                .await
+                .unwrap(),
+            "table is full, the variant must be declined"
+        );
+
+        let pending = store
+            .get_pending_proposal_parts(height, round)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].proposer(),
+            first_proposer,
+            "the entry already held must survive"
+        );
     }
 
     #[tokio::test]
@@ -2466,6 +2906,160 @@ mod tests {
             store.max_height().await.unwrap().unwrap(),
             Height::new(curr_height)
         );
+    }
+
+    async fn store_proposal_monitor_at_height(store: &Store, height: Height) {
+        let monitor = ProposalMonitor::new(height, Address::new([0u8; 20]), SystemTime::now());
+        store.store_proposal_monitor_data(monitor).await.unwrap();
+    }
+
+    async fn store_empty_misbehavior_evidence_at_height(store: &Store, height: Height) {
+        store
+            .store_misbehavior_evidence(StoredMisbehaviorEvidence::empty(height))
+            .await
+            .unwrap();
+    }
+
+    async fn append_invalid_payload_at_height(store: &Store, height: Height) {
+        let payload = InvalidPayload::new_without_payload(
+            height,
+            Round::new(0),
+            Address::new([0u8; 20]),
+            "test",
+        );
+        store.append_invalid_payload(payload).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_prune_proposal_monitor_data() {
+        let store = create_store().await;
+
+        let heights = [1u64, 2, 3, 4];
+        for h in heights.iter() {
+            store_block_at_height(&store, Height::new(*h)).await;
+            store_proposal_monitor_at_height(&store, Height::new(*h)).await;
+        }
+
+        let pruned = store
+            .prune_proposal_monitor_data(Height::new(3))
+            .await
+            .unwrap();
+        assert_eq!(pruned, vec![Height::new(1), Height::new(2)]);
+
+        for h in heights.iter() {
+            let height = Height::new(*h);
+            let exists = store
+                .get_proposal_monitor_data(Some(height))
+                .await
+                .unwrap()
+                .is_some();
+            if *h < 3 {
+                assert!(!exists, "Proposal monitor at height {h} should be pruned");
+            } else {
+                assert!(exists, "Proposal monitor at height {h} should be retained");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prune_misbehavior_evidence() {
+        let store = create_store().await;
+
+        let heights = [1u64, 2, 3, 4];
+        for h in heights.iter() {
+            store_block_at_height(&store, Height::new(*h)).await;
+            store_empty_misbehavior_evidence_at_height(&store, Height::new(*h)).await;
+        }
+
+        let pruned = store
+            .prune_misbehavior_evidence(Height::new(3))
+            .await
+            .unwrap();
+        assert_eq!(pruned, vec![Height::new(1), Height::new(2)]);
+
+        // Re-running with the same retain_height must be a no-op once rows are gone.
+        let pruned_again = store
+            .prune_misbehavior_evidence(Height::new(3))
+            .await
+            .unwrap();
+        assert!(pruned_again.is_empty());
+
+        // Raising retain_height must still find the remaining rows at heights 3 and 4.
+        let pruned_more = store
+            .prune_misbehavior_evidence(Height::new(5))
+            .await
+            .unwrap();
+        assert_eq!(pruned_more, vec![Height::new(3), Height::new(4)]);
+    }
+
+    #[tokio::test]
+    async fn test_prune_invalid_payloads() {
+        let store = create_store().await;
+
+        let heights = [1u64, 2, 3, 4];
+        for h in heights.iter() {
+            store_block_at_height(&store, Height::new(*h)).await;
+            append_invalid_payload_at_height(&store, Height::new(*h)).await;
+        }
+
+        let pruned = store.prune_invalid_payloads(Height::new(3)).await.unwrap();
+        assert_eq!(pruned, vec![Height::new(1), Height::new(2)]);
+
+        let pruned_again = store.prune_invalid_payloads(Height::new(3)).await.unwrap();
+        assert!(pruned_again.is_empty());
+
+        let pruned_more = store.prune_invalid_payloads(Height::new(5)).await.unwrap();
+        assert_eq!(pruned_more, vec![Height::new(3), Height::new(4)]);
+    }
+
+    #[tokio::test]
+    async fn test_prune_proposal_monitor_data_batch_cap() {
+        let store = create_store().await;
+
+        let limit = Db::PRUNE_BATCH_LIMIT as u64;
+        let retain_height = limit + 50;
+        let curr_height = retain_height + 2;
+
+        for h in 1..=curr_height {
+            let height = Height::new(h);
+            store_block_at_height(&store, height).await;
+            store_proposal_monitor_at_height(&store, height).await;
+        }
+
+        let pruned1 = store
+            .prune_proposal_monitor_data(Height::new(retain_height))
+            .await
+            .unwrap();
+        assert_eq!(pruned1.len() as u64, limit);
+        let expected1 = (1..=limit).map(Height::new).collect::<Vec<_>>();
+        assert_eq!(pruned1, expected1);
+
+        let pruned2 = store
+            .prune_proposal_monitor_data(Height::new(retain_height))
+            .await
+            .unwrap();
+        assert_eq!(pruned2.len() as u64, retain_height - 1 - limit);
+        let expected2 = ((limit + 1)..retain_height)
+            .map(Height::new)
+            .collect::<Vec<_>>();
+        assert_eq!(pruned2, expected2);
+
+        for h in 1..retain_height {
+            let exists = store
+                .get_proposal_monitor_data(Some(Height::new(h)))
+                .await
+                .unwrap()
+                .is_some();
+            assert!(!exists, "Proposal monitor at height {h} should be pruned");
+        }
+        for h in retain_height..=curr_height {
+            let exists = store
+                .get_proposal_monitor_data(Some(Height::new(h)))
+                .await
+                .unwrap()
+                .is_some();
+            assert!(exists, "Proposal monitor at height {h} should be retained");
+        }
     }
 
     async fn store_block_at_height(store: &Store, height: Height) {
@@ -2912,5 +3506,301 @@ mod tests {
             vec![(10, 0), (10, 1), (10, 2)],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_get_certificate_range_complete() {
+        let store = create_store().await;
+        store_blocks_at_heights(&store, &(1..=10).collect::<Vec<_>>()).await;
+
+        let result = store
+            .get_certificate_range(Height::new(3), 5)
+            .await
+            .unwrap();
+
+        let Some(RangeQueryResult::Complete(certs)) = result else {
+            panic!("expected complete range");
+        };
+        let heights: Vec<u64> = certs
+            .iter()
+            .map(|c| c.certificate.height.as_u64())
+            .collect();
+        assert_eq!(heights, vec![3, 4, 5, 6, 7]);
+    }
+
+    #[tokio::test]
+    async fn test_get_certificate_range_above_head() {
+        let store = create_store().await;
+        store_blocks_at_heights(&store, &(1..=10).collect::<Vec<_>>()).await;
+
+        let result = store
+            .get_certificate_range(Height::new(8), 5)
+            .await
+            .unwrap();
+
+        let Some(RangeQueryResult::Unavailable {
+            reason,
+            failed_heights,
+        }) = result
+        else {
+            panic!("expected unavailable range");
+        };
+        assert_eq!(reason, RangeFailureReason::AboveCurrentHead);
+        assert_eq!(failed_heights, vec![Height::new(11), Height::new(12)]);
+    }
+
+    #[tokio::test]
+    async fn test_get_certificate_range_below_head() {
+        let store = create_store().await;
+        store_blocks_at_heights(&store, &(1..=10).collect::<Vec<_>>()).await;
+        store.prune_historical_certs(Height::new(5)).await.unwrap();
+
+        let result = store
+            .get_certificate_range(Height::new(3), 6)
+            .await
+            .unwrap();
+
+        let Some(RangeQueryResult::Unavailable {
+            reason,
+            failed_heights,
+        }) = result
+        else {
+            panic!("expected unavailable range");
+        };
+        assert_eq!(reason, RangeFailureReason::Pruned);
+        assert_eq!(failed_heights, vec![Height::new(3), Height::new(4)]);
+    }
+
+    #[tokio::test]
+    async fn test_get_certificate_range_mixed_reports_first_class_only() {
+        let store = create_store().await;
+        store_blocks_at_heights(&store, &(1..=10).collect::<Vec<_>>()).await;
+        store.prune_historical_certs(Height::new(5)).await.unwrap();
+
+        // Height 4 is pruned and heights 11-12 are above head; only the
+        // first failure class encountered (pruned) is reported.
+        let result = store
+            .get_certificate_range(Height::new(4), 9)
+            .await
+            .unwrap();
+
+        let Some(RangeQueryResult::Unavailable {
+            reason,
+            failed_heights,
+        }) = result
+        else {
+            panic!("expected unavailable range");
+        };
+        assert_eq!(reason, RangeFailureReason::Pruned);
+        assert_eq!(failed_heights, vec![Height::new(4)]);
+    }
+
+    #[tokio::test]
+    async fn test_get_certificate_range_empty_store() {
+        let store = create_store().await;
+
+        let result = store
+            .get_certificate_range(Height::new(1), 3)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_certificate_range_count_one_matches_single_getter() {
+        let store = create_store().await;
+        store_blocks_at_heights(&store, &(1..=5).collect::<Vec<_>>()).await;
+
+        let single = store
+            .get_certificate(Some(Height::new(3)))
+            .await
+            .unwrap()
+            .unwrap();
+        let result = store
+            .get_certificate_range(Height::new(3), 1)
+            .await
+            .unwrap();
+
+        let Some(RangeQueryResult::Complete(certs)) = result else {
+            panic!("expected complete range");
+        };
+        assert_eq!(certs, vec![single]);
+    }
+
+    #[tokio::test]
+    async fn test_get_certificate_range_count_zero_is_error() {
+        let store = create_store().await;
+        store_blocks_at_heights(&store, &[1]).await;
+
+        let result = store.get_certificate_range(Height::new(1), 0).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_certificate_range_missing_row_is_internal() {
+        let store = create_store().await;
+        // Heights 1-3 and 5 are stored; height 4 is a hole inside [1, 5].
+        // A certificate must exist for every decided height, so the hole
+        // is an invariant violation reported as Internal, not a synthesized
+        // empty record.
+        store_blocks_at_heights(&store, &[1, 2, 3, 5]).await;
+
+        let result = store
+            .get_certificate_range(Height::new(1), 5)
+            .await
+            .unwrap();
+
+        let Some(RangeQueryResult::Unavailable {
+            reason,
+            failed_heights,
+        }) = result
+        else {
+            panic!("expected unavailable range");
+        };
+        assert_eq!(reason, RangeFailureReason::Internal);
+        assert_eq!(failed_heights, vec![Height::new(4)]);
+    }
+
+    #[tokio::test]
+    async fn test_get_certificate_range_undecodable_row_is_internal() {
+        let store = create_store().await;
+        store_blocks_at_heights(&store, &(1..=5).collect::<Vec<_>>()).await;
+
+        // Overwrite height 3's row with bytes whose leading version byte
+        // (0xff) is not a valid CommitCertificateVersion, simulating on-disk
+        // corruption. The key stays valid, so the window remains [1, 5] and
+        // the present-but-undecodable row classifies as Internal.
+        {
+            let tx = store.db.db.begin_write().unwrap();
+            {
+                let mut table = tx.open_table(CERTIFICATES_TABLE).unwrap();
+                table.insert(Height::new(3), vec![0xffu8; 4]).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let result = store
+            .get_certificate_range(Height::new(1), 5)
+            .await
+            .unwrap();
+
+        let Some(RangeQueryResult::Unavailable {
+            reason,
+            failed_heights,
+        }) = result
+        else {
+            panic!("expected unavailable range");
+        };
+        assert_eq!(reason, RangeFailureReason::Internal);
+        assert_eq!(failed_heights, vec![Height::new(3)]);
+    }
+
+    #[tokio::test]
+    async fn test_get_misbehavior_evidence_range_synthesizes_empty() {
+        use arc_consensus_types::evidence::ValidatorEvidence;
+
+        let store = create_store().await;
+        store_blocks_at_heights(&store, &(1..=5).collect::<Vec<_>>()).await;
+
+        // A real (non-empty) record only at height 3.
+        let evidence = StoredMisbehaviorEvidence {
+            height: Height::new(3),
+            validators: vec![ValidatorEvidence {
+                address: Address::new([7u8; 20]),
+                double_votes: vec![],
+                double_proposals: vec![],
+            }],
+        };
+        store.store_misbehavior_evidence(evidence).await.unwrap();
+
+        let result = store
+            .get_misbehavior_evidence_range(Height::new(1), 5)
+            .await
+            .unwrap();
+
+        let Some(RangeQueryResult::Complete(items)) = result else {
+            panic!("expected complete range");
+        };
+        let heights: Vec<u64> = items.iter().map(|e| e.height.as_u64()).collect();
+        assert_eq!(heights, vec![1, 2, 3, 4, 5]);
+        assert!(!items[2].is_empty(), "stored record should be returned");
+        assert!(
+            items.iter().all(|e| e.height.as_u64() == 3 || e.is_empty()),
+            "recordless heights should synthesize empty evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_invalid_payloads_range_synthesizes_empty() {
+        let store = create_store().await;
+        store_blocks_at_heights(&store, &(1..=5).collect::<Vec<_>>()).await;
+        append_invalid_payload_at_height(&store, Height::new(2)).await;
+
+        let result = store
+            .get_invalid_payloads_range(Height::new(1), 5)
+            .await
+            .unwrap();
+
+        let Some(RangeQueryResult::Complete(items)) = result else {
+            panic!("expected complete range");
+        };
+        let heights: Vec<u64> = items.iter().map(|p| p.height.as_u64()).collect();
+        assert_eq!(heights, vec![1, 2, 3, 4, 5]);
+        assert_eq!(items[1].payloads.len(), 1);
+        assert!(
+            items
+                .iter()
+                .all(|p| p.height.as_u64() == 2 || p.payloads.is_empty()),
+            "recordless heights should synthesize empty payloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_proposal_monitor_range_with_gap() {
+        let store = create_store().await;
+        store_blocks_at_heights(&store, &(1..=5).collect::<Vec<_>>()).await;
+        for h in [1u64, 2, 4, 5] {
+            store_proposal_monitor_at_height(&store, Height::new(h)).await;
+        }
+
+        let result = store
+            .get_proposal_monitor_data_range(Height::new(1), 5)
+            .await
+            .unwrap();
+
+        let Some(RangeQueryResult::Unavailable {
+            reason,
+            failed_heights,
+        }) = result
+        else {
+            panic!("expected unavailable range");
+        };
+        assert_eq!(reason, RangeFailureReason::NotRecorded);
+        assert_eq!(failed_heights, vec![Height::new(3)]);
+    }
+
+    #[tokio::test]
+    async fn test_get_proposal_monitor_range_complete() {
+        let store = create_store().await;
+        store_blocks_at_heights(&store, &(1..=5).collect::<Vec<_>>()).await;
+        for h in 1u64..=5 {
+            store_proposal_monitor_at_height(&store, Height::new(h)).await;
+        }
+
+        let result = store
+            .get_proposal_monitor_data_range(Height::new(1), 5)
+            .await
+            .unwrap();
+
+        // Proposal-monitor is the only sparse table whose on_missing
+        // returns Err, so a gap-free range is the only path that reaches
+        // Complete for it.
+        let Some(RangeQueryResult::Complete(items)) = result else {
+            panic!("expected complete range");
+        };
+        let heights: Vec<u64> = items.iter().map(|m| m.height.as_u64()).collect();
+        assert_eq!(heights, vec![1, 2, 3, 4, 5]);
     }
 }

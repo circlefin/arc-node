@@ -1,8 +1,7 @@
 name = "db-upgrade"
 description = "DB upgrade testing scenario with 3 validators. Tests upgrade of a single validator (call perturb upgrade validator1)."
 
-# Use RPC connection for Engine API
-engine_api_connection = "rpc"
+engine_api_connection = "ipc"
 
 # Starting versions (what the testnet begins with).
 # Both starting and upgrade images must be Modern (>= v0.5.0) — the upgrade

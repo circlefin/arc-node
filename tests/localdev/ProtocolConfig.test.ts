@@ -273,9 +273,8 @@ describe('ProtocolConfig Smoke Tests', function () {
       const gasLimit = feeParams.blockGasLimit
 
       const baseFeeMax = 200000000000n
-      const baseFeeMin = 1000000000n
+      const baseFeeMin = 20000000000n
 
-      // Drive up the base fee to notice base fee shifts more easily
       await updateBaseFeeBounds(baseFeeMin, baseFeeMax)
       await mineBlock() // Advance again
 
@@ -610,25 +609,25 @@ describe('ProtocolConfig Smoke Tests', function () {
     })
 
     it('does not exceed the configured max across multiple blocks', async function () {
-      // Set block gas limit low, to trigger base fee increases from smaller transactions
       const gasLimit = 1_000_000n
       await updateBlockGasLimit(gasLimit)
 
       const head = await publicClient.getBlock()
       const currentBaseFee = head.baseFeePerGas || 0n
 
-      // Set a tight cap near current to observe saturation
       const maxBaseFee = currentBaseFee + 5n
       const minBaseFee = currentBaseFee
       await updateBaseFeeBounds(minBaseFee, maxBaseFee)
 
-      // Mine several blocks, trying to push usage
+      // `eth_gasPrice` can lag below currentBaseFee at gwei-scale, leaving txs stuck under-priced.
+      const gasPrice = currentBaseFee * 2n + 1_000_000_000n
+
       const guzzler = GasGuzzler.attach(sender, gasGuzzlerAddress)
       for (let i = 0; i < 5; i++) {
         const receipt = await guzzler.write
           .guzzle([200n], {
             gas: (gasLimit * 9n) / 10n,
-            gasPrice: await publicClient.getGasPrice(),
+            gasPrice,
             value: 0n,
           })
           .then(ReceiptVerifier.waitSuccess)

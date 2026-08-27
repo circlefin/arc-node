@@ -14,12 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
 use arc_consensus_db::invalid_payloads::StoredInvalidPayloads;
+use arc_consensus_db::RangeQueryResult;
 use arc_consensus_types::evidence::StoredMisbehaviorEvidence;
 use arc_consensus_types::{
     signing::PublicKey, Address, ArcContext, BlockHash, CommitCertificateType, Height, Round,
@@ -31,10 +32,17 @@ use arc_consensus_types::proposal_monitor::ProposalMonitor;
 
 use crate::utils::sync_state::SyncState;
 
+/// Why an [`AppRequest`] round-trip to the consensus task failed.
+///
+/// The RPC layer maps these to HTTP statuses via `request_error_to_response`
+/// (`Full` → 429, `Closed`/`Recv` → 500).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AppRequestError {
+    /// The request channel is closed; the consensus task has stopped.
     Closed,
+    /// The request channel is at capacity; the caller should retry later.
     Full,
+    /// The reply channel was dropped before a response was sent.
     Recv,
 }
 
@@ -77,15 +85,28 @@ pub struct CommitCertificateInfo {
     pub proposer: Address,
 }
 
+/// Forward range of heights `from..=from+count-1`.
+///
+/// `count` is validated against the RPC cap before the request is sent.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HeightRangeRequest {
+    /// First height of the range.
+    pub from: Height,
+    /// Total number of heights, including `from`.
+    pub count: u64,
+}
+
 #[allow(clippy::enum_variant_names)]
 pub enum AppRequest {
     /// Retrieves a commit certificate at the given height
-    GetCertificate(
+    GetCertificate {
         /// The height to get the certificate for. If None, get the latest certificate.
-        Option<Height>,
+        height: Option<Height>,
+        /// The time the request was enqueued.
+        enqueued_at: Instant,
         /// The channel to send the certificate back on.
-        oneshot::Sender<Option<CommitCertificateInfo>>,
-    ),
+        reply: oneshot::Sender<Option<CommitCertificateInfo>>,
+    },
     /// Retrieves misbehavior evidence at the given height
     GetMisbehaviorEvidence(
         /// The height to get the evidence for. If None, use the latest height.
@@ -107,6 +128,34 @@ pub enum AppRequest {
         /// The channel to send the payloads back on.
         oneshot::Sender<Option<StoredInvalidPayloads>>,
     ),
+    /// Retrieves commit certificates for a range of heights
+    GetCertificateRange(
+        /// The range of heights to read.
+        HeightRangeRequest,
+        /// The channel to send the certificates back on.
+        oneshot::Sender<Option<RangeQueryResult<CommitCertificateInfo>>>,
+    ),
+    /// Retrieves misbehavior evidence for a range of heights
+    GetMisbehaviorEvidenceRange(
+        /// The range of heights to read.
+        HeightRangeRequest,
+        /// The channel to send the evidence back on.
+        oneshot::Sender<Option<RangeQueryResult<StoredMisbehaviorEvidence>>>,
+    ),
+    /// Retrieves proposal monitor data for a range of heights
+    GetProposalMonitorDataRange(
+        /// The range of heights to read.
+        HeightRangeRequest,
+        /// The channel to send the data back on.
+        oneshot::Sender<Option<RangeQueryResult<ProposalMonitor>>>,
+    ),
+    /// Retrieves invalid payloads for a range of heights
+    GetInvalidPayloadsRange(
+        /// The range of heights to read.
+        HeightRangeRequest,
+        /// The channel to send the payloads back on.
+        oneshot::Sender<Option<RangeQueryResult<StoredInvalidPayloads>>>,
+    ),
     /// Get the application status
     GetStatus(oneshot::Sender<Status>),
     /// Check if the application is healthy
@@ -127,7 +176,11 @@ impl AppRequest {
     ) -> Result<Option<CommitCertificateInfo>, AppRequestError> {
         let (tx, rx) = oneshot::channel();
         tx_app_req
-            .try_send(Self::GetCertificate(height, tx))
+            .try_send(Self::GetCertificate {
+                height,
+                enqueued_at: Instant::now(),
+                reply: tx,
+            })
             .inspect_err(|e| error!("Failed to send GetCertificate request to consensus: {e}"))?;
 
         let cert = rx.await.inspect_err(|e| {
@@ -199,6 +252,90 @@ impl AppRequest {
 
         let payloads = rx.await.inspect_err(|e| {
             error!("Failed to receive GetInvalidPayloads response from consensus: {e}")
+        })?;
+
+        Ok(payloads)
+    }
+
+    /// Request commit certificates for a range of heights.
+    ///
+    /// Returns `Ok(None)` when the store has no certificates at all.
+    pub async fn get_certificate_range(
+        range: HeightRangeRequest,
+        tx_app_req: &mpsc::Sender<AppRequest>,
+    ) -> Result<Option<RangeQueryResult<CommitCertificateInfo>>, AppRequestError> {
+        let (tx, rx) = oneshot::channel();
+        tx_app_req
+            .try_send(Self::GetCertificateRange(range, tx))
+            .inspect_err(|e| {
+                error!("Failed to send GetCertificateRange request to consensus: {e}")
+            })?;
+
+        let certs = rx.await.inspect_err(|e| {
+            error!("Failed to receive GetCertificateRange response from consensus: {e}")
+        })?;
+
+        Ok(certs)
+    }
+
+    /// Request misbehavior evidence for a range of heights.
+    ///
+    /// Returns `Ok(None)` when the store has no certificates at all.
+    pub async fn get_misbehavior_evidence_range(
+        range: HeightRangeRequest,
+        tx_app_req: &mpsc::Sender<AppRequest>,
+    ) -> Result<Option<RangeQueryResult<StoredMisbehaviorEvidence>>, AppRequestError> {
+        let (tx, rx) = oneshot::channel();
+        tx_app_req
+            .try_send(Self::GetMisbehaviorEvidenceRange(range, tx))
+            .inspect_err(|e| {
+                error!("Failed to send GetMisbehaviorEvidenceRange request to consensus: {e}")
+            })?;
+
+        let evidence = rx.await.inspect_err(|e| {
+            error!("Failed to receive GetMisbehaviorEvidenceRange response from consensus: {e}")
+        })?;
+
+        Ok(evidence)
+    }
+
+    /// Request proposal monitor data for a range of heights.
+    ///
+    /// Returns `Ok(None)` when the store has no certificates at all.
+    pub async fn get_proposal_monitor_data_range(
+        range: HeightRangeRequest,
+        tx_app_req: &mpsc::Sender<AppRequest>,
+    ) -> Result<Option<RangeQueryResult<ProposalMonitor>>, AppRequestError> {
+        let (tx, rx) = oneshot::channel();
+        tx_app_req
+            .try_send(Self::GetProposalMonitorDataRange(range, tx))
+            .inspect_err(|e| {
+                error!("Failed to send GetProposalMonitorDataRange request to consensus: {e}")
+            })?;
+
+        let data = rx.await.inspect_err(|e| {
+            error!("Failed to receive GetProposalMonitorDataRange response from consensus: {e}")
+        })?;
+
+        Ok(data)
+    }
+
+    /// Request invalid payloads for a range of heights.
+    ///
+    /// Returns `Ok(None)` when the store has no certificates at all.
+    pub async fn get_invalid_payloads_range(
+        range: HeightRangeRequest,
+        tx_app_req: &mpsc::Sender<AppRequest>,
+    ) -> Result<Option<RangeQueryResult<StoredInvalidPayloads>>, AppRequestError> {
+        let (tx, rx) = oneshot::channel();
+        tx_app_req
+            .try_send(Self::GetInvalidPayloadsRange(range, tx))
+            .inspect_err(|e| {
+                error!("Failed to send GetInvalidPayloadsRange request to consensus: {e}")
+            })?;
+
+        let payloads = rx.await.inspect_err(|e| {
+            error!("Failed to receive GetInvalidPayloadsRange response from consensus: {e}")
         })?;
 
         Ok(payloads)

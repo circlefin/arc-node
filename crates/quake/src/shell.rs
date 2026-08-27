@@ -15,8 +15,11 @@
 // limitations under the License.
 
 use color_eyre::eyre::{bail, eyre, Context, Result};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use tracing::debug;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use tracing::{debug, info, warn};
 
 /// Execute a command in a given directory
 ///
@@ -98,6 +101,78 @@ pub(crate) fn exec_with_output(cmd: &str, args: Vec<&str>, dir: &Path) -> Result
     }
 }
 
+/// Like `exec_with_output`, but streams each stdout/stderr line through the
+/// runner's tracing infrastructure as it arrives, while still capturing the
+/// full stdout for return. Use this when the wrapped subprocess is long-lived
+/// (e.g. a remote spammer phase) and the user needs live visibility into what
+/// it's doing rather than waiting for the buffered output at the end.
+///
+/// `prefix` is prepended to each forwarded line so it's distinguishable from
+/// the runner's own logs (e.g. `prefix="spammer"` produces `spammer | …`).
+pub(crate) fn exec_with_streaming_output(
+    cmd: &str,
+    args: Vec<&str>,
+    dir: &Path,
+    prefix: &str,
+) -> Result<String> {
+    debug!(%cmd, args=%args.join(" "), dir=%dir.display(), "Executing (streaming)");
+
+    let mut child = std::process::Command::new(cmd)
+        .args(&args)
+        .current_dir(dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .wrap_err_with(|| format!("Failed to spawn {cmd} {}", args.join(" ")))?;
+
+    let stdout = child.stdout.take().expect("stdout piped by spawn config");
+    let stderr = child.stderr.take().expect("stderr piped by spawn config");
+
+    let captured_stdout = Arc::new(Mutex::new(String::new()));
+    let captured_stderr = Arc::new(Mutex::new(String::new()));
+
+    let stdout_buf = Arc::clone(&captured_stdout);
+    let stdout_prefix = prefix.to_string();
+    let stdout_thread = std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            info!("{stdout_prefix} | {line}");
+            if let Ok(mut buf) = stdout_buf.lock() {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+    });
+
+    let stderr_buf = Arc::clone(&captured_stderr);
+    let stderr_prefix = prefix.to_string();
+    let stderr_thread = std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            warn!("{stderr_prefix} | {line}");
+            if let Ok(mut buf) = stderr_buf.lock() {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+    });
+
+    let status = child
+        .wait()
+        .wrap_err_with(|| format!("Failed to wait for {cmd} {}", args.join(" ")))?;
+    stdout_thread.join().expect("stdout reader thread panicked");
+    stderr_thread.join().expect("stderr reader thread panicked");
+
+    let stdout_str = captured_stdout.lock().expect("stdout mutex").clone();
+    let stderr_str = captured_stderr.lock().expect("stderr mutex").clone();
+
+    if status.success() {
+        Ok(stdout_str.trim().to_string())
+    } else {
+        bail!("Command failed: {}", stderr_str.trim());
+    }
+}
+
 /// Return the relative path to the given base path
 pub(crate) fn relative_path(path: &PathBuf, base: &PathBuf) -> Result<PathBuf> {
     pathdiff::diff_paths(path, base)
@@ -162,6 +237,25 @@ pub(crate) fn ssh_with_output(
     let args = format!("{ssh_opts} -i {private_key_path} {user_name}@{host} \"{cmd}\"");
     let full_cmd = format!("ssh {args}");
     exec_with_output("bash", vec!["-c", full_cmd.as_str()], dir)
+}
+
+/// Same as [`ssh_with_output`], but streams the remote command's stdout/stderr
+/// line-by-line through the runner's tracing infrastructure as it arrives. Use
+/// this for long-lived remote commands (e.g. a saturation phase's spammer
+/// subprocess) where buffering the output until completion would hide what the
+/// remote process is currently doing.
+pub(crate) fn ssh_with_streaming_output(
+    host: &str,
+    user_name: &str,
+    private_key_path: &str,
+    dir: &Path,
+    cmd: &str,
+    prefix: &str,
+) -> Result<String> {
+    let ssh_opts = ssh_opts(host).join(" ");
+    let args = format!("{ssh_opts} -i {private_key_path} {user_name}@{host} \"{cmd}\"");
+    let full_cmd = format!("ssh {args}");
+    exec_with_streaming_output("bash", vec!["-c", full_cmd.as_str()], dir, prefix)
 }
 
 /// Copy multiple files or directories to a remote server.

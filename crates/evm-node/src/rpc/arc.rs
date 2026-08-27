@@ -16,7 +16,7 @@
 
 //! Top level file of `reth` node API extension RPCs
 
-use crate::rpc::common::ARC_DEFAULT_BASE_URL;
+use crate::rpc::common::{HexOrDecimalU64, ARC_DEFAULT_BASE_URL};
 use crate::rpc::get_certificate::{
     rpc_get_certificate, CertificateSource, HttpCertificateSource, RpcCommitCertificate,
 };
@@ -35,7 +35,7 @@ pub trait ArcApi {
     fn version(&self) -> RpcResult<RpcVersionInfo>;
 
     #[method(name = "getCertificate")]
-    async fn get_certificate(&self, height: u64) -> RpcResult<RpcCommitCertificate>;
+    async fn get_certificate(&self, height: HexOrDecimalU64) -> RpcResult<RpcCommitCertificate>;
 }
 
 pub struct ArcApiImpl<S: CertificateSource + 'static> {
@@ -50,8 +50,8 @@ impl<S: CertificateSource> ArcApiImpl<S> {
 
 #[async_trait]
 impl<S: CertificateSource + 'static> ArcApiServer for ArcApiImpl<S> {
-    async fn get_certificate(&self, height: u64) -> RpcResult<RpcCommitCertificate> {
-        rpc_get_certificate(&self.certificate_source, height).await
+    async fn get_certificate(&self, height: HexOrDecimalU64) -> RpcResult<RpcCommitCertificate> {
+        rpc_get_certificate(&self.certificate_source, height.as_u64()).await
     }
     fn version(&self) -> RpcResult<RpcVersionInfo> {
         rpc_get_version()

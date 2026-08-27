@@ -2,6 +2,65 @@
 
 All notable changes to arc-node are documented in this file.
 
+## [v0.8.0]
+
+**Changes:** [v0.7.3...v0.8.0](https://github.com/circlefin/arc-node/compare/v0.7.3...v0.8.0) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.0)
+
+*Note: testnet node operators must use a version supporting Zero8 before timestamp `1788447600` (2026-09-03 15:00:00 UTC), when Zero8 activates on testnet. Earlier versions are not supported.*
+
+*Note: mainnet node operators must use a version supporting Zero7/Zero8 before timestamp `1789052400` (2026-09-10 15:00:00 UTC), when Zero7/Zero8 activate on mainnet. Earlier versions are not supported.*
+
+### For Node Operators
+
+- **[Format] JSON-RPC error text for insufficient-balance `eth_call` and `eth_estimateGas` calls changed with the reth 2.2 / revm 38 upgrade.** Transactions whose value or gas cost exceeds the sender balance now surface revm 38's `OutOfFunds` text (previously `insufficient funds for gas * price + value`); simple EOA-to-EOA transfers with insufficient balance now surface `gas required exceeds allowance` (previously `Missing or invalid parameters`). Tooling that matches on these strings must update its patterns. No consensus-affecting behavior changed; only the RPC error surface. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v080) for migration details.
+- **[CLI] `arc-node-consensus` admin RPC routes are disabled by default.** The new `--rpc.admin` flag enables the unauthenticated `POST` and `DELETE /persistent-peers` routes; read-only RPC routes remain available without it. Enable admin routes only on a trusted interface. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v080) for migration details.
+- **[Config] Explicit invalid CL environment values now fail startup.** Eleven value-sync, consensus-queue, discovery, and remote-signing tunables can now be overridden through `ARC_*` environment variables. Unset or empty variables retain their defaults; malformed values and zero values for settings that must be positive abort startup. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v080) for migration details.
+- **[CLI] Arc denylist checks are mandatory and their contract configuration is chain-derived.** Remove `--arc.denylist.enabled`, `--arc.denylist.address`, and `--arc.denylist.storage-slot`; `--arc.denylist.addresses-exclusions` remains available. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v080) for migration details.
+- **[CLI] `arc-snapshots download` no longer defaults `--chain` to testnet and requires `--el-profile` for execution manifest restores.** Supply the chain for automatic URL resolution and supply both options for a manifest URL. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v080) for migration details.
+- **[Config] Execution-layer pruning presets now inject `--prune.block-interval=128` instead of `5000`.** This applies to the `node` subcommand when `--full` or `--minimal` is used without an explicit interval. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v080) for migration details.
+
+### Features
+
+- [EL] Upgrade to reth 2.2.0 and revm 38; brings EVM improvements and reth Storage V2 support. Nodes running existing V1 data may optionally migrate in place with `arc-node-execution db migrate-v2` (offline, one-way); the v0.8.0 binary runs V1 data without migration
+- [EL] Add ordered transaction relay failover for follow nodes through `--arc.tx.relays` and `--arc.tx.relays.timeout`
+- [EL] Add reth V2 modular execution snapshot restores with explicit minimal, full, and archive profiles
+- [CL] Add `arc-node-consensus db migrate` command (alias: `upgrade`) to upgrade the consensus database schema to the latest version; migrations run automatically at node startup, so the manual command is a recovery tool for failed auto-migrations. Pass `--dry-run` to preview changes without committing
+- [CL] Add forward height-range queries to the `/commit`, `/misbehavior-evidence`, `/proposal-monitor`, and `/invalid-payloads` endpoints, with negotiated response compression
+- [CL] Add gzip compression negotiation to the CL `/metrics` endpoint
+- [CL] Deprecate the RPC/HTTP transport between CL and EL in favor of IPC; RPC configurations now emit a startup warning ahead of removal in v0.9.0
+- [CL] Close completed proposal-part stream keys so resurfaced duplicate parts cannot consume streaming capacity
+- [CL] Add `arc_malachite_app_transient_validation_errors_count` metrics for transient proposal-validation failures
+- [CL] Record proposal-monitor latency and outcome data when proposal parts arrive before round 0 starts
+
+### Fixes
+
+- [CL] Exit with non-zero status when the EL IPC connection closes unexpectedly, enabling container orchestrators to restart the node automatically
+- [CL] Generate a fresh JWT token per Engine API request to prevent token staleness during long-running consensus operations
+- [CL] Reject proposal stream messages carrying an invalid Fin sequence number
+- [CL] Retry EL chain-identity resolution for up to 30 seconds during startup, then exit non-zero for orchestrator restart instead of hanging indefinitely
+- [CL] Refuse to restream blocks without their original proposal signature
+- [CL] Reject payloads with non-canonical block hashes before storing them as undecided blocks
+- [CL] Let a proposer decline the round when `getPayload` exceeds the proposal deadline instead of crashing the consensus application
+- [CL] Fail fast when multiple locally built blocks exist for the same height and round
+- [CL] Bound CL RPC request bodies, execution time, and concurrency to prevent slow requests from exhausting node resources
+- [CL] Treat invalid-payload forensic persistence failures as diagnostic errors instead of aborting consensus-critical processing
+- [CL] Stop the Malachite Node actor before application teardown during SIGTERM shutdown to avoid spurious consensus errors
+- [CL] Bind each execution payload to its consensus height and the block finalized at the previous height
+- [CL] Key pending proposal parts by proposer, proof-of-lock round, and signature so distinct proposal streams cannot alias in storage
+- [CL] Select the expected proposer from the proposal parts' round when validating streamed proposals
+- [CL] Treat `engine_newPayload` internal JSON-RPC errors as no-verdict outcomes instead of permanently recording a payload as invalid
+- [EL] Gate corrected EIP-161 deletion of synthetic empty accounts behind Zero8, preserving historical pre-Zero8 state roots
+- [EL] Reject Engine API payloads containing withdrawals because Arc does not support withdrawals
+- [EL] Evict permanently un-includable transactions from the transaction pool after payload construction rejects them
+- [EL] Preserve transaction-warm status when evaluating `SELFDESTRUCT` targets
+- [EL] Validate transaction size before recovering EIP-7702 authorities for denylist checks
+- [EL] Keep the sparse-trie state hook active through post-block writes so committed state roots include those writes
+- [EL] Reject a block beneficiary that was self-destructed during the same block
+- [EL] Apply pending-transaction subscription filtering when `eth_subscribe` uses object-form parameters
+- [EL] Classify beneficiary blocklist read failures as internal execution errors instead of deterministic transaction failures
+- [Shared] Update h2 to reject unbounded empty DATA-frame streams and remove the related denial-of-service vulnerability
+- [Shared] Update ruint to correct overflow flags and shift-amount handling used by EVM big-integer operations
+
 ## [v0.7.3]
 
 **Changes:** [v0.7.2...v0.7.3](https://github.com/circlefin/arc-node/compare/v0.7.2...v0.7.3) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.7.3)
@@ -9,11 +68,13 @@ All notable changes to arc-node are documented in this file.
 ### Features
 
 - [CL] Add consensus and RPC Prometheus metrics on the `/metrics` endpoint: `arc_malachite_app_consensus_round_missed` (counter, labeled by the missed round's proposer), `arc_malachite_app_rpc_request_time`, and app-request channel queue-time, process-time, and full-channel-rejection metrics
+- [CL] Process application and RPC requests concurrently with consensus messages so slow database-backed reads do not delay consensus progress
 - [EL] Add the Zero8 hardfork (dormant). Once active on a chain, a rejected delegatecall into a stateful Arc precompile is charged the uniform 200-gas early-revert penalty, matching the penalty already applied to other precompile authorization and validation reverts. Zero8 is not scheduled on any public chain
 - [EL] `arc_getCertificate` now accepts a hex-encoded quantity string (e.g. `"0x7"`) for the block-height parameter in addition to a plain decimal number, aligning with the EVM hex-quantity convention used by `eth_getBlockByNumber`
 
 ### Fixes
 
+- [CL] Avoid querying the EL for a validator set when a stored certificate already includes proposer metadata
 - [EL] Complete the pending-block RPC filter so permissionless callers can no longer read the proposed pre-finalization block through case-variant `pending` tags, previously-uncovered block-content methods, or object-style block parameters
 - [Shared] Remediate cargo audit advisories via dependency bumps
 
@@ -75,7 +136,7 @@ Full documentation tree at this release: [`arc-node` v0.7.2 docs](https://github
 
 ### For Node Operators
 
-*Note: mainnet node operators must use v0.7.0. Earlier versions are not supported.* 
+*Note: mainnet node operators must use v0.7.0. Earlier versions are not supported.*
 
 - **[Config] Pending transactions are hidden from RPC by default.** Renamed `--arc.hide-pending-txs` (opt-in to hide) to `--arc.expose-pending-txs` (opt-in to expose) and flipped the default. Added `--public-api`, a convenience flag for externally-exposed nodes that forces hiding and warns if `--http.api` / `--ws.api` expose namespaces outside `{eth, net, web3, rpc}`.
 - **[Config] CL default log level changed from `debug` to `info`.** Pass `--log-level debug` explicitly if your monitoring depends on debug-level output.

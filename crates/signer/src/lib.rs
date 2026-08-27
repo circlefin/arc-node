@@ -23,7 +23,7 @@ pub use arc_consensus_types::signing::{
 pub use arc_consensus_types::signing::{SignedExtension, SignedProposal, SignedVote};
 
 use arc_consensus_types::{ArcContext, Proposal, Vote};
-use malachitebft_core_types::ValidatorProof;
+use malachitebft_core_types::{ValidatorProof, VoteExtensionScope};
 
 #[cfg(not(any(feature = "local", feature = "remote")))]
 compile_error!("At least one signing provider feature must be enabled");
@@ -86,6 +86,7 @@ impl Signer<ArcContext> for ArcSigningProvider {
 
     async fn sign_vote_extension(
         &self,
+        _scope: VoteExtensionScope<ArcContext>,
         _extension: Bytes,
     ) -> Result<SignedExtension<ArcContext>, SigningError> {
         unreachable!("Vote extensions are not supported in Arc at the moment");
@@ -156,6 +157,7 @@ impl Verifier<ArcContext> for ArcSigningProvider {
 
     async fn verify_signed_vote_extension(
         &self,
+        _scope: &VoteExtensionScope<ArcContext>,
         _extension: &Bytes,
         _signature: &Signature,
         _public_key: &PublicKey,

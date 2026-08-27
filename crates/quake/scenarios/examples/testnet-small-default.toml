@@ -10,7 +10,7 @@ cl.config.discovery_num_inbound_peers = 50
 cl.config.discovery_num_outbound_peers = 50
 
 latency_emulation = true
-engine_api_connection = "rpc"
+engine_api_connection = "ipc"
 monitoring_bind_host = "0.0.0.0"
 
 # ==============================================================================
@@ -38,34 +38,34 @@ RPC_NODES = ["rpc-full", "arc-node"]
 #                     arc-node
 # ==============================================================================
 
-# --- Core validators (5 across 5 regions) on private1 ---
+# --- Core validators on private1 ---
 
 [nodes.validator1]
-region = "us-east-2"
+region = "us-east-1"
 subnets = ["private1"]
 cl_persistent_peers = ["CORE_VALIDATORS"]
 el.config.trusted_peers = ["CORE_VALIDATORS"]
 
 [nodes.validator2]
-region = "us-west-2"
+region = "eu-west-2"
 subnets = ["private1"]
 cl_persistent_peers = ["CORE_VALIDATORS"]
 el.config.trusted_peers = ["CORE_VALIDATORS"]
 
 [nodes.validator3]
-region = "eu-central-1"
+region = "ap-south-1"
 subnets = ["private1"]
 cl_persistent_peers = ["CORE_VALIDATORS"]
 el.config.trusted_peers = ["CORE_VALIDATORS"]
 
 [nodes.validator4]
-region = "ap-northeast-1"
+region = "ca-central-1"
 subnets = ["private1"]
 cl_persistent_peers = ["CORE_VALIDATORS"]
 el.config.trusted_peers = ["CORE_VALIDATORS"]
 
 [nodes.validator5]
-region = "eu-west-1"
+region = "sa-east-1"
 subnets = ["private1"]
 cl_persistent_peers = ["CORE_VALIDATORS"]
 el.config.trusted_peers = ["CORE_VALIDATORS"]
@@ -73,14 +73,14 @@ el.config.trusted_peers = ["CORE_VALIDATORS"]
 # --- Sentries ---
 
 [nodes.sentry-1]
-region = "us-east-2"
+region = "us-east-1"
 subnets = ["private1", "public"]
 cl_persistent_peers = ["sentry-2", "CORE_VALIDATORS"]
 el.config.trusted_peers = ["sentry-2", "CORE_VALIDATORS"]
 el.config.disable_discovery = true
 
 [nodes.sentry-2]
-region = "eu-central-1"
+region = "ap-south-1"
 subnets = ["public", "private2"]
 external = true
 start_at = 25
@@ -91,7 +91,7 @@ el.config.disable_discovery = true
 # --- External validator connected via sentry chain on private2 ---
 
 [nodes.validator6]
-region = "ap-southeast-1"
+region = "ap-southeast-2"
 subnets = ["private2"]
 external = true
 start_at = 30
@@ -101,7 +101,7 @@ el.config.trusted_peers = []
 # --- RPC full node (non-validator, externally exposed) ---
 
 [nodes.rpc-full]
-region = "us-west-2"
+region = "eu-west-2"
 subnets = ["public"]
 external = true
 start_at = 25
@@ -116,7 +116,7 @@ el.config.prune.preset = "full"
 # --- Snapshot node (full profile, snapshot source) ---
 
 [nodes.snapshot]
-region = "us-east-2"
+region = "us-east-1"
 subnets = ["public"]
 external = true
 start_at = 30
@@ -130,7 +130,7 @@ el.config.prune.preset = "full"
 # --- Arc node (RPC follow from rpc-full and snapshot) ---
 
 [nodes.arc-node]
-region = "us-east-2"
+region = "us-east-1"
 subnets = ["public"]
 external = true
 start_at = 30

@@ -33,7 +33,14 @@ import { buildProtocolConfigGenesisAllocs, schemaProtocolConfig } from './Protoc
 import { BuilderContext } from './context'
 import { Address, fromHex, Hex, toHex } from 'viem'
 import { buildValidatorManagerGenesisAllocs, schemaValidatorManager } from './ValidatorManager'
-import { memoAddress, multicall3FromAddress, nativeCoinAutorityAddress, nativeCoinControlAddress } from './addresses'
+import {
+  gasGuzzlerAddress,
+  memoAddress,
+  multicall3FromAddress,
+  nativeCoinAutorityAddress,
+  nativeCoinControlAddress,
+  testTokenAddress,
+} from './addresses'
 
 const emptyPrecompileStart = 0x1800000000000000000000000000000000000002n
 const emptyPrecompileEnd = 0x18000000000000000000000000000000000000ffn
@@ -92,6 +99,7 @@ export const schemaGenesisConfig = z
         zero5Block: z.number().optional(),
         zero6Block: z.number().optional(),
         zero7Time: z.number().optional(),
+        zero8Time: z.number().optional(),
         osakaTime: z.number().optional(),
       })
       .optional(),
@@ -127,7 +135,7 @@ export const schemaGenesisConfig = z
 export type GenesisConfig = z.infer<typeof schemaGenesisConfig>
 
 // Defines hardfork name, this is used for genesis builder command line arguments.
-export const hardforkNameSchema = z.enum(['zero3', 'zero4', 'zero5', 'zero6', 'zero7'])
+export const hardforkNameSchema = z.enum(['zero3', 'zero4', 'zero5', 'zero6', 'zero7', 'zero8'])
 
 // Defines the mapping from hardfork name to genesis hardforks initialize setting.
 export function initialHardforksByName(hardforkName: z.infer<typeof hardforkNameSchema>): GenesisConfig['hardforks'] {
@@ -137,6 +145,15 @@ export function initialHardforksByName(hardforkName: z.infer<typeof hardforkName
     zero5: { zero3Block: 0, zero4Block: 0, zero5Block: 0, osakaTime: 0 },
     zero6: { zero3Block: 0, zero4Block: 0, zero5Block: 0, zero6Block: 0, osakaTime: 0 },
     zero7: { zero3Block: 0, zero4Block: 0, zero5Block: 0, zero6Block: 0, zero7Time: 0, osakaTime: 0 },
+    zero8: {
+      zero3Block: 0,
+      zero4Block: 0,
+      zero5Block: 0,
+      zero6Block: 0,
+      zero7Time: 0,
+      zero8Time: 0,
+      osakaTime: 0,
+    },
   }[hardforkName]
 }
 
@@ -194,15 +211,11 @@ export const buildGenesis = async (ctx: BuilderContext, config: GenesisConfig) =
     }
   }
 
-  // Add GasGuzzler test contract if enabled.
+  // Add GasGuzzler test contract if enabled. Pinned to the canonical gasGuzzlerAddress
+  // (like Memo/Multicall3From) so it stays in sync with consumers that hardcode it
+  // (spammer, addresses.ts) regardless of bytecode/toolchain drift.
   if (gasGuzzlerEnabled === true) {
-    const [address, alloc] = buildAccountAlloc({
-      address: await ctx.contractLoader.getDeterministicAddress('GasGuzzler'),
-      balance: 0n,
-      nonce: 1n,
-      code: await ctx.contractLoader.getCode('GasGuzzler'),
-    })
-    insert([address, alloc])
+    insert(await buildImplContractAlloc(ctx, 'GasGuzzler', { address: gasGuzzlerAddress }))
   }
 
   // Add Memo contract if enabled.
@@ -216,8 +229,9 @@ export const buildGenesis = async (ctx: BuilderContext, config: GenesisConfig) =
   }
 
   // Add TestToken ERC-20 contract if enabled. Prefund accounts receive token balances.
+  // Pinned to the canonical testTokenAddress (like GasGuzzler) so it stays in sync with
+  // consumers that hardcode it (spammer), regardless of bytecode/toolchain drift.
   if (testTokenEnabled === true) {
-    const testTokenAddress = await ctx.contractLoader.getDeterministicAddress('TestToken')
     const testTokenCode = await ctx.contractLoader.getCode('TestToken')
     const prefundAddresses = prefund?.map((p) => p.address) ?? []
     const balancePerAccount = 1_000_000n * 10n ** 18n // 1M tokens

@@ -193,7 +193,7 @@ mod tests {
         // Engine API spec: forkchoice_updated returns latest_valid_hash == head block hash
         mock_engine
             .expect_forkchoice_updated()
-            .returning(move |_, _| {
+            .returning(move |_, _, _| {
                 Ok(ForkchoiceUpdated {
                     payload_status: PayloadStatus {
                         status: PayloadStatusEnum::Valid,

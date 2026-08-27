@@ -144,8 +144,15 @@ impl EthereumIPC {
         block.ok_or_else(|| eyre::eyre!("Genesis block not found"))
     }
 
+    /// Get the validator set that signs at the given consensus height.
+    /// Queries the registry at `consensus_height - 1` (saturating), because
+    /// the set active at height H is the one committed after executing H-1.
     #[tracing::instrument(skip(self))]
-    pub async fn get_active_validator_set(&self, block_height: u64) -> eyre::Result<ValidatorSet> {
+    pub async fn get_signing_validator_set(
+        &self,
+        consensus_height: u64,
+    ) -> eyre::Result<ValidatorSet> {
+        let block_height = consensus_height.saturating_sub(1);
         let params = abi_get_active_validator_set_params_ipc(block_height)?;
         debug!("eth_call params: {params:?}",);
 
@@ -188,11 +195,10 @@ impl EthereumIPC {
         abi_decode_consensus_params(result)
     }
 
-    /// Get a block by its number.
-    /// - block_number: The number of the block to get.
+    /// Get a block by its number or tag.
     pub async fn get_block_by_number(
         &self,
-        block_number: &str,
+        block_number: BlockNumberOrTag,
     ) -> eyre::Result<Option<ExecutionBlock>> {
         let return_full_transaction_objects = false;
         self.rpc_request(
@@ -206,7 +212,7 @@ impl EthereumIPC {
     /// Get a batch of full execution payloads.
     async fn get_execution_payloads(
         &self,
-        block_numbers: &[String],
+        block_numbers: &[BlockNumberOrTag],
     ) -> eyre::Result<Vec<Option<ExecutionPayloadV3>>> {
         if block_numbers.is_empty() {
             return Ok(vec![]);
@@ -216,7 +222,7 @@ impl EthereumIPC {
         let return_full_transaction_objects = true;
         let params_list = block_numbers
             .iter()
-            .map(|block_number| rpc_params![block_number, return_full_transaction_objects])
+            .map(|block_number| rpc_params![*block_number, return_full_transaction_objects])
             .collect::<Vec<_>>();
         let batch_blocks: Vec<Option<Option<Block>>> = self
             .ipc
@@ -281,13 +287,12 @@ impl EthereumAPI for EthereumIPC {
             .wrap_err("EthereumIPC get_genesis_block call failed")
     }
 
-    /// Get the active validator set at a specific block height.
-    async fn get_active_validator_set(&self, block_height: u64) -> eyre::Result<ValidatorSet> {
-        self.get_active_validator_set(block_height)
+    async fn get_signing_validator_set(&self, consensus_height: u64) -> eyre::Result<ValidatorSet> {
+        self.get_signing_validator_set(consensus_height)
             .await
             .wrap_err_with(|| {
                 format!(
-                    "EthereumIPC get_active_validator_set call failed for height={block_height}"
+                    "EthereumIPC get_signing_validator_set call failed for consensus_height={consensus_height}"
                 )
             })
     }
@@ -297,10 +302,10 @@ impl EthereumAPI for EthereumIPC {
         self.get_consensus_params(block_height).await
     }
 
-    /// Get a block by its number.
+    /// Get a block by its number or tag.
     async fn get_block_by_number(
         &self,
-        block_number: &str,
+        block_number: BlockNumberOrTag,
     ) -> eyre::Result<Option<ExecutionBlock>> {
         self.get_block_by_number(block_number)
             .await
@@ -314,7 +319,7 @@ impl EthereumAPI for EthereumIPC {
     /// Get a batch of full execution payloads.
     async fn get_execution_payloads(
         &self,
-        block_numbers: &[String],
+        block_numbers: &[BlockNumberOrTag],
     ) -> eyre::Result<Vec<Option<ExecutionPayloadV3>>> {
         self.get_execution_payloads(block_numbers)
             .await
@@ -602,7 +607,7 @@ mod tests {
         let (socket_path, _handle) = start_mock_ipc_server(responses).await.unwrap();
         let ethereum_ipc = EthereumIPC::new(&socket_path).await.unwrap();
 
-        let block_numbers = vec!["0x1".to_string(), "0x2".to_string()];
+        let block_numbers = vec![BlockNumberOrTag::Number(1), BlockNumberOrTag::Number(2)];
         let result = ethereum_ipc
             .get_execution_payloads(&block_numbers)
             .await
@@ -638,7 +643,7 @@ mod tests {
         let (socket_path, _handle) = start_mock_ipc_server(responses).await.unwrap();
         let ethereum_ipc = EthereumIPC::new(&socket_path).await.unwrap();
 
-        let block_numbers = vec!["0x1".to_string(), "0x999".to_string()];
+        let block_numbers = vec![BlockNumberOrTag::Number(1), BlockNumberOrTag::Number(0x999)];
         let result = ethereum_ipc
             .get_execution_payloads(&block_numbers)
             .await
@@ -670,7 +675,7 @@ mod tests {
         let (socket_path, _handle) = start_mock_ipc_server(responses).await.unwrap();
         let ethereum_ipc = EthereumIPC::new(&socket_path).await.unwrap();
 
-        let block_numbers = vec!["0x1".to_string(), "0x2".to_string()];
+        let block_numbers = vec![BlockNumberOrTag::Number(1), BlockNumberOrTag::Number(2)];
         let result = ethereum_ipc
             .get_execution_payloads(&block_numbers)
             .await
@@ -707,7 +712,7 @@ mod tests {
         let (socket_path, _handle) = start_mock_ipc_server(responses).await.unwrap();
         let ethereum_ipc = EthereumIPC::new(&socket_path).await.unwrap();
 
-        let block_numbers = vec!["0x1".to_string()];
+        let block_numbers = vec![BlockNumberOrTag::Number(1)];
         let result = ethereum_ipc
             .get_execution_payloads(&block_numbers)
             .await
@@ -736,7 +741,7 @@ mod tests {
         let (socket_path, _handle) = start_mock_ipc_server(responses).await.unwrap();
         let ethereum_ipc = EthereumIPC::new(&socket_path).await.unwrap();
 
-        let block_numbers = vec!["0x1".to_string()];
+        let block_numbers = vec![BlockNumberOrTag::Number(1)];
         let result = ethereum_ipc
             .get_execution_payloads(&block_numbers)
             .await
@@ -755,7 +760,7 @@ mod tests {
         let (socket_path, _handle) = start_mock_ipc_server(responses).await.unwrap();
         let ethereum_ipc = EthereumIPC::new(&socket_path).await.unwrap();
 
-        let block_numbers = vec!["0x1".to_string()];
+        let block_numbers = vec![BlockNumberOrTag::Number(1)];
         let result = ethereum_ipc
             .get_execution_payloads(&block_numbers)
             .await
@@ -798,10 +803,10 @@ mod tests {
         let ethereum_ipc = EthereumIPC::new(&socket_path).await.unwrap();
 
         let block_numbers = vec![
-            "0x1".to_string(),
-            "0x2".to_string(),
-            "0x3".to_string(),
-            "0x4".to_string(),
+            BlockNumberOrTag::Number(1),
+            BlockNumberOrTag::Number(2),
+            BlockNumberOrTag::Number(3),
+            BlockNumberOrTag::Number(4),
         ];
         let result = ethereum_ipc.get_execution_payloads(&block_numbers).await;
 

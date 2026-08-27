@@ -17,7 +17,7 @@ services:
         FEATURES: ${EL_FEATURES:-default js-tracer}
         ARC_IDEMPOTENT_BUILD: ${ARC_IDEMPOTENT_BUILD:-false}
       secrets:
-        - GITHUB_TOKEN
+        - github_token
     image: {{this.tag}}
 {{/each}}
 {{#each malachite_builds}}
@@ -33,10 +33,10 @@ services:
         FEATURES: ${CL_FEATURES:-}
         ARC_IDEMPOTENT_BUILD: ${ARC_IDEMPOTENT_BUILD:-false}
       secrets:
-        - GITHUB_TOKEN
+        - github_token
     image: {{this.tag}}
 {{/each}}
 
 secrets:
-  GITHUB_TOKEN:
+  github_token:
     environment: GITHUB_TOKEN

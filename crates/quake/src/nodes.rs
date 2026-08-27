@@ -15,10 +15,11 @@
 // limitations under the License.
 
 use crate::infra::{InfraData, InfraType};
-use crate::manifest::{self, Subnets};
+use crate::manifest::{self, Manifest, Subnets};
 use crate::node::{Container, ContainerName, IpAddress, NodeMetadata, NodeName, EXECUTION_SUFFIX};
+use crate::testnet;
 use color_eyre::eyre::{bail, eyre, Context, Result};
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
@@ -40,7 +41,10 @@ pub(crate) struct NodesMetadata {
 
 impl NodesMetadata {
     /// Create a new `NodesMetadata` instance from the given `InfraData`,
-    /// `manifest_nodes`, and `upgraded_containers`.
+    /// `manifest`, resolved `base_images`, and `upgraded_containers`.
+    ///
+    /// `base_images` are the network-wide resolved images; a node uses them
+    /// unless the manifest set a per-node override.
     ///
     /// `upgraded_containers` tracks which containers have been upgraded so they
     /// persist across Quake restarts (e.g., `quake stop` followed by `quake start`
@@ -49,6 +53,7 @@ impl NodesMetadata {
     pub fn new(
         infra_data: InfraData,
         manifest: &manifest::Manifest,
+        base_images: &testnet::DockerImages,
         upgraded_containers: &BTreeSet<ContainerName>,
     ) -> Result<Self> {
         // Remote mode before provision: infra_data has no nodes yet; return empty so
@@ -100,7 +105,7 @@ impl NodesMetadata {
                 .filter_map(|endpoint_name| node_to_el_url.get(endpoint_name).cloned())
                 .collect();
 
-            let consensus_enabled = manifest_node.cl_config.consensus_enabled();
+            let consensus_enabled = !manifest_node.cl_config.no_consensus;
 
             let mut node = match infra_data.infra_type {
                 InfraType::Local => {
@@ -128,6 +133,25 @@ impl NodesMetadata {
                 ),
             };
 
+            node.el_env = manifest_node.el_env.clone();
+            node.cl_env = manifest_node.cl_env.clone();
+
+            // Effective per-node images: the manifest override (inline or group,
+            // already flattened in TryFrom) falls back to the resolved global image.
+            let (image_cl, image_el) =
+                manifest_node.effective_images(&base_images.cl, &base_images.el);
+            if matches!(infra_data.infra_type, InfraType::Remote) {
+                for img in [&image_cl, &image_el] {
+                    if !img.starts_with("ghcr.io/") {
+                        bail!(
+                            "Image '{img}' for node '{name}' must start with 'ghcr.io/' for remote mode"
+                        );
+                    }
+                }
+            }
+            node.consensus.image = image_cl;
+            node.execution.image = image_el;
+
             // Mark containers that have been upgraded
             if upgraded_containers.contains(&node.consensus.name) {
                 node.consensus.upgrade();
@@ -147,6 +171,19 @@ impl NodesMetadata {
 
     pub fn num_nodes(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Distinct effective execution-layer and consensus-layer images across all
+    /// nodes, in first-seen order. Returned as `(el_images, cl_images)` so build
+    /// and pull paths cover per-node overrides, not just the global images.
+    pub fn distinct_images(&self) -> (Vec<String>, Vec<String>) {
+        let mut el = IndexSet::new();
+        let mut cl = IndexSet::new();
+        for node in self.nodes.values() {
+            el.insert(node.execution.image.clone());
+            cl.insert(node.consensus.image.clone());
+        }
+        (el.into_iter().collect(), cl.into_iter().collect())
     }
 
     pub fn node_names(&self) -> Vec<NodeName> {
@@ -272,6 +309,10 @@ impl NodesMetadata {
         peer_meta.execution.private_ip_address_for(subnet)
     }
 
+    pub fn consensus_rpc_url(&self, node: &str) -> Option<Url> {
+        self.nodes.get(node).map(|n| n.consensus.rpc_url.clone())
+    }
+
     pub fn execution_http_url(&self, node: &str) -> Option<Url> {
         self.nodes.get(node).map(|n| n.execution.http_url.clone())
     }
@@ -284,6 +325,13 @@ impl NodesMetadata {
         nodes
             .iter()
             .map(|name| (name.clone(), self.execution_http_url(name).unwrap()))
+            .collect()
+    }
+
+    pub fn to_consensus_rpc_urls(&self, nodes: &[NodeName]) -> Vec<(NodeName, Url)> {
+        nodes
+            .iter()
+            .map(|name| (name.clone(), self.consensus_rpc_url(name).unwrap()))
             .collect()
     }
 
@@ -314,16 +362,49 @@ impl NodesMetadata {
             .map(|(name, n)| (name.clone(), n.consensus.metrics_url.clone()))
             .collect()
     }
+
     /// The list of consensus layer RPC URLs for nodes with consensus enabled.
     /// Nodes with `consensus_enabled: false` (sync-only followers) are excluded.
     /// In local mode, ports are mapped to 127.0.0.1 with per-node offsets.
     /// In remote mode, URLs use the node's private IP.
-    pub fn all_consensus_rpc_urls(&self) -> Vec<(NodeName, Url)> {
+    pub fn all_consensus_enabled_rpc_urls(&self) -> Vec<(NodeName, Url)> {
         self.nodes
             .iter()
             .filter(|(_, n)| n.consensus_enabled)
             .map(|(name, n)| (name.clone(), n.consensus.rpc_url.clone()))
             .collect()
+    }
+
+    /// CL RPC URL of the first node in the manifest.
+    /// Useful for single-node CL reads (e.g. the endpoint catalog) where any consensus will do.
+    pub fn first_consensus_rpc_url(&self) -> (NodeName, Url) {
+        let (name, node) = self
+            .nodes
+            .first()
+            .expect("There should always be at least one node in a testnet");
+        (name.clone(), node.consensus.rpc_url.clone())
+    }
+
+    /// Resolve the selectors against the manifest and return each matching
+    /// node paired with its EL JSON-RPC URL.
+    pub fn resolve_el_targets(
+        &self,
+        manifest: &Manifest,
+        selectors: Option<&[String]>,
+    ) -> Result<Vec<(NodeName, Url)>> {
+        let node_names = manifest.resolve_optional_node_selectors(selectors)?;
+        Ok(self.to_execution_http_urls(&node_names))
+    }
+
+    /// Resolve target selectors against the manifest and return each matching
+    /// node paired with its CL RPC URL.
+    pub fn resolve_cl_targets(
+        &self,
+        manifest: &Manifest,
+        selectors: Option<&[String]>,
+    ) -> Result<Vec<(NodeName, Url)>> {
+        let node_names = manifest.resolve_optional_node_selectors(selectors)?;
+        Ok(self.to_consensus_rpc_urls(&node_names))
     }
 
     /// Serialize node metadata for use on the Control Center.
@@ -356,8 +437,19 @@ impl NodesMetadata {
     pub fn all_container_names(&self) -> Vec<ContainerName> {
         self.nodes
             .values()
-            .flat_map(|n| n.container_names())
+            .flat_map(|n| n.running_container_names())
             .collect()
+    }
+
+    /// Resolve the name of a node's running CL or EL container from metadata.
+    ///
+    /// Looks up `node` and delegates to [`NodeMetadata::running_container_name`],
+    /// which honors the `_u` suffix applied to upgraded containers.
+    pub fn running_container_name(&self, node: &NodeName, suffix: &str) -> Result<ContainerName> {
+        let meta = self
+            .get(node)
+            .ok_or_else(|| eyre!("node '{node}' not found in metadata"))?;
+        Ok(meta.running_container_name(suffix)?.clone())
     }
 
     /// Convert a list of container names to a list of containers
@@ -393,13 +485,13 @@ impl NodesMetadata {
         if !name.contains('*') {
             // If the name is a node name, return its containers
             if let Some(node) = self.nodes.get(name) {
-                return Ok(node.container_names());
+                return Ok(node.running_container_names());
             }
             // If the name is a container name, return it
             if self
                 .nodes
                 .values()
-                .any(|node| node.container_names().contains(name))
+                .any(|node| node.running_container_names().contains(name))
             {
                 return Ok(vec![name.to_string()]);
             }
@@ -414,10 +506,10 @@ impl NodesMetadata {
         for (name, node) in self.nodes.iter() {
             // Check if node name matches
             if regex.is_match(name) {
-                matches.extend(node.container_names());
+                matches.extend(node.running_container_names());
             } else {
                 // Check if container names match
-                for container in node.container_names() {
+                for container in node.running_container_names() {
                     if regex.is_match(&container) {
                         matches.push(container);
                     }
@@ -527,7 +619,74 @@ mod tests {
         let testnet_name = Some("testnet".to_string());
         let manifest = Manifest::new(testnet_name, &manifest_nodes, &node_subnets);
 
-        NodesMetadata::new(infra_data, &manifest, &BTreeSet::new()).unwrap()
+        NodesMetadata::new(
+            infra_data,
+            &manifest,
+            &manifest.images.to_local().unwrap(),
+            &BTreeSet::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn effective_images_use_override_then_global() {
+        let manifest = Manifest::from_string(
+            r#"
+            image_cl = "arc_consensus:global"
+            image_el = "arc_execution:global"
+            [nodes.validator1]
+            image_cl = "arc_consensus:pinned"
+            [nodes.validator2]
+            "#,
+        )
+        .unwrap();
+        let infra_data = InfraData::new_local("testnet".to_string(), &manifest.nodes);
+        let base = manifest.images.to_local().unwrap();
+        let md = NodesMetadata::new(infra_data, &manifest, &base, &BTreeSet::new()).unwrap();
+
+        // validator1: CL pinned; EL falls back to the global image.
+        assert_eq!(
+            md.nodes["validator1"].consensus.image,
+            "arc_consensus:pinned"
+        );
+        assert_eq!(
+            md.nodes["validator1"].execution.image,
+            "arc_execution:global"
+        );
+        // validator2: no override, both fall back to global.
+        assert_eq!(
+            md.nodes["validator2"].consensus.image,
+            "arc_consensus:global"
+        );
+        assert_eq!(
+            md.nodes["validator2"].execution.image,
+            "arc_execution:global"
+        );
+    }
+
+    #[test]
+    fn remote_rejects_non_ghcr_per_node_image() {
+        let manifest = Manifest::from_string(
+            r#"
+            [nodes.validator1]
+            image_el = "docker.io/foo/el:1"
+            "#,
+        )
+        .unwrap();
+        // Reuse the populated local infra, then mark it remote so the ghcr guard runs.
+        let mut infra_data = InfraData::new_local("testnet".to_string(), &manifest.nodes);
+        infra_data.infra_type = InfraType::Remote;
+        let base = testnet::DockerImages {
+            cl: "ghcr.io/org/cl:1".to_string(),
+            el: "ghcr.io/org/el:1".to_string(),
+            cl_upgrade: None,
+            el_upgrade: None,
+        };
+        let err = NodesMetadata::new(infra_data, &manifest, &base, &BTreeSet::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("ghcr.io/"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Build metadata where `source` shares subnet B with `reachable`,

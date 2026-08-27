@@ -258,6 +258,7 @@ DEPS=(
     "malachitebft-core-state-machine"
     "malachitebft-core-types"
     # "malachitebft-engine"
+    "malachitebft-engine-byzantine"
     # "malachitebft-metrics"
     "malachitebft-network"
     "malachitebft-peer"

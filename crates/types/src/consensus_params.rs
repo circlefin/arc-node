@@ -175,6 +175,7 @@ impl Default for ConsensusParams {
                 precommit: bounds::timeout_precommit.default,
                 precommit_delta: bounds::timeout_delta.default,
                 rebroadcast: bounds::timeout_rebroadcast.default,
+                ..LinearTimeouts::default()
             },
         }
     }
@@ -205,6 +206,7 @@ mod tests {
         assert_eq!(linear.precommit, params.timeouts.precommit);
         assert_eq!(linear.precommit_delta, params.timeouts.precommit_delta);
         assert_eq!(linear.rebroadcast, params.timeouts.rebroadcast);
+        assert_eq!(linear.max_timeout, params.timeouts.max_timeout);
     }
 
     #[test]
@@ -220,6 +222,7 @@ mod tests {
                 precommit: Duration::from_secs(3),           // within 1s..=5s
                 precommit_delta: Duration::from_millis(300), // within 250ms..=1s
                 rebroadcast: Duration::from_secs(5),         // within 3s..=30s
+                ..LinearTimeouts::default()
             },
         );
 
@@ -247,6 +250,7 @@ mod tests {
                 precommit: Duration::ZERO,                // below 250ms min
                 precommit_delta: Duration::ZERO,          // below 50ms min
                 rebroadcast: Duration::from_millis(500),  // below 1s min
+                ..LinearTimeouts::default()
             },
         );
 
@@ -279,6 +283,7 @@ mod tests {
                 precommit: Duration::from_secs(100),      // above 10s max
                 precommit_delta: Duration::from_secs(10), // above 1s max
                 rebroadcast: Duration::from_secs(100),    // above 30s max
+                ..LinearTimeouts::default()
             },
         );
 
@@ -311,6 +316,7 @@ mod tests {
                 precommit: Duration::from_secs(1),
                 precommit_delta: Duration::from_millis(500),
                 rebroadcast: Duration::from_secs(5),
+                ..LinearTimeouts::default()
             },
         );
 
@@ -333,6 +339,7 @@ mod tests {
                 precommit: Duration::from_secs(1),
                 precommit_delta: Duration::from_millis(500),
                 rebroadcast: Duration::from_secs(5),
+                ..LinearTimeouts::default()
             },
         );
 
@@ -352,6 +359,7 @@ mod tests {
                 precommit: Duration::from_secs(1),
                 precommit_delta: Duration::from_millis(500),
                 rebroadcast: Duration::from_secs(5),
+                ..LinearTimeouts::default()
             },
         );
 
@@ -371,6 +379,7 @@ mod tests {
                 precommit: Duration::from_secs(3),           // within bounds
                 precommit_delta: Duration::from_millis(500), // within bounds
                 rebroadcast: Duration::from_secs(5),
+                ..LinearTimeouts::default()
             },
         );
 
@@ -398,6 +407,7 @@ mod tests {
                 precommit: Duration::from_secs(4),         // valid
                 precommit_delta: Duration::from_secs(5),   // invalid - above max
                 rebroadcast: Duration::from_secs(10),      // valid
+                ..LinearTimeouts::default()
             },
         );
 

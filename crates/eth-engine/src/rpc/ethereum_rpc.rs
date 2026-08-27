@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use alloy_consensus::TxEnvelope;
-use alloy_rpc_types::Block;
+use alloy_rpc_types::{Block, BlockNumberOrTag};
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use alloy_rpc_types_txpool::{TxpoolInspect, TxpoolStatus};
 use alloy_sol_types::SolCall;
@@ -150,8 +150,15 @@ impl EthereumRPC {
         block.ok_or_else(|| eyre::eyre!("Genesis block not found"))
     }
 
+    /// Get the validator set that signs at the given consensus height.
+    /// Queries the registry at `consensus_height - 1` (saturating), because
+    /// the set active at height H is the one committed after executing H-1.
     #[tracing::instrument(skip(self))]
-    pub async fn get_active_validator_set(&self, block_height: u64) -> eyre::Result<ValidatorSet> {
+    pub async fn get_signing_validator_set(
+        &self,
+        consensus_height: u64,
+    ) -> eyre::Result<ValidatorSet> {
+        let block_height = consensus_height.saturating_sub(1);
         let params = abi_get_active_validator_set_params_rpc(block_height)?;
         debug!("eth_call params: {params}");
 
@@ -164,7 +171,7 @@ impl EthereumRPC {
             .await
             .wrap_err_with(|| {
                 format!(
-                    "eth_call request for active validator set failed for height={block_height}"
+                    "eth_call request for signing validator set failed for consensus_height={consensus_height}"
                 )
             })?;
 
@@ -196,11 +203,10 @@ impl EthereumRPC {
         abi_decode_consensus_params(result)
     }
 
-    /// Get a block by its number.
-    /// - block_number: The number of the block to get.
+    /// Get a block by its number or tag.
     pub async fn get_block_by_number(
         &self,
-        block_number: &str,
+        block_number: BlockNumberOrTag,
     ) -> eyre::Result<Option<ExecutionBlock>> {
         let return_full_transaction_objects = false;
         let params = json!([block_number, return_full_transaction_objects]);
@@ -211,7 +217,7 @@ impl EthereumRPC {
     /// Get a batch of full execution payloads.
     async fn get_execution_payloads(
         &self,
-        block_numbers: &[String],
+        block_numbers: &[BlockNumberOrTag],
     ) -> eyre::Result<Vec<Option<ExecutionPayloadV3>>> {
         if block_numbers.is_empty() {
             return Ok(vec![]);
@@ -338,13 +344,12 @@ impl EthereumAPI for EthereumRPC {
             .wrap_err("EthereumRPC get_genesis_block call failed")
     }
 
-    /// Get the active validator set at a specific block height.
-    async fn get_active_validator_set(&self, block_height: u64) -> eyre::Result<ValidatorSet> {
-        self.get_active_validator_set(block_height)
+    async fn get_signing_validator_set(&self, consensus_height: u64) -> eyre::Result<ValidatorSet> {
+        self.get_signing_validator_set(consensus_height)
             .await
             .wrap_err_with(|| {
                 format!(
-                    "EthereumRPC get_active_validator_set call failed for height={block_height}"
+                    "EthereumRPC get_signing_validator_set call failed for consensus_height={consensus_height}"
                 )
             })
     }
@@ -354,10 +359,10 @@ impl EthereumAPI for EthereumRPC {
         self.get_consensus_params(block_height).await
     }
 
-    /// Get a block by its number.
+    /// Get a block by its number or tag.
     async fn get_block_by_number(
         &self,
-        block_number: &str,
+        block_number: BlockNumberOrTag,
     ) -> eyre::Result<Option<ExecutionBlock>> {
         self.get_block_by_number(block_number)
             .await
@@ -371,7 +376,7 @@ impl EthereumAPI for EthereumRPC {
     /// Get a batch of full execution payloads.
     async fn get_execution_payloads(
         &self,
-        block_numbers: &[String],
+        block_numbers: &[BlockNumberOrTag],
     ) -> eyre::Result<Vec<Option<ExecutionPayloadV3>>> {
         self.get_execution_payloads(block_numbers)
             .await
@@ -570,7 +575,7 @@ mod tests {
         let url = Url::parse(&server.uri()).unwrap();
         let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
-        let block_numbers = vec!["0x1".to_string(), "0x2".to_string()];
+        let block_numbers = vec![BlockNumberOrTag::Number(1), BlockNumberOrTag::Number(2)];
         let result = ethereum_rpc
             .get_execution_payloads(&block_numbers)
             .await
@@ -635,7 +640,7 @@ mod tests {
         let url = Url::parse(&server.uri()).unwrap();
         let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
-        let block_numbers = vec!["0x1".to_string(), "0x999".to_string()];
+        let block_numbers = vec![BlockNumberOrTag::Number(1), BlockNumberOrTag::Number(0x999)];
         let result = ethereum_rpc
             .get_execution_payloads(&block_numbers)
             .await
@@ -682,7 +687,7 @@ mod tests {
         let url = Url::parse(&server.uri()).unwrap();
         let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
-        let block_numbers = vec!["0x1".to_string()];
+        let block_numbers = vec![BlockNumberOrTag::Number(1)];
         let result = ethereum_rpc
             .get_execution_payloads(&block_numbers)
             .await
@@ -725,7 +730,7 @@ mod tests {
         let url = Url::parse(&server.uri()).unwrap();
         let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
-        let block_numbers = vec!["0x1".to_string()];
+        let block_numbers = vec![BlockNumberOrTag::Number(1)];
         let result = ethereum_rpc
             .get_execution_payloads(&block_numbers)
             .await
@@ -741,7 +746,7 @@ mod tests {
         let url = Url::parse("http://invalid-host:8545").unwrap();
         let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
-        let block_numbers = vec!["0x1".to_string()];
+        let block_numbers = vec![BlockNumberOrTag::Number(1)];
         let result = ethereum_rpc.get_execution_payloads(&block_numbers).await;
 
         assert!(result.is_err());
@@ -784,7 +789,7 @@ mod tests {
         let url = Url::parse(&server.uri()).unwrap();
         let ethereum_rpc = EthereumRPC::new(url).unwrap();
 
-        let block_numbers = vec!["0x1".to_string()];
+        let block_numbers = vec![BlockNumberOrTag::Number(1)];
         let result = ethereum_rpc
             .get_execution_payloads(&block_numbers)
             .await

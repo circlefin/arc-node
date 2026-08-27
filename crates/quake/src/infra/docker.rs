@@ -18,7 +18,6 @@ use color_eyre::eyre::{bail, Context, Result};
 use std::path::Path;
 
 use crate::shell;
-use crate::testnet::DockerImages;
 
 /// Check if the docker compose file exists
 pub(crate) fn compose_file_exists(compose_path: &Path) -> Result<()> {
@@ -97,8 +96,8 @@ pub(crate) fn pull(image: &str) -> Result<()> {
 
 /// Check if the given Docker images exist in the local Docker image store.
 /// Returns an error if any image does not exist.
-pub(crate) fn images_exist(images: &DockerImages) -> Result<()> {
-    for tag in &images.all() {
+pub(crate) fn images_exist(images: &[String]) -> Result<()> {
+    for tag in images {
         let filter = format!("reference={tag}");
         let args = vec![
             "images",

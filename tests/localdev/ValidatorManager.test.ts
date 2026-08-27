@@ -15,7 +15,14 @@
 // limitations under the License.
 
 import { expect } from 'chai'
-import { ReceiptVerifier, getClients } from '../helpers'
+import {
+  ReceiptVerifier,
+  getClients,
+  consensusRpcUrl,
+  getConsensusStatus,
+  findConsensusValidator,
+  waitForConsensusStatus,
+} from '../helpers'
 import { getValidators } from '../helpers/networks/localdev'
 import {
   PermissionedValidatorManager,
@@ -354,4 +361,87 @@ describe('ValidatorManager', () => {
         .then(ReceiptVerifier.waitSuccess)
     })
   })
+
+  // Only runs under `make smoke-malachite` (ARC_SMOKE_SCENARIO=malachite), which
+  // runs a real consensus layer; smoke-reth uses a mock CL with no RPC server.
+  ;(process.env.ARC_SMOKE_SCENARIO === 'malachite' ? describe : describe.skip)(
+    'Consensus Participation (malachite)',
+    () => {
+      it('reflects an added validator in the consensus-layer validator set', async function () {
+        this.timeout(180_000)
+        const { client, admin, validatorRegistry, registerer, sender, receiver, getController } = await clients()
+
+        const clRpcUrl = consensusRpcUrl()
+        const initialCount = (await getConsensusStatus(clRpcUrl)).validator_set.count
+
+        // Register, configure, fund and activate a new validator.
+        const privateKey = ed.utils.randomPrivateKey()
+        const publicKey = toHex(await ed.getPublicKeyAsync(privateKey))
+        const registrationId = await validatorRegistry.getNextRegistrationId()
+        await PermissionedValidatorManager.attach(registerer).write.registerValidator([publicKey])
+
+        const controllerAccount = getController(registrationId, false)
+        const fundingTx = await sender.sendTransaction({
+          account: sender.account,
+          to: controllerAccount.account.address,
+          value: parseEther('1'),
+          chain: null,
+        })
+        await client.waitForTransactionReceipt({ hash: fundingTx })
+
+        await PermissionedValidatorManager.attach(admin)
+          .write.configureController([controllerAccount.account.address, registrationId, 10_000n])
+          .then(ReceiptVerifier.waitSuccess)
+        await PermissionedValidatorManager.attach(controllerAccount)
+          .write.activateValidator()
+          .then(ReceiptVerifier.waitSuccess)
+
+        // Validators with zero voting power are excluded from the consensus signing set,
+        // so assign a small positive power that keeps the proposer share negligible.
+        const votingPower = 1n
+        try {
+          await PermissionedValidatorManager.attach(controllerAccount)
+            .write.updateValidatorVotingPower([votingPower])
+            .then(ReceiptVerifier.waitSuccess)
+
+          const registered = await validatorRegistry.getValidator([registrationId])
+          expect(registered.status).to.equal(ValidatorStatus.Active)
+          expect(registered.votingPower).to.equal(votingPower)
+
+          // Advance a block so the consensus layer re-reads the registry.
+          await finalizeTx(client, sender, receiver, 'block progression after adding validator')
+
+          const consensus = await waitForConsensusStatus(
+            (status) => findConsensusValidator(status, publicKey) !== undefined,
+            { url: clRpcUrl },
+          )
+          const consensusValidator = findConsensusValidator(consensus, publicKey)
+          if (consensusValidator === undefined) {
+            expect.fail('Added validator did not appear in the consensus validator set')
+          }
+          expect(consensusValidator.voting_power).to.equal(Number(votingPower))
+          expect(consensus.validator_set.count).to.equal(initialCount + 1)
+
+          // The chain keeps producing blocks with the expanded validator set.
+          await finalizeTx(client, sender, receiver, 'block progression with added validator')
+        } finally {
+          // Always restore the validator set so the shared testnet stays clean for
+          // later tests, even if an assertion above fails.
+          await PermissionedValidatorManager.attach(controllerAccount)
+            .write.removeValidator()
+            .then(ReceiptVerifier.waitSuccess)
+          await PermissionedValidatorManager.attach(admin)
+            .write.removeController([controllerAccount.account.address])
+            .then(ReceiptVerifier.waitSuccess)
+        }
+
+        // Removal propagates back to the consensus validator set.
+        const afterRemoval = await waitForConsensusStatus(
+          (status) => findConsensusValidator(status, publicKey) === undefined,
+          { url: clRpcUrl },
+        )
+        expect(afterRemoval.validator_set.count).to.equal(initialCount)
+      })
+    },
+  )
 })

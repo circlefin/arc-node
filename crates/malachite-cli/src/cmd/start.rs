@@ -21,7 +21,7 @@ use arc_consensus_types::rpc_sync::SyncEndpointUrl;
 use clap::Parser;
 use color_eyre::eyre;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 use arc_consensus_types::Address;
@@ -281,6 +281,15 @@ pub struct StartCmd {
     #[serde(skip)]
     pub rpc_addr: Option<SocketAddr>,
 
+    /// Enable the admin RPC routes.
+    ///
+    /// Disabled by default. These routes mutate node state and have no
+    /// authentication, so they stay unreachable unless explicitly enabled.
+    /// Only enable on an internal, trusted RPC interface.
+    #[clap(long = "rpc.admin", default_value_t = false)]
+    #[serde(skip)]
+    pub rpc_admin: bool,
+
     // ===== Runtime =====
     /// Tokio runtime flavor to use.
     #[clap(
@@ -469,6 +478,28 @@ pub struct StartCmd {
     #[clap(long = "follow.endpoint", value_name = "ENDPOINT", requires = "follow")]
     #[serde(skip)]
     pub follow_endpoints: Vec<SyncEndpointUrl>,
+
+    /// Byzantine behavior configuration as a JSON blob. Testnet / Quake only.
+    ///
+    /// Deserializes into `arc_consensus_types::ByzantineConfig` and enables
+    /// configurable Byzantine faults: vote/proposal equivocation, message
+    /// dropping, inbound-proposal drops, amnesia, force-precommit-nil.
+    ///
+    /// Example: --byzantine='{"equivocate_votes":{"mode":"always"},"seed":42}'
+    #[cfg(feature = "byzantine")]
+    #[clap(
+        long,
+        value_name = "JSON",
+        value_parser = parse_byzantine_json,
+        help_heading = "Byzantine (testnet only)"
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byzantine: Option<arc_consensus_types::ByzantineConfig>,
+}
+
+#[cfg(feature = "byzantine")]
+fn parse_byzantine_json(s: &str) -> Result<arc_consensus_types::ByzantineConfig, String> {
+    serde_json::from_str(s).map_err(|e| format!("invalid --byzantine JSON: {e}"))
 }
 
 fn parse_non_zero_address(s: &str) -> Result<Address, String> {
@@ -511,6 +542,7 @@ impl Default for StartCmd {
             execution_jwt: None,
             metrics: None,
             rpc_addr: None,
+            rpc_admin: false,
             runtime_flavor: RUNTIME_MULTI_THREADED.to_string(),
             worker_threads: None,
             full: false,
@@ -524,6 +556,8 @@ impl Default for StartCmd {
             skip_db_upgrade: false,
             signing_remote: None,
             signing_tls_cert_path: None,
+            #[cfg(feature = "byzantine")]
+            byzantine: None,
             follow: false,
             follow_endpoints: Vec::new(),
         }
@@ -626,6 +660,7 @@ impl StartCmd {
         push_if_some!("execution-jwt", self.execution_jwt);
         push_if_some!("metrics", self.metrics);
         push_if_some!("rpc.addr", self.rpc_addr);
+        push_if!("rpc.admin", self.rpc_admin);
         push_if!("full", self.full);
         push_if!("minimal", self.minimal);
         if let Some(ref path) = self.private_key {
@@ -639,6 +674,13 @@ impl StartCmd {
         push_if_some!("signing.tls-cert-path", self.signing_tls_cert_path);
         push_if!("follow", self.follow);
         push_each!("follow.endpoint", &self.follow_endpoints);
+
+        #[cfg(feature = "byzantine")]
+        if let Some(ref byz) = self.byzantine {
+            let json =
+                serde_json::to_string(byz).expect("ByzantineConfig serialization cannot fail");
+            flags.push(format!("--byzantine={json}"));
+        }
 
         flags
     }
@@ -661,6 +703,25 @@ impl StartCmd {
                 RPC options: --eth-rpc-endpoint, --execution-endpoint, --execution-jwt\n\
                 Please choose either IPC (for local communication) or RPC (for remote communication)."
             ));
+        }
+
+        // The RPC/HTTP CL<->EL transport is deprecated and removed in v0.9.0.
+        // Warn on any RPC option; --execution-ws-endpoint only applies to RPC.
+        let uses_rpc_transport = self.eth_rpc_endpoint.is_some()
+            || self.execution_endpoint.is_some()
+            || self.execution_ws_endpoint.is_some()
+            || self.execution_jwt.is_some();
+        if uses_rpc_transport {
+            warn!(
+                "DEPRECATION: the RPC/HTTP transport for CL<->EL (Engine API) \
+                communication is deprecated and will be removed in v0.9.0. \
+                Migrate to IPC: on the consensus layer use --eth-socket and \
+                --execution-socket in place of --eth-rpc-endpoint, \
+                --execution-endpoint, --execution-ws-endpoint, and \
+                --execution-jwt; on the execution layer enable IPC with \
+                --ipcpath, --auth-ipc, and --auth-ipc.path. See \
+                docs/running-an-arc-node.md."
+            );
         }
 
         // Validate persistent-peers-only configuration
@@ -821,6 +882,48 @@ mod tests {
         assert!(
             cmd.validate().is_ok(),
             "Should be valid with only RPC options"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn validate_warns_on_deprecated_rpc_transport() {
+        let mut cmd = new_start_cmd();
+        cmd.eth_rpc_endpoint = Some(dummy_url());
+        cmd.execution_endpoint = Some(dummy_url());
+        cmd.execution_jwt = Some("/path/to/jwt.hex".to_string());
+
+        assert!(cmd.validate().is_ok(), "RPC options remain valid");
+        assert!(
+            logs_contain("deprecated") && logs_contain("v0.9.0"),
+            "RPC transport must emit a deprecation warning naming v0.9.0"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn validate_warns_on_execution_ws_endpoint_alone() {
+        let mut cmd = new_start_cmd();
+        cmd.execution_ws_endpoint = Some(dummy_url());
+
+        assert!(cmd.validate().is_ok(), "ws endpoint alone stays valid");
+        assert!(
+            logs_contain("deprecated"),
+            "--execution-ws-endpoint must trigger the deprecation warning"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn validate_no_deprecation_warning_in_ipc_mode() {
+        let mut cmd = new_start_cmd();
+        cmd.eth_socket = Some("/tmp/reth.ipc".to_string());
+        cmd.execution_socket = Some("/tmp/reth-auth.ipc".to_string());
+
+        assert!(cmd.validate().is_ok(), "IPC options remain valid");
+        assert!(
+            !logs_contain("deprecated"),
+            "IPC mode must not emit the RPC deprecation warning"
         );
     }
 
@@ -1603,6 +1706,7 @@ mod tests {
             execution_jwt: None,
             metrics: Some("127.0.0.1:9000".parse().unwrap()),
             rpc_addr: Some("127.0.0.1:31000".parse().unwrap()),
+            rpc_admin: true,
             runtime_flavor: RUNTIME_SINGLE_THREADED.to_string(),
             worker_threads: Some(8),
             full: false,
@@ -1620,6 +1724,10 @@ mod tests {
             skip_db_upgrade: true,
             signing_remote: Some("http://signer:10340".to_string()),
             signing_tls_cert_path: Some("/etc/arc/signer.pem".to_string()),
+            #[cfg(feature = "byzantine")]
+            byzantine: Some(
+                serde_json::from_str(r#"{"equivocate_votes":{"mode":"always"}}"#).unwrap(),
+            ),
             follow: true,
             follow_endpoints: vec!["http://rpc-1:8545,ws=8546".parse().unwrap()],
         };

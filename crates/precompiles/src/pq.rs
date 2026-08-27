@@ -13,100 +13,25 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use crate::helpers::{
-    record_cost_or_out_of_gas, PrecompileErrorOrRevert, ERR_EXECUTION_REVERTED,
-    PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
-};
-use crate::precompile;
-use alloy_primitives::{address, Address};
-use alloy_sol_types::{sol, SolCall, SolValue};
-use reth_ethereum::evm::revm::precompile::PrecompileOutput;
-use revm_interpreter::gas::KECCAK256WORD;
-use revm_interpreter::Gas;
-use slh_dsa::{signature::Verifier, Sha2_128s, Signature, VerifyingKey as SlhDsaVerifyingKey};
 
-pub const PQ_ADDRESS: Address = address!("1800000000000000000000000000000000000004");
+pub use arc_pq_precompile::{IPQ, PQ_ADDRESS};
 
-/// Base gas for SLH-DSA-SHA2-128s verification.
-///
-/// Conservative relative to the SHA-256 precompile's per-word work anchor. See
-/// `crates/precompiles/benches/pq.rs` for the benchmark context comparing this
-/// price against SLH-DSA-SHA2-128s verification and 64-byte SHA-256 / KECCAK256
-/// work.
-const VERIFY_BASE_GAS: u64 = 230_000;
+use arc_execution_config::hardforks::ArcHardforkFlags;
+use reth_ethereum::evm::revm::precompile::{PrecompileError, PrecompileOutput};
 
-/// Dynamic gas cost per 32-byte word of message input.
-///
-/// SLH-DSA-SHA2-128s hashes the message once via `H_msg` (SHA-256 + MGF1).
-/// This is comparable to KECCAK256, so we use the same per-word rate.
-const GAS_PER_MSG_WORD: u64 = KECCAK256WORD;
-
-sol! {
-    /// Experimental PQ Signature Verifier precompile interface.
-    interface IPQ {
-        /// Verify an SLH-DSA-SHA2-128s signature.
-        ///
-        /// Since PQ signatures are still very new, we recommend not to solely
-        /// rely on them for authentication, but pair them with classical
-        /// signatures.
-        ///
-        /// Gas cost: 230,000 base + 6 per 32-byte word of message (same as KECCAK256)
-        function verifySlhDsaSha2128s(bytes calldata vk, bytes calldata message, bytes calldata sig) external returns (bool isValid);
-    }
+pub(crate) fn run_pq(
+    input: reth_evm::precompiles::PrecompileInput,
+    _hardfork_flags: ArcHardforkFlags,
+) -> Result<PrecompileOutput, PrecompileError> {
+    arc_pq_precompile::run_pq_precompile(input.gas, input.data, input.reservoir)
 }
 
-precompile!(run_pq, precompile_input, hardfork_flags; {
-    IPQ::verifySlhDsaSha2128sCall => |input| {
-        (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
-            let _ = hardfork_flags;
-            let mut gas_counter = Gas::new(precompile_input.gas);
-
-            let args = IPQ::verifySlhDsaSha2128sCall::abi_decode_raw_validate(input).map_err(|_| {
-                PrecompileErrorOrRevert::new_reverted_with_penalty(
-                    gas_counter,
-                    PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
-                    ERR_EXECUTION_REVERTED,
-                )
-            })?;
-
-            // Charge base gas, then per-word message gas, then validate inputs
-            record_cost_or_out_of_gas(&mut gas_counter, VERIFY_BASE_GAS)?;
-
-            // GAS_PER_MSG_WORD (6) < 32, so the product cannot exceed u64::MAX
-            #[allow(clippy::arithmetic_side_effects)]
-            let msg_word_gas = (args.message.len() as u64).div_ceil(32) * GAS_PER_MSG_WORD;
-            record_cost_or_out_of_gas(&mut gas_counter, msg_word_gas)?;
-
-            // SLH-DSA-SHA2-128s constants from FIPS 205
-            const VK_LEN: usize = 32;
-            const SIG_LEN: usize = 7856;
-
-            if args.vk.len() != VK_LEN {
-                return Err(PrecompileErrorOrRevert::new_reverted(
-                    gas_counter,
-                    "Invalid verifying key length",
-                ));
-            }
-
-            if args.sig.len() != SIG_LEN {
-                return Err(PrecompileErrorOrRevert::new_reverted(
-                    gas_counter,
-                    "Invalid signature length",
-                ));
-            }
-
-            let verifying_key = SlhDsaVerifyingKey::<Sha2_128s>::try_from(args.vk.as_ref())
-                .map_err(|_| PrecompileErrorOrRevert::new_reverted(gas_counter, "Failed to parse verifying key"))?;
-
-            let signature = Signature::<Sha2_128s>::try_from(args.sig.as_ref())
-                .map_err(|_| PrecompileErrorOrRevert::new_reverted(gas_counter, "Failed to parse signature"))?;
-
-            let is_valid = verifying_key.verify(args.message.as_ref(), &signature).is_ok();
-
-            Ok(PrecompileOutput::new(gas_counter.used(), is_valid.abi_encode().into()))
-        })()
-    },
-});
+// arc-pq-precompile cannot depend on arc-precompiles (cycle), so this cross-crate equality check
+// is placed here to ensure EARLY_REVERT_GAS and PRECOMPILE_EARLY_REVERT_GAS_PENALTY stay in sync.
+const _: () = assert!(
+    arc_pq_precompile::EARLY_REVERT_GAS == crate::helpers::PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+    "arc_pq_precompile::EARLY_REVERT_GAS diverged from PRECOMPILE_EARLY_REVERT_GAS_PENALTY"
+);
 
 #[cfg(test)]
 mod tests {
@@ -210,8 +135,13 @@ mod tests {
             "Transaction should be successful"
         );
 
-        IPQ::verifySlhDsaSha2128sCall::abi_decode_returns(exec_result.result.output().unwrap())
-            .expect("Should decode return value")
+        IPQ::verifySlhDsaSha2128sCall::abi_decode_returns(
+            exec_result
+                .result
+                .output()
+                .expect("transaction result should have output"),
+        )
+        .expect("Should decode return value")
     }
 
     /// Assert transaction completed but failed (revert/halt)
@@ -243,7 +173,8 @@ mod tests {
         let sk_seed = [1u8; 16];
         let sk_prf = [2u8; 16];
         let pk_seed = [3u8; 16];
-        let signing_key = SigningKey::<Sha2_128s>::slh_keygen_internal(&sk_seed, &sk_prf, &pk_seed);
+        let signing_key =
+            SigningKey::<slh_dsa::Sha2_128s>::slh_keygen_internal(&sk_seed, &sk_prf, &pk_seed);
         let verifying_key = signing_key.verifying_key();
 
         // Sign a message (note: SLH-DSA sign() is deterministic)
@@ -271,7 +202,8 @@ mod tests {
         let sk_seed = [1u8; 16];
         let sk_prf = [2u8; 16];
         let pk_seed = [3u8; 16];
-        let signing_key = SigningKey::<Sha2_128s>::slh_keygen_internal(&sk_seed, &sk_prf, &pk_seed);
+        let signing_key =
+            SigningKey::<slh_dsa::Sha2_128s>::slh_keygen_internal(&sk_seed, &sk_prf, &pk_seed);
         let verifying_key = signing_key.verifying_key();
 
         // Test with 32-byte message
@@ -290,7 +222,7 @@ mod tests {
 
         // Our precompile cost: 230,000 (base) + 1 word * 6 (message) = 230,006
         // Plus EVM calldata cost for large signature (7856 bytes)
-        let actual_gas = exec_result.result.gas_used();
+        let actual_gas = exec_result.result.tx_gas_used();
 
         // SLH-DSA has largest signatures, expect ~370-390K total gas
         assert!(
@@ -316,7 +248,8 @@ mod tests {
         let sk_seed = [1u8; 16];
         let sk_prf = [2u8; 16];
         let pk_seed = [3u8; 16];
-        let signing_key = SigningKey::<Sha2_128s>::slh_keygen_internal(&sk_seed, &sk_prf, &pk_seed);
+        let signing_key =
+            SigningKey::<slh_dsa::Sha2_128s>::slh_keygen_internal(&sk_seed, &sk_prf, &pk_seed);
         let verifying_key = signing_key.verifying_key();
 
         // Sign one message, verify with different message

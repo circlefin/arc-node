@@ -29,9 +29,7 @@ use arc_execution_validation::ArcConsensus;
 use reth_chainspec::{EthereumHardforks, Hardforks};
 use reth_engine_primitives::EngineTypes;
 use reth_ethereum::{node::EthEngineTypes, node::EthEvmConfig};
-use reth_ethereum_engine_primitives::{
-    EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
-};
+use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadAttributes};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
 use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, PeersInfo};
@@ -59,7 +57,9 @@ use reth_rpc::{
     ValidationApi,
 };
 use reth_rpc_api::servers::BlockSubmissionValidationApiServer;
-use reth_rpc_builder::{config::RethRpcServerConfig, middleware::RethRpcMiddleware};
+use reth_rpc_builder::{
+    config::RethRpcServerConfig, middleware::RethRpcMiddleware, TransportRpcModules,
+};
 use reth_rpc_eth_api::{
     helpers::{
         config::{EthConfigApiServer, EthConfigHandler},
@@ -82,8 +82,25 @@ use arc_execution_txpool::{ArcPoolBuilder, InvalidTxList, InvalidTxListConfig};
 // FIXME use the ethereum chain spec temporary, we need to define Arc chain spec
 // original traits for ChainSpec in this file `Hardforks + EthereumHardforks + EthExecutorSpec`
 
-use crate::rpc_middleware::{ArcRpcLayer, ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT};
+use crate::rpc_middleware::{
+    ArcRpcLayer, ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT, DEFAULT_TX_RELAY_TIMEOUT,
+};
 use crate::ArcEngineValidator;
+
+/// Bundle RPC methods that Arc never exposes on public RPC transports.
+const BUNDLE_RPC_METHODS: [&str; 6] = [
+    "eth_callBundle",
+    "eth_sendBundle",
+    "eth_cancelBundle",
+    "eth_sendPrivateTransaction",
+    "eth_sendPrivateRawTransaction",
+    "eth_cancelPrivateTransaction",
+];
+
+fn remove_public_bundle_rpc_methods(modules: &mut TransportRpcModules) {
+    modules.remove_http_methods(BUNDLE_RPC_METHODS);
+    modules.remove_ws_methods(BUNDLE_RPC_METHODS);
+}
 
 /// Type configuration for a regular Arc node.
 #[derive(Debug, Clone)]
@@ -115,14 +132,19 @@ pub struct ArcNode {
     pub max_batch_entries: usize,
     /// Interval between tx rebroadcast rounds. Zero disables rebroadcast.
     pub rebroadcast_interval: std::time::Duration,
+    /// Upstream RPC URLs for transaction relay, in priority order. Empty disables relaying.
+    pub tx_relays: Vec<String>,
+    /// Connection timeout for relays, and request timeout for async relayed submissions.
+    pub tx_relay_timeout: std::time::Duration,
 }
 
-impl Default for ArcNode {
-    fn default() -> Self {
+impl ArcNode {
+    /// Node with default settings and an explicitly supplied denylist config.
+    pub fn with_denylist_config(addresses_denylist_config: AddressesDenylistConfig) -> Self {
         Self {
             rpc_cfg: ArcRpcConfig::default(),
             invalid_tx_list_cfg: InvalidTxListConfig::default(),
-            addresses_denylist_config: AddressesDenylistConfig::default(),
+            addresses_denylist_config,
             payload_builder_deadline_ms: None,
             wait_for_payload: true,
             filter_pending_txs: true,
@@ -130,11 +152,11 @@ impl Default for ArcNode {
             max_response_body_size: 160 * 1024 * 1024,
             max_batch_entries: ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
             rebroadcast_interval: crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
+            tx_relays: Vec::new(),
+            tx_relay_timeout: DEFAULT_TX_RELAY_TIMEOUT,
         }
     }
-}
 
-impl ArcNode {
     /// Creates a new `ArcNode`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -148,6 +170,8 @@ impl ArcNode {
         max_response_body_size: u32,
         max_batch_entries: usize,
         rebroadcast_interval: std::time::Duration,
+        tx_relays: Vec<String>,
+        tx_relay_timeout: std::time::Duration,
     ) -> Self {
         Self {
             rpc_cfg,
@@ -160,6 +184,8 @@ impl ArcNode {
             max_response_body_size,
             max_batch_entries,
             rebroadcast_interval,
+            tx_relays,
+            tx_relay_timeout,
         }
     }
 
@@ -180,11 +206,8 @@ impl ArcNode {
     >
     where
         Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ArcChainSpec, Primitives = EthPrimitives>>,
-        <Node::Types as NodeTypes>::Payload: PayloadTypes<
-            BuiltPayload = EthBuiltPayload,
-            PayloadAttributes = EthPayloadAttributes,
-            PayloadBuilderAttributes = EthPayloadBuilderAttributes,
-        >,
+        <Node::Types as NodeTypes>::Payload:
+            PayloadTypes<BuiltPayload = EthBuiltPayload, PayloadAttributes = EthPayloadAttributes>,
     {
         let invalid_tx_list_opt = if invalid_tx_list_cfg.enabled {
             info!(
@@ -327,6 +350,7 @@ where
             BasicEngineApiBuilder::default(),
             BasicEngineValidatorBuilder::default(),
             Default::default(),
+            Default::default(),
         );
         Self::new(addons, ArcRpcConfig::default())
     }
@@ -415,7 +439,7 @@ where
             Arc::new(ctx.node.consensus().clone()),
             ctx.node.evm_config().clone(),
             ctx.config.rpc.flashbots_config(),
-            Box::new(ctx.node.task_executor().clone()),
+            ctx.node.task_executor().clone(),
             Arc::new(ArcEngineValidator::new(ctx.config.chain.clone())),
         );
 
@@ -432,6 +456,9 @@ where
                 container
                     .modules
                     .merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
+                // Reth includes eth_callBundle in the eth namespace. Remove the full bundle API
+                // from externally reachable transports while retaining trusted local IPC access.
+                remove_public_bundle_rpc_methods(container.modules);
 
                 if self.arc_rpc.enabled {
                     if let Ok(arc_module) =
@@ -537,6 +564,8 @@ where
                 self.allow_unprotected_txs,
                 self.max_response_body_size as usize,
                 self.max_batch_entries,
+                self.tx_relays.clone(),
+                self.tx_relay_timeout,
             ))
     }
 }
@@ -689,6 +718,72 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arc_execution_config::addresses_denylist::{
+        DEFAULT_DENYLIST_ERC7201_BASE_SLOT, DENYLIST_ADDRESS_LOCALDEV,
+    };
+    use jsonrpsee::RpcModule;
+
+    fn module_with_bundle_methods() -> RpcModule<()> {
+        let mut module = RpcModule::new(());
+        for method in BUNDLE_RPC_METHODS {
+            module.register_method(method, |_, _, _| "bundle").unwrap();
+        }
+        module
+            .register_method("eth_blockNumber", |_, _, _| "0x1")
+            .unwrap();
+        module
+    }
+
+    #[test]
+    fn removes_bundle_rpc_methods_from_public_transports_only() {
+        let module = module_with_bundle_methods();
+        let mut modules = TransportRpcModules::default()
+            .with_http(module.clone())
+            .with_ws(module.clone())
+            .with_ipc(module);
+
+        remove_public_bundle_rpc_methods(&mut modules);
+
+        for method in BUNDLE_RPC_METHODS {
+            assert!(modules
+                .http_methods(|name| name == method)
+                .unwrap()
+                .method_names()
+                .next()
+                .is_none());
+            assert!(modules
+                .ws_methods(|name| name == method)
+                .unwrap()
+                .method_names()
+                .next()
+                .is_none());
+            assert!(modules
+                .ipc_methods(|name| name == method)
+                .unwrap()
+                .method_names()
+                .next()
+                .is_some());
+        }
+
+        assert!(modules
+            .http_methods(|name| name == "eth_blockNumber")
+            .unwrap()
+            .method_names()
+            .next()
+            .is_some());
+        assert!(modules
+            .ws_methods(|name| name == "eth_blockNumber")
+            .unwrap()
+            .method_names()
+            .next()
+            .is_some());
+        assert!(modules
+            .ipc_methods(|name| name == "eth_blockNumber")
+            .unwrap()
+            .method_names()
+            .next()
+            .is_some());
+    }
 
     #[test]
     fn arc_rpc_config_construction() {
@@ -722,7 +817,11 @@ mod tests {
         let node = ArcNode::new(
             rpc_cfg,
             invalid_tx_list_cfg,
-            AddressesDenylistConfig::default(),
+            AddressesDenylistConfig::new(
+                DENYLIST_ADDRESS_LOCALDEV,
+                DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+                Vec::new(),
+            ),
             None,
             true,
             true,
@@ -730,26 +829,27 @@ mod tests {
             160 * 1024 * 1024,
             ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
+            Vec::new(),
+            DEFAULT_TX_RELAY_TIMEOUT,
         );
 
         assert!(!node.rpc_cfg.enabled);
         assert!(node.invalid_tx_list_cfg.enabled);
         assert_eq!(node.invalid_tx_list_cfg.capacity, 25_000);
-        assert!(!node.addresses_denylist_config.is_enabled());
+        assert_eq!(
+            node.addresses_denylist_config.contract_address(),
+            DENYLIST_ADDRESS_LOCALDEV
+        );
     }
 
     #[test]
     fn arc_node_construction_with_addresses_denylist_config() {
         use alloy_primitives::{address, b256};
-        let addresses_cfg = AddressesDenylistConfig::try_new(
-            true,
-            Some(address!("0x3600000000000000000000000000000000000001")),
-            Some(b256!(
-                "0x0000000000000000000000000000000000000000000000000000000000000001"
-            )),
+        let addresses_cfg = AddressesDenylistConfig::new(
+            address!("0x3600000000000000000000000000000000000001"),
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
             Vec::new(),
-        )
-        .unwrap();
+        );
         let node = ArcNode::new(
             ArcRpcConfig::default(),
             InvalidTxListConfig::default(),
@@ -761,24 +861,22 @@ mod tests {
             160 * 1024 * 1024,
             ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
+            Vec::new(),
+            DEFAULT_TX_RELAY_TIMEOUT,
         );
-        assert!(node.addresses_denylist_config.is_enabled());
-        if let AddressesDenylistConfig::Enabled {
-            contract_address, ..
-        } = &node.addresses_denylist_config
-        {
-            assert_eq!(
-                *contract_address,
-                address!("0x3600000000000000000000000000000000000001")
-            );
-        } else {
-            panic!("expected Enabled variant");
-        }
+        assert_eq!(
+            node.addresses_denylist_config.contract_address(),
+            address!("0x3600000000000000000000000000000000000001")
+        );
     }
 
     #[test]
     fn arc_node_default_has_pending_txs_filter_enabled() {
-        let node = ArcNode::default();
+        let node = ArcNode::with_denylist_config(AddressesDenylistConfig::new(
+            DENYLIST_ADDRESS_LOCALDEV,
+            DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+            Vec::new(),
+        ));
         assert!(
             node.filter_pending_txs,
             "Default ArcNode should have pending txs filter enabled"
@@ -790,7 +888,11 @@ mod tests {
         let node = ArcNode::new(
             ArcRpcConfig::default(),
             InvalidTxListConfig::default(),
-            AddressesDenylistConfig::default(),
+            AddressesDenylistConfig::new(
+                DENYLIST_ADDRESS_LOCALDEV,
+                DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+                Vec::new(),
+            ),
             None,
             true,
             false,
@@ -798,13 +900,19 @@ mod tests {
             160 * 1024 * 1024,
             ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
+            Vec::new(),
+            DEFAULT_TX_RELAY_TIMEOUT,
         );
         assert!(!node.filter_pending_txs);
     }
 
     #[test]
     fn arc_node_default_wait_for_payload_enabled() {
-        let node = ArcNode::default();
+        let node = ArcNode::with_denylist_config(AddressesDenylistConfig::new(
+            DENYLIST_ADDRESS_LOCALDEV,
+            DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+            Vec::new(),
+        ));
         assert!(
             node.wait_for_payload,
             "Default ArcNode should have wait_for_payload enabled"
@@ -816,7 +924,11 @@ mod tests {
         let node = ArcNode::new(
             ArcRpcConfig::default(),
             InvalidTxListConfig::default(),
-            AddressesDenylistConfig::default(),
+            AddressesDenylistConfig::new(
+                DENYLIST_ADDRESS_LOCALDEV,
+                DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+                Vec::new(),
+            ),
             None,
             false,
             false,
@@ -824,13 +936,19 @@ mod tests {
             160 * 1024 * 1024,
             ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
+            Vec::new(),
+            DEFAULT_TX_RELAY_TIMEOUT,
         );
         assert!(!node.wait_for_payload);
     }
 
     #[test]
     fn arc_node_default_rebroadcast_interval() {
-        let node = ArcNode::default();
+        let node = ArcNode::with_denylist_config(AddressesDenylistConfig::new(
+            DENYLIST_ADDRESS_LOCALDEV,
+            DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+            Vec::new(),
+        ));
         assert_eq!(
             node.rebroadcast_interval,
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL
@@ -842,7 +960,11 @@ mod tests {
         let node = ArcNode::new(
             ArcRpcConfig::default(),
             InvalidTxListConfig::default(),
-            AddressesDenylistConfig::default(),
+            AddressesDenylistConfig::new(
+                DENYLIST_ADDRESS_LOCALDEV,
+                DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+                Vec::new(),
+            ),
             None,
             true,
             true,
@@ -850,6 +972,8 @@ mod tests {
             160 * 1024 * 1024,
             ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
             std::time::Duration::ZERO,
+            Vec::new(),
+            DEFAULT_TX_RELAY_TIMEOUT,
         );
         assert!(node.rebroadcast_interval.is_zero());
     }

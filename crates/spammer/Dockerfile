@@ -41,9 +41,14 @@ RUN cargo clean
 RUN --mount=type=cache,sharing=private,target=/usr/local/cargo/registry \
 	--mount=type=cache,sharing=private,target=/usr/local/cargo/git \
 	--mount=type=cache,sharing=private,target=/app/target \
-    # Build the Spammer binary.
+	--mount=type=secret,id=github_token,required=false \
+    set -eu; \
+    if [ -s /run/secrets/github_token ]; then \
+        token="$(cat /run/secrets/github_token)"; \
+        git config --global url."https://${token}@github.com/".insteadOf "https://github.com/"; \
+        trap 'git config --global --remove-section url."https://${token}@github.com/" || true' EXIT; \
+    fi; \
     cargo build -p spammer --release && \
-    # Copy the built binary to a temporary, non-cached location to make it accessible to the next stage.
     cp /app/target/release/spammer /tmp/spammer
 
 ###########

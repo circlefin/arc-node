@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::log::{create_eip7708_transfer_log, create_native_transfer_log};
+use crate::log::create_eip7708_transfer_log;
 use alloy_evm::eth::EthEvmContext;
 use arc_execution_config::native_coin_control::{
     compute_is_blocklisted_storage_slot, is_blocklisted_status,
@@ -23,23 +23,10 @@ use arc_precompiles::helpers::{
     self, ERR_BLOCKED_ADDRESS, ERR_SELFDESTRUCTED_BALANCE_INCREASED, ERR_ZERO_ADDRESS,
 };
 use arc_precompiles::native_coin_control;
-use revm_context_interface::{ContextTr, JournalTr};
-
-/// Controls which transfer log is emitted by the SELFDESTRUCT instruction.
-enum TransferLogMode {
-    /// Emit the custom NativeCoinTransferred log (pre-Zero5).
-    NativeCoinTransferred,
-    /// Emit an EIP-7708 ERC-20 Transfer log (Zero5+).
-    Eip7708Transfer,
-}
-
-#[derive(Clone, Copy)]
-enum BlocklistReadPolicy {
-    /// SLOAD failures are treated as "not blocklisted" for backward compatibility.
-    FailOpen,
-    /// SLOAD failures propagate to the caller; an unexpected cold NCC account is loaded and retried.
-    FailClosed,
-}
+use revm_context_interface::{
+    journaled_state::{account::JournaledAccountTr, JournalLoadError},
+    ContextTr, JournalTr,
+};
 
 use reth_ethereum::evm::primitives::Database;
 use reth_evm::revm::{
@@ -57,6 +44,17 @@ use revm::interpreter::interpreter_types::LoopControl;
 use revm_interpreter::StateLoad;
 
 // Overridden SELFDESTRUCT that applies Arc Network-specific functionality
+#[derive(Clone, Copy, Debug)]
+enum BlocklistReadPolicy {
+    FailOpen,
+    FailClosed,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TargetWarmthPolicy {
+    AccessListOnly,
+    Transaction,
+}
 
 // Forked from: https://github.com/bluealloy/revm/blob/v97/crates/interpreter/src/instructions/host.rs#L387,
 // with the following modifications:
@@ -65,9 +63,8 @@ use revm_interpreter::StateLoad;
 //  - Disallow selfdestruct if target == addr, and amount is non-zero
 fn arc_network_selfdestruct_impl<WIRE: InterpreterTypes, DB: Database>(
     mut context: InstructionContext<'_, EthEvmContext<DB>, WIRE>,
-    check_target_destructed: bool,
-    log_mode: Option<TransferLogMode>,
     blocklist_read_policy: BlocklistReadPolicy,
+    target_warmth_policy: TargetWarmthPolicy,
 ) {
     require_non_staticcall!(context.interpreter);
     popn!([target], context.interpreter);
@@ -81,10 +78,7 @@ fn arc_network_selfdestruct_impl<WIRE: InterpreterTypes, DB: Database>(
     let addr_balance = context.host.balance(addr);
     let is_cold = match addr_balance.clone() {
         Some(balance) if !balance.is_zero() => {
-            // Zero5: reject SELFDESTRUCT to zero address (prevents burn-like semantics)
-            if matches!(log_mode, Some(TransferLogMode::Eip7708Transfer))
-                && target == alloy_primitives::Address::ZERO
-            {
+            if target == alloy_primitives::Address::ZERO {
                 context
                     .interpreter
                     .bytecode
@@ -102,8 +96,8 @@ fn arc_network_selfdestruct_impl<WIRE: InterpreterTypes, DB: Database>(
                 addr,
                 target,
                 skip_cold_load,
-                check_target_destructed,
                 blocklist_read_policy,
+                target_warmth_policy,
             ) else {
                 // The next action is set in the check_selfdestruct_accounts.
                 return;
@@ -141,19 +135,9 @@ fn arc_network_selfdestruct_impl<WIRE: InterpreterTypes, DB: Database>(
     // The balance was captured before selfdestruct zeroed it.
     if let Some(balance) = addr_balance {
         if !balance.is_zero() {
-            match log_mode {
-                Some(TransferLogMode::NativeCoinTransferred) => {
-                    context
-                        .host
-                        .log(create_native_transfer_log(addr, target, balance.data));
-                }
-                Some(TransferLogMode::Eip7708Transfer) => {
-                    context
-                        .host
-                        .log(create_eip7708_transfer_log(addr, target, balance.data));
-                }
-                None => {}
-            }
+            context
+                .host
+                .log(create_eip7708_transfer_log(addr, target, balance.data));
         }
     }
     // END MODIFIED CODE
@@ -183,39 +167,36 @@ fn arc_network_selfdestruct_impl<WIRE: InterpreterTypes, DB: Database>(
     context.interpreter.halt(InstructionResult::SelfDestruct);
 }
 
-/// Pre-Zero5 variant: does not check target destructed status and emits NativeCoinTransferred logs.
-pub(crate) fn arc_network_selfdestruct_zero4<WIRE: InterpreterTypes, DB: Database>(
+/// Pre-Zero7 SELFDESTRUCT handler with fail-open blocklist reads.
+pub(crate) fn arc_network_selfdestruct<WIRE: InterpreterTypes, DB: Database>(
     context: InstructionContext<'_, EthEvmContext<DB>, WIRE>,
 ) {
     arc_network_selfdestruct_impl(
         context,
-        false,
-        Some(TransferLogMode::NativeCoinTransferred),
         BlocklistReadPolicy::FailOpen,
+        TargetWarmthPolicy::AccessListOnly,
     );
 }
 
-/// Zero5 and Zero6: checks target destructed status and emits EIP-7708 Transfer logs.
-pub(crate) fn arc_network_selfdestruct_zero5<WIRE: InterpreterTypes, DB: Database>(
-    context: InstructionContext<'_, EthEvmContext<DB>, WIRE>,
-) {
-    arc_network_selfdestruct_impl(
-        context,
-        true,
-        Some(TransferLogMode::Eip7708Transfer),
-        BlocklistReadPolicy::FailOpen,
-    );
-}
-
-/// Zero7+: fail closed on blocklist read failures.
+/// Zero7+ SELFDESTRUCT handler with fail-closed blocklist reads.
 pub(crate) fn arc_network_selfdestruct_zero7<WIRE: InterpreterTypes, DB: Database>(
     context: InstructionContext<'_, EthEvmContext<DB>, WIRE>,
 ) {
     arc_network_selfdestruct_impl(
         context,
-        true,
-        Some(TransferLogMode::Eip7708Transfer),
         BlocklistReadPolicy::FailClosed,
+        TargetWarmthPolicy::AccessListOnly,
+    );
+}
+
+/// Zero8+ SELFDESTRUCT handler with transaction-warm target checks.
+pub(crate) fn arc_network_selfdestruct_zero8<WIRE: InterpreterTypes, DB: Database>(
+    context: InstructionContext<'_, EthEvmContext<DB>, WIRE>,
+) {
+    arc_network_selfdestruct_impl(
+        context,
+        BlocklistReadPolicy::FailClosed,
+        TargetWarmthPolicy::Transaction,
     );
 }
 
@@ -250,10 +231,8 @@ fn is_blocklisted<WIRE: InterpreterTypes, H: Host + ?Sized>(
                     };
                     debug_assert!(
                         !native_coin_control_was_cold,
-                        "NativeCoinControl should be preloaded before Zero7 SELFDESTRUCT blocklist reads"
+                        "NativeCoinControl should be preloaded before SELFDESTRUCT blocklist reads"
                     );
-                    // The account is now loaded and warm; the retry should succeed.
-                    // If it doesn't, the `?` propagates the load error to the caller.
                     context.host.sload_skip_cold_load(
                         native_coin_control::NATIVE_COIN_CONTROL_ADDRESS,
                         slot,
@@ -284,8 +263,8 @@ fn check_selfdestruct_accounts<WIRE: InterpreterTypes, DB: Database>(
     source: alloy_primitives::Address,
     target: alloy_primitives::Address,
     skip_cold_load: bool,
-    check_target_destructed: bool,
     blocklist_read_policy: BlocklistReadPolicy,
+    target_warmth_policy: TargetWarmthPolicy,
 ) -> Result<Option<bool>, ()> {
     // Disallow selfdestruct if target == source
     if source == target {
@@ -293,7 +272,6 @@ fn check_selfdestruct_accounts<WIRE: InterpreterTypes, DB: Database>(
         return Err(());
     }
 
-    // Check if either account is blocklisted
     let target_blocklisted = match is_blocklisted(context, target, blocklist_read_policy) {
         Ok(is_blocklisted) => is_blocklisted,
         Err(err) => {
@@ -342,46 +320,72 @@ fn check_selfdestruct_accounts<WIRE: InterpreterTypes, DB: Database>(
         return Err(());
     }
 
-    // Skip the selfdestruct, early return.
-    if !check_target_destructed {
-        return Ok(None);
-    }
-
-    // We cannot call JournalInner here to skip a cold load.
-    // Additionally, `load_account_mut_skip_cold_load` will panic if a `LoadError::ColdLoadSkipped` occurs.
-    // Therefore, we use `warm_addresses.check_is_cold` to check the cold status directly.
-    if context
-        .host
-        .journal_mut()
-        .warm_addresses
-        .check_is_cold::<DB::Error>(&target, skip_cold_load)
-        .is_err()
-    {
-        context.interpreter.halt_oog();
-        return Err(());
-    }
-
-    // Load target account and check if it is desctructed.
-    match context.host.journal_mut().load_account(target) {
-        Ok(acc) => {
-            if acc.is_selfdestructed() {
-                context
-                    .interpreter
-                    .bytecode
-                    .set_action(InterpreterAction::new_return(
-                        InstructionResult::Revert,
-                        helpers::revert_message_to_bytes(ERR_SELFDESTRUCTED_BALANCE_INCREASED),
-                        context.interpreter.gas,
-                    ));
-                return Err(());
+    if matches!(target_warmth_policy, TargetWarmthPolicy::Transaction) {
+        // Load target account and check if it is destructed.
+        match context
+            .host
+            .journal_mut()
+            .load_account_mut_skip_cold_load(target, skip_cold_load)
+        {
+            Ok(acc) => {
+                if acc.data.account().is_selfdestructed() {
+                    context
+                        .interpreter
+                        .bytecode
+                        .set_action(InterpreterAction::new_return(
+                            InstructionResult::Revert,
+                            helpers::revert_message_to_bytes(ERR_SELFDESTRUCTED_BALANCE_INCREASED),
+                            context.interpreter.gas,
+                        ));
+                    return Err(());
+                }
+                Ok(Some(acc.is_cold))
             }
-            Ok(Some(acc.is_cold))
+            Err(JournalLoadError::ColdLoadSkipped) => {
+                context.interpreter.halt_oog();
+                Err(())
+            }
+            Err(JournalLoadError::DBError(e)) => {
+                // Follow the original error handling on Host::selfdestruct for Context,
+                tracing::error!("load account failed: {:?}", e);
+                context.interpreter.halt_fatal();
+                Err(())
+            }
         }
-        Err(e) => {
-            // Follow the original error handling on Host::selfdestruct for Context,
-            tracing::error!("load account failed: {:?}", e);
-            context.interpreter.halt_fatal();
-            Err(())
+    } else {
+        if context
+            .host
+            .journal_mut()
+            .warm_addresses
+            .check_is_cold::<DB::Error>(&target, skip_cold_load)
+            .is_err()
+        {
+            context.interpreter.halt_oog();
+            return Err(());
+        }
+
+        // Load target account and check if it is destructed.
+        match context.host.journal_mut().load_account(target) {
+            Ok(acc) => {
+                if acc.is_selfdestructed() {
+                    context
+                        .interpreter
+                        .bytecode
+                        .set_action(InterpreterAction::new_return(
+                            InstructionResult::Revert,
+                            helpers::revert_message_to_bytes(ERR_SELFDESTRUCTED_BALANCE_INCREASED),
+                            context.interpreter.gas,
+                        ));
+                    return Err(());
+                }
+                Ok(Some(acc.is_cold))
+            }
+            Err(e) => {
+                // Follow the original error handling on Host::selfdestruct for Context,
+                tracing::error!("load account failed: {:?}", e);
+                context.interpreter.halt_fatal();
+                Err(())
+            }
         }
     }
 }
@@ -390,7 +394,6 @@ fn check_selfdestruct_accounts<WIRE: InterpreterTypes, DB: Database>(
 mod tests {
     use super::*;
     use alloy_primitives::{address, Address, U256};
-    use alloy_sol_types::SolEvent;
     use reth_ethereum::evm::revm::db::{EmptyDB, InMemoryDB};
     use reth_ethereum::evm::revm::{
         context::{Context, ContextTr, JournalTr},
@@ -467,6 +470,13 @@ mod tests {
         host: EthEvmContext<DB>,
     }
 
+    #[derive(Clone, Copy)]
+    enum SelfdestructHandler {
+        Legacy,
+        Zero7,
+        Zero8,
+    }
+
     impl<DB: Database> HostTestEnv<DB> {
         fn new(db: DB) -> Self {
             Self::new_with_spec(db, SpecId::PRAGUE)
@@ -540,22 +550,15 @@ mod tests {
                 .expect("selfdestruct")
         }
 
-        /// Simulates a call to `arc_network_selfdestruct_impl` for testing.
+        /// Simulates a call to `arc_network_selfdestruct` for testing.
         /// Executes SELFDESTRUCT from `account` to `target` using the arc logic,
         /// Returns the resulting `InterpreterResult`.
         fn simulate_arc_selfdestruct(
             &mut self,
             account: Address,
             target: Address,
-            check_target_destructed: bool,
         ) -> InterpreterResult {
-            self.simulate_arc_selfdestruct_full(
-                account,
-                target,
-                check_target_destructed,
-                Some(TransferLogMode::NativeCoinTransferred),
-                None,
-            )
+            self.simulate_arc_selfdestruct_full(account, target, None)
         }
 
         /// Like `simulate_arc_selfdestruct` but with a custom gas limit.
@@ -564,15 +567,30 @@ mod tests {
             &mut self,
             account: Address,
             target: Address,
-            check_target_destructed: bool,
             initial_gas_limit: Option<u64>,
         ) -> InterpreterResult {
-            self.simulate_arc_selfdestruct_full(
+            self.simulate_arc_selfdestruct_full_with_preload(
                 account,
                 target,
-                check_target_destructed,
-                Some(TransferLogMode::NativeCoinTransferred),
                 initial_gas_limit,
+                true,
+                SelfdestructHandler::Zero8,
+            )
+        }
+
+        /// Like `simulate_arc_selfdestruct_with_gas`, but uses the Zero7 handler.
+        fn simulate_arc_selfdestruct_pre_zero8_with_gas(
+            &mut self,
+            account: Address,
+            target: Address,
+            initial_gas_limit: Option<u64>,
+        ) -> InterpreterResult {
+            self.simulate_arc_selfdestruct_full_with_preload(
+                account,
+                target,
+                initial_gas_limit,
+                true,
+                SelfdestructHandler::Zero7,
             )
         }
 
@@ -581,18 +599,14 @@ mod tests {
             &mut self,
             account: Address,
             target: Address,
-            check_target_destructed: bool,
-            log_mode: Option<TransferLogMode>,
             initial_gas_limit: Option<u64>,
         ) -> InterpreterResult {
             self.simulate_arc_selfdestruct_full_with_preload(
                 account,
                 target,
-                check_target_destructed,
-                log_mode,
                 initial_gas_limit,
                 true,
-                BlocklistReadPolicy::FailClosed,
+                SelfdestructHandler::Zero8,
             )
         }
 
@@ -600,30 +614,51 @@ mod tests {
             &mut self,
             account: Address,
             target: Address,
-            check_target_destructed: bool,
-            blocklist_read_policy: BlocklistReadPolicy,
         ) -> InterpreterResult {
             self.simulate_arc_selfdestruct_full_with_preload(
                 account,
                 target,
-                check_target_destructed,
-                Some(TransferLogMode::NativeCoinTransferred),
                 None,
                 false,
-                blocklist_read_policy,
+                SelfdestructHandler::Legacy,
             )
         }
 
-        #[allow(clippy::too_many_arguments)]
+        fn simulate_arc_selfdestruct_zero7_without_native_coin_control_preload(
+            &mut self,
+            account: Address,
+            target: Address,
+        ) -> InterpreterResult {
+            self.simulate_arc_selfdestruct_full_with_preload(
+                account,
+                target,
+                None,
+                false,
+                SelfdestructHandler::Zero7,
+            )
+        }
+
+        fn simulate_arc_selfdestruct_zero8_without_native_coin_control_preload(
+            &mut self,
+            account: Address,
+            target: Address,
+        ) -> InterpreterResult {
+            self.simulate_arc_selfdestruct_full_with_preload(
+                account,
+                target,
+                None,
+                false,
+                SelfdestructHandler::Zero8,
+            )
+        }
+
         fn simulate_arc_selfdestruct_full_with_preload(
             &mut self,
             account: Address,
             target: Address,
-            check_target_destructed: bool,
-            log_mode: Option<TransferLogMode>,
             initial_gas_limit: Option<u64>,
             preload_native_coin_control: bool,
-            blocklist_read_policy: BlocklistReadPolicy,
+            handler: SelfdestructHandler,
         ) -> InterpreterResult {
             if preload_native_coin_control {
                 self.host
@@ -649,19 +684,18 @@ mod tests {
             }
 
             // Deduct the static cost of selfdestruct first to simulate the full op cost.
-            assert!(interpreter.gas.record_cost(STATIC_GAS_COST));
+            assert!(interpreter.gas.record_regular_cost(STATIC_GAS_COST));
 
             // Prepare context and execute.
             let context = InstructionContext {
                 interpreter: &mut interpreter,
                 host: &mut self.host,
             };
-            arc_network_selfdestruct_impl(
-                context,
-                check_target_destructed,
-                log_mode,
-                blocklist_read_policy,
-            );
+            match handler {
+                SelfdestructHandler::Legacy => arc_network_selfdestruct(context),
+                SelfdestructHandler::Zero7 => arc_network_selfdestruct_zero7(context),
+                SelfdestructHandler::Zero8 => arc_network_selfdestruct_zero8(context),
+            }
 
             // The selfdestruct should halt and return a Return action.
             let next_action = interpreter.take_next_action();
@@ -786,60 +820,28 @@ mod tests {
     }
 
     #[test]
-    fn selfdestruct_emits_event_when_balance_non_zero() {
-        let amount = U256::from(42);
-
-        for check_target_destruct_locally in [true, false] {
-            let mut env = HostTestEnv::new(EmptyDB::new());
-            env.set_account_balance(ACCOUNT, amount);
-
-            let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET, check_target_destruct_locally);
-            assert_eq!(res.result, InstructionResult::SelfDestruct);
-            assert_eq!(res.gas.spent(), 32600u64); // 5000 static + 25000 new account + 2600 cold account
-            assert_eq!(res.gas.refunded(), 0i64);
-
-            // Verify log.
-            let logs = env.host.journal_mut().take_logs();
-            assert_eq!(logs.len(), 1, "exactly one transfer event expected");
-            let decoded =
-                crate::log::NativeCoinTransferred::decode_log(&logs[0]).expect("decode log");
-            assert_eq!(decoded.data.from, ACCOUNT);
-            assert_eq!(decoded.data.to, TARGET);
-            assert_eq!(decoded.data.amount, amount);
-        }
-    }
-
-    #[test]
     fn selfdestruct_no_event_emitted_when_balance_zero() {
-        for check_target_destruct_locally in [true, false] {
-            let mut env = HostTestEnv::new(EmptyDB::new());
+        let mut env = HostTestEnv::new(EmptyDB::new());
 
-            let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET, check_target_destruct_locally);
-            assert_eq!(res.result, InstructionResult::SelfDestruct);
-            assert_eq!(res.gas.spent(), 7600u64); // 5000 static cost + 2600 cold target, no transfer to create new account
-            assert_eq!(res.gas.refunded(), 0i64);
+        let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET);
+        assert_eq!(res.result, InstructionResult::SelfDestruct);
+        assert_eq!(res.gas.total_gas_spent(), 7600u64); // 5000 static cost + 2600 cold target, no transfer to create new account
+        assert_eq!(res.gas.refunded(), 0i64);
 
-            assert!(
-                env.host.journal_mut().take_logs().is_empty(),
-                "no transfer event expected"
-            );
-        }
+        assert!(
+            env.host.journal_mut().take_logs().is_empty(),
+            "no transfer event expected"
+        );
     }
 
-    /// Under Zero5, selfdestruct with non-zero balance emits an EIP-7708 Transfer log.
+    /// Selfdestruct with non-zero balance emits an EIP-7708 Transfer log.
     #[test]
-    fn selfdestruct_zero5_emits_eip7708_transfer_log() {
+    fn selfdestruct_emits_eip7708_transfer_log() {
         let amount = U256::from(42);
         let mut env = HostTestEnv::new(EmptyDB::new());
         env.set_account_balance(ACCOUNT, amount);
 
-        let res = env.simulate_arc_selfdestruct_full(
-            ACCOUNT,
-            TARGET,
-            true,
-            Some(TransferLogMode::Eip7708Transfer),
-            None,
-        );
+        let res = env.simulate_arc_selfdestruct_full(ACCOUNT, TARGET, None);
         assert_eq!(res.result, InstructionResult::SelfDestruct);
 
         // Verify EIP-7708 Transfer log was emitted
@@ -847,7 +849,7 @@ mod tests {
         assert_eq!(
             logs.len(),
             1,
-            "Zero5: exactly one EIP-7708 Transfer log expected from selfdestruct"
+            "exactly one EIP-7708 Transfer log expected from selfdestruct"
         );
         assert_eq!(
             logs[0].address,
@@ -860,50 +862,22 @@ mod tests {
         assert_account_matches!(env, TARGET, State::touch_new(), amount);
     }
 
-    /// Zero5: SELFDESTRUCT to Address::ZERO with non-zero balance should revert.
+    /// SELFDESTRUCT to Address::ZERO with non-zero balance should revert.
     #[test]
-    fn selfdestruct_zero5_to_zero_address_reverts() {
+    fn selfdestruct_to_zero_address_reverts() {
         let amount = U256::from(42);
         let mut env = HostTestEnv::new(EmptyDB::new());
         env.set_account_balance(ACCOUNT, amount);
 
-        let res = env.simulate_arc_selfdestruct_full(
-            ACCOUNT,
-            Address::ZERO,
-            true,
-            Some(TransferLogMode::Eip7708Transfer),
-            None,
-        );
+        let res = env.simulate_arc_selfdestruct_full(ACCOUNT, Address::ZERO, None);
         assert_eq!(
             res.result,
             InstructionResult::Revert,
-            "Zero5: SELFDESTRUCT to zero address should revert"
+            "SELFDESTRUCT to zero address should revert"
         );
 
         // Balance should NOT have been transferred (account was touched during setup)
         assert_account_matches!(env, ACCOUNT, State::touch_new(), amount);
-    }
-
-    /// Pre-Zero5: SELFDESTRUCT to Address::ZERO is not blocked (existing behavior).
-    #[test]
-    fn selfdestruct_pre_zero5_to_zero_address_allowed() {
-        let amount = U256::from(42);
-        let mut env = HostTestEnv::new(EmptyDB::new());
-        env.set_account_balance(ACCOUNT, amount);
-
-        let res = env.simulate_arc_selfdestruct_full(
-            ACCOUNT,
-            Address::ZERO,
-            false,
-            Some(TransferLogMode::NativeCoinTransferred),
-            None,
-        );
-        // Pre-Zero5 variants use NativeCoinTransferred and don't block zero address
-        assert_eq!(
-            res.result,
-            InstructionResult::SelfDestruct,
-            "Pre-Zero5: SELFDESTRUCT to zero address should succeed"
-        );
     }
 
     #[test]
@@ -912,125 +886,310 @@ mod tests {
         // Target is cold (not loaded), so host.selfdestruct returns ColdLoadSkipped.
         let initial_gas = STATIC_GAS_COST + 100;
 
-        for check_target_destruct_locally in [true, false] {
-            let mut env = HostTestEnv::new(EmptyDB::new());
-            env.set_account_balance(ACCOUNT, U256::from(1));
+        let mut env = HostTestEnv::new(EmptyDB::new());
+        env.set_account_balance(ACCOUNT, U256::from(1));
 
-            let res = env.simulate_arc_selfdestruct_with_gas(
-                ACCOUNT,
-                TARGET,
-                check_target_destruct_locally,
-                Some(initial_gas),
-            );
+        let res = env.simulate_arc_selfdestruct_with_gas(ACCOUNT, TARGET, Some(initial_gas));
 
-            assert_eq!(
-                res.result,
-                InstructionResult::OutOfGas,
-                "ColdLoadSkipped from host.selfdestruct should halt with OutOfGas"
-            );
-            assert!(
-                res.gas.spent() <= initial_gas,
-                "gas spent should not exceed initial limit"
-            );
-        }
+        assert_eq!(
+            res.result,
+            InstructionResult::OutOfGas,
+            "ColdLoadSkipped from host.selfdestruct should halt with OutOfGas"
+        );
+        assert!(
+            res.gas.total_gas_spent() <= initial_gas,
+            "gas spent should not exceed initial limit"
+        );
     }
 
-    #[test]
     #[cfg_attr(
         debug_assertions,
         should_panic(expected = "NativeCoinControl should be preloaded")
     )]
+    #[test]
     fn selfdestruct_zero7_recovers_or_debug_asserts_when_native_coin_control_is_not_loaded() {
-        let check_target_destruct_locally_values: &[bool] = if cfg!(debug_assertions) {
-            &[true]
-        } else {
-            &[true, false]
-        };
+        let mut db = InMemoryDB::default();
+        let slot = native_coin_control::compute_is_blocklisted_storage_slot(TARGET);
+        db.insert_account_storage(
+            native_coin_control::NATIVE_COIN_CONTROL_ADDRESS,
+            slot.into(),
+            U256::from(1),
+        )
+        .expect("insert blocklist storage");
+        let mut env = HostTestEnv::new(db);
+        env.set_account_balance(ACCOUNT, U256::from(1));
 
-        for check_target_destruct_locally in check_target_destruct_locally_values {
-            let mut db = InMemoryDB::default();
-            let slot = native_coin_control::compute_is_blocklisted_storage_slot(TARGET);
-            db.insert_account_storage(
-                native_coin_control::NATIVE_COIN_CONTROL_ADDRESS,
-                slot.into(),
-                U256::from(1),
-            )
-            .expect("insert blocklist storage");
-            let mut env = HostTestEnv::new(db);
-            env.set_account_balance(ACCOUNT, U256::from(1));
+        let res = env
+            .simulate_arc_selfdestruct_zero7_without_native_coin_control_preload(ACCOUNT, TARGET);
 
-            let res = env.simulate_arc_selfdestruct_without_native_coin_control_preload(
-                ACCOUNT,
-                TARGET,
-                *check_target_destruct_locally,
-                BlocklistReadPolicy::FailClosed,
-            );
+        #[cfg(debug_assertions)]
+        let _ = res;
 
-            #[cfg(debug_assertions)]
-            let _ = res;
-
-            #[cfg(not(debug_assertions))]
-            {
-                assert_eq!(res.result, InstructionResult::Revert);
-                assert_eq!(res.gas.spent(), STATIC_GAS_COST);
-                assert_eq!(res.gas.refunded(), 0);
-                assert_account_matches!(env, ACCOUNT, State::touch_new(), U256::from(1));
-                assert_account_matches!(env, TARGET, State::loaded_new(), U256::ZERO);
-            }
+        #[cfg(not(debug_assertions))]
+        {
+            assert_eq!(res.result, InstructionResult::Revert);
+            assert_eq!(res.gas.total_gas_spent(), STATIC_GAS_COST);
+            assert_eq!(res.gas.refunded(), 0);
+            assert_account_matches!(env, ACCOUNT, State::touch_new(), U256::from(1));
+            assert_account_matches!(env, TARGET, State::loaded_new(), U256::ZERO);
         }
     }
 
     #[test]
     fn selfdestruct_pre_zero7_preserves_fail_open_without_native_coin_control_loaded() {
-        for check_target_destruct_locally in [true, false] {
-            let mut db = InMemoryDB::default();
-            let slot = native_coin_control::compute_is_blocklisted_storage_slot(TARGET);
-            db.insert_account_storage(
-                native_coin_control::NATIVE_COIN_CONTROL_ADDRESS,
-                slot.into(),
-                U256::from(1),
-            )
-            .expect("insert blocklist storage");
+        let mut db = InMemoryDB::default();
+        let slot = native_coin_control::compute_is_blocklisted_storage_slot(TARGET);
+        db.insert_account_storage(
+            native_coin_control::NATIVE_COIN_CONTROL_ADDRESS,
+            slot.into(),
+            U256::from(1),
+        )
+        .expect("insert blocklist storage");
+        let mut env = HostTestEnv::new(db);
+        env.set_account_balance(ACCOUNT, U256::from(1));
+
+        let res =
+            env.simulate_arc_selfdestruct_without_native_coin_control_preload(ACCOUNT, TARGET);
+
+        assert_eq!(res.result, InstructionResult::SelfDestruct);
+        assert_account_matches!(env, ACCOUNT, State::touch_new(), U256::ZERO);
+        assert_account_matches!(env, TARGET, State::touch_new(), U256::from(1));
+    }
+
+    /// Database wrapper that forces a storage-read failure for the Native Coin Control
+    /// blocklist account, while delegating every other access to an inner `InMemoryDB`.
+    ///
+    /// This lets the SELFDESTRUCT opcode tests inject a `LoadError::DBError` on the
+    /// blocklist SLOAD: `basic()` (used to preload/warm the NCC account) is delegated so
+    /// the account loads cleanly, but `storage()` for `NATIVE_COIN_CONTROL_ADDRESS` errors,
+    /// which the journal surfaces to the host as `LoadError::DBError`.
+    #[derive(Debug, thiserror::Error)]
+    #[error("forced blocklist storage read failure")]
+    struct ForcedBlocklistReadError;
+    impl revm::database_interface::DBErrorMarker for ForcedBlocklistReadError {}
+
+    #[derive(Debug)]
+    struct BlocklistReadFailingDb {
+        inner: InMemoryDB,
+    }
+
+    impl BlocklistReadFailingDb {
+        fn new(inner: InMemoryDB) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl revm::Database for BlocklistReadFailingDb {
+        type Error = ForcedBlocklistReadError;
+
+        fn basic(
+            &mut self,
+            address: Address,
+        ) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+            <InMemoryDB as revm::Database>::basic(&mut self.inner, address)
+                .map_err(|infallible: core::convert::Infallible| match infallible {})
+        }
+
+        fn code_by_hash(
+            &mut self,
+            code_hash: alloy_primitives::B256,
+        ) -> Result<revm::state::Bytecode, Self::Error> {
+            <InMemoryDB as revm::Database>::code_by_hash(&mut self.inner, code_hash)
+                .map_err(|infallible: core::convert::Infallible| match infallible {})
+        }
+
+        fn storage(
+            &mut self,
+            address: Address,
+            index: revm_primitives::StorageKey,
+        ) -> Result<revm_primitives::StorageValue, Self::Error> {
+            // Force the failure only for the blocklist account so the test exercises the
+            // exact SLOAD that `is_blocklisted` performs.
+            if address == native_coin_control::NATIVE_COIN_CONTROL_ADDRESS {
+                return Err(ForcedBlocklistReadError);
+            }
+            <InMemoryDB as revm::Database>::storage(&mut self.inner, address, index)
+                .map_err(|infallible: core::convert::Infallible| match infallible {})
+        }
+
+        fn block_hash(&mut self, number: u64) -> Result<alloy_primitives::B256, Self::Error> {
+            <InMemoryDB as revm::Database>::block_hash(&mut self.inner, number)
+                .map_err(|infallible: core::convert::Infallible| match infallible {})
+        }
+    }
+
+    /// A blocklist SLOAD that hits a DB error during SELFDESTRUCT must
+    /// hard-halt under the Zero7 `FailClosed` policy (the error propagates) and must be
+    /// swallowed under the pre-Zero7 `FailOpen` policy (treated as not-blocklisted, so
+    /// SELFDESTRUCT proceeds). The DB error is injected via `BlocklistReadFailingDb`,
+    /// which errors on `storage()` for `NATIVE_COIN_CONTROL_ADDRESS`.
+    #[test]
+    fn selfdestruct_blocklist_db_error_fail_closed_halts_fail_open_swallows() {
+        // FailClosed (Zero7): the blocklist read error must propagate as a fatal halt.
+        {
+            let db = BlocklistReadFailingDb::new(InMemoryDB::default());
             let mut env = HostTestEnv::new(db);
             env.set_account_balance(ACCOUNT, U256::from(1));
 
-            let res = env.simulate_arc_selfdestruct_without_native_coin_control_preload(
+            // args: (account, target, gas, preload_native_coin_control, handler)
+            // SelfdestructHandler::Zero7 selects the FailClosed handler.
+            let res = env.simulate_arc_selfdestruct_full_with_preload(
                 ACCOUNT,
                 TARGET,
-                check_target_destruct_locally,
-                BlocklistReadPolicy::FailOpen,
+                None,
+                true,
+                SelfdestructHandler::Zero7,
             );
 
-            assert_eq!(res.result, InstructionResult::SelfDestruct);
+            assert_eq!(
+                res.result,
+                InstructionResult::FatalExternalError,
+                "Zero7 FailClosed: a blocklist SLOAD DBError must hard-halt (fatal), not be swallowed"
+            );
+            // The fatal halt occurs before any balance transfer, so no transfer log.
+            assert!(
+                env.host.journal_mut().take_logs().is_empty(),
+                "no transfer log expected when the read fails closed"
+            );
+        }
+
+        // FailOpen (pre-Zero7): the same read error is swallowed; SELFDESTRUCT proceeds.
+        {
+            let db = BlocklistReadFailingDb::new(InMemoryDB::default());
+            let mut env = HostTestEnv::new(db);
+            env.set_account_balance(ACCOUNT, U256::from(1));
+
+            // SelfdestructHandler::Legacy selects the pre-Zero7 FailOpen handler.
+            let res = env.simulate_arc_selfdestruct_full_with_preload(
+                ACCOUNT,
+                TARGET,
+                None,
+                true,
+                SelfdestructHandler::Legacy,
+            );
+
+            assert_eq!(
+                res.result,
+                InstructionResult::SelfDestruct,
+                "Pre-Zero7 FailOpen: a blocklist SLOAD DBError must be swallowed so SELFDESTRUCT succeeds"
+            );
             assert_account_matches!(env, ACCOUNT, State::touch_new(), U256::ZERO);
             assert_account_matches!(env, TARGET, State::touch_new(), U256::from(1));
         }
+    }
+
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "NativeCoinControl should be preloaded")
+    )]
+    #[test]
+    fn selfdestruct_zero8_includes_zero7_fail_closed_blocklist_reads() {
+        let mut db = InMemoryDB::default();
+        let slot = native_coin_control::compute_is_blocklisted_storage_slot(TARGET);
+        db.insert_account_storage(
+            native_coin_control::NATIVE_COIN_CONTROL_ADDRESS,
+            slot.into(),
+            U256::from(1),
+        )
+        .expect("insert blocklist storage");
+        let mut env = HostTestEnv::new(db);
+        env.set_account_balance(ACCOUNT, U256::from(1));
+
+        let res = env
+            .simulate_arc_selfdestruct_zero8_without_native_coin_control_preload(ACCOUNT, TARGET);
+
+        #[cfg(debug_assertions)]
+        let _ = res;
+
+        #[cfg(not(debug_assertions))]
+        {
+            assert_eq!(res.result, InstructionResult::Revert);
+            assert_eq!(res.gas.total_gas_spent(), STATIC_GAS_COST);
+            assert_eq!(res.gas.refunded(), 0);
+            assert_account_matches!(env, ACCOUNT, State::touch_new(), U256::from(1));
+            assert_account_matches!(env, TARGET, State::loaded_new(), U256::ZERO);
+        }
+    }
+
+    #[test]
+    fn selfdestruct_to_transaction_warm_target_with_low_gas_succeeds() {
+        // Gas limit so that after static cost, remaining < cold load cost (2600), so skip_cold_load = true.
+        // TARGET was warmed earlier in this transaction, so SELFDESTRUCT must not require a cold load.
+        let initial_gas = STATIC_GAS_COST + 100;
+
+        let mut env = HostTestEnv::new(EmptyDB::new());
+        env.set_account_balance(ACCOUNT, U256::from(1));
+        env.set_account_balance(TARGET, U256::from(1));
+
+        let res = env.simulate_arc_selfdestruct_with_gas(ACCOUNT, TARGET, Some(initial_gas));
+
+        assert_eq!(
+            res.result,
+            InstructionResult::SelfDestruct,
+            "transaction-warm target should not require cold selfdestruct gas"
+        );
+        assert_eq!(res.gas.total_gas_spent(), STATIC_GAS_COST);
+    }
+
+    #[test]
+    fn selfdestruct_to_transaction_warm_target_before_zero8_halts_oog() {
+        // Same setup as the Zero8 behavior, but the legacy handler only consults
+        // warm_addresses and therefore still treats TARGET as cold.
+        let initial_gas = STATIC_GAS_COST + 100;
+
+        let mut env = HostTestEnv::new(EmptyDB::new());
+        env.set_account_balance(ACCOUNT, U256::from(1));
+        env.set_account_balance(TARGET, U256::from(1));
+
+        let res =
+            env.simulate_arc_selfdestruct_pre_zero8_with_gas(ACCOUNT, TARGET, Some(initial_gas));
+
+        assert_eq!(
+            res.result,
+            InstructionResult::OutOfGas,
+            "pre-Zero8 SELFDESTRUCT should not use transaction-warm target state"
+        );
+        assert!(
+            res.gas.total_gas_spent() <= initial_gas,
+            "gas spent should not exceed initial limit"
+        );
+    }
+
+    #[test]
+    fn selfdestruct_to_transaction_warm_target_before_zero8_preserves_legacy_warm_charge() {
+        let initial_gas = STATIC_GAS_COST + 2600;
+
+        let mut env = HostTestEnv::new(EmptyDB::new());
+        env.set_account_balance(ACCOUNT, U256::from(1));
+        env.set_account_balance(TARGET, U256::from(1));
+
+        let res =
+            env.simulate_arc_selfdestruct_pre_zero8_with_gas(ACCOUNT, TARGET, Some(initial_gas));
+
+        assert_eq!(res.result, InstructionResult::SelfDestruct);
+        assert_eq!(res.gas.total_gas_spent(), STATIC_GAS_COST);
     }
 
     // Regression tests against existing behavior
 
     #[test]
     fn selfdestruct_refund_recorded_pre_london() {
-        for check_target_destruct_locally in [true, false] {
-            let mut env = HostTestEnv::new_with_spec(EmptyDB::new(), SpecId::ISTANBUL);
+        let mut env = HostTestEnv::new_with_spec(EmptyDB::new(), SpecId::ISTANBUL);
 
-            let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET, check_target_destruct_locally);
-            assert_eq!(res.result, InstructionResult::SelfDestruct);
-            assert_eq!(res.gas.spent(), STATIC_GAS_COST);
-            assert_eq!(res.gas.refunded(), gas::SELFDESTRUCT_REFUND);
-        }
+        let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET);
+        assert_eq!(res.result, InstructionResult::SelfDestruct);
+        assert_eq!(res.gas.total_gas_spent(), STATIC_GAS_COST);
+        assert_eq!(res.gas.refunded(), gas::SELFDESTRUCT_REFUND);
     }
 
     #[test]
     fn selfdestruct_no_refund_after_london() {
-        for check_target_destruct_locally in [true, false] {
-            let mut env = HostTestEnv::new_with_spec(EmptyDB::new(), SpecId::LONDON);
+        let mut env = HostTestEnv::new_with_spec(EmptyDB::new(), SpecId::LONDON);
 
-            let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET, check_target_destruct_locally);
-            assert_eq!(res.result, InstructionResult::SelfDestruct);
-            assert_eq!(res.gas.spent(), 7600u64); // 5000 static cost + 2600 cold target
-            assert_eq!(res.gas.refunded(), 0i64);
-        }
+        let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET);
+        assert_eq!(res.result, InstructionResult::SelfDestruct);
+        assert_eq!(res.gas.total_gas_spent(), 7600u64); // 5000 static cost + 2600 cold target
+        assert_eq!(res.gas.refunded(), 0i64);
     }
 
     #[test]
@@ -1038,48 +1197,43 @@ mod tests {
         let initial_account_balance = U256::from(123u64);
         let initial_target_balance = U256::from(456u64);
 
-        for check_target_destruct_locally in [true, false] {
-            let mut env = HostTestEnv::new(EmptyDB::new());
+        let mut env = HostTestEnv::new(EmptyDB::new());
 
-            // Set balances
-            env.set_account_balance(ACCOUNT, initial_account_balance);
-            env.set_account_balance(TARGET, initial_target_balance);
+        // Set balances
+        env.set_account_balance(ACCOUNT, initial_account_balance);
+        env.set_account_balance(TARGET, initial_target_balance);
 
-            let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET, check_target_destruct_locally);
-            assert_eq!(res.result, InstructionResult::SelfDestruct);
-            assert_eq!(res.gas.spent(), STATIC_GAS_COST);
-            assert_eq!(res.gas.refunded(), 0i64);
+        let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET);
+        assert_eq!(res.result, InstructionResult::SelfDestruct);
+        assert_eq!(res.gas.total_gas_spent(), STATIC_GAS_COST);
+        assert_eq!(res.gas.refunded(), 0i64);
 
-            // Verify balances
-            assert_account_matches!(env, ACCOUNT, State::touch_new(), U256::ZERO);
-            assert_account_matches!(
-                env,
-                TARGET,
-                State::touch_new(),
-                initial_target_balance + initial_account_balance
-            );
-        }
+        // Verify balances
+        assert_account_matches!(env, ACCOUNT, State::touch_new(), U256::ZERO);
+        assert_account_matches!(
+            env,
+            TARGET,
+            State::touch_new(),
+            initial_target_balance + initial_account_balance
+        );
     }
 
     #[test]
     fn selfdestruct_rejects_transfers_to_self() {
         let initial_account_balance = U256::from(123u64);
 
-        for check_target_destruct_locally in [true, false] {
-            let mut env = HostTestEnv::new(EmptyDB::new());
+        let mut env = HostTestEnv::new(EmptyDB::new());
 
-            // Set balances
-            env.set_account_balance(ACCOUNT, initial_account_balance);
+        // Set balances
+        env.set_account_balance(ACCOUNT, initial_account_balance);
 
-            let res =
-                env.simulate_arc_selfdestruct(ACCOUNT, ACCOUNT, check_target_destruct_locally);
-            assert_eq!(res.result, InstructionResult::Revert);
-            assert_eq!(res.gas.spent(), STATIC_GAS_COST);
-            assert_eq!(res.gas.refunded(), 0i64);
+        let res = env.simulate_arc_selfdestruct(ACCOUNT, ACCOUNT);
+        assert_eq!(res.result, InstructionResult::Revert);
+        assert_eq!(res.gas.total_gas_spent(), STATIC_GAS_COST);
+        assert_eq!(res.gas.refunded(), 0i64);
 
-            // Verify balance is unchanged
-            assert_account_matches!(env, ACCOUNT, State::touch_new(), initial_account_balance);
-        }
+        // Verify balance is unchanged
+        assert_account_matches!(env, ACCOUNT, State::touch_new(), initial_account_balance);
     }
 
     #[test]
@@ -1087,29 +1241,27 @@ mod tests {
         let initial_account_balance = U256::from(456u64);
         let initial_target_balance = U256::from(789u64);
 
-        for check_target_destruct_locally in [true, false] {
-            let mut env = HostTestEnv::new(EmptyDB::new());
+        let mut env = HostTestEnv::new(EmptyDB::new());
 
-            // Set balances
-            env.set_account_balance(ACCOUNT, initial_account_balance);
-            env.set_account_balance(TARGET, initial_target_balance);
+        // Set balances
+        env.set_account_balance(ACCOUNT, initial_account_balance);
+        env.set_account_balance(TARGET, initial_target_balance);
 
-            // Blocklist the target address
-            env.set_blocklist(TARGET);
+        // Blocklist the target address
+        env.set_blocklist(TARGET);
 
-            let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET, check_target_destruct_locally);
-            assert_eq!(
-                res.result,
-                InstructionResult::Revert,
-                "Selfdestruct should revert when target is blocklisted"
-            );
-            assert_eq!(res.gas.spent(), STATIC_GAS_COST);
-            assert_eq!(res.gas.refunded(), 0i64);
+        let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET);
+        assert_eq!(
+            res.result,
+            InstructionResult::Revert,
+            "Selfdestruct should revert when target is blocklisted"
+        );
+        assert_eq!(res.gas.total_gas_spent(), STATIC_GAS_COST);
+        assert_eq!(res.gas.refunded(), 0i64);
 
-            // Verify balances are unchanged
-            assert_account_matches!(env, ACCOUNT, State::touch_new(), initial_account_balance);
-            assert_account_matches!(env, TARGET, State::touch_new(), initial_target_balance);
-        }
+        // Verify balances are unchanged
+        assert_account_matches!(env, ACCOUNT, State::touch_new(), initial_account_balance);
+        assert_account_matches!(env, TARGET, State::touch_new(), initial_target_balance);
     }
 
     #[test]
@@ -1117,32 +1269,30 @@ mod tests {
         let initial_account_balance = U256::from(321u64);
         let initial_target_balance = U256::from(654u64);
 
-        for check_target_destruct_locally in [true, false] {
-            let mut env = HostTestEnv::new(EmptyDB::new());
+        let mut env = HostTestEnv::new(EmptyDB::new());
 
-            // Set balances
-            env.set_account_balance(ACCOUNT, initial_account_balance);
-            env.set_account_balance(TARGET, initial_target_balance);
+        // Set balances
+        env.set_account_balance(ACCOUNT, initial_account_balance);
+        env.set_account_balance(TARGET, initial_target_balance);
 
-            // Blocklist the selfdestructing address (ACCOUNT)
-            env.set_blocklist(ACCOUNT);
+        // Blocklist the selfdestructing address (ACCOUNT)
+        env.set_blocklist(ACCOUNT);
 
-            // Run interpreter
-            let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET, check_target_destruct_locally);
+        // Run interpreter
+        let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET);
 
-            // Verify the operation was reverted by checking the action set on bytecode
-            assert_eq!(
-                res.result,
-                InstructionResult::Revert,
-                "Selfdestruct should revert when selfdestructing address is blocklisted"
-            );
-            assert_eq!(res.gas.spent(), STATIC_GAS_COST);
-            assert_eq!(res.gas.refunded(), 0i64);
+        // Verify the operation was reverted by checking the action set on bytecode
+        assert_eq!(
+            res.result,
+            InstructionResult::Revert,
+            "Selfdestruct should revert when selfdestructing address is blocklisted"
+        );
+        assert_eq!(res.gas.total_gas_spent(), STATIC_GAS_COST);
+        assert_eq!(res.gas.refunded(), 0i64);
 
-            // Verify balances are unchanged
-            assert_account_matches!(env, ACCOUNT, State::touch_new(), initial_account_balance);
-            assert_account_matches!(env, TARGET, State::touch_new(), initial_target_balance);
-        }
+        // Verify balances are unchanged
+        assert_account_matches!(env, ACCOUNT, State::touch_new(), initial_account_balance);
+        assert_account_matches!(env, TARGET, State::touch_new(), initial_target_balance);
     }
 
     // transfer to a destructed account
@@ -1151,32 +1301,29 @@ mod tests {
     fn selfdestruct_transfer_to_not_destructed_account() {
         let amount = U256::from(234);
 
-        for check_target_destruct_locally in [true, false] {
-            // Prepare host context with caller balance.
-            let mut env = HostTestEnv::new(EmptyDB::new());
-            env.set_account_balance(ACCOUNT, amount);
+        // Prepare host context with caller balance.
+        let mut env = HostTestEnv::new(EmptyDB::new());
+        env.set_account_balance(ACCOUNT, amount);
 
-            // Destruct `ACCOUNT`, transfer to empty, cold account `TARGET`
-            // After Cancun, the account will not be destructed if it was not created on the same transaction.
-            let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET, check_target_destruct_locally);
-            assert_eq!(res.result, InstructionResult::SelfDestruct);
-            assert_eq!(res.gas.spent(), 32600u64);
-            assert_eq!(res.gas.refunded(), 0i64);
-            assert_account_matches!(env, ACCOUNT, State::touch_new(), U256::ZERO);
-            assert_account_matches!(env, TARGET, State::touch_new(), amount);
+        // Destruct `ACCOUNT`, transfer to empty, cold account `TARGET`
+        // After Cancun, the account will not be destructed if it was not created on the same transaction.
+        let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET);
+        assert_eq!(res.result, InstructionResult::SelfDestruct);
+        assert_eq!(res.gas.total_gas_spent(), 32600u64);
+        assert_eq!(res.gas.refunded(), 0i64);
+        assert_account_matches!(env, ACCOUNT, State::touch_new(), U256::ZERO);
+        assert_account_matches!(env, TARGET, State::touch_new(), amount);
 
-            // Destruct `TARGET`, transfer to warm, not destructed account `ACCOUNT`
-            let res = env.simulate_arc_selfdestruct(TARGET, ACCOUNT, check_target_destruct_locally);
-            assert_eq!(res.result, InstructionResult::SelfDestruct);
-            assert_eq!(res.gas.spent(), 30000u64); // // 5000 static + 25000 new account, warm target
-            assert_eq!(res.gas.refunded(), 0i64);
-            assert_account_matches!(env, ACCOUNT, State::touch_new(), amount);
-            assert_account_matches!(env, TARGET, State::touch_new(), U256::ZERO);
-        }
+        // Destruct `TARGET`, transfer to warm, not destructed account `ACCOUNT`
+        let res = env.simulate_arc_selfdestruct(TARGET, ACCOUNT);
+        assert_eq!(res.result, InstructionResult::SelfDestruct);
+        assert_eq!(res.gas.total_gas_spent(), 30000u64); // // 5000 static + 25000 new account, warm target
+        assert_eq!(res.gas.refunded(), 0i64);
+        assert_account_matches!(env, ACCOUNT, State::touch_new(), amount);
+        assert_account_matches!(env, TARGET, State::touch_new(), U256::ZERO);
     }
 
     struct TransferToDestructedTestCase {
-        check_target_destruct_locally: bool,
         locally: bool,
         amount: U256,
         expect_state_after_selfdestructed: (AccountStatus, AccountStatus),
@@ -1185,7 +1332,7 @@ mod tests {
 
     impl TransferToDestructedTestCase {
         fn expect_revert(&self) -> bool {
-            self.check_target_destruct_locally && !self.amount.is_zero()
+            !self.amount.is_zero()
         }
     }
 
@@ -1195,7 +1342,6 @@ mod tests {
 
         let test_cases = [
             TransferToDestructedTestCase {
-                check_target_destruct_locally: true,
                 locally: true,
                 amount: U256::ZERO,
                 expect_state_after_selfdestructed: (
@@ -1205,17 +1351,6 @@ mod tests {
                 expect_state_after_committed: (State::loaded(), State::loaded_new()),
             },
             TransferToDestructedTestCase {
-                check_target_destruct_locally: false,
-                locally: true,
-                amount: U256::ZERO,
-                expect_state_after_selfdestructed: (
-                    State::touch_new(),
-                    State::touch_new_destructed(),
-                ),
-                expect_state_after_committed: (State::loaded(), State::loaded_new()),
-            },
-            TransferToDestructedTestCase {
-                check_target_destruct_locally: true,
                 locally: true,
                 amount: U256::from(234),
                 expect_state_after_selfdestructed: (
@@ -1225,17 +1360,6 @@ mod tests {
                 expect_state_after_committed: (State::loaded(), State::loaded_new()),
             },
             TransferToDestructedTestCase {
-                check_target_destruct_locally: false,
-                locally: true,
-                amount: U256::from(234),
-                expect_state_after_selfdestructed: (
-                    State::touch_new(),
-                    State::touch_new_destructed(),
-                ),
-                expect_state_after_committed: (State::loaded(), State::loaded_new()),
-            },
-            TransferToDestructedTestCase {
-                check_target_destruct_locally: true,
                 locally: false,
                 amount: U256::ZERO,
                 expect_state_after_selfdestructed: (
@@ -1245,27 +1369,6 @@ mod tests {
                 expect_state_after_committed: (State::loaded(), State::loaded_new()),
             },
             TransferToDestructedTestCase {
-                check_target_destruct_locally: false,
-                locally: false,
-                amount: U256::ZERO,
-                expect_state_after_selfdestructed: (
-                    State::touch_new(),
-                    State::destructed_new_before(),
-                ),
-                expect_state_after_committed: (State::loaded(), State::loaded_new()),
-            },
-            TransferToDestructedTestCase {
-                check_target_destruct_locally: true,
-                locally: false,
-                amount: U256::from(234),
-                expect_state_after_selfdestructed: (
-                    State::touch_new(),
-                    State::destructed_new_before(),
-                ),
-                expect_state_after_committed: (State::loaded(), State::loaded_new()),
-            },
-            TransferToDestructedTestCase {
-                check_target_destruct_locally: false,
                 locally: false,
                 amount: U256::from(234),
                 expect_state_after_selfdestructed: (
@@ -1278,8 +1381,8 @@ mod tests {
 
         for (index, tc) in test_cases.iter().enumerate() {
             let desc = format!(
-                "index={index}, check_target_destruct_locally={}, locally={}, amount={}",
-                tc.check_target_destruct_locally, tc.locally, tc.amount
+                "index={index}, locally={}, amount={}",
+                tc.locally, tc.amount
             );
             let mut env = HostTestEnv::new(InMemoryDB::default());
 
@@ -1287,8 +1390,7 @@ mod tests {
             env.set_account_balance(sender, tc.amount);
             env.simulate_create_account(sender, TARGET, tc.amount);
             assert_account_matches!(env, sender, State::touch_new(), U256::ZERO, "({desc})");
-            let res =
-                env.simulate_arc_selfdestruct(TARGET, ACCOUNT, tc.check_target_destruct_locally);
+            let res = env.simulate_arc_selfdestruct(TARGET, ACCOUNT);
             assert_eq!(res.result, InstructionResult::SelfDestruct, "({desc})");
             assert_account_matches!(
                 env,
@@ -1305,8 +1407,7 @@ mod tests {
             }
 
             // Destruct ACCOUNT, transfer balance to local destructed account `TARGET`
-            let res =
-                env.simulate_arc_selfdestruct(ACCOUNT, TARGET, tc.check_target_destruct_locally);
+            let res = env.simulate_arc_selfdestruct(ACCOUNT, TARGET);
 
             let (account_amount, target_amount) = if tc.expect_revert() {
                 assert_eq!(
@@ -1314,7 +1415,7 @@ mod tests {
                     InstructionResult::Revert,
                     "({desc}) not reverted",
                 );
-                assert_eq!(res.gas.spent(), STATIC_GAS_COST, "({desc})");
+                assert_eq!(res.gas.total_gas_spent(), STATIC_GAS_COST, "({desc})");
                 assert_eq!(res.gas.refunded(), 0i64, "({desc})");
                 (tc.amount, U256::ZERO)
             } else {
@@ -1371,29 +1472,23 @@ mod tests {
     // account B's selfdestruct in the same transaction). Arc does not implement delayed burn
     // logs because its restrictions prevent the scenarios that would trigger them:
     //   1. SELFDESTRUCT to self is always rejected (revert)
-    //   2. SELFDESTRUCT to Address::ZERO is rejected under Zero5
+    //   2. SELFDESTRUCT to Address::ZERO is rejected
     //   3. SELFDESTRUCT to an already-destructed target is rejected
-    // These tests verify each restriction holds under Zero5's EIP-7708 log mode.
+    // These tests verify each restriction holds under baseline EIP-7708 log mode.
 
-    /// Zero5: SELFDESTRUCT to self is rejected, so a self-destructed account cannot
+    /// SELFDESTRUCT to self is rejected, so a self-destructed account cannot
     /// re-receive its own balance (the primary delayed burn scenario).
     #[test]
-    fn selfdestruct_zero5_to_self_rejected() {
+    fn selfdestruct_to_self_rejected() {
         let amount = U256::from(100);
         let mut env = HostTestEnv::new(EmptyDB::new());
         env.set_account_balance(ACCOUNT, amount);
 
-        let res = env.simulate_arc_selfdestruct_full(
-            ACCOUNT,
-            ACCOUNT,
-            true,
-            Some(TransferLogMode::Eip7708Transfer),
-            None,
-        );
+        let res = env.simulate_arc_selfdestruct_full(ACCOUNT, ACCOUNT, None);
         assert_eq!(
             res.result,
             InstructionResult::Revert,
-            "Zero5: SELFDESTRUCT to self should revert"
+            "SELFDESTRUCT to self should revert"
         );
 
         // Balance unchanged — no state modification
@@ -1401,16 +1496,13 @@ mod tests {
 
         // No logs emitted
         let logs = env.host.journal_mut().take_logs();
-        assert!(
-            logs.is_empty(),
-            "Zero5: SELFDESTRUCT to self should emit no logs"
-        );
+        assert!(logs.is_empty(), "SELFDESTRUCT to self should emit no logs");
     }
 
-    /// Zero5: SELFDESTRUCT to an already-destructed target is rejected, preventing
+    /// SELFDESTRUCT to an already-destructed target is rejected, preventing
     /// cross-selfdestruct balance accumulation that would require delayed burn logs.
     #[test]
-    fn selfdestruct_zero5_to_destructed_target_rejected() {
+    fn selfdestruct_to_destructed_target_rejected() {
         let amount_a = U256::from(100);
         let amount_b = U256::from(200);
         let mut env = HostTestEnv::new(EmptyDB::new());
@@ -1422,13 +1514,7 @@ mod tests {
         env.set_account_balance(TARGET, amount_b);
 
         // First: ACCOUNT selfdestructs to TARGET (succeeds)
-        let res1 = env.simulate_arc_selfdestruct_full(
-            ACCOUNT,
-            TARGET,
-            true,
-            Some(TransferLogMode::Eip7708Transfer),
-            None,
-        );
+        let res1 = env.simulate_arc_selfdestruct_full(ACCOUNT, TARGET, None);
         assert_eq!(
             res1.result,
             InstructionResult::SelfDestruct,
@@ -1438,46 +1524,34 @@ mod tests {
         // TARGET now has balance: amount_b + amount_a
         // TARGET selfdestructs back to ACCOUNT — but ACCOUNT is now destructed.
         // Arc's check_selfdestruct_accounts rejects this.
-        let res2 = env.simulate_arc_selfdestruct_full(
-            TARGET,
-            ACCOUNT,
-            true, // check_target_destructed = true (Zero5+ behavior)
-            Some(TransferLogMode::Eip7708Transfer),
-            None,
-        );
+        let res2 = env.simulate_arc_selfdestruct_full(TARGET, ACCOUNT, None);
         assert_eq!(
             res2.result,
             InstructionResult::Revert,
-            "Zero5: SELFDESTRUCT to already-destructed target should revert"
+            "SELFDESTRUCT to already-destructed target should revert"
         );
     }
 
-    /// Zero5: SELFDESTRUCT to Address::ZERO with zero balance succeeds but produces no log.
+    /// SELFDESTRUCT to Address::ZERO with zero balance succeeds but produces no log.
     /// (The zero-address check only triggers when balance is non-zero.)
     #[test]
-    fn selfdestruct_zero5_to_zero_address_zero_balance_succeeds() {
+    fn selfdestruct_to_zero_address_zero_balance_succeeds() {
         let mut env = HostTestEnv::new(EmptyDB::new());
         // ACCOUNT has zero balance
         env.set_account_balance(ACCOUNT, U256::ZERO);
 
-        let res = env.simulate_arc_selfdestruct_full(
-            ACCOUNT,
-            Address::ZERO,
-            true,
-            Some(TransferLogMode::Eip7708Transfer),
-            None,
-        );
+        let res = env.simulate_arc_selfdestruct_full(ACCOUNT, Address::ZERO, None);
         // Zero balance → the non-zero branch is skipped entirely → proceeds to host.selfdestruct
         assert_eq!(
             res.result,
             InstructionResult::SelfDestruct,
-            "Zero5: SELFDESTRUCT to zero address with zero balance should succeed"
+            "SELFDESTRUCT to zero address with zero balance should succeed"
         );
 
         let logs = env.host.journal_mut().take_logs();
         assert!(
             logs.is_empty(),
-            "Zero5: SELFDESTRUCT with zero balance should emit no logs"
+            "SELFDESTRUCT with zero balance should emit no logs"
         );
     }
 }

@@ -12,6 +12,31 @@ Entries are split by audience. A change appears under `### For Validators` when 
 
 Compare and release-notes links resolve once the corresponding tag is published at [`circlefin/arc-node`](https://github.com/circlefin/arc-node).
 
+## [v0.8.0]
+
+**Changes:** [v0.7.3...v0.8.0](https://github.com/circlefin/arc-node/compare/v0.7.3...v0.8.0) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.0)
+
+### For Node Operators
+
+- **[Format] JSON-RPC error text on insufficient-balance `eth_call` / `eth_estimateGas` changed with the reth 2.2 / revm 38 upgrade.**
+  - Value exceeds balance: the error previously read `insufficient funds for gas * price + value`; it now reflects revm 38's `OutOfFunds` variant.
+  - Simple (EOA-to-EOA) transfer with insufficient balance: reth 2.2 runs these RPC paths with `disable_fee_charge`, so the basic-transfer shortcut no longer applies the caller gas-allowance cap. The surfaced error shifted from `Missing or invalid parameters` to `gas required exceeds allowance`.
+  - Neither string is a stable API contract, but tooling that matches JSON-RPC error text on these paths must update its patterns. No consensus-affecting behavior changed; only the RPC error surface.
+- **[CLI] `arc-node-consensus` admin RPC routes are disabled by default.**
+  - The unauthenticated `POST` and `DELETE /persistent-peers` routes are no longer mounted unless `--rpc.admin` is provided.
+  - Read-only RPC routes are unaffected.
+  - Operators using persistent-peer mutation routes must add `--rpc.admin` and restrict the RPC listener to a trusted interface.
+- **[Config] Explicit invalid CL environment values now fail startup.**
+  - Unset or empty `ARC_*` configuration variables continue to use their defaults.
+  - Malformed values, and zero values for resource sizes, counts, timeouts, or thresholds that must be positive, now abort startup instead of silently falling back.
+  - Correct or remove invalid environment values before upgrading.
+- **[CLI] `arc-node-execution` denylist configuration flags were removed and denylist checks are mandatory.**
+  - Remove `--arc.denylist.enabled`, `--arc.denylist.address`, and `--arc.denylist.storage-slot`. `--arc.denylist.addresses-exclusions` remains available.
+- **[CLI] `arc-snapshots download` no longer defaults `--chain` to testnet and adds an execution manifest profile.**
+  - Add `--chain <CHAIN>` for automatic URL resolution. For a manifest URL, also add `--el-profile <minimal|full|archive>`.
+- **[Config] Execution-layer pruning presets now inject a 128-block pruning interval.**
+  - `node --full` and `node --minimal` previously injected `5000`. Set `--prune.block-interval=5000` explicitly to retain that schedule.
+
 ## [v0.7.3]
 
 **Changes:** [v0.7.2...v0.7.3](https://github.com/circlefin/arc-node/compare/v0.7.2...v0.7.3) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.7.3)
@@ -63,7 +88,7 @@ No breaking changes in this release.
 
 **Changes:** [v0.6.0...v0.7.0](https://github.com/circlefin/arc-node/compare/v0.6.0...v0.7.0) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.7.0)
 
-*Note: mainnet node operators must use v0.7.0. Earlier versions are not supported.* 
+*Note: mainnet node operators must use v0.7.0. Earlier versions are not supported.*
 
 ### For Node Operators
 

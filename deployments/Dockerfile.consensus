@@ -1,7 +1,7 @@
 ###############
 # cargo chef
 ###############
-FROM public.ecr.aws/docker/library/rust:1.91.1-bookworm AS chef
+FROM public.ecr.aws/docker/library/rust:1.93.0-bookworm AS chef
 
 # Install any custom CA certificates from the certs named context.
 RUN --mount=type=bind,from=certs,target=/usr/local/share/ca-certificates/ \
@@ -52,7 +52,14 @@ COPY --from=planner /src/arc-node-consensus-recipe.json arc-node-consensus-recip
 RUN --mount=type=cache,id=malachite-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=malachite-cargo-git,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=malachite-cargo-target,sharing=locked,target=/app/target \
+    --mount=type=secret,id=github_token,required=false \
     # Cook the recipe produced by the planner, namely compile dependencies
+    set -eu; \
+    if [ -s /run/secrets/github_token ]; then \
+        token="$(cat /run/secrets/github_token)"; \
+        git config --global url."https://${token}@github.com/".insteadOf "https://github.com/"; \
+        trap 'git config --global --remove-section url."https://${token}@github.com/" || true' EXIT; \
+    fi; \
     cargo chef cook --bin arc-node-consensus --bin arc-snapshots --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path arc-node-consensus-recipe.json
 
 # Per-commit git version args come after dep-cook — moving them here prevents the
@@ -76,6 +83,13 @@ COPY . .
 RUN --mount=type=cache,id=malachite-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=malachite-cargo-git,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=malachite-cargo-target,sharing=locked,target=/app/target \
+    --mount=type=secret,id=github_token,required=false \
+    set -eu; \
+    if [ -s /run/secrets/github_token ]; then \
+        token="$(cat /run/secrets/github_token)"; \
+        git config --global url."https://${token}@github.com/".insteadOf "https://github.com/"; \
+        trap 'git config --global --remove-section url."https://${token}@github.com/" || true' EXIT; \
+    fi; \
     cargo build --bin arc-node-consensus --bin arc-snapshots --profile $BUILD_PROFILE --features "$FEATURES" --locked && \
     # Copy built binaries to a temporary, non-cached location to make them accessible to the next stage.
     # Cargo outputs 'dev' profile to 'debug' directory, but other profiles use their own name

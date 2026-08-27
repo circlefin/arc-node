@@ -274,6 +274,7 @@ impl Manifest {
             block_gas_limit: None,
             node_volume_type: None,
             node_volume_iops: None,
+            node_data_on_instance_store: false,
             el_cpu_limit: None,
             el_memory_limit_gb: None,
             cl_cpu_limit: None,
@@ -298,7 +299,7 @@ impl Manifest {
     }
 
     /// Build random per-node CL (Consensus Layer) config.
-    fn random_cl_node_config(rng: &mut StdRng, allow_no_consensus: bool) -> manifest::NodeClConfig {
+    fn random_cl_node_config(rng: &mut StdRng, allow_no_consensus: bool) -> StartCmd {
         use malachitebft_config::{LogFormat, LogLevel};
 
         // Runtime: 30% single_threaded, 70% multi_threaded; worker_threads 1-16 when multi.
@@ -339,7 +340,7 @@ impl Manifest {
 
         let no_consensus = allow_no_consensus && rng.gen_bool(0.1);
 
-        manifest::NodeClConfig::Modern(StartCmd {
+        StartCmd {
             runtime_flavor,
             worker_threads,
             prune_certificates_distance: distance,
@@ -348,7 +349,7 @@ impl Manifest {
             log_format,
             no_consensus,
             ..StartCmd::default()
-        })
+        }
     }
 
     /// Build random per-node EL (Execution Layer) config override.
@@ -885,9 +886,7 @@ mod tests {
         let manifest = Manifest::generate_random(100, &config).unwrap();
 
         for (node_id, node) in &manifest.nodes {
-            let manifest::NodeClConfig::Modern(cmd) = &node.cl_config else {
-                panic!("node {node_id}: expected Modern cl_config");
-            };
+            let cmd = &node.cl_config;
 
             assert!(
                 cmd != &StartCmd::default(),
@@ -1044,9 +1043,7 @@ mod tests {
                     .nodes
                     .get(name)
                     .unwrap_or_else(|| panic!("seed {seed}: {name} missing"));
-                let manifest::NodeClConfig::Modern(cmd) = &node.cl_config else {
-                    panic!("seed {seed}: {name} expected Modern cl_config");
-                };
+                let cmd = &node.cl_config;
                 assert!(
                     !cmd.no_consensus,
                     "seed {seed}: {name} must keep no_consensus=false (would partition consensus)"
@@ -1056,9 +1053,7 @@ mod tests {
                 if node.node_type != NodeType::Validator {
                     continue;
                 }
-                let manifest::NodeClConfig::Modern(cmd) = &node.cl_config else {
-                    panic!("seed {seed}: validator {name} expected Modern cl_config");
-                };
+                let cmd = &node.cl_config;
                 assert!(
                     !cmd.no_consensus,
                     "seed {seed}: validator {name} must never have no_consensus=true"

@@ -22,7 +22,7 @@
 //! `arc_ethereum_payload` and converted to `UnprocessableTransactionError`.
 
 use alloy_primitives::U256;
-use alloy_primitives::{hex, TxHash};
+use alloy_primitives::{hex, TxHash, B256};
 use alloy_rlp::Encodable;
 use eyre::Result;
 use reth_basic_payload_builder::{
@@ -32,25 +32,32 @@ use reth_basic_payload_builder::{
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
 use reth_errors::{BlockExecutionError, BlockValidationError, ConsensusError};
+use reth_ethereum::trie::updates::TrieUpdates;
+use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
 use reth_evm::{
-    execute::{BlockBuilder, BlockBuilderOutcome},
+    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutor},
     ConfigureEvm, Evm, NextBlockEnvAttributes,
+};
+use reth_execution_cache::{
+    CachedStateMetrics, CachedStateMetricsSource, CachedStateProvider, SavedCache,
 };
 use reth_node_api::{NodeTypes, PrimitivesTy};
 use reth_node_builder::{
     components::PayloadBuilderBuilder, node::FullNodeTypes, BuilderContext, PayloadBuilderConfig,
 };
-use reth_payload_builder::{BlobSidecars, EthBuiltPayload, EthPayloadBuilderAttributes};
-use reth_payload_primitives::{PayloadBuilderAttributes, PayloadBuilderError};
+use reth_payload_builder::{BlobSidecars, EthBuiltPayload};
+use reth_payload_primitives::PayloadBuilderError;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
 use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_storage_api::StateProviderFactory;
+use reth_storage_api::{StateProviderBox, StateProviderFactory};
 use reth_transaction_pool::{
     error::InvalidPoolTransactionError, BestTransactions, BestTransactionsAttributes,
     PoolTransaction, TransactionPool, ValidPoolTransaction,
 };
+use reth_trie_parallel::state_root_task::StateRootHandle;
+use revm::context_interface::result::InvalidTransaction;
 use revm::context_interface::Block as _;
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
@@ -62,6 +69,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::builder::UnprocessableTransactionError;
 use crate::metrics::PayloadBuildMetrics;
 use arc_execution_txpool::InvalidTxList;
+use arc_precompiles::helpers::ERR_BLOCKED_ADDRESS;
 
 type BestTransactionsIter<Pool> = Box<
     dyn BestTransactions<Item = Arc<ValidPoolTransaction<<Pool as TransactionPool>::Transaction>>>,
@@ -109,7 +117,6 @@ where
     <Node::Types as NodeTypes>::Payload: reth_node_api::PayloadTypes<
         BuiltPayload = EthBuiltPayload,
         PayloadAttributes = reth_ethereum_engine_primitives::EthPayloadAttributes,
-        PayloadBuilderAttributes = EthPayloadBuilderAttributes,
     >,
 {
     type PayloadBuilder = InvalidTxFilteringPayloadBuilder<
@@ -219,12 +226,8 @@ fn purge_unprocessable_tx<P: TransactionPool>(
             error!(tx_hash = %tx_hash, "unprocessable transaction not found in pool");
         }
 
-        if let Some(invalid_tx_list) = invalid_tx_list {
-            error!(tx_hash = %tx_hash, "adding unprocessable transaction to invalid tx list");
-            add_pending_txs_to_invalid_list(pool, invalid_tx_list, vec![tx_hash]);
-        } else {
-            error!(tx_hash = %tx_hash, "invalid tx list is disabled, cannot add unprocessable transaction");
-        }
+        error!(tx_hash = %tx_hash, quarantined = invalid_tx_list.is_some(), "evicting unprocessable transaction from pool");
+        evict_unincludable_txs(pool, invalid_tx_list, vec![tx_hash]);
     }
 }
 
@@ -242,12 +245,11 @@ fn purge_pending_and_resume_panic<P: TransactionPool>(
         .map(|tx| *tx.hash())
         .collect();
 
-    if let Some(invalid_tx_list) = invalid_tx_list {
-        error!("payload builder panicked, adding all PENDING TXs to invalid tx list");
-        add_pending_txs_to_invalid_list(pool, invalid_tx_list, pending_hashes);
-    } else {
-        error!("payload builder panicked, but invalid tx list disabled");
-    }
+    error!(
+        quarantined = invalid_tx_list.is_some(),
+        "payload builder panicked, evicting all PENDING TXs from pool"
+    );
+    evict_unincludable_txs(pool, invalid_tx_list, pending_hashes);
     std::panic::resume_unwind(panic)
 }
 
@@ -312,7 +314,7 @@ fn extract_unprocessable_tx_hash(err: &PayloadBuilderError) -> Option<TxHash> {
     }
 }
 
-/// Introduced to improve testability of `add_pending_txs_to_invalid_list`
+/// Introduced to improve testability of `evict_unincludable_txs`
 trait PendingPool {
     fn remove_transactions_and_descendants(&self, hashes: Vec<TxHash>) -> usize;
     fn pending_len(&self) -> usize;
@@ -327,25 +329,46 @@ impl<T: TransactionPool> PendingPool for T {
     }
 }
 
-fn add_pending_txs_to_invalid_list<P: PendingPool>(
+/// Evicts permanently un-includable transactions.
+///
+/// Pool removal is unconditional — it frees the slot and unblocks the sender's nonce, which
+/// is the remediation and must happen regardless of whether the invalid-tx-list
+/// feature is enabled. Quarantining the hash in the `InvalidTxList` is an
+/// optional re-gossip suppression on top, applied only when a list is configured.
+fn evict_unincludable_txs<P: PendingPool>(
     pool: &P,
-    invalid_tx_list: &InvalidTxList,
+    invalid_tx_list: Option<&InvalidTxList>,
     hashes: Vec<TxHash>,
 ) {
     let before = pool.pending_len();
 
     if hashes.is_empty() {
-        error!("add_pending_txs_to_invalid_list: no pending transactions to add");
+        error!("evict_unincludable_txs: no transactions to evict");
     }
 
-    invalid_tx_list.insert_many(hashes.iter().copied());
+    if let Some(invalid_tx_list) = invalid_tx_list {
+        invalid_tx_list.insert_many(hashes.iter().copied());
+    }
     let removed = pool.remove_transactions_and_descendants(hashes);
     warn!(
         removed,
         pending_before = before,
         pending_after = pool.pending_len(),
-        "added pending txs to invalid tx list"
+        quarantined = invalid_tx_list.is_some(),
+        "evicted unincludable txs from pool"
     );
+}
+
+/// True when a tx can never be included under the current block gas limit (as opposed to
+/// merely not fitting this block's remaining gas, which can be retried in a fresh block).
+fn exceeds_block_gas_limit_permanently(tx_gas_limit: u64, block_gas_limit: u64) -> bool {
+    tx_gas_limit > block_gas_limit
+}
+
+/// True when an EVM rejection is a blocklist hit. A blocklisted address can never produce an
+/// includable tx until it is unblocklisted, so such a tx is permanently un-includable.
+fn is_blocked_address_error(err: Option<&InvalidTransaction>) -> bool {
+    matches!(err, Some(InvalidTransaction::Str(msg)) if msg.as_ref() == ERR_BLOCKED_ADDRESS)
 }
 
 /// Format TX data as a multi-line hexdump if too long.
@@ -422,12 +445,12 @@ where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
 {
-    type Attributes = EthPayloadBuilderAttributes;
+    type Attributes = EthPayloadAttributes;
     type BuiltPayload = EthBuiltPayload;
 
     fn try_build(
         &self,
-        args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
+        args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
         arc_ethereum_payload(
             self.evm_config.clone(),
@@ -455,9 +478,16 @@ where
 
     fn build_empty_payload(
         &self,
-        config: PayloadConfig<Self::Attributes>,
+        config: PayloadConfig<Self::Attributes, HeaderForPayload<Self::BuiltPayload>>,
     ) -> Result<Self::BuiltPayload, PayloadBuilderError> {
-        let args = BuildArguments::new(Default::default(), config, Default::default(), None);
+        let args = BuildArguments::new(
+            Default::default(),
+            Default::default(),
+            None,
+            config,
+            Default::default(),
+            None,
+        );
 
         // This is what's done in upstream EthereumPayloadBuilder::build_empty_payload
         arc_ethereum_payload(
@@ -489,6 +519,137 @@ fn proposer_revenue<T: alloy_consensus::Transaction>(tx: &T, gas_used: u64, base
     }
 }
 
+/// Outcome of running a single transaction in the payload-building loop.
+enum TxOutcome {
+    /// Transaction executed successfully — record `gas_used`, advance.
+    Included(u64),
+    /// Skip this tx silently (e.g. nonce too low). Caller continues.
+    Skip,
+    /// Skip and mark the tx invalid in the pool so descendants are evicted.
+    SkipAndMarkInvalid,
+    /// Tx was rejected because its sender or recipient is blocklisted. Skip, mark
+    /// invalid, and evict from the pool — a blocklisted address is permanently
+    /// un-includable until unblocklisted.
+    SkipMarkInvalidAndEvictBlocked,
+    /// Tx gas limit exceeds the gas remaining in the block. Skip and mark invalid
+    /// with the executor's reported limits so descendants are evicted.
+    SkipExceedsGasLimit {
+        transaction_gas_limit: u64,
+        block_available_gas: u64,
+    },
+    /// Unrecoverable error for this build attempt — propagate.
+    Fatal(PayloadBuilderError),
+}
+
+/// Classifies the result of `catch_unwind(|| builder.execute_transaction(...))`
+/// into one of six loop-control outcomes. The caller is responsible for invoking
+/// `best_txs.mark_invalid(...)` (and pool eviction) on the `SkipAndMarkInvalid`,
+/// `SkipMarkInvalidAndEvictBlocked`, and `SkipExceedsGasLimit` arms — kept out of
+/// this helper so the signature stays non-generic.
+fn classify_tx_outcome(
+    result: std::thread::Result<Result<u64, BlockExecutionError>>,
+    tx_hash: TxHash,
+    tx: &TransactionSigned,
+) -> TxOutcome {
+    match result {
+        Ok(Ok(gas_used)) => TxOutcome::Included(gas_used),
+        Ok(Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
+            error, ..
+        }))) => {
+            if error.is_nonce_too_low() {
+                trace!(target: "payload_builder", %error, ?tx, "(arc) skipping nonce too low transaction");
+                TxOutcome::Skip
+            } else if is_blocked_address_error(error.as_invalid_tx_err()) {
+                trace!(target: "payload_builder", %error, ?tx, "(arc) evicting blocklisted transaction and its descendants");
+                TxOutcome::SkipMarkInvalidAndEvictBlocked
+            } else {
+                trace!(target: "payload_builder", %error, ?tx, "(arc) skipping invalid transaction and its descendants");
+                TxOutcome::SkipAndMarkInvalid
+            }
+        }
+        // The executor is the source of truth for block gas availability. Keep this
+        // non-fatal in case local builder accounting diverges from executor rules.
+        Ok(Err(BlockExecutionError::Validation(
+            BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                transaction_gas_limit,
+                block_available_gas,
+            },
+        ))) => {
+            trace!(target: "payload_builder", %transaction_gas_limit, %block_available_gas, ?tx, "(arc) skipping transaction exceeding block gas limit");
+            TxOutcome::SkipExceedsGasLimit {
+                transaction_gas_limit,
+                block_available_gas,
+            }
+        }
+        Ok(Err(err)) => TxOutcome::Fatal(PayloadBuilderError::evm(err)),
+        Err(_panic_payload) => {
+            TxOutcome::Fatal(PayloadBuilderError::other(UnprocessableTransactionError {
+                tx_hash,
+            }))
+        }
+    }
+}
+
+/// True when an optional time budget has been exceeded.
+fn time_budget_exhausted(started: Instant, limit: Option<Duration>) -> bool {
+    limit.is_some_and(|l| started.elapsed() >= l)
+}
+
+/// True when the Osaka hardfork is active AND the candidate block size
+/// exceeds [`MAX_RLP_BLOCK_SIZE`].
+fn osaka_size_exceeded(is_osaka: bool, size: usize) -> bool {
+    is_osaka && size > MAX_RLP_BLOCK_SIZE
+}
+
+/// Returns `state_provider` wrapped in a [`CachedStateProvider`] when an
+/// execution cache is present, otherwise returns it unwrapped. Centralises
+/// the conditional so the caller stays free of control flow.
+fn maybe_wrap_with_execution_cache(
+    state_provider: StateProviderBox,
+    execution_cache: Option<SavedCache>,
+) -> StateProviderBox {
+    if let Some(cache) = execution_cache {
+        // reth 2.2 removed `SavedCache::metrics()`, so we construct fresh builder-sourced
+        // metrics per build, matching the default payload builder. Per-cache hit/miss
+        // continuity is lost; global Prometheus aggregates are unaffected because the
+        // metric handles are shared.
+        Box::new(CachedStateProvider::new(
+            state_provider,
+            cache.cache().clone(),
+            CachedStateMetrics::zeroed(CachedStateMetricsSource::Builder),
+        ))
+    } else {
+        state_provider
+    }
+}
+
+/// Drives the sparse-trie state-root task to completion, falling back to
+/// sync state-root computation (returns `None`) on failure. Returns the
+/// precomputed `(state_root, trie_updates)` pair to hand to
+/// `BlockBuilder::finish` when the parallel result is usable.
+///
+/// Caller must clear the builder's state hook before invoking — the helper
+/// stays non-generic by keeping the builder out of its signature.
+fn try_precomputed_state_root(
+    trie_handle: Option<StateRootHandle>,
+    payload_id: &impl std::fmt::Display,
+) -> Option<(B256, TrieUpdates)> {
+    let mut handle = trie_handle?;
+    match handle.state_root() {
+        Ok(outcome) => {
+            debug!(target: "payload_builder", id=%payload_id, state_root=?outcome.state_root, "(arc) received state root from sparse trie");
+            Some((
+                outcome.state_root,
+                Arc::unwrap_or_clone(outcome.trie_updates),
+            ))
+        }
+        Err(err) => {
+            warn!(target: "payload_builder", id=%payload_id, %err, "(arc) sparse trie failed, falling back to sync state root");
+            None
+        }
+    }
+}
+
 /// Constructs an transaction payload using the best transactions from the pool.
 /// It follows the upstream Ethereum payload building logic with a Arc-specific deadline for the main loop.
 ///
@@ -497,13 +658,14 @@ fn proposer_revenue<T: alloy_consensus::Transaction>(tx: &T, gas_used: u64, base
 /// and configuration, this function creates a transaction payload. Returns
 /// a result indicating success with the payload or an error in case of failure.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn arc_ethereum_payload<EvmConfig, Client, Pool, F>(
     evm_config: EvmConfig,
     client: Client,
-    _pool: Pool,
+    pool: Pool,
     builder_config: EthereumBuilderConfig,
     loop_time_limit: Option<Duration>,
-    args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
+    args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
     best_txs: F,
 ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
 where
@@ -514,6 +676,8 @@ where
 {
     let BuildArguments {
         mut cached_reads,
+        execution_cache,
+        trie_handle,
         config,
         cancel,
         best_payload,
@@ -521,12 +685,16 @@ where
     let PayloadConfig {
         parent_header,
         attributes,
+        payload_id,
     } = config;
 
     let total_start = Instant::now();
 
     let stage_start = Instant::now();
-    let state_provider = client.state_by_block_hash(parent_header.hash())?;
+    let state_provider = maybe_wrap_with_execution_cache(
+        client.state_by_block_hash(parent_header.hash())?,
+        execution_cache,
+    );
     let state = StateProviderDatabase::new(state_provider.as_ref());
     let mut db = State::builder()
         .with_database(cached_reads.as_db_mut(state))
@@ -539,20 +707,21 @@ where
             &mut db,
             &parent_header,
             NextBlockEnvAttributes {
-                timestamp: attributes.timestamp(),
-                suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                prev_randao: attributes.prev_randao(),
+                timestamp: attributes.timestamp,
+                suggested_fee_recipient: attributes.suggested_fee_recipient,
+                prev_randao: attributes.prev_randao,
                 gas_limit: builder_config.gas_limit(parent_header.gas_limit),
-                parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                withdrawals: Some(attributes.withdrawals().clone()),
+                parent_beacon_block_root: attributes.parent_beacon_block_root,
+                withdrawals: attributes.withdrawals.clone().map(Into::into),
                 extra_data: builder_config.extra_data,
+                slot_number: None,
             },
         )
         .map_err(PayloadBuilderError::other)?;
 
     let chain_spec = client.chain_spec();
 
-    info!(target: "payload_builder", id=%attributes.id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "(arc) building new payload");
+    info!(target: "payload_builder", id=%payload_id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "(arc) building new payload");
     let mut cumulative_gas_used = 0u64;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
@@ -562,6 +731,12 @@ where
         None, // Explicitly disable blob transactions by not providing a blob gas price.
     ));
     let mut total_fees = U256::ZERO;
+
+    trie_handle.as_ref().inspect(|handle| {
+        builder
+            .executor_mut()
+            .set_state_hook(Some(Box::new(handle.state_hook())));
+    });
 
     let stage_start = Instant::now();
     builder.apply_pre_execution_changes().map_err(|err| {
@@ -573,19 +748,16 @@ where
     let mut block_transactions_rlp_length = 0usize;
     let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp);
 
-    let withdrawals_rlp_length = attributes.withdrawals().length();
+    let withdrawals_rlp_length = attributes.withdrawals.as_ref().map_or(0, |w| w.length());
 
     let loop_started = Instant::now();
 
     while let Some(pool_tx) = best_txs.next() {
-        // Break early if loop time budget exhausted
-        if let Some(limit) = loop_time_limit {
-            if loop_started.elapsed() >= limit {
-                #[allow(clippy::cast_possible_truncation)]
-                let elapsed_ms = loop_started.elapsed().as_millis() as u64;
-                warn!(elapsed_ms, "(arc) loop time budget reached; sealing early");
-                break;
-            }
+        if time_budget_exhausted(loop_started, loop_time_limit) {
+            #[allow(clippy::cast_possible_truncation)]
+            let elapsed_ms = loop_started.elapsed().as_millis() as u64;
+            warn!(elapsed_ms, "(arc) loop time budget reached; sealing early");
+            break;
         }
 
         // ensure we still have capacity for this transaction
@@ -601,6 +773,15 @@ where
                 &pool_tx,
                 &InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
             );
+            // A tx whose gas limit exceeds the block gas limit can never be included in any
+            // block, so evict it from the pool instead of skipping it every build. This is a
+            // recoverable condition (the limit may be raised), so we only free the pool slot
+            // and leave re-admission to the validator's stateful gas-limit check rather than
+            // quarantining the hash in the invalid tx list.
+            if exceeds_block_gas_limit_permanently(pool_tx.gas_limit(), block_gas_limit) {
+                warn!(target: "payload_builder", tx_hash = %pool_tx.hash(), tx_gas_limit = pool_tx.gas_limit(), block_gas_limit, "(arc) evicting permanently un-includable transaction (exceeds block gas limit)");
+                evict_unincludable_txs(&pool, None, vec![*pool_tx.hash()]);
+            }
             continue;
         }
 
@@ -622,7 +803,7 @@ where
             .saturating_add(withdrawals_rlp_length)
             .saturating_add(1024); // 1Kb of overhead for the block header
 
-        if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
+        if osaka_size_exceeded(is_osaka, estimated_block_size_with_tx) {
             best_txs.mark_invalid(
                 &pool_tx,
                 &InvalidPoolTransactionError::OversizedData {
@@ -633,40 +814,55 @@ where
             continue;
         }
 
-        let gas_used = match catch_unwind(AssertUnwindSafe(|| {
-            builder.execute_transaction(tx.clone())
-        })) {
-            Ok(Ok(gas_used)) => gas_used,
-            Ok(Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
-                error,
-                ..
-            }))) => {
-                if error.is_nonce_too_low() {
-                    // if the nonce is too low, we can skip this transaction
-                    trace!(target: "payload_builder", %error, ?tx, "(arc) skipping nonce too low transaction");
-                } else {
-                    // if the transaction is invalid, we can skip it and all of its
-                    // descendants
-                    trace!(target: "payload_builder", %error, ?tx, "(arc) skipping invalid transaction and its descendants");
-                    best_txs.mark_invalid(
-                        &pool_tx,
-                        &InvalidPoolTransactionError::Consensus(
-                            InvalidTransactionError::TxTypeNotSupported,
-                        ),
-                    );
-                }
+        let raw_result = catch_unwind(AssertUnwindSafe(|| {
+            builder
+                .execute_transaction(tx.clone())
+                .map(|out| out.tx_gas_used())
+        }));
+        let gas_used = match classify_tx_outcome(raw_result, *pool_tx.hash(), &tx) {
+            TxOutcome::Included(g) => g,
+            TxOutcome::Skip => continue,
+            TxOutcome::SkipAndMarkInvalid => {
+                best_txs.mark_invalid(
+                    &pool_tx,
+                    &InvalidPoolTransactionError::Consensus(
+                        InvalidTransactionError::TxTypeNotSupported,
+                    ),
+                );
                 continue;
             }
-            // this is an error that we should treat as fatal for this attempt
-            Ok(Err(err)) => return Err(PayloadBuilderError::evm(err)),
-            // a single transaction caused a panic — wrap it so handle_build_res
-            // can identify the offending tx and purge it from the mempool
-            Err(_panic_payload) => {
-                let tx_hash = *pool_tx.hash();
-                return Err(PayloadBuilderError::other(UnprocessableTransactionError {
-                    tx_hash,
-                }));
+            TxOutcome::SkipMarkInvalidAndEvictBlocked => {
+                best_txs.mark_invalid(
+                    &pool_tx,
+                    &InvalidPoolTransactionError::Consensus(
+                        InvalidTransactionError::TxTypeNotSupported,
+                    ),
+                );
+                // A blocklisted address can never produce an includable tx until it is
+                // unblocklisted, so evict it from the pool instead of skipping it every
+                // build. This is a recoverable condition (the address may be
+                // unblocklisted), so we only free the pool slot and leave re-admission to
+                // the validator's stateful blocklist check rather than quarantining the
+                // hash in the invalid tx list. Other invalid errors (e.g. insufficient
+                // funds) may become valid later, so they keep the skip-only behavior above.
+                warn!(target: "payload_builder", tx_hash = %pool_tx.hash(), sender = %pool_tx.sender(), to = ?pool_tx.to(), "(arc) evicting permanently un-includable transaction (blocklisted address)");
+                evict_unincludable_txs(&pool, None, vec![*pool_tx.hash()]);
+                continue;
             }
+            TxOutcome::SkipExceedsGasLimit {
+                transaction_gas_limit,
+                block_available_gas,
+            } => {
+                best_txs.mark_invalid(
+                    &pool_tx,
+                    &InvalidPoolTransactionError::ExceedsGasLimit(
+                        transaction_gas_limit,
+                        block_available_gas,
+                    ),
+                );
+                continue;
+            }
+            TxOutcome::Fatal(e) => return Err(e),
         };
 
         block_transactions_rlp_length = block_transactions_rlp_length.saturating_add(tx_rlp_len);
@@ -696,11 +892,15 @@ where
     }
 
     let builder_finish = Instant::now();
+    // `set_state_hook(None)` is idempotent; call unconditionally so the
+    // sparse-trie hook (if any) is always cleared before block finalization.
+    builder.executor_mut().set_state_hook(None);
+    let precomputed = try_precomputed_state_root(trie_handle, &payload_id);
     let BlockBuilderOutcome {
         execution_result,
         block,
         ..
-    } = builder.finish(state_provider.as_ref())?;
+    } = builder.finish(state_provider.as_ref(), precomputed)?;
     PayloadBuildMetrics::record_stage_post_execution(builder_finish.elapsed());
 
     let stage_start = Instant::now();
@@ -709,9 +909,9 @@ where
         .then_some(execution_result.requests);
 
     let sealed_block = Arc::new(block.sealed_block().clone());
-    debug!(target: "payload_builder", id=%attributes.id, sealed_block_header = ?sealed_block.sealed_header(), "(arc) sealed built block");
+    debug!(target: "payload_builder", id=%payload_id, sealed_block_header = ?sealed_block.sealed_header(), "(arc) sealed built block");
 
-    if is_osaka && sealed_block.rlp_length() > MAX_RLP_BLOCK_SIZE {
+    if osaka_size_exceeded(is_osaka, sealed_block.rlp_length()) {
         PayloadBuildMetrics::record_stage_assembly_and_sealing(stage_start.elapsed());
         PayloadBuildMetrics::record_total_duration(total_start);
         return Err(PayloadBuilderError::other(ConsensusError::BlockTooLarge {
@@ -720,7 +920,7 @@ where
         }));
     }
 
-    let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests)
+    let payload = EthBuiltPayload::new(sealed_block, total_fees, requests, None)
         // add blob sidecars from the executed txs; empty for now
         .with_sidecars(BlobSidecars::Empty);
     PayloadBuildMetrics::record_stage_assembly_and_sealing(stage_start.elapsed());
@@ -766,11 +966,45 @@ mod tests {
     }
 
     #[test]
-    fn add_pending_txs_to_invalid_list_inserts_all() {
+    fn exceeds_block_gas_limit_permanently_classifies_correctly() {
+        // Strictly greater than the block limit: can never fit any block.
+        assert!(exceeds_block_gas_limit_permanently(30000001, 30000000));
+        // Equal to or below the block limit: fits a fresh block, only temporarily skipped.
+        assert!(!exceeds_block_gas_limit_permanently(30000000, 30000000));
+        assert!(!exceeds_block_gas_limit_permanently(21000, 30000000));
+    }
+
+    #[test]
+    fn is_blocked_address_error_only_matches_blocklist() {
+        // Blocklist rejection: permanent until unblocklisted -> evict.
+        let blocked = InvalidTransaction::Str(ERR_BLOCKED_ADDRESS.into());
+        assert!(is_blocked_address_error(Some(&blocked)));
+
+        // Other string errors must not be treated as blocklist hits.
+        let other = InvalidTransaction::Str("some other error".into());
+        assert!(!is_blocked_address_error(Some(&other)));
+
+        // Temporarily-invalid errors may become valid later -> keep.
+        assert!(!is_blocked_address_error(Some(
+            &InvalidTransaction::NonceTooLow { tx: 1, state: 2 }
+        )));
+        assert!(!is_blocked_address_error(Some(
+            &InvalidTransaction::LackOfFundForMaxFee {
+                fee: Box::new(U256::from(1)),
+                balance: Box::new(U256::ZERO),
+            }
+        )));
+
+        // No invalid-tx error at all (e.g. a non-InvalidTransaction rejection).
+        assert!(!is_blocked_address_error(None));
+    }
+
+    #[test]
+    fn evict_unincludable_txs_inserts_all() {
         let hashes: Vec<TxHash> = (0..3).map(TxHash::repeat_byte).collect();
         let pool = MockPendingPool::new(hashes.clone());
         let invalid_tx_list = InvalidTxList::new(16);
-        add_pending_txs_to_invalid_list(&pool, &invalid_tx_list, hashes.clone());
+        evict_unincludable_txs(&pool, Some(&invalid_tx_list), hashes.clone());
         assert_eq!(hashes.len(), invalid_tx_list.len());
         for h in hashes {
             assert!(invalid_tx_list.contains(&h));
@@ -778,23 +1012,38 @@ mod tests {
     }
 
     #[test]
-    fn add_pending_txs_to_invalid_list_empty_no_insert() {
+    fn evict_unincludable_txs_empty_no_insert() {
         let pool = MockPendingPool::new(vec![]);
         let invalid_tx_list = InvalidTxList::new(16);
-        add_pending_txs_to_invalid_list(&pool, &invalid_tx_list, vec![]);
+        evict_unincludable_txs(&pool, Some(&invalid_tx_list), vec![]);
         assert_eq!(0, invalid_tx_list.len());
     }
 
     #[test]
-    fn add_pending_txs_to_invalid_list_removes_from_pool() {
+    fn evict_unincludable_txs_removes_from_pool() {
         let hashes: Vec<TxHash> = (0..5).map(TxHash::repeat_byte).collect();
         let pool = MockPendingPool::new(hashes.clone());
         let invalid_tx_list = InvalidTxList::new(64);
-        add_pending_txs_to_invalid_list(&pool, &invalid_tx_list, hashes.clone());
+        evict_unincludable_txs(&pool, Some(&invalid_tx_list), hashes.clone());
         assert_eq!(hashes.len(), invalid_tx_list.len());
         for h in &hashes {
             assert!(invalid_tx_list.contains(h));
         }
+
+        let removed = pool.removed.borrow().clone();
+        assert_eq!(hashes.len(), removed.len());
+        for h in &hashes {
+            assert!(removed.contains(h));
+        }
+    }
+
+    #[test]
+    fn evict_unincludable_txs_removes_from_pool_when_list_disabled() {
+        // When the invalid tx list is disabled (None), pool removal must still happen —
+        // this is the remediation under `--invalid-tx-list-enable=false`.
+        let hashes: Vec<TxHash> = (0..4).map(TxHash::repeat_byte).collect();
+        let pool = MockPendingPool::new(hashes.clone());
+        evict_unincludable_txs(&pool, None, hashes.clone());
 
         let removed = pool.removed.borrow().clone();
         assert_eq!(hashes.len(), removed.len());
@@ -1018,20 +1267,20 @@ mod tests {
 
     impl MockInnerBuilder {
         fn build_payload() -> EthBuiltPayload {
-            use reth_payload_builder::{BlobSidecars, PayloadId};
+            use reth_payload_builder::BlobSidecars;
 
             let block = reth_ethereum::Block {
                 header: alloy_consensus::Header::default(),
                 body: Default::default(),
             };
             let sealed = reth_ethereum::primitives::SealedBlock::from(block);
-            EthBuiltPayload::new(PayloadId::new([0u8; 8]), Arc::new(sealed), U256::ZERO, None)
+            EthBuiltPayload::new(Arc::new(sealed), U256::ZERO, None, None)
                 .with_sidecars(BlobSidecars::Empty)
         }
     }
 
     impl RethPayloadBuilder for MockInnerBuilder {
-        type Attributes = EthPayloadBuilderAttributes;
+        type Attributes = EthPayloadAttributes;
         type BuiltPayload = EthBuiltPayload;
 
         fn try_build(
@@ -1057,20 +1306,20 @@ mod tests {
         }
     }
 
-    fn empty_payload_config() -> PayloadConfig<EthPayloadBuilderAttributes> {
-        let attributes = EthPayloadBuilderAttributes::new(
-            Default::default(),
-            reth_ethereum_engine_primitives::EthPayloadAttributes {
-                timestamp: 1,
-                prev_randao: Default::default(),
-                suggested_fee_recipient: Default::default(),
-                withdrawals: Some(vec![]),
-                parent_beacon_block_root: Some(Default::default()),
-            },
-        );
+    fn empty_payload_config(
+    ) -> PayloadConfig<EthPayloadAttributes, HeaderForPayload<EthBuiltPayload>> {
+        let attributes = EthPayloadAttributes {
+            timestamp: 1,
+            prev_randao: Default::default(),
+            suggested_fee_recipient: Default::default(),
+            withdrawals: Some(vec![]),
+            parent_beacon_block_root: Some(Default::default()),
+            slot_number: None,
+        };
         PayloadConfig {
             parent_header: Arc::new(reth_ethereum::primitives::SealedHeader::default()),
             attributes,
+            payload_id: reth_payload_builder::PayloadId::new([0u8; 8]),
         }
     }
 
@@ -1227,5 +1476,387 @@ mod tests {
 
         let expected = U256::from(gas_price) * U256::from(gas_used);
         assert_eq!(proposer_revenue(&tx, gas_used, base_fee), expected);
+    }
+
+    // A tx whose gas limit exceeds the gas remaining in the block must skip and
+    // mark-invalid (matching the default builder), never abort the build. Before
+    // reth 2.2 this error fell into the catch-all `Fatal` arm, which would have
+    // killed payload production for one oversized pool tx.
+    #[test]
+    fn classify_gas_limit_exceeded_skips_with_executor_limits() {
+        use alloy_consensus::{Signed, TxEip1559};
+        use alloy_primitives::{Address, Signature, TxKind};
+
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 0,
+            gas_limit: 30_000_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 0,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Default::default(),
+        };
+        let signed: TransactionSigned =
+            Signed::new_unhashed(tx, Signature::test_signature()).into();
+
+        let err = BlockExecutionError::Validation(
+            BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                transaction_gas_limit: 30_000_000,
+                block_available_gas: 1_000_000,
+            },
+        );
+
+        match classify_tx_outcome(Ok(Err(err)), TxHash::ZERO, &signed) {
+            TxOutcome::SkipExceedsGasLimit {
+                transaction_gas_limit,
+                block_available_gas,
+            } => {
+                assert_eq!(transaction_gas_limit, 30_000_000);
+                assert_eq!(block_available_gas, 1_000_000);
+            }
+            _ => panic!("expected SkipExceedsGasLimit"),
+        }
+    }
+
+    // --- Tests for `arc_ethereum_payload` Arc-specific branches ---
+    //
+    // Covers the three Arc additions over reth's upstream builder: the
+    // loop-time-budget early seal, the in-loop Osaka `OversizedData` rejection,
+    // and the `is_better_payload` early abort. The harness pairs `EthEvmConfig`
+    // with an empty `MockEthProvider` and a recording `BestTransactions` iterator
+    // (`RecordingBestTxs`) to observe which branch ran via `mark_invalid` calls.
+    //
+    // The post-build `BlockTooLarge` branch is not covered: it needs a sealed
+    // block over `MAX_RLP_BLOCK_SIZE` (8 MiB) while every Osaka-gated in-loop
+    // estimate stayed under it, i.e. executing ~8 MiB of txs, with no production
+    // seam to shrink the constant.
+    mod arc_ethereum_payload_branches {
+        use super::*;
+        use alloy_primitives::{Address, Bytes, B256};
+        use reth_basic_payload_builder::PayloadConfig;
+        use reth_chainspec::{ChainSpec, ChainSpecBuilder};
+        use reth_evm_ethereum::EthEvmConfig;
+        use reth_payload_builder::PayloadId;
+        use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+        use reth_transaction_pool::test_utils::{MockTransaction, MockTransactionFactory};
+        use reth_transaction_pool::ValidPoolTransaction;
+        use std::sync::Mutex;
+
+        type TestPoolTx = MockTransaction;
+        type TestValidTx = ValidPoolTransaction<TestPoolTx>;
+
+        /// The kind of invalidation recorded by `RecordingBestTxs`.
+        ///
+        /// `InvalidPoolTransactionError` is neither `Clone` nor easily comparable,
+        /// so we project each `mark_invalid` call to the discriminant the tests need
+        /// to distinguish.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum MarkedKind {
+            OversizedData,
+            ExceedsGasLimit,
+            Other,
+        }
+
+        impl MarkedKind {
+            fn from_err(err: &InvalidPoolTransactionError) -> Self {
+                match err {
+                    InvalidPoolTransactionError::OversizedData { .. } => Self::OversizedData,
+                    InvalidPoolTransactionError::ExceedsGasLimit(..) => Self::ExceedsGasLimit,
+                    _ => Self::Other,
+                }
+            }
+        }
+
+        /// A `BestTransactions` iterator over a fixed list of validated pool
+        /// transactions that records every `mark_invalid` call. This lets a test
+        /// feed exact transactions into `arc_ethereum_payload` and then assert which
+        /// ones the builder rejected and why.
+        ///
+        /// `BestTransactions: Send` requires the recorder state to be `Send`, hence
+        /// `Arc<Mutex<_>>` rather than `Rc<RefCell<_>>`.
+        struct RecordingBestTxs {
+            txs: std::vec::IntoIter<Arc<TestValidTx>>,
+            /// Records `(tx_hash, marked_kind)` for each `mark_invalid` call.
+            marked: Arc<Mutex<Vec<(TxHash, MarkedKind)>>>,
+            /// Counts how many times `next()` was polled.
+            polled: Arc<Mutex<usize>>,
+        }
+
+        impl Iterator for RecordingBestTxs {
+            type Item = Arc<TestValidTx>;
+            fn next(&mut self) -> Option<Self::Item> {
+                let mut polled = self.polled.lock().expect("polled lock poisoned");
+                *polled = polled.saturating_add(1);
+                drop(polled);
+                self.txs.next()
+            }
+        }
+
+        impl BestTransactions for RecordingBestTxs {
+            fn mark_invalid(&mut self, tx: &Self::Item, kind: &InvalidPoolTransactionError) {
+                self.marked
+                    .lock()
+                    .expect("marked lock poisoned")
+                    .push((*tx.hash(), MarkedKind::from_err(kind)));
+            }
+            fn no_updates(&mut self) {}
+            fn set_skip_blobs(&mut self, _skip_blobs: bool) {}
+        }
+
+        /// Handles returned by the harness so the test can inspect builder behavior.
+        struct Recorders {
+            marked: Arc<Mutex<Vec<(TxHash, MarkedKind)>>>,
+            polled: Arc<Mutex<usize>>,
+        }
+
+        /// Builds an `EthEvmConfig` + `MockEthProvider` over a chain spec, plus a
+        /// `best_txs` closure yielding `txs`, and runs `arc_ethereum_payload`.
+        ///
+        /// `parent_gas_limit` flows into the next-block gas limit; set it high enough
+        /// that the per-tx gas-capacity check (L592) passes for txs that should reach
+        /// the size check.
+        fn run_payload(
+            chain_spec: Arc<ChainSpec>,
+            parent_gas_limit: u64,
+            loop_time_limit: Option<Duration>,
+            best_payload: Option<EthBuiltPayload>,
+            txs: Vec<Arc<TestValidTx>>,
+        ) -> (
+            Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>,
+            Recorders,
+        ) {
+            let evm_config = EthEvmConfig::ethereum(chain_spec.clone());
+            let provider = MockEthProvider::default().with_chain_spec((*chain_spec).clone());
+
+            // Parent header: timestamp 0 keeps Osaka/Prague active-at-timestamp(0)
+            // true, and the chosen gas limit drives next-block capacity.
+            let parent = alloy_consensus::Header {
+                gas_limit: parent_gas_limit,
+                number: 0,
+                timestamp: 0,
+                ..Default::default()
+            };
+            let parent_header = reth_ethereum::primitives::SealedHeader::seal_slow(parent);
+
+            // Fee recipient must be non-zero/funded enough for sealing to succeed on
+            // empty state; an empty `ExtendedAccount` is sufficient.
+            let fee_recipient = Address::repeat_byte(0xAA);
+            provider.add_account(fee_recipient, ExtendedAccount::new(0, U256::ZERO));
+
+            let attributes = reth_ethereum_engine_primitives::EthPayloadAttributes {
+                timestamp: 0,
+                prev_randao: B256::ZERO,
+                suggested_fee_recipient: fee_recipient,
+                withdrawals: Some(vec![]),
+                parent_beacon_block_root: Some(B256::ZERO),
+                slot_number: None,
+            };
+
+            let config = PayloadConfig {
+                parent_header: Arc::new(parent_header),
+                attributes,
+                payload_id: PayloadId::new([0u8; 8]),
+            };
+
+            let args = BuildArguments {
+                cached_reads: Default::default(),
+                execution_cache: None,
+                trie_handle: None,
+                config,
+                cancel: Default::default(),
+                best_payload,
+            };
+
+            let marked: Arc<Mutex<Vec<(TxHash, MarkedKind)>>> = Arc::new(Mutex::new(Vec::new()));
+            let polled = Arc::new(Mutex::new(0usize));
+            let marked_for_closure = marked.clone();
+            let polled_for_closure = polled.clone();
+
+            let best_txs = move |_attrs: BestTransactionsAttributes| -> BestTransactionsIter<
+                reth_transaction_pool::test_utils::TestPool,
+            > {
+                Box::new(RecordingBestTxs {
+                    txs: txs.into_iter(),
+                    marked: marked_for_closure,
+                    polled: polled_for_closure,
+                })
+            };
+
+            let pool = reth_transaction_pool::test_utils::testing_pool();
+            let outcome = arc_ethereum_payload(
+                evm_config,
+                provider,
+                pool,
+                EthereumBuilderConfig::new(),
+                loop_time_limit,
+                args,
+                best_txs,
+            );
+
+            (outcome, Recorders { marked, polled })
+        }
+
+        fn prague_spec() -> Arc<ChainSpec> {
+            Arc::new(ChainSpecBuilder::mainnet().prague_activated().build())
+        }
+
+        fn osaka_spec() -> Arc<ChainSpec> {
+            Arc::new(ChainSpecBuilder::mainnet().osaka_activated().build())
+        }
+
+        /// Validates a `MockTransaction` into the `Arc<ValidPoolTransaction<..>>`
+        /// shape the iterator yields.
+        fn validate(tx: MockTransaction) -> Arc<TestValidTx> {
+            MockTransactionFactory::default().validated_arc(tx)
+        }
+
+        /// AC #3: with `loop_time_limit = Some(Duration::ZERO)` and a pending tx
+        /// available, the loop breaks on the first iteration before including any
+        /// transaction. The sealed block has zero transactions, the iterator's first
+        /// `next()` was polled, and no tx was marked invalid.
+        #[test]
+        fn loop_time_limit_seals_empty_block_early() {
+            // Pre-Osaka spec keeps the path simple; branch 1 is not Osaka-gated.
+            let tx = MockTransaction::eip1559().with_gas_limit(21_000);
+            let txs = vec![validate(tx)];
+
+            let (outcome, rec) =
+                run_payload(prague_spec(), 30_000_000, Some(Duration::ZERO), None, txs);
+
+            let outcome = outcome.expect("payload build should succeed");
+            let payload = match outcome {
+                BuildOutcome::Better { payload, .. } => payload,
+                other => panic!("expected BuildOutcome::Better, got {other:?}"),
+            };
+
+            assert_eq!(
+                payload.block().body().transactions.len(),
+                0,
+                "loop must break before including any tx"
+            );
+            assert_eq!(
+                *rec.polled.lock().expect("polled lock poisoned"),
+                1,
+                "iterator should be polled exactly once before the early break"
+            );
+            assert!(
+                rec.marked.lock().expect("marked lock poisoned").is_empty(),
+                "no tx should be marked invalid on an early time-budget seal"
+            );
+        }
+
+        /// AC #1: with Osaka active and a transaction whose consensus RLP length
+        /// pushes the estimated block size above `MAX_RLP_BLOCK_SIZE`, the tx is
+        /// marked invalid with `OversizedData` and excluded from the sealed block.
+        #[test]
+        fn osaka_oversized_tx_marked_invalid_and_excluded() {
+            // ~8.5 MiB of calldata; well above MAX_RLP_BLOCK_SIZE (8 MiB). Small gas
+            // limit so the L592 capacity check passes (the tx is never executed).
+            let oversized_input = Bytes::from(vec![0u8; MAX_RLP_BLOCK_SIZE + 100_000]);
+            let oversized = MockTransaction::eip1559()
+                .with_gas_limit(21_000)
+                .with_input(oversized_input);
+            let oversized_tx = validate(oversized);
+            let oversized_hash = *oversized_tx.hash();
+
+            // Sanity: the consensus encoding really does exceed the limit, so the
+            // estimate-with-overhead check trips.
+            let consensus_len = oversized_tx.to_consensus().inner().length();
+            assert!(
+                consensus_len > MAX_RLP_BLOCK_SIZE,
+                "test tx must encode larger than MAX_RLP_BLOCK_SIZE to hit the branch"
+            );
+
+            let (outcome, rec) =
+                run_payload(osaka_spec(), 30_000_000, None, None, vec![oversized_tx]);
+
+            let outcome = outcome.expect("payload build should succeed");
+            let payload = match outcome {
+                BuildOutcome::Better { payload, .. } => payload,
+                other => panic!("expected BuildOutcome::Better, got {other:?}"),
+            };
+
+            assert_eq!(
+                payload.block().body().transactions.len(),
+                0,
+                "oversized tx must be excluded from the sealed block"
+            );
+
+            let marked = rec.marked.lock().expect("marked lock poisoned");
+            assert_eq!(marked.len(), 1, "exactly one tx should be marked invalid");
+            assert_eq!(
+                marked[0].0, oversized_hash,
+                "the oversized tx is the one marked"
+            );
+            assert_eq!(
+                marked[0].1,
+                MarkedKind::OversizedData,
+                "tx must be marked invalid with OversizedData, got {:?}",
+                marked[0].1
+            );
+        }
+
+        /// Regression guard: an undersized tx under Osaka is NOT marked
+        /// `OversizedData` by the in-loop check (it proceeds to execution). This pins
+        /// that the branch is size-gated, not unconditional.
+        #[test]
+        fn osaka_small_tx_not_marked_oversized() {
+            let small = MockTransaction::eip1559()
+                .with_gas_limit(21_000)
+                .with_input(Bytes::from(vec![0u8; 32]));
+            let small_tx = validate(small);
+
+            let (outcome, rec) = run_payload(osaka_spec(), 30_000_000, None, None, vec![small_tx]);
+
+            // The build itself must not error; we only assert the size branch did not
+            // fire. (Execution against empty MockEthProvider state may skip the tx as
+            // invalid for other reasons, which is fine — it must just not be
+            // OversizedData.)
+            assert!(outcome.is_ok(), "build should not error: {outcome:?}");
+            assert!(
+                rec.marked
+                    .lock()
+                    .expect("marked lock poisoned")
+                    .iter()
+                    .all(|(_, kind)| *kind != MarkedKind::OversizedData),
+                "small tx must never be marked OversizedData"
+            );
+        }
+
+        /// AC #4: when `best_payload` carries higher fees than the block being built
+        /// (total_fees == 0 here, since no tx is executed), `is_better_payload`
+        /// returns false and the builder returns `BuildOutcome::Aborted` without
+        /// sealing.
+        #[test]
+        fn aborts_when_best_payload_has_higher_fees() {
+            // A stand-in "best" payload with non-zero fees. The sealed block content
+            // is irrelevant; only `fees()` is compared.
+            let better_block = {
+                let block = reth_ethereum::Block {
+                    header: alloy_consensus::Header::default(),
+                    body: Default::default(),
+                };
+                let sealed = reth_ethereum::primitives::SealedBlock::from(block);
+                EthBuiltPayload::new(Arc::new(sealed), U256::from(1_000_000u64), None, None)
+            };
+
+            // No txs -> total_fees stays 0 -> not better than 1_000_000.
+            let (outcome, _rec) =
+                run_payload(prague_spec(), 30_000_000, None, Some(better_block), vec![]);
+
+            let outcome = outcome.expect("payload build should succeed");
+            match outcome {
+                BuildOutcome::Aborted { fees, .. } => {
+                    assert_eq!(
+                        fees,
+                        U256::ZERO,
+                        "aborted fees should be the (zero) total_fees"
+                    );
+                }
+                other => panic!("expected BuildOutcome::Aborted, got {other:?}"),
+            }
+        }
     }
 }

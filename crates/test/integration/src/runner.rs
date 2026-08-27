@@ -73,8 +73,10 @@ use tracing::{error, info};
 
 use arc_consensus_types::{ArcContext, Config as ConsensusConfig};
 use arc_evm_node::node::{ArcNode, ArcRpcConfig};
-use arc_evm_node::ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT;
-use arc_execution_config::addresses_denylist::AddressesDenylistConfig;
+use arc_evm_node::{ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT, DEFAULT_TX_RELAY_TIMEOUT};
+use arc_execution_config::addresses_denylist::{
+    AddressesDenylistConfig, DEFAULT_DENYLIST_ERC7201_BASE_SLOT, DENYLIST_ADDRESS_LOCALDEV,
+};
 use arc_execution_config::chainspec::{localdev_with_block_gas_limit, ArcChainSpec, LOCAL_DEV};
 use arc_execution_txpool::InvalidTxListConfig;
 use arc_node_consensus::hardcoded_config::{
@@ -607,6 +609,9 @@ fn build_node_consensus_config(
         rpc: arc_consensus_types::RpcConfig {
             enabled: true,
             listen_addr: rpc_listen_addr,
+            // In-process integration nodes expose the full API, including the
+            // admin routes.
+            admin: true,
         },
         ..Default::default()
     };
@@ -712,7 +717,11 @@ async fn spawn_execution_layer(
     let arc_node = ArcNode::new(
         ArcRpcConfig::default(),
         InvalidTxListConfig::default(),
-        AddressesDenylistConfig::default(),
+        AddressesDenylistConfig::new(
+            DENYLIST_ADDRESS_LOCALDEV,
+            DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
+            Vec::new(),
+        ),
         None,
         true,
         false,
@@ -720,6 +729,8 @@ async fn spawn_execution_layer(
         160 * 1024 * 1024,
         ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
         std::time::Duration::from_secs(0),
+        Vec::new(),
+        DEFAULT_TX_RELAY_TIMEOUT,
     );
 
     let reth_handle = NodeBuilder::new(node_config)

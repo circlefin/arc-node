@@ -22,12 +22,13 @@
 //!
 //! Only available under `#[cfg(test)]`.
 
-use alloy_primitives::{address, Address, Bytes};
+use alloy_primitives::{address, Address, Bytes, B256};
 use alloy_sol_types::{sol_data, SolType, SolValue};
 use arc_precompiles::subcall::{
     SubcallCompletionResult, SubcallContinuationData, SubcallError, SubcallInitResult,
     SubcallPrecompile,
 };
+use revm::bytecode::Bytecode;
 use revm::handler::FrameResult;
 use revm::interpreter::interpreter_action::{CallInput, CallInputs, CallScheme, CallValue};
 use revm::interpreter::Gas;
@@ -65,13 +66,14 @@ impl SubcallPrecompile for SubcallTestPrecompile {
             scheme: CallScheme::Call,
             target_address: target,
             bytecode_address: target,
-            known_bytecode: None,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
             value: CallValue::Transfer(alloy_primitives::U256::ZERO),
             input: CallInput::Bytes(calldata),
             gas_limit: child_gas.remaining(),
             is_static: inputs.is_static,
             caller: inputs.caller,
             return_memory_offset: 0..0,
+            reservoir: 0,
         });
 
         Ok(SubcallInitResult {
@@ -205,13 +207,14 @@ impl SubcallPrecompile for FailingCompleteSubcallPrecompile {
                 scheme: CallScheme::Call,
                 target_address: target,
                 bytecode_address: target,
-                known_bytecode: None,
+                known_bytecode: (B256::ZERO, Bytecode::default()),
                 value: CallValue::Transfer(alloy_primitives::U256::ZERO),
                 input: CallInput::Bytes(calldata),
                 gas_limit: 50_000,
                 is_static: false,
                 caller: inputs.caller,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             }),
             continuation_data: SubcallContinuationData {
                 state: Box::new(()),
@@ -264,13 +267,14 @@ impl SubcallPrecompile for RejectingCompleteSubcallPrecompile {
                 scheme: CallScheme::Call,
                 target_address: target,
                 bytecode_address: target,
-                known_bytecode: None,
+                known_bytecode: (B256::ZERO, Bytecode::default()),
                 value: CallValue::Transfer(alloy_primitives::U256::ZERO),
                 input: CallInput::Bytes(calldata),
                 gas_limit: 50_000,
                 is_static: false,
                 caller: inputs.caller,
                 return_memory_offset: 0..0,
+                reservoir: 0,
             }),
             continuation_data: SubcallContinuationData {
                 state: Box::new(()),

@@ -14,7 +14,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{setup, testnet};
+use std::collections::HashSet;
+
+use crate::setup;
 
 /// Check if a Docker image should be built locally.
 ///
@@ -25,58 +27,89 @@ fn should_build_locally(image: &str) -> bool {
     !image.starts_with("ghcr.io/")
 }
 
-fn push_build_if_local(builds: &mut Vec<setup::ImageBuild>, tag: &str, service_name: &str) {
-    if should_build_locally(tag) {
-        builds.push(setup::ImageBuild {
-            service_name: service_name.to_string(),
-            tag: tag.to_string(),
-        });
+/// Compose service name for the nth local build of a layer. The first build keeps
+/// the historical base name so single-image scenarios generate identical output.
+fn build_service_name(base: &str, index: usize) -> String {
+    if index == 0 {
+        base.to_string()
+    } else {
+        format!("{base}_{index}")
     }
 }
 
-fn maybe_push_build(builds: &mut Vec<setup::ImageBuild>, tag: Option<&String>, service_name: &str) {
-    if let Some(tag) = tag {
-        push_build_if_local(builds, tag, service_name);
+/// Local build targets for one layer: every distinct locally-built node image,
+/// plus the layer's upgrade image, each with a unique compose service name.
+/// `images` may contain duplicates and remote (ghcr.io) references; both are skipped.
+fn local_builds(
+    images: &[String],
+    upgrade: Option<&String>,
+    base_name: &str,
+    upgrade_name: &str,
+) -> Vec<setup::ImageBuild> {
+    let mut builds = Vec::new();
+    let mut seen = HashSet::new();
+    for tag in images {
+        if should_build_locally(tag) && seen.insert(tag.clone()) {
+            builds.push(setup::ImageBuild {
+                service_name: build_service_name(base_name, builds.len()),
+                tag: tag.clone(),
+            });
+        }
     }
+    if let Some(tag) = upgrade {
+        if should_build_locally(tag) && seen.insert(tag.clone()) {
+            builds.push(setup::ImageBuild {
+                service_name: upgrade_name.to_string(),
+                tag: tag.clone(),
+            });
+        }
+    }
+    builds
 }
 
-/// Build lists of local Docker images to build (excluding remote images).
+/// Build lists of local Docker images to build (excluding remote images), covering
+/// every distinct per-node image plus the global upgrade images.
 pub(crate) fn local_images_to_build(
-    images: &testnet::DockerImages,
+    el_images: &[String],
+    cl_images: &[String],
+    el_upgrade: Option<&String>,
+    cl_upgrade: Option<&String>,
 ) -> (Vec<setup::ImageBuild>, Vec<setup::ImageBuild>) {
-    let mut reth_builds = Vec::new();
-    let mut malachite_builds = Vec::new();
-
-    push_build_if_local(&mut reth_builds, &images.el, "arc_execution_build");
-    push_build_if_local(&mut malachite_builds, &images.cl, "arc_consensus_build");
-    maybe_push_build(
-        &mut reth_builds,
-        images.el_upgrade.as_ref(),
-        "arc_execution_upgrade_build",
-    );
-    maybe_push_build(
-        &mut malachite_builds,
-        images.cl_upgrade.as_ref(),
-        "arc_consensus_upgrade_build",
-    );
-
-    (reth_builds, malachite_builds)
+    (
+        local_builds(
+            el_images,
+            el_upgrade,
+            "arc_execution_build",
+            "arc_execution_upgrade_build",
+        ),
+        local_builds(
+            cl_images,
+            cl_upgrade,
+            "arc_consensus_build",
+            "arc_consensus_upgrade_build",
+        ),
+    )
 }
 
-/// Return the list of remote Docker images that need to be pulled.
-pub(crate) fn remote_images_to_pull(images: &testnet::DockerImages) -> Vec<String> {
+/// Return the distinct remote (ghcr.io) Docker images that need to be pulled from
+/// the given set of all effective images.
+pub(crate) fn remote_images_to_pull(images: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
     images
-        .all()
-        .into_iter()
+        .iter()
         .filter(|img| !should_build_locally(img))
-        .map(|s| s.to_string())
+        .filter(|img| seen.insert(img.as_str()))
+        .cloned()
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testnet::DockerImages;
+
+    fn tags(builds: &[setup::ImageBuild]) -> Vec<&str> {
+        builds.iter().map(|b| b.tag.as_str()).collect()
+    }
 
     #[test]
     fn test_should_build_locally() {
@@ -96,27 +129,23 @@ mod tests {
 
     #[test]
     fn test_remote_images_to_pull_all_local() {
-        let images = DockerImages {
-            cl: "arc_consensus:latest".to_string(),
-            el: "arc_execution:latest".to_string(),
-            cl_upgrade: None,
-            el_upgrade: None,
-        };
-        let remote = remote_images_to_pull(&images);
-        assert!(remote.is_empty());
+        let images = [
+            "arc_consensus:latest".to_string(),
+            "arc_execution:latest".to_string(),
+        ];
+        assert!(remote_images_to_pull(&images).is_empty());
     }
 
     #[test]
     fn test_remote_images_to_pull_mixed() {
-        let images = DockerImages {
-            cl: "ghcr.io/org-name/repo-name/cl-image:0.5.0-rc1".to_string(),
-            el: "ghcr.io/org-name/repo-name/el-image:0.5.0-rc1".to_string(),
-            cl_upgrade: Some("arc_consensus:latest".to_string()),
-            el_upgrade: Some("arc_execution:latest".to_string()),
-        };
-        let remote = remote_images_to_pull(&images);
+        let images = [
+            "ghcr.io/org-name/repo-name/cl-image:0.5.0-rc1".to_string(),
+            "ghcr.io/org-name/repo-name/el-image:0.5.0-rc1".to_string(),
+            "arc_consensus:latest".to_string(),
+            "arc_execution:latest".to_string(),
+        ];
         assert_eq!(
-            remote,
+            remote_images_to_pull(&images),
             vec![
                 "ghcr.io/org-name/repo-name/cl-image:0.5.0-rc1",
                 "ghcr.io/org-name/repo-name/el-image:0.5.0-rc1",
@@ -125,20 +154,63 @@ mod tests {
     }
 
     #[test]
-    fn test_remote_images_to_pull_all_remote() {
-        let images = DockerImages {
-            cl: "ghcr.io/org-name/repo-name/cl-image:latest".to_string(),
-            el: "ghcr.io/org-name/repo-name/el-image:latest".to_string(),
-            cl_upgrade: None,
-            el_upgrade: None,
-        };
-        let remote = remote_images_to_pull(&images);
+    fn remote_images_to_pull_includes_per_node_ghcr_override() {
+        // A per-node ghcr.io override must be pulled, not only the global images.
+        let images = [
+            "arc_consensus:latest".to_string(),
+            "arc_execution:latest".to_string(),
+            "ghcr.io/org-name/repo-name/el-image:0.6.0".to_string(),
+        ];
         assert_eq!(
-            remote,
-            vec![
-                "ghcr.io/org-name/repo-name/cl-image:latest",
-                "ghcr.io/org-name/repo-name/el-image:latest",
-            ]
+            remote_images_to_pull(&images),
+            vec!["ghcr.io/org-name/repo-name/el-image:0.6.0"]
         );
+    }
+
+    #[test]
+    fn local_images_to_build_covers_per_node_overrides() {
+        // Two distinct local EL images produce two builds with unique service names;
+        // the historical base name is preserved for the first.
+        let el = [
+            "arc_execution:latest".to_string(),
+            "arc_execution:old".to_string(),
+        ];
+        let cl = ["arc_consensus:latest".to_string()];
+        let (reth, malachite) = local_images_to_build(&el, &cl, None, None);
+
+        assert_eq!(
+            tags(&reth),
+            vec!["arc_execution:latest", "arc_execution:old"]
+        );
+        assert_eq!(reth[0].service_name, "arc_execution_build");
+        let names: HashSet<&str> = reth.iter().map(|b| b.service_name.as_str()).collect();
+        assert_eq!(names.len(), 2, "service names must be unique");
+        assert_eq!(tags(&malachite), vec!["arc_consensus:latest"]);
+    }
+
+    #[test]
+    fn local_images_to_build_skips_ghcr_and_dedupes() {
+        // ghcr images are pulled, not built; duplicates collapse to one build.
+        let el = [
+            "arc_execution:latest".to_string(),
+            "arc_execution:latest".to_string(),
+            "ghcr.io/org/el:0.6.0".to_string(),
+        ];
+        let cl = ["arc_consensus:latest".to_string()];
+        let (reth, _) = local_images_to_build(&el, &cl, None, None);
+        assert_eq!(tags(&reth), vec!["arc_execution:latest"]);
+    }
+
+    #[test]
+    fn local_images_to_build_includes_upgrade_images() {
+        let el = ["arc_execution:latest".to_string()];
+        let cl = ["arc_consensus:latest".to_string()];
+        let el_up = "arc_execution:next".to_string();
+        let (reth, _) = local_images_to_build(&el, &cl, Some(&el_up), None);
+        assert_eq!(
+            tags(&reth),
+            vec!["arc_execution:latest", "arc_execution:next"]
+        );
+        assert_eq!(reth[1].service_name, "arc_execution_upgrade_build");
     }
 }

@@ -15,7 +15,6 @@
 // limitations under the License.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +32,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
 use url::Url;
 
-use crate::latency::REGION_ASSIGNMENTS_FILENAME;
+use crate::latency;
 use crate::manifest::{Manifest, NodeType};
 use crate::node::{ContainerKind, NodeName};
 use crate::nodes::NodesMetadata;
@@ -147,7 +146,13 @@ pub(crate) async fn run_server(
         container_refresh_ms,
     );
 
-    let region_assignments = Arc::new(load_region_assignments(&testnet.dir));
+    let region_assignments = match latency::load_region_assignments(&testnet.dir) {
+        Ok(map) => Arc::new(map.into_iter().map(|(k, v)| (k, v.to_string())).collect()),
+        Err(e) => {
+            warn!("Failed to load region assignments: {e}");
+            Arc::new(HashMap::new())
+        }
+    };
 
     let state = AppState {
         testnet: Arc::new(RwLock::new(testnet)),
@@ -846,24 +851,6 @@ fn merge_per_node_errors(
 
 // ── Manifest-based topology ─────────────────────────────────────────────
 
-/// Load region assignments from the testnet's `region_assignments.json` file.
-///
-/// Returns an empty map if the file doesn't exist or can't be parsed
-/// (e.g. latency emulation was never enabled for this testnet).
-fn load_region_assignments(testnet_dir: &Path) -> HashMap<String, String> {
-    let path = testnet_dir.join(REGION_ASSIGNMENTS_FILENAME);
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => match serde_json::from_str(&contents) {
-            Ok(map) => map,
-            Err(e) => {
-                warn!(?path, "Failed to parse {REGION_ASSIGNMENTS_FILENAME}: {e}");
-                HashMap::new()
-            }
-        },
-        Err(_) => HashMap::new(),
-    }
-}
-
 /// Build the list of graph nodes from the manifest.
 fn build_node_list(
     manifest: &Manifest,
@@ -889,7 +876,7 @@ fn build_node_list(
             GraphNode {
                 name: name.clone(),
                 node_type: node_type.to_string(),
-                consensus_enabled: node.cl_config.consensus_enabled(),
+                consensus_enabled: !node.cl_config.no_consensus,
                 status: NODE_STATUS_OK.to_string(),
                 subnets,
                 height: None,

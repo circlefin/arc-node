@@ -14,95 +14,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(
-    clippy::arithmetic_side_effects,
-    clippy::cast_possible_truncation,
-    clippy::unwrap_used
-)]
+#![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
 
 //! Arc E2E Test Framework
 //!
-//! An e2e testing framework for Arc execution, inspired by reth's testsuite architecture.
-//! Uses the Action pattern for composable test scenarios.
+//! New tests should use `ArcTestNode`, which exposes the live node and small
+//! helpers for common Engine API and transaction operations.
 
-mod action;
-pub mod actions;
 pub mod chainspec;
-mod environment;
+mod node;
 mod setup;
 
-pub use action::{Action, ActionBox};
-pub use environment::{ArcEnvironment, BlockInfo};
+pub use alloy_primitives::TxKind;
+pub use node::{ArcTestNode, DEFAULT_FEE_RECIPIENT};
 pub use setup::ArcSetup;
-
-/// Builder for creating and running Arc test scenarios.
-///
-/// Follows the builder pattern to compose tests from setup and actions.
-pub struct ArcTestBuilder {
-    setup: Option<ArcSetup>,
-    actions: Vec<ActionBox>,
-}
-
-impl Default for ArcTestBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ArcTestBuilder {
-    /// Creates a new test builder.
-    pub fn new() -> Self {
-        Self {
-            setup: None,
-            actions: Vec::new(),
-        }
-    }
-
-    /// Sets the test setup configuration.
-    pub fn with_setup(mut self, setup: ArcSetup) -> Self {
-        self.setup = Some(setup);
-        self
-    }
-
-    /// Adds an action to be executed.
-    pub fn with_action<A: Action>(mut self, action: A) -> Self {
-        self.actions.push(ActionBox::new(action));
-        self
-    }
-
-    /// Runs the test scenario.
-    ///
-    /// 1. Applies the setup to create the node
-    /// 2. Executes all actions in sequence
-    pub async fn run(self) -> eyre::Result<()> {
-        let mut env = ArcEnvironment::new();
-
-        // Apply setup
-        if let Some(setup) = self.setup {
-            setup.apply(&mut env).await?;
-        } else {
-            return Err(eyre::eyre!("No setup configured"));
-        }
-
-        // Execute all actions
-        for mut action in self.actions {
-            action.execute(&mut env).await?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_run_without_setup_returns_error() {
-        let result = ArcTestBuilder::new().run().await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("No setup configured"));
-    }
-}

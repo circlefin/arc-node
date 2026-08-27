@@ -19,7 +19,7 @@ services:
 {{#each nodes}}
   {{execution.inner.name}}:
     container_name: {{execution.inner.name}}
-    image: {{../images.el}}
+    image: {{execution.image}}
     entrypoint: ["/app/assets/entrypoint_el.sh"]
     cap_add:
       - NET_ADMIN
@@ -62,9 +62,18 @@ services:
       - "{{execution.metrics_port}}:9001" # Metrics
       - "{{execution.pprof_port}}:6061" # Pprof
     environment:
+      {{#unless (contains_key el_env "PATH")}}
       PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      {{/unless}}
+      {{#unless (contains_key el_env "ARC_LOG_FILE")}}
       ARC_LOG_FILE: /var/log/arc/{{execution.inner.name}}.log
+      {{/unless}}
+      {{#unless (contains_key el_env "RUST_LOG")}}
       RUST_LOG: debug,net::peers=trace,net::discovery=trace,net::discv5=trace
+      {{/unless}}
+      {{#each el_env}}
+      {{@key}}: "{{{yaml_dq_escape this}}}"
+      {{/each}}
     command:
       - "node"
       - "--datadir=/data/reth/execution-data"
@@ -79,7 +88,7 @@ services:
       - "--log.file.directory=/var/log/arc"
       - "--log.file.max-files=0"
       {{#each execution.cli_flags}}
-      - "{{{this}}}"
+      - "{{{yaml_dq_escape this}}}"
       {{/each}}
       - "--arc-rpc-upstream-url=http://{{consensus.inner.name}}:31000"
       {{#if ../rpc}}
@@ -99,7 +108,7 @@ services:
 
   {{consensus.inner.name}}:
     container_name: {{consensus.inner.name}}
-    image: {{../images.cl}}
+    image: {{consensus.image}}
     entrypoint: ["/app/assets/entrypoint_cl.sh"]
     cap_add:
       - NET_ADMIN
@@ -140,14 +149,23 @@ services:
       - "{{consensus.pprof_port}}:6060" # Pprof
       - "{{consensus.rpc_port}}:31000" # RPC
     environment:
+      {{#unless (contains_key cl_env "ARC_LOG_FILE")}}
       ARC_LOG_FILE: /var/log/arc/{{consensus.inner.name}}.log
+      {{/unless}}
+      {{#unless (contains_key cl_env "ARC_HALT_AT_BLOCK_HEIGHT")}}
       ARC_HALT_AT_BLOCK_HEIGHT: 0
+      {{/unless}}
+      {{#unless (contains_key cl_env "ARC_GENESIS_FILE_PATH")}}
       ARC_GENESIS_FILE_PATH: /app/assets/genesis.json
+      {{/unless}}
+      {{#each cl_env}}
+      {{@key}}: "{{{yaml_dq_escape this}}}"
+      {{/each}}
     command:
       - "start"
       - "--home=/app/.malachite"
       {{#each consensus.cli_flags}}
-      - "{{{this}}}"
+      - "{{{yaml_dq_escape this}}}"
       {{/each}}
       {{#if ../rpc}}
       - "--eth-rpc-endpoint=http://{{execution.inner.name}}:8545"
@@ -206,9 +224,18 @@ services:
       - "{{execution.metrics_port}}:9001" # Metrics
       - "{{execution.pprof_port}}:6061" # Pprof
     environment:
+      {{#unless (contains_key el_env "PATH")}}
       PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      {{/unless}}
+      {{#unless (contains_key el_env "ARC_LOG_FILE")}}
       ARC_LOG_FILE: /var/log/arc/{{execution.inner.name}}.log
+      {{/unless}}
+      {{#unless (contains_key el_env "RUST_LOG")}}
       RUST_LOG: debug,net::peers=trace,net::discovery=trace,net::discv5=trace
+      {{/unless}}
+      {{#each el_env}}
+      {{@key}}: "{{{yaml_dq_escape this}}}"
+      {{/each}}
     command:
       - "node"
       - "--datadir=/data/reth/execution-data"
@@ -223,7 +250,7 @@ services:
       - "--log.file.directory=/var/log/arc"
       - "--log.file.max-files=0"
       {{#each execution.cli_flags}}
-      - "{{{this}}}"
+      - "{{{yaml_dq_escape this}}}"
       {{/each}}
       - "--arc-rpc-upstream-url=http://{{consensus.inner.name}}{{#if ../images.cl_upgrade}}_u{{/if}}:31000"
       {{#if ../rpc}}
@@ -287,14 +314,23 @@ services:
       - "{{consensus.pprof_port}}:6060" # Pprof
       - "{{consensus.rpc_port}}:31000" # RPC
     environment:
+      {{#unless (contains_key cl_env "ARC_LOG_FILE")}}
       ARC_LOG_FILE: /var/log/arc/{{consensus.inner.name}}.log
+      {{/unless}}
+      {{#unless (contains_key cl_env "ARC_HALT_AT_BLOCK_HEIGHT")}}
       ARC_HALT_AT_BLOCK_HEIGHT: 0
+      {{/unless}}
+      {{#unless (contains_key cl_env "ARC_GENESIS_FILE_PATH")}}
       ARC_GENESIS_FILE_PATH: /app/assets/genesis.json
+      {{/unless}}
+      {{#each cl_env}}
+      {{@key}}: "{{{yaml_dq_escape this}}}"
+      {{/each}}
     command:
       - "start"
       - "--home=/app/.malachite"
       {{#each consensus.cli_flags_upgraded}}
-      - "{{{this}}}"
+      - "{{{yaml_dq_escape this}}}"
       {{/each}}
       {{#if ../rpc}}
       - "--eth-rpc-endpoint=http://{{execution.inner.name}}_u:8545"
@@ -321,7 +357,7 @@ services:
     environment:
       <<: *aws-base
       APP_ENV: ${APP_ENV:-dev}
-      APP_PROVIDER_ENCLAVE_CLIENT_BASEURL: http://{{name}}-signer-enclave:10350
+      APP_PROVIDER_ENCLAVE_CLIENT_BASEURL: {{name}}-signer-enclave:10350
       APP_PROVIDER_SECRETS_LOCALSTACK_ENABLED: false
       APP_SERVICE_SIGNER_KEYID: ${APP_SERVICE_SIGNER{{inc @index}}_KEYID:-dev/arc/remote-signer/{{remote_signer}}}
       APP_PROVIDER_AWSKMS_ARNS: ${APP_PROVIDER_AWSKMS_ARNS}
@@ -356,7 +392,7 @@ services:
       memlock: -1
     entrypoint: ["/usr/local/circle/run_enclave.dev.sh"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -f --insecure http://localhost:10350/ping"]
+      test: ["CMD", "grpc_health_probe", "-addr=localhost:10350"]
       <<: *health-retry
   {{/if}}
 

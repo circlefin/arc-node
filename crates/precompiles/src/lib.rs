@@ -55,7 +55,6 @@
 //!                 ADDRESS,
 //!                 COUNTER_STORAGE_KEY,
 //!                 &mut gas_counter,
-//!                 hardfork_flags,
 //!             )?;
 //!             let new_value = U256::from_be_slice(&output) + U256::from(1);
 //!
@@ -65,7 +64,6 @@
 //!                 COUNTER_STORAGE_KEY,
 //!                 &new_value.to_be_bytes_vec(),
 //!                 &mut gas_counter,
-//!                 hardfork_flags,
 //!             )?;
 //!
 //!             Ok(PrecompileOutput::new(gas_counter.used(), new_value.abi_encode().into()))
@@ -108,10 +106,7 @@
 //!             let mut gas_counter = Gas::new(precompile_input.gas);
 //!             let mut precompile_input = precompile_input;
 //!
-//!             let args = abi_decode_raw_with_zero6_validation::<IMyPrecompile::myFunctionCall>(
-//!                 input,
-//!                 hardfork_flags,
-//!             )
+//!             let args = abi_decode_raw_validated::<IMyPrecompile::myFunctionCall>(input)
 //!                 .map_err(|_| PrecompileErrorOrRevert::new_reverted_with_penalty(
 //!                     gas_counter,
 //!                     PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
@@ -123,7 +118,6 @@
 //!                 MY_PRECOMPILE_ADDRESS,
 //!                 StorageKey::from(0),
 //!                 &mut gas_counter,
-//!                 hardfork_flags,
 //!             )?;
 //!
 //!             Ok(PrecompileOutput::new(gas_counter.used(), output))
@@ -170,7 +164,6 @@
 //!     address,
 //!     key,
 //!     &mut gas_counter,
-//!     hardfork_flags,
 //! )?;
 //! let current = U256::from_be_slice(&output);
 //!
@@ -180,14 +173,11 @@
 //!     key,
 //!     &new_value.to_be_bytes_vec(),
 //!     &mut gas_counter,
-//!     hardfork_flags,
 //! )?;
 //! ```
 //!
-//! Gas costs:
-//! - `read`: 2,100 gas pre-Zero5; EIP-2929 warm/cold pricing from Zero5+
-//!   (`WARM_STORAGE_READ_COST` / `COLD_SLOAD_COST`).
-//! - `write`: 2,900 gas pre-Zero5; EIP-2929 / EIP-2200 pricing from Zero5+.
+//! Gas costs use EIP-2929 warm/cold pricing for reads
+//! (`WARM_STORAGE_READ_COST` / `COLD_SLOAD_COST`) and EIP-2200 pricing for writes.
 
 pub mod helpers;
 mod macros;

@@ -17,6 +17,7 @@
 use std::ops::RangeInclusive;
 
 use alloy_rpc_types_engine::ExecutionPayloadV3;
+use alloy_rpc_types_eth::BlockNumberOrTag;
 use arc_eth_engine::engine::Engine;
 use bytesize::ByteSize;
 use eyre::{eyre, WrapErr};
@@ -27,7 +28,7 @@ use malachitebft_app_channel::app::types::codec::HasEncodedLen;
 use malachitebft_app_channel::app::types::sync::RawDecidedValue;
 use malachitebft_app_channel::Reply;
 use malachitebft_core_types::utils::height::{DisplayRange, HeightRangeExt};
-use malachitebft_core_types::Height as _;
+use malachitebft_core_types::{ExtendedCommitCertificate, Height as _, VoteExtensions};
 
 use arc_consensus_types::codec::proto::ProtobufCodec;
 use arc_consensus_types::sync::{Response, ValueResponse};
@@ -119,7 +120,7 @@ async fn get_decided_values(
     let heights = range.clone().iter_heights().collect::<Vec<_>>();
     let block_numbers = heights
         .iter()
-        .map(|height| format!("0x{:x}", height.as_u64()))
+        .map(|height| BlockNumberOrTag::Number(height.as_u64()))
         .collect::<Vec<_>>();
 
     let execution_payloads = engine.eth.get_execution_payloads(&block_numbers).await?;
@@ -200,9 +201,13 @@ async fn get_raw_decided_value(
         .ok_or_else(|| eyre!("No certificate found at height {height}"))?;
 
     let decided_block = DecidedBlock::new(execution_payload, stored.certificate);
+    let certificate = ExtendedCommitCertificate::from_commit_certificate_and_extensions(
+        decided_block.certificate,
+        VoteExtensions::default(),
+    );
 
     let raw_value = RawDecidedValue {
-        certificate: decided_block.certificate,
+        certificate,
         value_bytes: decided_block.execution_payload.as_ssz_bytes().into(),
     };
 

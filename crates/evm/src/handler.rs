@@ -15,11 +15,11 @@
 // limitations under the License.
 
 use alloy_primitives::{Address, U256};
-use arc_execution_config::hardforks::ArcHardforkFlags;
+use arc_execution_config::hardforks::{ArcHardfork, ArcHardforkFlags};
 use arc_execution_config::native_coin_control::{
     compute_is_blocklisted_storage_slot, is_blocklisted_status,
 };
-use arc_precompiles::helpers::ERR_BLOCKED_ADDRESS;
+use arc_precompiles::helpers::{ERR_BLOCKED_ADDRESS, ERR_SELFDESTRUCTED_BALANCE_INCREASED};
 use arc_precompiles::NATIVE_COIN_CONTROL_ADDRESS;
 use revm::inspector::{Inspector, InspectorEvmTr, InspectorHandler};
 use revm::{
@@ -37,8 +37,6 @@ use revm_primitives::TxKind;
 pub struct ArcEvmHandler<EVM, ERROR> {
     mainnet: MainnetHandler<EVM, ERROR, EthFrame<EthInterpreter>>,
     /// Feature flags for Arc hardforks active at the current block.
-    /// Retained for future hardfork-gated handler behavior (e.g. new precompiles).
-    #[allow(dead_code)]
     hardfork_flags: ArcHardforkFlags,
 }
 
@@ -64,7 +62,11 @@ where
     type HaltReason = HaltReason;
 
     #[inline]
-    fn pre_execution(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
+    fn pre_execution(
+        &self,
+        evm: &mut Self::Evm,
+        init_and_floor_gas: &mut revm_context_interface::cfg::gas::InitialAndFloorGas,
+    ) -> Result<u64, Self::Error> {
         let ctx = evm.ctx();
         let tx = ctx.tx();
         let caller = tx.caller();
@@ -76,7 +78,7 @@ where
             .load_account(NATIVE_COIN_CONTROL_ADDRESS)?;
         self.check_blocklist(evm, caller, &tx_kind, tx_value)?;
 
-        self.mainnet.pre_execution(evm)
+        self.mainnet.pre_execution(evm, init_and_floor_gas)
     }
 
     #[inline]
@@ -96,6 +98,17 @@ where
         // u128 * u64 fits in U256 (max 192 bits).
         #[allow(clippy::arithmetic_side_effects)]
         let total_fee_amount = U256::from(effective_gas_price) * U256::from(gas_used);
+
+        // Crediting a self-destructed beneficiary silently burns the fee at commit: reject the
+        // condition instead, matching the native-coin precompile credit guard.
+        if self.hardfork_flags.is_active(ArcHardfork::Zero8) {
+            let account = evm.ctx_mut().journal_mut().load_account(beneficiary)?;
+            if account.is_selfdestructed() {
+                return Err(
+                    InvalidTransaction::Str(ERR_SELFDESTRUCTED_BALANCE_INCREASED.into()).into(),
+                );
+            }
+        }
 
         // Transfer the total fee to the beneficiary (both base fee and priority fee)
         evm.ctx_mut()
@@ -180,6 +193,7 @@ mod tests {
         interpreter::{CallOutcome, Gas, InstructionResult, InterpreterResult},
         MainBuilder, MainContext,
     };
+    use rstest::rstest;
     use std::convert::Infallible;
 
     #[test]
@@ -514,6 +528,98 @@ mod tests {
         );
     }
 
+    /// A beneficiary self-destructed in the same transaction must not be silently credited (and
+    /// burned at commit). Under Zero8 the credit is rejected; before Zero8 the legacy behaviour
+    /// (unconditional credit) is preserved.
+    #[rstest]
+    #[case(
+        "zero8",
+        ArcHardforkFlags::with(&[ArcHardfork::Zero6, ArcHardfork::Zero7, ArcHardfork::Zero8]),
+        true
+    )]
+    #[case(
+        "pre-zero8",
+        ArcHardforkFlags::with(&[ArcHardfork::Zero6, ArcHardfork::Zero7]),
+        false
+    )]
+    fn test_reward_beneficiary_rejects_selfdestructed_under_zero8(
+        #[case] case_name: &str,
+        #[case] hardfork_flags: ArcHardforkFlags,
+        #[case] expect_error: bool,
+    ) {
+        let beneficiary = address!("1200000000000000000000000000000000000012");
+        let caller = address!("3400000000000000000000000000000000000034");
+        let gas_price = 10u128;
+        let gas_used = 21000u64;
+        let db: CacheDB<EmptyDBTyped<Infallible>> = CacheDB::new(EmptyDB::default());
+        let mut evm = Context::mainnet().with_db(db).build_mainnet();
+        evm.block.beneficiary = beneficiary;
+        evm.block.basefee = 7;
+        evm.tx.caller = caller;
+        evm.tx.gas_price = gas_price;
+
+        let mut exec_result = FrameResult::Call(CallOutcome::new(
+            InterpreterResult::new(
+                InstructionResult::Return,
+                alloy_primitives::Bytes::new(),
+                Gas::new_spent(gas_used),
+            ),
+            0..0,
+        ));
+
+        evm.journaled_state.load_account(beneficiary).unwrap();
+        evm.journaled_state
+            .state
+            .get_mut(&beneficiary)
+            .unwrap()
+            .mark_selfdestruct();
+        let initial_balance = evm
+            .journaled_state
+            .load_account(beneficiary)
+            .unwrap()
+            .info
+            .balance;
+
+        let handler: ArcEvmHandler<_, EVMError<Infallible>> = ArcEvmHandler::new(hardfork_flags);
+        let result = handler.reward_beneficiary(&mut evm, &mut exec_result);
+        let final_balance = evm
+            .journaled_state
+            .load_account(beneficiary)
+            .unwrap()
+            .info
+            .balance;
+
+        if expect_error {
+            match result {
+                Err(EVMError::Transaction(InvalidTransaction::Str(msg))) => {
+                    assert_eq!(
+                        msg, ERR_SELFDESTRUCTED_BALANCE_INCREASED,
+                        "'{case_name}' should return the selfdestructed balance error"
+                    );
+                }
+                other => {
+                    panic!(
+                        "'{case_name}' should reject with EVMError::Transaction(InvalidTransaction::Str), got: {:?}",
+                        other
+                    );
+                }
+            }
+            assert_eq!(
+                final_balance, initial_balance,
+                "'{case_name}' beneficiary balance must be unchanged"
+            );
+        } else {
+            if let Err(err) = result {
+                panic!("'{case_name}' should credit the beneficiary, got: {err:?}");
+            }
+            assert_eq!(
+                final_balance,
+                initial_balance + U256::from(gas_price * gas_used as u128),
+                "'{case_name}' beneficiary should be credited the full fee"
+            );
+        }
+    }
+
     #[derive(Debug)]
     struct BlocklistTestCase {
         name: &'static str,
@@ -639,7 +745,9 @@ mod tests {
 
             let handler: ArcEvmHandler<_, EVMError<Infallible>> =
                 ArcEvmHandler::new(ArcHardforkFlags::default());
-            let result = handler.pre_execution(&mut evm);
+            let mut init_and_floor_gas =
+                revm_context_interface::cfg::gas::InitialAndFloorGas::default();
+            let result = handler.pre_execution(&mut evm, &mut init_and_floor_gas);
 
             // Check caller balance after pre_execution to verify correct gas deduction behavior
             let final_caller_balance = evm
@@ -731,7 +839,7 @@ mod tests {
 
         assert!(result.is_ok(), "validate_initial_tx_gas should succeed");
         assert_eq!(
-            result.unwrap().initial_gas,
+            result.unwrap().initial_total_gas,
             21000,
             "Native value transfer should cost exactly 21,000 gas (no blocklist surcharge)"
         );

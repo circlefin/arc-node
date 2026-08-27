@@ -20,7 +20,7 @@ use std::time::Duration;
 use std::{env, fs};
 
 use color_eyre::eyre::{self, bail, eyre, Context, Result};
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use rand::Rng;
 use tokio::task::JoinHandle;
@@ -40,7 +40,8 @@ use crate::valset::ValidatorPowerUpdate;
 use crate::wait::{check_ws_connectable, wait_for_nodes, wait_for_nodes_sync, wait_for_rounds};
 use crate::{build, clean, info as info_mod, latency, monitor, setup, shell};
 use crate::{
-    DownloadSubcommand, InfoSubcommand, MonitoringSubcommand, RemoteSubcommand, SSMSubcommand,
+    DownloadKindSubcommand, DownloadSubcommand, InfoSubcommand, MonitoringSubcommand,
+    RemoteSubcommand, SSMSubcommand,
 };
 
 pub(crate) const QUAKE_DIR: &str = ".quake";
@@ -79,20 +80,6 @@ pub(crate) struct DockerImages {
     pub el_upgrade: Option<String>,
 }
 
-impl DockerImages {
-    /// All present image references (base + upgrade).
-    pub fn all(&self) -> Vec<&str> {
-        let mut out = vec![self.cl.as_str(), self.el.as_str()];
-        if let Some(ref img) = self.cl_upgrade {
-            out.push(img.as_str());
-        }
-        if let Some(ref img) = self.el_upgrade {
-            out.push(img.as_str());
-        }
-        out
-    }
-}
-
 pub(crate) struct Testnet {
     pub name: String,
     pub dir: PathBuf,
@@ -105,6 +92,21 @@ pub(crate) struct Testnet {
     pub infra: Arc<dyn InfraProvider>,
     pub infra_data: InfraData,
     pub nodes_metadata: NodesMetadata,
+}
+
+/// Resolve an optional `--output` flag into a concrete archive path. If the
+/// user passed a directory, append a timestamped `<prefix>-<ts>.tar.gz` inside
+/// it. If nothing was passed, use that timestamped name inside `default_dir`.
+/// The directory is **not** created here — callers create it just-in-time
+/// before writing, so a failed download does not leave an empty dir behind.
+fn resolve_archive_path(output: Option<PathBuf>, default_dir: &Path, prefix: &str) -> PathBuf {
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let filename = format!("{prefix}-{ts}.tar.gz");
+    match output {
+        None => default_dir.join(filename),
+        Some(p) if p.is_dir() => p.join(filename),
+        Some(p) => p,
+    }
 }
 
 impl Testnet {
@@ -166,7 +168,7 @@ impl Testnet {
 
         // Build container information for the nodes in the manifest
         let nodes_metadata =
-            NodesMetadata::new(infra_data.clone(), &manifest, &upgraded_containers)?;
+            NodesMetadata::new(infra_data.clone(), &manifest, &images, &upgraded_containers)?;
 
         // Create infrastructure provider, monitoring manager (local only)
         let infra: Arc<dyn InfraProvider> = match infra_data.infra_type {
@@ -332,8 +334,14 @@ impl Testnet {
             InfraType::Local => {
                 let local_infra = self.local_infra()?;
 
-                // The Docker images to build locally
-                let (reth_builds, malachite_builds) = build::local_images_to_build(&self.images);
+                // The Docker images to build locally, covering per-node overrides.
+                let (el_images, cl_images) = self.nodes_metadata.distinct_images();
+                let (reth_builds, malachite_builds) = build::local_images_to_build(
+                    &el_images,
+                    &cl_images,
+                    self.images.el_upgrade.as_ref(),
+                    self.images.cl_upgrade.as_ref(),
+                );
 
                 // Generate Docker Compose files
                 let compose_data = setup::ComposeTemplateDataLocal {
@@ -435,13 +443,24 @@ impl Testnet {
                         })
                         .collect();
 
-                    // Generate CL CLI flags including persistent peers
+                    // Effective per-node images (mixed-version networks): the
+                    // manifest override falls back to the global image.
+                    let (cl, el) = node.effective_images(&self.images.cl, &self.images.el);
+                    let node_images = DockerImages {
+                        cl,
+                        el,
+                        cl_upgrade: None,
+                        el_upgrade: None,
+                    };
+
+                    // Generate CL CLI flags including persistent peers. Pass this
+                    // node's CL image so version-compat targets its own binary.
                     let cl_cli_flags = setup::generate_consensus_cli_flags(
                         node_name,
                         Some(node),
                         "0.0.0.0", // Remote nodes listen on all interfaces
                         &peers_ips,
-                        Some(self.images.cl.as_str()),
+                        Some(node_images.cl.as_str()),
                         &follow_endpoint_urls,
                     )?;
 
@@ -453,7 +472,7 @@ impl Testnet {
                         latency_emulation: self.manifest.latency_emulation,
                         rpc,
                         remote_home_dir: format!("/home/{}", remote::USER_NAME),
-                        images: self.images.clone(),
+                        images: node_images,
                         cl_cli_flags,
                         el_cli_flags,
                         trusted_peers: trusted_peers.get(node_name).cloned().unwrap_or_default(),
@@ -461,6 +480,8 @@ impl Testnet {
                         el_memory_limit_gb: self.manifest.el_memory_limit_gb,
                         cl_cpu_limit: self.manifest.cl_cpu_limit,
                         cl_memory_limit_gb: self.manifest.cl_memory_limit_gb,
+                        el_env: node.el_env.clone(),
+                        cl_env: node.cl_env.clone(),
                     };
                     // Create node directory for compose file
                     let node_dir = self.dir.join(node_name);
@@ -482,9 +503,6 @@ impl Testnet {
         // Generate Malachite app private keys for each node.
         // Validators must get keys first so their BIP39 indices match the genesis.
         setup::generate_app_private_keys(&self.dir, &self.nodes_metadata, force)?;
-
-        // Generate Malachite app config files for each node (for backward compatibility with older versions)
-        setup::generate_app_config_files(&self.dir, &self.nodes_metadata, &self.manifest, force)?;
 
         // Generate JWT secret for authenticated RPC connection between Reth and Malachite
         if rpc {
@@ -535,7 +553,7 @@ impl Testnet {
 
         // Pull remote images (local mode only)
         if self.is_local() {
-            let remote_images = build::remote_images_to_pull(&self.images);
+            let remote_images = build::remote_images_to_pull(&self.effective_images());
             remote_images.iter().try_for_each(|image| {
                 info!(%image, "Pulling remote image");
                 infra::docker::pull(image)
@@ -633,7 +651,10 @@ impl Testnet {
             }
 
             // Start containers associated with the node group
-            let containers: Vec<_> = nodes.iter().flat_map(|n| n.container_names()).collect();
+            let containers: Vec<_> = nodes
+                .iter()
+                .flat_map(|n| n.running_container_names())
+                .collect();
             debug!(containers=%containers.join(", "), "Starting containers");
             self.infra.start(&containers)?;
 
@@ -717,7 +738,7 @@ impl Testnet {
     /// Once connected, monitoring errors (including timeout) are returned immediately
     /// without trying other nodes.
     pub async fn wait_rounds(&self, consecutive: u64, timeout: Duration) -> Result<()> {
-        let consensus_urls = self.nodes_metadata.all_consensus_rpc_urls();
+        let consensus_urls = self.nodes_metadata.all_consensus_enabled_rpc_urls();
         if consensus_urls.is_empty() {
             bail!("No consensus nodes found");
         }
@@ -1074,6 +1095,9 @@ impl Testnet {
                 let node_volume_iops = infra_args
                     .node_volume_iops
                     .or(self.manifest.node_volume_iops);
+                // Enabled by either the CLI flag or the manifest field.
+                let node_data_on_instance_store = infra_args.node_data_on_instance_store
+                    || self.manifest.node_data_on_instance_store;
                 // CLI overrides can mix freely with manifest fields, so re-validate
                 // the merged pair before reaching Terraform.
                 crate::manifest::validate_node_volume(node_volume_type, node_volume_iops)?;
@@ -1086,6 +1110,7 @@ impl Testnet {
                     cc_disk_gb,
                     node_volume_type,
                     node_volume_iops,
+                    node_data_on_instance_store,
                 )
             }
             RemoteSubcommand::Status => {
@@ -1113,6 +1138,9 @@ impl Testnet {
                 SSMSubcommand::Start => infra.ssm_tunnels.start().await,
                 SSMSubcommand::Stop => infra.ssm_tunnels.stop().await,
                 SSMSubcommand::List => infra.ssm_tunnels.list().await,
+                SSMSubcommand::KeepAlive { duration } => {
+                    infra.ssm_tunnels.keep_alive(duration).await
+                }
             },
             RemoteSubcommand::Destroy { yes } => {
                 if let Err(err) = infra.ssm_tunnels.stop().await {
@@ -1157,15 +1185,9 @@ impl Testnet {
             // File import handled in main(); start SSM tunnels so quake commands work immediately
             RemoteSubcommand::Import { .. } => infra.ssm_tunnels.start().await,
             RemoteSubcommand::Download { command } => {
-                let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-                let resolve = |output: Option<PathBuf>, prefix: &str| -> PathBuf {
-                    let default = PathBuf::from(format!("{prefix}-{ts}.tar.gz"));
-                    match output {
-                        None => default,
-                        Some(p) if p.is_dir() => p.join(default),
-                        Some(p) => p,
-                    }
-                };
+                warn!(
+                    "`quake remote download` is deprecated; use `quake download {{metrics,db}}` instead"
+                );
                 match command {
                     DownloadSubcommand::Metrics {
                         from,
@@ -1174,24 +1196,15 @@ impl Testnet {
                         metric_names,
                         output,
                     } => {
-                        let dest = resolve(output, "quake-metrics");
-                        infra.download_metrics(
-                            &metric_names,
-                            from.map(|dt| dt.unix_secs()),
-                            to.map(|dt| dt.unix_secs()),
-                            step.as_deref(),
-                            &dest,
-                        )
+                        self.download_metrics(from, to, step, metric_names, output)
+                            .await
                     }
                     DownloadSubcommand::Db {
                         nodes,
                         execution_only,
                         consensus_only,
                         output,
-                    } => {
-                        let dest = resolve(output, "quake-db");
-                        infra.download_node_db(&nodes, execution_only, consensus_only, &dest)
-                    }
+                    } => self.download_db(nodes, execution_only, consensus_only, output),
                 }
             }
         }
@@ -1206,6 +1219,104 @@ impl Testnet {
                 self.infra.stop_monitoring()?;
                 self.infra.clean_monitoring_data()?;
                 Ok(())
+            }
+        }
+    }
+
+    /// Download monitoring data (metrics and/or node databases).
+    pub async fn download(&self, command: Option<DownloadKindSubcommand>) -> Result<()> {
+        match command {
+            Some(DownloadKindSubcommand::Metrics {
+                from,
+                to,
+                step,
+                metric_names,
+                output,
+            }) => {
+                self.download_metrics(from, to, step, metric_names, output)
+                    .await
+            }
+            Some(DownloadKindSubcommand::Db {
+                nodes,
+                execution_only,
+                consensus_only,
+                output,
+            }) => self.download_db(nodes, execution_only, consensus_only, output),
+            None => {
+                self.download_metrics(None, None, None, vec![], None)
+                    .await?;
+                self.download_db(vec![], false, false, None)
+            }
+        }
+    }
+
+    async fn download_metrics(
+        &self,
+        from: Option<crate::CliTimestamp>,
+        to: Option<crate::CliTimestamp>,
+        step: Option<String>,
+        metric_names: Vec<String>,
+        output: Option<PathBuf>,
+    ) -> Result<()> {
+        let default_dir = self.quake_dir.join("metrics").join(&self.name);
+        let dest = resolve_archive_path(output, &default_dir, "quake-metrics");
+        let names: Vec<&str> = metric_names.iter().map(String::as_str).collect();
+        let (prometheus_port, _, _) = self.infra_data.monitoring_ports();
+        let prometheus_url = format!("http://127.0.0.1:{prometheus_port}");
+        crate::metrics::download_to_tarball(
+            &prometheus_url,
+            &names,
+            from.map(|t| t.unix_secs()),
+            to.map(|t| t.unix_secs()),
+            step.as_deref(),
+            &dest,
+        )
+        .await
+    }
+
+    fn download_db(
+        &self,
+        nodes: Vec<String>,
+        execution_only: bool,
+        consensus_only: bool,
+        output: Option<PathBuf>,
+    ) -> Result<()> {
+        warn!(
+            "⚠️  Downloading node DBs while nodes are still running may yield an inconsistent snapshot. Stop nodes first (`quake stop`) if you need a consistent point-in-time view."
+        );
+
+        let target_nodes: Vec<String> = if nodes.is_empty() {
+            let first = self
+                .manifest
+                .nodes
+                .keys()
+                .next()
+                .ok_or_else(|| eyre!("manifest has no nodes"))?
+                .clone();
+            info!(node=%first, "No node specified; defaulting to the first node in the manifest");
+            vec![first]
+        } else {
+            nodes
+        };
+
+        match self.infra_data.infra_type {
+            InfraType::Local => {
+                for node in &target_nodes {
+                    let node_dir = self.dir.join(node);
+                    if !consensus_only {
+                        info!(node=%node, path=%node_dir.join("reth").display(), "📂 Local EL data");
+                    }
+                    if !execution_only {
+                        info!(node=%node, path=%node_dir.join("malachite").display(), "📂 Local CL data");
+                    }
+                }
+                Ok(())
+            }
+            InfraType::Remote => {
+                let infra = self.remote_infra()?;
+                let default_dir = self.quake_dir.join("db").join(&self.name);
+                let dest = resolve_archive_path(output, &default_dir, "quake-db");
+                infra.download_node_db(&target_nodes, execution_only, consensus_only, &dest)
             }
         }
     }
@@ -1305,6 +1416,15 @@ impl Testnet {
                 })
                 .unwrap_or_default();
 
+            // Per-node CL image so version-compat rewrites this node's flags to
+            // its own binary's schema, not a single global image (mixed networks).
+            let cl_image = self
+                .nodes_metadata
+                .nodes
+                .get(&name)
+                .map(|n| n.consensus.image.clone())
+                .unwrap_or_default();
+
             // Local compose defines both the current CL service and the `_u`
             // upgrade service. Generate flags for each target image because
             // version compatibility can rewrite the two flag sets differently.
@@ -1313,7 +1433,7 @@ impl Testnet {
                 node_config,
                 &listen_ip,
                 &peers_ips,
-                Some(self.images.cl.as_str()),
+                Some(cl_image.as_str()),
                 &follow_endpoint_urls,
             )?;
 
@@ -1351,5 +1471,16 @@ impl Testnet {
             println!("               http://localhost:{RPC_PROXY_SSM_PORT}/nodes, http://localhost:{RPC_PROXY_SSM_PORT}/health");
             println!("  - Pprof proxy: http://localhost:{PPROF_PROXY_SSM_PORT}/nodes, http://localhost:{PPROF_PROXY_SSM_PORT}/health");
         }
+    }
+
+    /// All distinct images the running network references: each node's effective
+    /// CL and EL image plus the global upgrade images. Used for pull and existence
+    /// checks so per-node overrides are covered, not just the global images.
+    pub(crate) fn effective_images(&self) -> Vec<String> {
+        let (el, cl) = self.nodes_metadata.distinct_images();
+        let mut seen: IndexSet<String> = el.into_iter().chain(cl).collect();
+        seen.extend(self.images.cl_upgrade.clone());
+        seen.extend(self.images.el_upgrade.clone());
+        seen.into_iter().collect()
     }
 }

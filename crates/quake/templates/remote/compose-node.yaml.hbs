@@ -43,8 +43,15 @@ services:
       - shared-socket-volume:/sockets/
       {{/unless}}
     environment:
+      {{#unless (contains_key el_env "PATH")}}
       PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      {{/unless}}
+      {{#unless (contains_key el_env "ARC_LOG_FILE")}}
       ARC_LOG_FILE: /var/log/arc/{{el_container_name}}.log
+      {{/unless}}
+      {{#each el_env}}
+      {{@key}}: "{{{yaml_dq_escape this}}}"
+      {{/each}}
     command:
       - "node"
       - "--datadir=/data/reth"
@@ -114,8 +121,15 @@ services:
       - shared-socket-volume:/sockets/
       {{/unless}}
     environment:
+      {{#unless (contains_key cl_env "ARC_LOG_FILE")}}
       ARC_LOG_FILE: /var/log/arc/{{cl_container_name}}.log
+      {{/unless}}
+      {{#unless (contains_key cl_env "ARC_GENESIS_FILE_PATH")}}
       ARC_GENESIS_FILE_PATH: /assets/genesis.json
+      {{/unless}}
+      {{#each cl_env}}
+      {{@key}}: "{{{yaml_dq_escape this}}}"
+      {{/each}}
     command:
       # - "--log-format=json"
       - "start"

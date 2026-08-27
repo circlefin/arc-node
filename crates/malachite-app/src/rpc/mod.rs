@@ -27,3 +27,4 @@ mod version;
 
 pub use routes::build_router;
 pub use routes::serve;
+pub(crate) use routes::serve_with_metrics;

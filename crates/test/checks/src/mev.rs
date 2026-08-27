@@ -24,6 +24,7 @@
 //! - **Pending-block suppression** — `eth_getBlockByNumber("pending")` returns null
 //! - **Pending state fallback** — state methods with `"pending"` tag match `"latest"`
 //! - **Pending-tx RPCs blocked** — `eth_newPendingTransactionFilter` returns `-32001`
+//! - **Bundle RPCs unavailable** — all six Reth bundle methods return method-not-found
 //! - **Sensitive namespaces disabled** — txpool, debug, trace, admin, flashbots, mev, ots
 //! - **Mempool nonce lookup blocked** — `eth_getTransactionBySenderAndNonce` returns no data
 
@@ -38,6 +39,8 @@ use crate::types::{CheckResult, Report};
 
 /// JSON-RPC error code returned by Arc's pending-tx filter.
 const ARC_BLOCKED_ERROR_CODE: i64 = -32001;
+/// Standard JSON-RPC error code for a method that is not registered.
+const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
 
 /// Default address for state-query assertions (Anvil account #0, localdev genesis).
 pub const DEFAULT_ADDR: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
@@ -273,6 +276,39 @@ async fn check_namespace_disabled(
     }
 }
 
+async fn check_method_not_found(
+    client: &reqwest::Client,
+    url: &Url,
+    node: &str,
+    method: &str,
+    params: Value,
+) -> CheckResult {
+    match rpc_call(client, url, method, params).await {
+        RpcOutcome::Err { code, .. } if code == METHOD_NOT_FOUND_ERROR_CODE => CheckResult {
+            name: node.into(),
+            passed: true,
+            message: format!("{method} is not exposed"),
+        },
+        RpcOutcome::Ok(_) => CheckResult {
+            name: node.into(),
+            passed: false,
+            message: format!("{method} returned data; bundle RPC must not be exposed"),
+        },
+        RpcOutcome::Err { code, message } => CheckResult {
+            name: node.into(),
+            passed: false,
+            message: format!(
+                "{method} unexpected error {code}: {message} (expected method-not-found)"
+            ),
+        },
+        RpcOutcome::Transport(e) => CheckResult {
+            name: node.into(),
+            passed: false,
+            message: format!("{method} transport error: {e}"),
+        },
+    }
+}
+
 async fn check_mempool_nonce_blocked(
     client: &reqwest::Client,
     url: &Url,
@@ -414,7 +450,19 @@ async fn check_node(
         .await,
     );
 
-    // 9. Sensitive namespaces disabled
+    // 9. Bundle RPC methods are never exposed, independently of namespace selection
+    for method in [
+        "eth_callBundle",
+        "eth_sendBundle",
+        "eth_cancelBundle",
+        "eth_sendPrivateTransaction",
+        "eth_sendPrivateRawTransaction",
+        "eth_cancelPrivateTransaction",
+    ] {
+        checks.push(check_method_not_found(client, url, node, method, json!([])).await);
+    }
+
+    // 10. Sensitive namespaces disabled
     for method in &["txpool_status", "txpool_inspect", "txpool_content"] {
         checks.push(check_namespace_disabled(client, url, node, method, json!([])).await);
     }
@@ -479,7 +527,7 @@ async fn check_node(
         .await,
     );
 
-    // 10. Mempool nonce lookup blocked
+    // 11. Mempool nonce lookup blocked
     checks.push(check_mempool_nonce_blocked(client, url, node, addr).await);
 
     checks

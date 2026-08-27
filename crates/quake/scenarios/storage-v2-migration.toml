@@ -1,0 +1,23 @@
+# 5-validator network; all EL nodes start in Storage V1 (legacy MDBX-only) layout,
+# archive retention (no pruning). Used by the V1->V2 migration smoke test: one node is
+# migrated to V2 mid-test, proving a mixed V1/V2 network reaches consensus.
+# Temporary — remove once the storage-v2 migration phase has shipped.
+
+# Start with V1 storage
+[el.config.storage]
+v2 = false
+
+[nodes.validator1]
+cl_suggested_fee_recipient = "0x1111111111111111111111111111111111111111"
+
+[nodes.validator2]
+cl_suggested_fee_recipient = "0x2222222222222222222222222222222222222222"
+
+[nodes.validator3]
+cl_suggested_fee_recipient = "0x3333333333333333333333333333333333333333"
+
+[nodes.validator4]
+cl_suggested_fee_recipient = "0x4444444444444444444444444444444444444444"
+
+[nodes.validator5]
+cl_suggested_fee_recipient = "0x5555555555555555555555555555555555555555"
