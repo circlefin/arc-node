@@ -17,6 +17,39 @@ You can run a node using [binaries](#binaries) or [Docker](#docker).
 Refer to the [installation](installation.md) instructions to obtain the
 binaries or Docker images.
 
+## Choosing a network
+
+Arc runs multiple networks. The examples in this guide target **Arc Testnet**;
+to run a node on another network, substitute the `--chain` value and chain ID
+accordingly:
+
+| Network     | `--chain` value | Chain ID  | Minimum node version |
+|-------------|-----------------|-----------|----------------------|
+| Arc Testnet | `arc-testnet`   | `5042002` | see [installation](installation.md#versions) |
+| Arc Mainnet | `arc-mainnet`   | `5042`    | `v0.7.0` |
+
+Both chainspecs are bundled in the node binaries — `--chain arc-mainnet`
+adopts the mainnet genesis configuration exactly as `--chain arc-testnet`
+does for testnet, with no external genesis file required.
+
+**Mainnet-specific notes:**
+
+- **Version floor.** Mainnet operators must run **v0.7.0 or later**; earlier
+  versions are not supported. From v0.7.0, the consensus layer advertises
+  Arc-branded libp2p protocol identifiers on mainnet, so a pre-v0.7.0 CL
+  cannot peer with v0.7.0+ nodes. Do not stage rollouts across the v0.7.0
+  boundary — a subset of nodes left on `v0.6.x` fragments the mainnet mesh.
+  See [BREAKING_CHANGES.md](../BREAKING_CHANGES.md#v070).
+- **Snapshots.** Syncing from genesis is not supported on any Arc network, so
+  bootstrapping a mainnet node requires a mainnet snapshot
+  (`arc-snapshots download --chain=arc-mainnet ...`), available once published
+  to the snapshot service.
+- **RPC endpoints.** The `--rpc.forwarder` and `--follow.endpoint` URLs shown
+  in this guide are testnet endpoints. For mainnet, substitute the mainnet
+  RPC endpoints published by your RPC providers; do not point a mainnet node
+  at testnet endpoints (the chain IDs differ and the node will reject the
+  data).
+
 ## Binaries
 
 ### Configure paths

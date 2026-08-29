@@ -16,6 +16,13 @@ Consult the table below to confirm which version to run for each network.
 | Network     | Version |
 |-------------|---------|
 | Arc Testnet | v0.6.0  |
+| Arc Mainnet | v0.7.0 or later |
+
+> **Mainnet version floor:** mainnet node operators must run **v0.7.0 or
+> later** — earlier versions are not supported. From v0.7.0 the consensus
+> layer advertises Arc-branded libp2p protocol identifiers on mainnet
+> (chain ID `5042`), so a pre-v0.7.0 CL cannot peer with the mainnet mesh.
+> See [BREAKING_CHANGES.md](../BREAKING_CHANGES.md#v070) for details.
 
 ## Pre-built Binary
 
