@@ -303,7 +303,7 @@ mkdir -p "${ARC_HOME:-$HOME/.arc}"
 Download `docker-compose.yml` into a working directory:
 
 ```sh
-curl -O https://raw.githubusercontent.com/circlefin/arc-node/v${ARC_VERSION}/deployments/docker-compose.yml
+curl -O https://raw.githubusercontent.com/circlefin/arc-node/${ARC_VERSION}/deployments/docker-compose.yml
 ```
 
 ### Start

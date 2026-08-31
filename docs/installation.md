@@ -201,11 +201,11 @@ Alternatively, build images from a release tag:
 
 ```sh
 git clone https://github.com/circlefin/arc-node.git && cd arc-node
-git checkout v$ARC_VERSION
+git checkout "$ARC_VERSION"
 docker buildx bake \
-  --set "*.args.GIT_COMMIT_HASH=$(git rev-parse v$ARC_VERSION^{commit})" \
-  --set "*.args.GIT_VERSION=v$ARC_VERSION" \
-  --set "*.args.GIT_SHORT_HASH=$(git rev-parse --short v$ARC_VERSION^{commit})" \
+  --set "*.args.GIT_COMMIT_HASH=$(git rev-parse "${ARC_VERSION}^{commit}")" \
+  --set "*.args.GIT_VERSION=$ARC_VERSION" \
+  --set "*.args.GIT_SHORT_HASH=$(git rev-parse --short "${ARC_VERSION}^{commit}")" \
   --set "arc-execution.tags=arc-execution:$ARC_VERSION" \
   --set "arc-consensus.tags=arc-consensus:$ARC_VERSION"
 ```
