@@ -76,18 +76,22 @@ fn save(path: &Path, data: &str) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use arc_consensus_types::signing::PrivateKey;
     use rand::rngs::OsRng;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
+    /// Returns the permission bits of `path` on Unix systems.
+    #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
-        fs::metadata(path).unwrap().permissions().mode() & 0o777
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(path).unwrap();
+        metadata.permissions().mode() & 0o777
     }
 
+    #[cfg(unix)]
     #[test]
     fn save_priv_validator_key_creates_file_with_0600() {
         let dir = tempdir().unwrap();
@@ -98,8 +102,11 @@ mod tests {
         assert_eq!(mode_of(&key_file), 0o600);
     }
 
+    #[cfg(unix)]
     #[test]
     fn save_priv_validator_key_tightens_existing_loose_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempdir().unwrap();
         let key_file = dir.path().join("priv_validator_key.json");
 
