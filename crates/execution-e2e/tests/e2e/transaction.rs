@@ -92,6 +92,43 @@ async fn test_multiple_transactions() -> Result<()> {
     Ok(())
 }
 
+/// Regression test for #191: EOA self-calls carrying non-empty calldata.
+///
+/// These are valid EVM transactions. An EOA has no code to execute, but calldata still contributes
+/// to gas; the sender should lose only the transaction fee.
+#[tokio::test]
+async fn test_eoa_self_call_with_calldata() -> Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut node = ArcTestNode::start(ArcSetup::new()).await?;
+    let signer = node.wallet_signer(0)?;
+    let sender = signer.address();
+    let before = node.balance(sender, None).await?;
+
+    let receipt = send_and_mine(
+        &mut node,
+        signer,
+        TransactionRequest {
+            from: Some(sender),
+            to: Some(TxKind::Call(sender)),
+            value: Some(U256::ZERO),
+            input: TransactionInput::new(bytes!("0x48656c6c6f")),
+            gas: Some(30_000),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    assert!(receipt.status());
+    assert_eq!(receipt.block_number, Some(1));
+    assert!(receipt.gas_used > 21_000);
+    assert_eq!(receipt.logs().len(), 0);
+    let after = node.balance(sender, None).await?;
+    assert_eq!(after, before - fee(&receipt));
+
+    Ok(())
+}
+
 /// Test that a contract call that reverts is detected.
 #[tokio::test]
 async fn test_reverted_transaction() -> Result<()> {
