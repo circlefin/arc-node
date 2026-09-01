@@ -117,6 +117,10 @@ test_checksum_validation() {
     verify_checksum_file "$archive" "$checksum_file" "$archive_name"
     pass "valid checksum file passes"
 
+    printf '%s  %s\n' "$(printf '%s' "$checksum" | tr '[:lower:]' '[:upper:]')" "$archive_name" > "$checksum_file"
+    verify_checksum_file "$archive" "$checksum_file" "$archive_name"
+    pass "uppercase checksum digest passes"
+
     printf '%s  other-asset.tar.gz\n' "$checksum" > "$checksum_file"
     expect_fail "checksum filename mismatch fails" verify_checksum_file "$archive" "$checksum_file" "$archive_name"
 }

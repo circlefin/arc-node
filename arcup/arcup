@@ -664,6 +664,11 @@ verify_checksum_file() {
         error "Checksum file has invalid SHA-256 hash: $checksum_path"
     fi
 
+    # sha256sum and shasum both print lowercase, but the format accepted above allows
+    # either case, so fold to lowercase before comparing — otherwise a valid digest
+    # written in uppercase fails as a mismatch. Same normalization detect_platform uses.
+    expected_checksum="$(printf '%s' "$expected_checksum" | tr '[:upper:]' '[:lower:]')"
+
     if [[ -n "$expected_name" ]]; then
         expected_name="${expected_name#\*}"
         expected_name="${expected_name##*/}"
