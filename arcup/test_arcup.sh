@@ -64,6 +64,16 @@ test_version_comparison() {
         fail "same prerelease base is not newer"
     fi
     pass "same prerelease base is not newer"
+
+    if ! version_gt "0.3.0" "0.3.0-rc.1"; then
+        fail "release is newer than its prerelease"
+    fi
+    pass "release is newer than its prerelease"
+
+    if ! version_gt "v0.3.0" "v0.3.0-rc.2"; then
+        fail "release is newer than its prerelease with v prefix"
+    fi
+    pass "release is newer than its prerelease with v prefix"
 }
 
 test_target_mapping() {

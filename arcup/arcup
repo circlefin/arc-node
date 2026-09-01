@@ -6,7 +6,7 @@ set -euo pipefail
 
 # NOTE: if you make modifications to this script, please increment the version number.
 # WARNING: the SemVer pattern: major.minor.patch must be followed as we use it to determine if the script is up to date.
-ARCUP_INSTALLER_VERSION="0.2.0"
+ARCUP_INSTALLER_VERSION="0.2.1"
 
 REPO="${ARC_REPO:-circlefin/arc-node}"
 if [[ -n "${ARC_REPO:-}" ]] && [[ ! "$ARC_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
@@ -264,6 +264,17 @@ version_gt() {
     # Remove 'v' prefix if present
     local ver1="${1#v}"
     local ver2="${2#v}"
+
+    # Keep the pre-release tags aside: SemVer orders a release above any
+    # pre-release of the same major.minor.patch.
+    local pre1="" pre2=""
+    if [[ "$ver1" == *-* ]]; then
+        pre1="${ver1#*-}"
+    fi
+    if [[ "$ver2" == *-* ]]; then
+        pre2="${ver2#*-}"
+    fi
+
     ver1="${ver1%%-*}"
     ver2="${ver2%%-*}"
 
@@ -280,6 +291,13 @@ EOF
     [ "$minor1" -lt "$minor2" ] && return 1
     [ "$patch1" -gt "$patch2" ] && return 0
     [ "$patch1" -lt "$patch2" ] && return 1
+
+    # Same major.minor.patch. A release outranks a pre-release of it, so
+    # 0.3.0 is newer than 0.3.0-rc.1. Two pre-releases of the same version
+    # are not ordered here; no caller compares them.
+    if [ -z "$pre1" ] && [ -n "$pre2" ]; then
+        return 0
+    fi
 
     return 1
 }
