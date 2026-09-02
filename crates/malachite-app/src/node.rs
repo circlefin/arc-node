@@ -849,11 +849,13 @@ impl App {
         #[cfg(not(feature = "byzantine"))]
         let ctx = ArcContext::new();
 
-        // Initialize the application state with the resolved spec and genesis block
-        // NOTE: ArcContext is not always Copy, depending on whether
-        // `byzantine` feature is enabled, so we clone it here to avoid a conditional compilation warning.
-        #[allow(clippy::redundant_clone)]
-        let mut state = State::builder(ctx.clone())
+        #[cfg(feature = "byzantine")]
+        let state_ctx = ctx.clone();
+        #[cfg(not(feature = "byzantine"))]
+        let state_ctx = ctx;
+
+        // Initialize the application state with the resolved spec and genesis block.
+        let mut state = State::builder(state_ctx)
             .identity(identity.consensus.clone())
             .store(store.clone())
             .config(self.config.clone())
