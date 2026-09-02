@@ -679,6 +679,8 @@ fn build_node_execution_config(
     // Use the synchronous state-root path to avoid debug-only panics from
     // Reth proof worker pools that are unrelated to lifecycle behavior.
     config.engine.legacy_state_root_task_enabled = true;
+    // These scenarios do not exercise precompile caching, whose memory is multiplied per node.
+    config.engine.precompile_cache_disabled = true;
 
     let reth_port_offset = u16::try_from(test_id * 100 + node_id.as_usize() * 10)
         .wrap_err("Reth port offset overflow")?;
@@ -774,6 +776,16 @@ mod tests {
             cl: Mutex::new(None),
             el: Mutex::new(None),
         }
+    }
+
+    #[test]
+    fn execution_config_disables_precompile_cache() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ipc = IpcPaths::new(temp_dir.path());
+        let config = build_node_execution_config(0, NodeId::new(0), &ipc, LOCAL_DEV.clone())
+            .expect("node config");
+
+        assert!(config.engine.precompile_cache_disabled);
     }
 
     #[tokio::test]
