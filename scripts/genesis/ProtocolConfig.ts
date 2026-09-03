@@ -71,7 +71,7 @@ export const schemaProtocolConfig = z
       inverseElasticityMultiplier: schemaBigInt.min(0n).max(10000n),
       minBaseFee: schemaBigInt.min(0n).max(maxUint64),
       maxBaseFee: schemaBigInt.min(0n).max(maxUint64),
-      blockGasLimit: schemaBigInt.min(0n).max(maxUint64),
+      blockGasLimit: schemaBigInt.min(1n).max(maxUint64),
     }),
     consensusParams: z
       .object({
