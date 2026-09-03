@@ -93,6 +93,14 @@ arcup --uninstall
 ```
 
 `arcup` always verifies the downloaded archive against its `.sha256` file.
+`arcup --self-update` is verified the same way. It takes the installer from the
+latest release of `circlefin/arc-node`, checks it against the `arcup.sha256`
+published in that release, and leaves the installed `arcup` untouched if that
+check cannot be completed. Self-update ignores `ARC_REPO`, so pointing `arcup`
+at another repository cannot redirect an installer update. Releases made before
+the installer was published as a release asset have nothing to verify against,
+so `--self-update` refuses to run on them and the installer has to be
+reinstalled with the bootstrap command above.
 GPG signature verification is disabled until the Arc release signing key is
 published. If an archive for your operating system or CPU architecture is not
 available in the selected release, `arcup` prints the expected asset name and
@@ -106,6 +114,9 @@ Troubleshooting:
   an archive for your platform.
 - `Checksum verification failed`: retry the install; if it persists, do not run
   the downloaded binaries.
+- `Refusing to self-update`: the latest release publishes no installer that can
+  be verified, so nothing was replaced. Reinstall with the bootstrap command
+  above.
 - On macOS, if manually copied binaries are blocked by quarantine attributes,
   run `xattr -dr com.apple.quarantine "$ARC_BIN_DIR"` after reviewing the
   downloaded files.
