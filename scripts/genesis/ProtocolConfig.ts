@@ -44,6 +44,8 @@ const PROTOCOL_CONFIG_CONTROLLER_STORAGE_LOCATION = 0x958f8fec699b51a1249f513ece
 const PAUSABLE_STORAGE_LOCATION = 0x0642d7922329a434cf4fd17a3c95eb692c24fd95f9f94d0b55420a5d895f4a00n
 
 const maxUint64 = 18446744073709551615n
+const maxUint16 = 65535n
+const schemaUint16 = schemaBigInt.min(0n).max(maxUint16)
 
 export const schemaProtocolConfig = z
   .object({
@@ -75,14 +77,14 @@ export const schemaProtocolConfig = z
     }),
     consensusParams: z
       .object({
-        timeoutProposeMs: schemaBigInt,
-        timeoutProposeDeltaMs: schemaBigInt,
-        timeoutPrevoteMs: schemaBigInt,
-        timeoutPrevoteDeltaMs: schemaBigInt,
-        timeoutPrecommitMs: schemaBigInt,
-        timeoutPrecommitDeltaMs: schemaBigInt,
-        timeoutRebroadcastMs: schemaBigInt,
-        targetBlockTimeMs: schemaBigInt,
+        timeoutProposeMs: schemaUint16,
+        timeoutProposeDeltaMs: schemaUint16,
+        timeoutPrevoteMs: schemaUint16,
+        timeoutPrevoteDeltaMs: schemaUint16,
+        timeoutPrecommitMs: schemaUint16,
+        timeoutPrecommitDeltaMs: schemaUint16,
+        timeoutRebroadcastMs: schemaUint16,
+        targetBlockTimeMs: schemaUint16,
       })
       .optional(),
   })
