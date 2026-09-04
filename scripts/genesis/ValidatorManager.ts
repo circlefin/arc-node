@@ -100,6 +100,13 @@ export const schemaValidatorManager = z
   })
   .strict()
   .superRefine((data, ctx) => {
+    if (!data.validators.some((validator) => validator.votingPower > 0n)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['validators'],
+        message: 'At least one validator must have positive voting power',
+      })
+    }
     // Verify the public keys are unique.
     const publicKeySet = new Set()
     for (const validator of data.validators) {
