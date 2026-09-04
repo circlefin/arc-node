@@ -15,6 +15,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+permissions:
+  contents: read
+
 jobs:
   # ---------------------------------------------------------------------------
   # Rust: fmt, deps, lint run in parallel -> unit tests after lint passes
