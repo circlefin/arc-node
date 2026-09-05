@@ -6,6 +6,7 @@ Each bullet is prefixed with a flag identifying the kind of breaking change:
 
 - `[CLI]` -- CLI flag added, renamed, removed, or made required.
 - `[Config]` -- default value, environment variable, or manifest field change.
+- `[EVM]` -- EVM / precompile gas-schedule or execution-cost change that affects estimates or limits.
 - `[Format]` -- log, metric label, or serialized output format change that breaks parsers.
 
 Entries are split by audience. A change appears under `### For Validators` when validator-mode operation must change; otherwise it appears under `### For Node Operators`. A change requiring both audiences to act appears in both sections (rare).
@@ -115,6 +116,12 @@ No breaking changes in this release.
 - **[Format] Address and public-key rendering uniformly switched to `0x`-prefixed lowercase hex.**
   - Logs, metrics, and JSON-RPC responses now use a single canonical format (signatures continue to use Base64). EIP-55 checksums are not used; Prometheus labels are case-sensitive.
   - Log parsers, alerting rules, and dashboards built against the previous mixed formats (EIP-55 checksummed, non-prefixed hex, etc.) must be updated.
+
+- **[EVM] EIP-2929 warm/cold pricing now applies to account loads performed by Arc precompiles.**
+  - Old (`v0.6.x`): stateful precompile helpers did not charge EIP-2929 cold/warm account-access gas for loaded accounts.
+  - New (`v0.7.0`): account loads in `NativeCoinAuthority` `mint` / `burn` / `transfer` charge that gas. Cost scales with the number of distinct cold accounts a call touches.
+  - `eth_estimateGas` results and hardcoded gas limits taken against a `v0.6.x` node can be too low. This applies chiefly to native fiat token `mint` / `burn` / `transfer`, which route through the `NativeCoinAuthority` precompile and are gated behind `Zero6` (already active on live networks). `CallFrom` subcalls (`Memo`, `Multicall3From`) also charge cold account access, but that precompile only exists once `Zero7` is active.
+  - Re-estimate against a `v0.7.1` (or later) node. Transaction outcomes are unchanged for callers that already supply sufficient gas. Because `Zero6` is already open on live networks, the new pricing takes effect as soon as the node runs `v0.7.1` or later — re-estimate at upgrade time rather than at the next fork. (`CallFrom` itself activates with `Zero7`, but that governs the precompile's availability, not the `NativeCoinAuthority` account-load pricing.)
 
 ### For Validators
 
