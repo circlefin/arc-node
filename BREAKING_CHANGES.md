@@ -19,8 +19,9 @@ Compare and release-notes links resolve once the corresponding tag is published 
 ### For Node Operators
 
 - **[Format] JSON-RPC error text on insufficient-balance `eth_call` / `eth_estimateGas` changed with the reth 2.2 / revm 38 upgrade.**
-  - Value exceeds balance: the error previously read `insufficient funds for gas * price + value`; it now reflects revm 38's `OutOfFunds` variant.
-  - Simple (EOA-to-EOA) transfer with insufficient balance: reth 2.2 runs these RPC paths with `disable_fee_charge`, so the basic-transfer shortcut no longer applies the caller gas-allowance cap. The surfaced error shifted from `Missing or invalid parameters` to `gas required exceeds allowance`.
+  - Value exceeds balance: the surfaced text depends on the request shape. Requests that omit gas-price/fee fields reflect revm 38's `OutOfFunds` variant (`EVM error: OutOfFunds`); requests that set `gasPrice` or `maxFeePerGas` still fail the pre-execution balance check with the previous `insufficient funds for gas * price + value: have <have> want <want>` text. Client libraries such as ethers and viem populate fee fields automatically, so tooling must keep matching both strings.
+  - Calls whose sender balance cannot cover gas (contract or precompile targets): the surfaced error shifted from `Missing or invalid parameters` to `gas required exceeds allowance (<limit>)`. Because reth 2.2 runs these RPC paths with `disable_fee_charge`, the basic-transfer shortcut bypasses the caller gas-allowance cap entirely: a plain EOA-to-EOA transfer whose balance covers `value` now estimates successfully regardless of gas affordability.
+  - `gas required exceeds allowance (<limit>)` is the same string emitted when a request is clamped by `--rpc.gascap`; only `<limit>` distinguishes the sender's balance-derived allowance from the configured cap.
   - Neither string is a stable API contract, but tooling that matches JSON-RPC error text on these paths must update its patterns. No consensus-affecting behavior changed; only the RPC error surface.
 - **[CLI] `arc-node-consensus` admin RPC routes are disabled by default.**
   - The unauthenticated `POST` and `DELETE /persistent-peers` routes are no longer mounted unless `--rpc.admin` is provided.
