@@ -23,7 +23,7 @@ use reth_cli_commands::download::DownloadDefaults;
 use reth_node_core::args::DefaultRpcServerArgs;
 use std::borrow::Cow;
 
-// FIXME: Update this to the actual snapshot URL.
+// Base prefix for the object store; the resolvable pointer is `<base>/latest.txt`.
 /// Default snapshot URL for Arc Network testnet (chain ID 5042002).
 pub(crate) const DEFAULT_DOWNLOAD_URL: &str = "https://snapshots.arc.network/5042002";
 
@@ -36,7 +36,7 @@ pub const RPC_MAX_SUBSCRIPTIONS_PER_CONNECTION: u32 = 32;
 fn init_download_urls() {
     let download_defaults = DownloadDefaults {
         available_snapshots: vec![
-            // FIXME: Update this to the actual snapshot URL.
+            // Base prefix for the object store; the resolvable pointer is `<base>/latest.txt`.
             Cow::Borrowed("https://snapshots.arc.network/5042002 (testnet)"),
             Cow::Borrowed("https://snapshots.arc.network/5042001 (devnet)"),
         ],
