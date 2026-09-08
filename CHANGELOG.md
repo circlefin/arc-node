@@ -2,6 +2,12 @@
 
 All notable changes to arc-node are documented in this file.
 
+## [Unreleased]
+
+### Fixes
+
+- [EL] Normalize `pending` block tags in `eth_getLogs` filters to `latest` to prevent queries from resolving against the proposed block
+
 ## [v0.8.0]
 
 **Changes:** [v0.7.3...v0.8.0](https://github.com/circlefin/arc-node/compare/v0.7.3...v0.8.0) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.0)

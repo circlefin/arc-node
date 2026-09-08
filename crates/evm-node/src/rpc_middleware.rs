@@ -29,6 +29,7 @@ use jsonrpsee::{
     BatchResponseBuilder, MethodResponse,
 };
 use serde::de::DeserializeOwned;
+use serde_json::value::RawValue;
 use std::{
     future::Future,
     sync::{
@@ -53,6 +54,14 @@ const ETH_GET_RAW_TX_BY_BLOCK_NUMBER_AND_INDEX_METHOD: &str =
     "eth_getRawTransactionByBlockNumberAndIndex";
 const ETH_GET_UNCLE_COUNT_BY_BLOCK_NUMBER_METHOD: &str = "eth_getUncleCountByBlockNumber";
 const ETH_GET_HEADER_BY_NUMBER_METHOD: &str = "eth_getHeaderByNumber";
+const ETH_GET_LOGS_METHOD: &str = "eth_getLogs";
+// jsonrpsee proc-macro field name for eth_getLogs' single Filter param.
+const FILTER_OBJECT_KEY: &str = "filter";
+// Field names inside the Filter object itself — these come from the JSON-RPC
+// wire format (alloy_rpc_types_eth::Filter's serde rename), not jsonrpsee's
+// proc-macro, so they stay camelCase regardless of the outer param style.
+const FILTER_FROM_BLOCK_KEY: &str = "fromBlock";
+const FILTER_TO_BLOCK_KEY: &str = "toBlock";
 // jsonrpsee proc-macro field name for eth_getHeaderByNumber's BlockNumberOrTag param.
 // Reth's trait declares `hash: BlockNumberOrTag` (copy-paste from getHeaderByHash) —
 // see reth-rpc-eth-api/src/core.rs. If that arg is ever renamed, update this key and
@@ -86,7 +95,12 @@ pub struct ArcRpcLayer {
     /// `eth_getBlockByNumber`, `eth_getBlockReceipts`,
     /// `eth_getBlockTransactionCountByNumber`, `eth_getTransactionByBlockNumberAndIndex`,
     /// `eth_getRawTransactionByBlockNumberAndIndex`, `eth_getUncleCountByBlockNumber`,
-    /// and `eth_getHeaderByNumber` when called with the `"pending"` tag.
+    /// and `eth_getHeaderByNumber` (answered with `null`) when called with the
+    /// `"pending"` tag. Also normalizes `eth_getLogs`' `fromBlock`/`toBlock`
+    /// filter fields from `"pending"` to `"latest"` — Reth's state provider
+    /// already resolves `"pending"` to `"latest"` for every block-tagged value
+    /// query, but `eth_getLogs` alone resolves it to `head + 1` instead, which
+    /// this normalizes away rather than leaving as an inconsistency.
     /// When false, the filter is bypassed and these are allowed.
     /// CLI users opt out of the default via `--arc.expose-pending-txs`.
     pub filter_pending_txs: bool,
@@ -315,8 +329,9 @@ where
     }
 }
 
-/// Intercepts pending-tx RPCs (error or null) or forwards to the inner service.
-async fn intercept_or_forward<'a, S>(service: &S, req: Request<'a>) -> MethodResponse
+/// Intercepts pending-tx RPCs (error or null), coerces `eth_getLogs`' pending
+/// block tags to `latest`, or forwards to the inner service.
+async fn intercept_or_forward<'a, S>(service: &S, mut req: Request<'a>) -> MethodResponse
 where
     S: RpcServiceT<MethodResponse = MethodResponse> + Send + Sync,
 {
@@ -326,6 +341,7 @@ where
     if is_pool_pending_tx_lookup(&req) || is_pending_block_query(&req) {
         return null_response(&req);
     }
+    coerce_pending_get_logs(&mut req);
     service.call(req).await
 }
 
@@ -786,19 +802,78 @@ fn is_pending_block_method(method: &str) -> bool {
         || method == ETH_GET_HEADER_BY_NUMBER_METHOD
 }
 
+/// Mutates `fromBlock`/`toBlock` in place from `"pending"` to `"latest"`.
+/// Returns true if anything was changed.
+fn coerce_filter_pending_fields(filter: &mut serde_json::Value) -> bool {
+    let mut changed = false;
+    for key in [FILTER_FROM_BLOCK_KEY, FILTER_TO_BLOCK_KEY] {
+        if let Some(field) = filter.get_mut(key) {
+            let is_pending = serde_json::from_value::<BlockNumberOrTag>(field.clone())
+                .ok()
+                .is_some_and(|t| t.is_pending());
+            if is_pending {
+                *field = serde_json::Value::String("latest".to_string());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Rewrites `eth_getLogs`' filter object in place, replacing a `"pending"`
+/// `fromBlock`/`toBlock` with `"latest"`. No-op for any other method, or if
+/// the filter can't be parsed, or if neither field is `"pending"`.
+///
+/// `pending` already resolves to `latest` in Reth's state provider for every
+/// other RPC method that accepts a block tag (confirmed live and asserted by
+/// this repo's own MEV conformance suite, `crates/test/checks/src/mev.rs`).
+/// `eth_getLogs` is the one exception — its `"pending"` resolves to `head + 1`
+/// instead, which is why it needs handling here rather than being left alone
+/// like the rest of the RPC surface.
+///
+/// Mutates `req.params` directly rather than rebuilding the `Request` via
+/// `Request::owned(...)`, which would silently drop whatever the server
+/// attached to `req.extensions` — that field isn't a constructor parameter.
+fn coerce_pending_get_logs(req: &mut Request<'_>) {
+    if req.method_name() != ETH_GET_LOGS_METHOD {
+        return;
+    }
+    let Ok(mut value) = req.params().parse::<serde_json::Value>() else {
+        return;
+    };
+    let filter = if value.is_object() {
+        value.get_mut(FILTER_OBJECT_KEY)
+    } else {
+        value.get_mut(0)
+    };
+    let Some(filter) = filter else { return };
+    if !coerce_filter_pending_fields(filter) {
+        return;
+    }
+    let Ok(new_params) = serde_json::to_string(&value) else {
+        return;
+    };
+    let Ok(raw) = RawValue::from_string(new_params) else {
+        return;
+    };
+    req.params = Some(std::borrow::Cow::Owned(raw));
+}
+
 /// Returns true if the request queries pending-block state via a block number/tag parameter.
 ///
 /// The consensus engine may briefly expose a pending block via `provider().pending_block()`
 /// even when `--rpc.pending-block=none` is set.  Intercepting at the middleware layer
 /// guarantees a consistent `null` response regardless of consensus-engine state.
 fn is_pending_block_query(req: &Request<'_>) -> bool {
-    if !is_pending_block_method(req.method_name()) {
+    let method = req.method_name();
+    let params = req.params();
+
+    if !is_pending_block_method(method) {
         return false;
     }
-    let params = req.params();
     // eth_getBlockReceipts accepts BlockId: handles string tags and EIP-1898 object form
     // ({"blockNumber": "pending"}).  All other methods accept BlockNumberOrTag.
-    if req.method_name() == ETH_GET_BLOCK_RECEIPTS_METHOD {
+    if method == ETH_GET_BLOCK_RECEIPTS_METHOD {
         return extract_param::<BlockId>(
             params,
             &[BLOCK_ID_OBJECT_KEY_SNAKE, BLOCK_ID_OBJECT_KEY_CAMEL],
@@ -806,7 +881,7 @@ fn is_pending_block_query(req: &Request<'_>) -> bool {
         .is_some_and(|id| id.is_pending());
     }
     // Object key for named params — coupled to jsonrpsee proc-macro field names.
-    let key = if req.method_name() == ETH_GET_HEADER_BY_NUMBER_METHOD {
+    let key = if method == ETH_GET_HEADER_BY_NUMBER_METHOD {
         BLOCK_HEADER_NUMBER_OBJECT_KEY
     } else {
         BLOCK_NUMBER_OBJECT_KEY
@@ -845,7 +920,6 @@ mod tests {
         types::{Id, ResponsePayload},
         BatchResponseBuilder,
     };
-    use serde_json::value::RawValue;
     use std::borrow::Cow;
 
     /// Mock RPC service that always returns a success response
@@ -1150,6 +1224,118 @@ mod tests {
             response.as_error_code().is_none(),
             "filter_pending_txs=true should allow getBlockByNumber(\"0x1\")"
         );
+    }
+
+    // -- eth_getLogs: pending fromBlock/toBlock coerced to latest --
+    //
+    // Unlike the six state-query methods (eth_getBalance and friends), which
+    // Reth already resolves pending -> latest for on its own, eth_getLogs
+    // resolves pending -> head + 1 instead — verified live against
+    // rpc.testnet.arc.io, non-deterministically erroring or returning the
+    // next block's logs depending on where head is at request time. This
+    // is the one place in the RPC surface that needs the middleware to step
+    // in, and it does so by rewriting the request rather than rejecting it,
+    // to match the pending == latest behaviour everywhere else.
+
+    #[tokio::test]
+    async fn test_get_logs_both_pending_coerced_to_latest() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let params =
+            RawValue::from_string(r#"[{"fromBlock":"pending","toBlock":"pending"}]"#.to_string())
+                .unwrap();
+        let request = create_request_with_params("eth_getLogs", params, 1);
+        let response = middleware.call(request).await;
+        assert!(response.as_error_code().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_logs_from_pending_to_numbered_coerces_from_only() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let params =
+            RawValue::from_string(r#"[{"fromBlock":"pending","toBlock":"0x123"}]"#.to_string())
+                .unwrap();
+        let request = create_request_with_params("eth_getLogs", params, 1);
+        let response = middleware.call(request).await;
+        assert!(response.as_error_code().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_logs_numbered_to_pending_coerces_to_only() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let params =
+            RawValue::from_string(r#"[{"fromBlock":"0x123","toBlock":"pending"}]"#.to_string())
+                .unwrap();
+        let request = create_request_with_params("eth_getLogs", params, 1);
+        let response = middleware.call(request).await;
+        assert!(response.as_error_code().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_logs_numbered_range_unaffected() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let params =
+            RawValue::from_string(r#"[{"fromBlock":"0x1","toBlock":"0x123"}]"#.to_string())
+                .unwrap();
+        let request = create_request_with_params("eth_getLogs", params, 1);
+        let response = middleware.call(request).await;
+        assert!(response.as_error_code().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_logs_latest_range_unaffected() {
+        let middleware = NoPendingTransactionsRpcMiddleware::new(MockRpcService);
+        let params =
+            RawValue::from_string(r#"[{"fromBlock":"latest","toBlock":"latest"}]"#.to_string())
+                .unwrap();
+        let request = create_request_with_params("eth_getLogs", params, 1);
+        let response = middleware.call(request).await;
+        assert!(response.as_error_code().is_none());
+    }
+
+    // Asserts the rewritten params, not just that the call succeeded — proves
+    // the middleware actually rewrote "pending" to "latest" rather than
+    // merely leaving the (still-pending) request to pass through unfiltered.
+    #[tokio::test]
+    async fn test_get_logs_coercion_rewrites_params_in_place() {
+        let params = RawValue::from_string(
+            r#"[{"fromBlock":"pending","toBlock":"pending","address":"0x0000000000000000000000000000000000000000"}]"#
+                .to_string(),
+        )
+        .unwrap();
+        let mut request = create_request_with_params("eth_getLogs", params, 1);
+        coerce_pending_get_logs(&mut request);
+        let rewritten: serde_json::Value = request.params().parse().unwrap();
+        assert_eq!(rewritten[0]["fromBlock"], "latest");
+        assert_eq!(rewritten[0]["toBlock"], "latest");
+        // Untouched fields survive the rewrite.
+        assert_eq!(
+            rewritten[0]["address"],
+            "0x0000000000000000000000000000000000000000"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_logs_object_params_coerced() {
+        let params = RawValue::from_string(
+            r#"{"filter":{"fromBlock":"pending","toBlock":"pending"}}"#.to_string(),
+        )
+        .unwrap();
+        let mut request = create_request_with_params("eth_getLogs", params, 1);
+        coerce_pending_get_logs(&mut request);
+        let rewritten: serde_json::Value = request.params().parse().unwrap();
+        assert_eq!(rewritten["filter"]["fromBlock"], "latest");
+        assert_eq!(rewritten["filter"]["toBlock"], "latest");
+    }
+
+    #[tokio::test]
+    async fn test_get_logs_no_pending_leaves_params_untouched() {
+        let original = r#"[{"fromBlock":"0x1","toBlock":"0x123"}]"#;
+        let params = RawValue::from_string(original.to_string()).unwrap();
+        let mut request = create_request_with_params("eth_getLogs", params, 1);
+        coerce_pending_get_logs(&mut request);
+        let untouched: serde_json::Value = request.params().parse().unwrap();
+        let original_value: serde_json::Value = serde_json::from_str(original).unwrap();
+        assert_eq!(untouched, original_value);
     }
 
     // -- pool pending tx lookup: intercepted --
