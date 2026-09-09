@@ -417,6 +417,9 @@ mod tests {
         for _ in 0..2_000 {
             base_fee = arc_calc_next_block_base_fee(0, gas_limit, base_fee, k_rate, iem);
         }
-        assert_eq!(base_fee, resting, "long empty-block run reaches resting value");
+        assert_eq!(
+            base_fee, resting,
+            "long empty-block run reaches resting value"
+        );
     }
 }
