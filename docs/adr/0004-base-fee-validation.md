@@ -165,13 +165,14 @@ This replaces the current `parent.extra_data → child.base_fee` check with a po
 
 ### Effective base-fee floor vs `minBaseFee`
 
-`arc_calc_next_block_base_fee` guarantees a minimum **increase** of 1 when utilization is above target, but the **decrease** path truncates to zero with no equivalent floor. For `k_rate > 0`, once `base_fee * k_rate < 10_000` an empty block no longer lowers the fee. The practical resting floor under sustained empty blocks is therefore:
+`arc_calc_next_block_base_fee` guarantees a minimum **increase** of 1 when utilization is above target, but the **decrease** path truncates to zero with no equivalent floor. For `k_rate > 0`, an empty block stops lowering the fee once `base_fee * k_rate < 10_000`. Under sustained empty blocks at production-scale gas limits, the resting value is therefore:
 
 ```text
-effective_floor ≈ max(minBaseFee, 10000 / kRate)
+resting_value = ceil(10000 / kRate) - 1
+effective_floor ≈ max(minBaseFee, resting_value)
 ```
 
-Operators reading only `feeParams.minBaseFee` can miss this interaction. It does not affect mainnet as currently configured (`minBaseFee = 20 gwei`, `kRate = 200` ⇒ truncation point 50 wei), but it did pin early testnet near 7 wei for an extended period against a declared `minBaseFee` of 1. A future governance update that lowers `minBaseFee` below `10000/kRate` (or lowers `kRate` enough to raise that truncation point above `minBaseFee`) would recreate the gap. See #367.
+`10000 / kRate` is the truncation *threshold*; the fee comes to rest one wei below it (e.g. `kRate = 1250` ⇒ threshold 8, rest 7; `kRate = 200` ⇒ threshold 50, rest 49). Operators reading only `feeParams.minBaseFee` can miss this interaction. It does not affect mainnet as currently configured (`minBaseFee = 20 gwei`, `kRate = 200`), but early testnet sat at 7 wei for millions of blocks against a declared `minBaseFee` of 1. A future governance update that lowers `minBaseFee` below that resting value (or lowers `kRate` enough to raise it above `minBaseFee`) would recreate the gap. See #367.
 
 Also note: the fee parameters in `assets/testnet/config.json` are **historical genesis values**. Live testnet `ProtocolConfig.feeParams()` currently matches the mainnet parameter set.
 
