@@ -169,4 +169,65 @@ mod tests {
 
         assert!(!<Proposal as ssz::Encode>::is_ssz_fixed_len());
     }
+
+    /// Signed preimages of different consensus message types must never collide.
+    ///
+    /// `Vote::to_sign_bytes` and `Proposal::to_sign_bytes` both hand raw SSZ to the
+    /// signer with no domain separator, unlike `ValidatorProof::signing_bytes`, which
+    /// prefixes `b"PoV"`. Today the two cannot collide because their encoded lengths are
+    /// disjoint -- `Vote` has one variable field pair and `Proposal` has two, so their SSZ
+    /// offset tables differ in size. That is an emergent property of the current field
+    /// sets, not an enforced one: adding a fixed field to `Vote`, or making `Value`
+    /// variable-length, could make the sets overlap and silently permit a signature over a
+    /// vote to be replayed as a proposal.
+    ///
+    /// This test pins the invariant so such a change fails loudly instead.
+    #[test]
+    fn test_vote_and_proposal_sign_bytes_lengths_are_disjoint() {
+        use alloy_primitives::BlockHash;
+
+        use crate::{Vote, ValueId};
+        use malachitebft_core_types::NilOrVal;
+
+        let height = Height::new(100);
+        let round = Round::new(5);
+        let block_hash = BlockHash::new([0xAA; 32]);
+        let validator_address = Address::new([0xBB; 20]);
+
+        // `to_sign_bytes` asserts the round is defined, so only `pol_round` / `value` vary.
+        let vote_lens: Vec<usize> = [NilOrVal::Nil, NilOrVal::Val(ValueId::new(block_hash))]
+            .into_iter()
+            .map(|value| {
+                Vote::new_prevote(height, round, value, validator_address)
+                    .to_sign_bytes()
+                    .len()
+            })
+            .collect();
+
+        let proposal_lens: Vec<usize> = [Round::Nil, Round::new(3)]
+            .into_iter()
+            .map(|pol_round| {
+                Proposal::new(
+                    height,
+                    round,
+                    Value::new(block_hash),
+                    pol_round,
+                    validator_address,
+                )
+                .to_sign_bytes()
+                .len()
+            })
+            .collect();
+
+        for v in &vote_lens {
+            assert!(
+                !proposal_lens.contains(v),
+                "Vote and Proposal signed-byte lengths overlap at {v} bytes \
+                 (vote={vote_lens:?}, proposal={proposal_lens:?}). Cross-type signature \
+                 replay may be possible; add an explicit domain separator to \
+                 `to_sign_bytes` for both types."
+            );
+        }
+    }
+
 }
