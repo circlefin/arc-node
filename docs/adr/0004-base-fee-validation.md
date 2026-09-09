@@ -132,6 +132,7 @@ next_base_fee = arc_calc_next_block_base_fee(smoothed_gas, gas_limit, base_fee, 
 if fee_params is not None:
     next_base_fee = clamp(next_base_fee, fee_params.minBaseFee, fee_params.maxBaseFee)
 
+
 # 4. Apply chainspec absolute bounds
 next_base_fee = clamp(next_base_fee, config.absolute_min_base_fee, config.absolute_max_base_fee)
 
@@ -161,6 +162,18 @@ assert decode(header.extra_data) == expected
 ```
 
 This replaces the current `parent.extra_data → child.base_fee` check with a post-execution invariant: the proposer's `extra_data` must match the deterministic output of execution.
+
+### Effective base-fee floor vs `minBaseFee`
+
+`arc_calc_next_block_base_fee` guarantees a minimum **increase** of 1 when utilization is above target, but the **decrease** path truncates to zero with no equivalent floor. For `k_rate > 0`, once `base_fee * k_rate < 10_000` an empty block no longer lowers the fee. The practical resting floor under sustained empty blocks is therefore:
+
+```text
+effective_floor ≈ max(minBaseFee, 10000 / kRate)
+```
+
+Operators reading only `feeParams.minBaseFee` can miss this interaction. It does not affect mainnet as currently configured (`minBaseFee = 20 gwei`, `kRate = 200` ⇒ truncation point 50 wei), but it did pin early testnet near 7 wei for an extended period against a declared `minBaseFee` of 1. A future governance update that lowers `minBaseFee` below `10000/kRate` (or lowers `kRate` enough to raise that truncation point above `minBaseFee`) would recreate the gap. See #367.
+
+Also note: the fee parameters in `assets/testnet/config.json` are **historical genesis values**. Live testnet `ProtocolConfig.feeParams()` currently matches the mainnet parameter set.
 
 ## Consequences
 

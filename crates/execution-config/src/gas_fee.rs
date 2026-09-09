@@ -387,4 +387,27 @@ mod tests {
             );
         }
     }
+
+    /// Empty blocks stop lowering the fee once `base_fee * k_rate < 10_000`
+    /// (integer truncation on the decrease path). For early-testnet-like
+    /// `k_rate = 1250`, that resting value is 7 — matching the on-chain
+    /// observation in #367.
+    #[test]
+    fn empty_blocks_rest_at_truncation_floor() {
+        let k_rate = 1250;
+        let iem = 5000; // 50% target
+        let gas_limit = 30_000_000;
+        let mut base_fee = 1_000_000_000u64; // 1 gwei
+        for _ in 0..2_000 {
+            base_fee = arc_calc_next_block_base_fee(0, gas_limit, base_fee, k_rate, iem);
+        }
+        assert_eq!(base_fee, 7, "expected truncation floor for k_rate={k_rate}");
+        // One more empty block must not move it.
+        assert_eq!(
+            arc_calc_next_block_base_fee(0, gas_limit, base_fee, k_rate, iem),
+            7
+        );
+        // Truncation point intuition: floor stops below 10000/k_rate (= 8).
+        assert_eq!(10_000 / k_rate, 8);
+    }
 }
