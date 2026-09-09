@@ -242,7 +242,7 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
             // Check balance and burn tokens
             balance_decr(&mut precompile_input.internals, args.from, args.amount, &mut gas_counter, reservoir, hardfork_flags)?;
 
-            // Adjust total supply
+            // Adjust total supply. Fail closed if supply lags the burned balance.
             let total_supply_output = read(
                 &mut precompile_input.internals,
                 NATIVE_COIN_AUTHORITY_ADDRESS,
@@ -252,13 +252,16 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
             )?;
             let current_total_supply = U256::from_be_slice(&total_supply_output);
 
-            // Write new total supply
-            // Underflow cannot happen due to the balance check
+            let new_total_supply = match current_total_supply.checked_sub(args.amount) {
+                Some(new_total_supply) => new_total_supply,
+                None => return Err(new_reverted_with_early_penalty(gas_counter, reservoir, ERR_OVERFLOW)),
+            };
+
             write(
                 &mut precompile_input.internals,
                 NATIVE_COIN_AUTHORITY_ADDRESS,
                 TOTAL_SUPPLY_STORAGE_KEY,
-                &current_total_supply.saturating_sub(args.amount).to_be_bytes_vec(),
+                &new_total_supply.to_be_bytes_vec(),
                 &mut gas_counter,
                 reservoir,
             )?;
@@ -1398,6 +1401,53 @@ mod tests {
 
                 cleanup_blocklist(&mut ctx, &tc.blocklisted_addresses);
             }
+        }
+    }
+
+    #[test]
+    fn burn_reverts_when_total_supply_underflows() {
+        let hardfork_flags = baseline_flags();
+        let mut ctx = mock_context(hardfork_flags);
+        setup_initial_state(&mut ctx, U256::from(1_000_000_000));
+        ctx.journal_mut()
+            .sstore(
+                NATIVE_COIN_AUTHORITY_ADDRESS,
+                TOTAL_SUPPLY_STORAGE_KEY.into(),
+                U256::ZERO,
+            )
+            .expect("Unable to zero total supply");
+
+        let inputs = CallInputs {
+            scheme: CallScheme::Call,
+            target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+            bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(
+                INativeCoinAuthority::burnCall {
+                    from: ADDRESS_A,
+                    amount: U256::from(1),
+                }
+                .abi_encode()
+                .into(),
+            ),
+            gas_limit: TEST_GAS_LIMIT,
+            caller: ALLOWED_CALLER_ADDRESS,
+            is_static: false,
+            return_memory_offset: 0..0,
+            reservoir: 0,
+        };
+
+        let precompile_res = call_native_coin_authority(&mut ctx, &inputs, hardfork_flags);
+        // Do not pin gas_used: balance_decr runs before the supply check, so the
+        // meter includes transfer accounting that mint-overflow does not.
+        match precompile_res {
+            Ok(Some(result)) => {
+                assert_eq!(result.result, InstructionResult::Revert);
+                let revert_reason = bytes_to_revert_message(result.output.as_ref());
+                assert_eq!(revert_reason.as_deref(), Some(ERR_OVERFLOW));
+            }
+            other => panic!("expected revert, got {other:?}"),
         }
     }
 
