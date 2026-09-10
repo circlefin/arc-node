@@ -132,7 +132,6 @@ next_base_fee = arc_calc_next_block_base_fee(smoothed_gas, gas_limit, base_fee, 
 if fee_params is not None:
     next_base_fee = clamp(next_base_fee, fee_params.minBaseFee, fee_params.maxBaseFee)
 
-
 # 4. Apply chainspec absolute bounds
 next_base_fee = clamp(next_base_fee, config.absolute_min_base_fee, config.absolute_max_base_fee)
 
@@ -172,9 +171,11 @@ resting_value = ceil(10000 / kRate) - 1
 effective_floor ≈ max(minBaseFee, resting_value)
 ```
 
-`10000 / kRate` is the truncation *threshold*; the fee comes to rest one wei below it (e.g. `kRate = 1250` ⇒ threshold 8, rest 7; `kRate = 200` ⇒ threshold 50, rest 49). Operators reading only `feeParams.minBaseFee` can miss this interaction. It does not affect mainnet as currently configured (`minBaseFee = 20 gwei`, `kRate = 200`), but early testnet sat at 7 wei for millions of blocks against a declared `minBaseFee` of 1. A future governance update that lowers `minBaseFee` below that resting value (or lowers `kRate` enough to raise it above `minBaseFee`) would recreate the gap. See #367.
+`10000 / kRate` is the truncation *threshold*; the fee comes to rest one wei below it (e.g. `kRate = 1250` ⇒ threshold 8, rest 7; `kRate = 200` ⇒ threshold 50, rest 49; `kRate = 10000` ⇒ rest 0, so a single empty block reaches zero before the output clamp). Operators reading only `feeParams.minBaseFee` can miss this interaction.
 
-Also note: the fee parameters in `assets/testnet/config.json` are **historical genesis values**. Live testnet `ProtocolConfig.feeParams()` currently matches the mainnet parameter set.
+This is a **forward-looking governance risk**, not a past Arc-curve incident: since the Arc fee curve has been live on testnet (`kRate = 200` from block ~21,659,090), `minBaseFee` has stayed well above the resting value (49 wei). The 7 wei floor observed earlier on testnet came from plain EIP-1559 dynamics (`/8`), not from Arc `kRate` truncation — do not treat that history as evidence the Arc curve already gapped. A future `updateFeeParams` that lowers `minBaseFee` below `ceil(10000/kRate) - 1` (or raises that resting value above `minBaseFee`) would create the gap. See #367.
+
+Also note: `assets/testnet/config.json` / `assets/devnet/config.json` fee params (`kRate: 25`, `minBaseFee: 1`) are **historical genesis values** (predicted Arc resting value 399). Live testnet `ProtocolConfig.feeParams()` currently matches the mainnet-like set (`kRate: 200`).
 
 ## Consequences
 
