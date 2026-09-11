@@ -37,6 +37,7 @@
     "@noble/hashes": "^1.8.0",
     "@nomicfoundation/hardhat-foundry": "^1.2.0",
     "@nomicfoundation/hardhat-toolbox-viem": "^4.1.0",
+    "@nomicfoundation/hardhat-verify": "^2.1.3",
     "@nomicfoundation/hardhat-viem": "^2.1.0",
     "c-kzg": "^2.1.2",
     "eslint": "^9.32.0",
