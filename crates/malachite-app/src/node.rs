@@ -959,10 +959,14 @@ impl App {
         };
 
         // Install SIGTERM handler for graceful shutdown
-        install_sigterm_handler(&handles);
+        let sigterm_handler = install_sigterm_handler(&handles);
 
         // Wait for the application to finish
         let result = handles.app.await?;
+
+        // If SIGTERM initiated the application shutdown, keep the runtime alive until
+        // the shutdown task completes its drain and exits the process.
+        sigterm_handler.wait_if_received().await?;
 
         // EL IPC closed: stop the Node actor with a bounded timeout, then exit non-zero so
         // the orchestrator restarts the container.
@@ -1121,12 +1125,29 @@ fn is_execution_engine_unreachable(err: &eyre::Report) -> bool {
         .any(|cause| cause.is::<ExecutionEngineUnreachable>())
 }
 
+#[cfg(unix)]
+struct SigtermHandler {
+    received: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    task: JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl SigtermHandler {
+    async fn wait_if_received(self) -> eyre::Result<()> {
+        if self.received.load(std::sync::atomic::Ordering::Acquire) {
+            self.task.await.wrap_err("SIGTERM shutdown task failed")?;
+        }
+
+        Ok(())
+    }
+}
+
 /// Install a SIGTERM handler to gracefully shutdown the node
 ///
 /// ## Note
 /// This is only available on Unix systems.
 #[cfg(unix)]
-fn install_sigterm_handler(handle: &Handle) {
+fn install_sigterm_handler(handle: &Handle) -> SigtermHandler {
     use tokio::signal::unix::signal;
 
     let node = handle.engine.actor.clone();
@@ -1134,10 +1155,15 @@ fn install_sigterm_handler(handle: &Handle) {
     let cancel_token = handle.cancel_token.clone();
     let graceful_shutdown = handle.graceful_shutdown.clone();
 
+    let received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let received_by_handler = received.clone();
+
     let mut sigterm = signal(SignalKind::terminate()).expect("inside Tokio runtime");
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         sigterm.recv().await;
+
+        received_by_handler.store(true, std::sync::atomic::Ordering::Release);
 
         warn!("Received SIGTERM, shutting down...");
 
@@ -1154,10 +1180,24 @@ fn install_sigterm_handler(handle: &Handle) {
         drain_before_exit(|| store.savepoint()).await;
         std::process::exit(SIGTERM_EXIT_CODE);
     });
+
+    SigtermHandler { received, task }
 }
 
 #[cfg(not(unix))]
-fn install_sigterm_handler(_handle: &Handle) {}
+struct SigtermHandler;
+
+#[cfg(not(unix))]
+impl SigtermHandler {
+    async fn wait_if_received(self) -> eyre::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn install_sigterm_handler(_handle: &Handle) -> SigtermHandler {
+    SigtermHandler
+}
 
 /// Wait for a termination signal (SIGTERM on Unix)
 async fn wait_for_termination() {
@@ -1253,6 +1293,26 @@ mod tests {
         drain_before_exit(|| saved.set(true)).await;
 
         assert!(saved.get());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_handler_waits_for_shutdown_task_after_signal() {
+        let received = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let shutdown_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_finished_by_task = shutdown_finished.clone();
+
+        let task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            shutdown_finished_by_task.store(true, Ordering::SeqCst);
+        });
+
+        SigtermHandler { received, task }
+            .wait_if_received()
+            .await
+            .unwrap();
+
+        assert!(shutdown_finished.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
