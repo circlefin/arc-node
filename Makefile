@@ -7,7 +7,9 @@ QUAKE_MANIFEST ?= crates/quake/scenarios/localdev.toml
 # Recursively expanded so smoke targets that override QUAKE_MANIFEST re-evaluate
 # at recipe time. All localdev* scenarios must keep the same validator count
 # (5) so `make smoke` produces a single genesis that matches both sub-targets.
-NUM_VALIDATORS = $(shell grep -c '^\[nodes\.validator' $(QUAKE_MANIFEST) 2>/dev/null || echo 5)
+NUM_VALIDATORS = $(shell \
+	count=$$(grep -c '^\[nodes\.validator' $(QUAKE_MANIFEST) 2>/dev/null); \
+	if [ -n "$$count" ] && [ "$$count" -gt 0 ] 2>/dev/null; then echo $$count; else echo 5; fi)
 QUAKE := cargo run --bin quake --
 DEFAULT_BRANCH ?= $(shell git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
 ifeq ($(DEFAULT_BRANCH),)
