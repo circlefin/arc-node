@@ -1,0 +1,26 @@
+name: Arc EVM Targeted Check
+
+on:
+  push:
+    branches:
+      - fix/assembler-storage-error
+
+jobs:
+  arc-evm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev zlib1g-dev
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+
+      - name: Run regression test
+        run: cargo test --locked -p arc-evm storage_provider_error_is_propagated -- --nocapture
+
+      - name: Run arc-evm clippy
+        run: cargo clippy --locked -p arc-evm --all-targets --all-features -- -D warnings
