@@ -7,8 +7,9 @@ Each bullet is prefixed with a flag identifying the kind of breaking change:
 - `[CLI]` -- CLI flag added, renamed, removed, or made required.
 - `[Config]` -- default value, environment variable, or manifest field change.
 - `[Format]` -- log, metric label, or serialized output format change that breaks parsers.
+- `[RPC]` -- JSON-RPC semantics, limits, defaults, validation, or error behavior changed for application callers.
 
-Entries are split by audience. A change appears under `### For Validators` when validator-mode operation must change; otherwise it appears under `### For Node Operators`. A change requiring both audiences to act appears in both sections (rare).
+Entries are split by audience. A change appears under `### For Validators` when validator-mode operation must change; under `### For Application Developers` when dApps, SDKs, wallets, or other JSON-RPC consumers may observe different behavior after a node upgrade (even when the method signatures are unchanged); otherwise it appears under `### For Node Operators`. A change requiring multiple audiences to act appears in each relevant section.
 
 Compare and release-notes links resolve once the corresponding tag is published at [`circlefin/arc-node`](https://github.com/circlefin/arc-node).
 
@@ -51,7 +52,7 @@ No breaking changes in this release.
 
 ### For Node Operators
 
-- **[Config] `arc-node-execution`: JSON-RPC gas cap default lowered.**
+- **[Config] `arc-node-execution`: JSON-RPC gas cap default lowered.** Also affects application callers; see `### For Application Developers` below.
   - Old (`v0.7.1`): `--rpc.gascap` default `50000000` (Reth stock default).
   - New (`v0.7.2`): `--rpc.gascap` default `30000000`.
   - `eth_call` and `eth_estimateGas` requests that need more than 30M gas now fail with a gas-cap error. Pass `--rpc.gascap 50000000` (or higher) to restore the previous budget. Operators who never set the flag and do not rely on calls above 30M gas are unaffected.
@@ -70,6 +71,21 @@ No breaking changes in this release.
   - Old (`v0.7.1`): `--invalid-tx-list-enable` default `false`.
   - New (`v0.7.2`): default `true`. On a payload-builder panic, all pending transactions are added to the list and removed from the mempool; resubmit them after investigating the panic.
   - Opt out with `--invalid-tx-list-enable=false`.
+
+### For Application Developers
+
+- **[RPC] `arc-node-execution`: JSON-RPC gas cap default lowered.**
+  - Old (`v0.7.1`): `--rpc.gascap` default `50000000` (Reth stock default).
+  - New (`v0.7.2`): `--rpc.gascap` default `30000000`.
+  - `--rpc.gascap` limits gas available to applicable JSON-RPC simulation paths (`eth_call`, `eth_estimateGas`). Reaching this limit does **not** necessarily mean the corresponding transaction exceeds Arc's protocol-level transaction or block gas limits — it may mean the node-local RPC simulation budget was exhausted first.
+  - `eth_call` and `eth_estimateGas` requests that need more than 30M gas now fail. The failure often surfaces as `gas required exceeds allowance (<limit>)` or an out-of-gas style error — the same allowance string is also used when the sender's balance-derived gas budget is exhausted, so compare the parenthesized `<limit>` against the node's configured `--rpc.gascap` to tell a cap rejection from a balance rejection. This is not the same as an on-chain execution revert or a protocol gas-limit rejection.
+  - Application developers should not treat gas-estimation failures after a node upgrade as proof that a transaction is impossible on-chain. Retry against a node with a higher cap, or ask the operator to raise `--rpc.gascap`. Public RPC endpoints may apply a lower effective cap than the repo default.
+
+- **[RPC] `arc-node-execution`: replay-unprotected (pre-EIP-155) transactions are rejected over JSON-RPC by default.**
+  - Applications submitting legacy unprotected transactions over RPC now receive `"only replay-protected (EIP-155) transactions allowed over RPC"` unless the operator enables `--arc.rpc.allow-unprotected-txs`.
+
+- **[RPC] `arc-node-execution`: JSON-RPC batch requests are capped.**
+  - Batches larger than `--arc.rpc.max-batch-entries` (default `100`) are rejected with JSON-RPC error `-32600` before any per-entry handler runs.
 
 ## [v0.7.1]
 
