@@ -886,6 +886,12 @@ impl Manifest {
             bail!("At least one node must be defined");
         }
 
+        for node_name in self.nodes.keys() {
+            if self.subnets.subnets_of(node_name).is_empty() {
+                bail!("Node '{node_name}' must belong to at least one subnet");
+            }
+        }
+
         if let Some(gb) = self.node_disk_gb {
             if gb < MIN_DISK_GB {
                 bail!("node_disk_gb must be at least {MIN_DISK_GB} (got {gb})");
