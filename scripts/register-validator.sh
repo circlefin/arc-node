@@ -49,8 +49,16 @@ cmd='forge script contracts/scripts/ValidatorManagement.s.sol --rpc-url http://l
 echo "Registering validator with public key: $VALIDATOR_PUBLIC_KEY_BYTES"
 result=$($cmd --sig "registerValidator()")
 
-# Find registration id from the output
-export REGISTRATION_ID=$(echo "$result" | ggrep -oP '_registrationId: uint256 \K[0-9]+' | tail -1)
+# Find registration id from the output. ggrep is Homebrew's GNU grep, which is
+# not installed by the setup in the README and does not exist on Linux, so
+# parse with POSIX sed instead.
+REGISTRATION_ID=$(echo "$result" | sed -n 's/.*_registrationId: uint256 \([0-9][0-9]*\).*/\1/p' | tail -1)
+if [ -z "$REGISTRATION_ID" ]; then
+    echo "Failed to read a registration id from the registerValidator() output:" >&2
+    echo "$result" >&2
+    exit 1
+fi
+export REGISTRATION_ID
 
 echo "Registered validator with registration id: $REGISTRATION_ID"
 
