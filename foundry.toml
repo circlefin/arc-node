@@ -30,3 +30,8 @@ fs_permissions = [
 [lint]
 ignore = ["contracts/test/scripts/*.t.sol"]
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+
+# Arcscan is Blockscout-backed but speaks the Etherscan V1 verify API (see #210).
+# A non-empty key is required by Foundry; Arcscan ignores the value.
+[etherscan]
+arc_testnet = { key = "${ETHERSCAN_API_KEY}", chain = 5042002, url = "https://testnet.arcscan.app/api" }
