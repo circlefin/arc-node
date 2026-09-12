@@ -93,7 +93,12 @@ where
         let beneficiary = ctx.block().beneficiary();
         let basefee = ctx.block().basefee() as u128;
         let effective_gas_price = ctx.tx().effective_gas_price(basefee);
-        let gas_used = exec_result.gas().used();
+        // Under EIP-8037 the top-level `Gas` spans the whole `tx.gas_limit`, and the unused
+        // state gas reservoir is returned to the caller by `reimburse_caller`. Leave it out
+        // here too, as revm's `post_execution::reward_beneficiary` does, so the reservoir is
+        // not both refunded to the caller and paid to the beneficiary.
+        let gas = exec_result.gas();
+        let gas_used = gas.used().saturating_sub(gas.reservoir());
 
         // u128 * u64 fits in U256 (max 192 bits).
         #[allow(clippy::arithmetic_side_effects)]
@@ -842,6 +847,88 @@ mod tests {
             result.unwrap().initial_total_gas,
             21000,
             "Native value transfer should cost exactly 21,000 gas (no blocklist surcharge)"
+        );
+    }
+
+    /// Under EIP-8037 the tx-level `Gas` built by `last_frame_result` spans the whole
+    /// `tx.gas_limit`, with the unused state gas reservoir kept outside `remaining`.
+    /// revm's `reimburse_caller` hands that reservoir back to the caller, so the
+    /// beneficiary must not be paid for it as well.
+    #[test]
+    fn test_reward_beneficiary_excludes_unused_reservoir() {
+        let beneficiary = address!("B000000000000000000000000000000000000001");
+        let caller = address!("C000000000000000000000000000000000000001");
+        let gas_limit = 20_000_000u64;
+        let remaining = 1_000_000u64;
+        let reservoir = 3_000_000u64;
+        let gas_price = 10u128;
+
+        let db: CacheDB<EmptyDBTyped<Infallible>> = CacheDB::new(EmptyDB::default());
+        let mut evm = Context::mainnet().with_db(db).build_mainnet();
+        evm.block.beneficiary = beneficiary;
+        evm.block.basefee = 7;
+        evm.tx.caller = caller;
+        evm.tx.gas_limit = gas_limit;
+        evm.tx.gas_price = gas_price;
+        evm.tx.gas_priority_fee = Some(3);
+
+        // The shape `last_frame_result` produces for a successful top-level frame.
+        let mut gas = Gas::new_spent(gas_limit);
+        gas.erase_cost(remaining);
+        gas.set_reservoir(reservoir);
+        let interpreter_result = InterpreterResult::new(
+            InstructionResult::Return,
+            alloy_primitives::Bytes::new(),
+            gas,
+        );
+        let mut exec_result = FrameResult::Call(CallOutcome::new(interpreter_result, 0..0));
+
+        let caller_before = evm
+            .journaled_state
+            .load_account(caller)
+            .unwrap()
+            .info
+            .balance;
+        let beneficiary_before = evm
+            .journaled_state
+            .load_account(beneficiary)
+            .unwrap()
+            .info
+            .balance;
+
+        revm::handler::post_execution::reimburse_caller(evm.ctx(), exec_result.gas(), U256::ZERO)
+            .unwrap();
+        let handler: ArcEvmHandler<_, EVMError<Infallible>> =
+            ArcEvmHandler::new(ArcHardforkFlags::default());
+        handler
+            .reward_beneficiary(&mut evm, &mut exec_result)
+            .unwrap();
+
+        let caller_credit = evm
+            .journaled_state
+            .load_account(caller)
+            .unwrap()
+            .info
+            .balance
+            - caller_before;
+        let beneficiary_credit = evm
+            .journaled_state
+            .load_account(beneficiary)
+            .unwrap()
+            .info
+            .balance
+            - beneficiary_before;
+
+        // The caller was charged `gas_limit * price` up front.
+        assert_eq!(
+            caller_credit + beneficiary_credit,
+            U256::from(gas_price * gas_limit as u128),
+            "reimbursement plus beneficiary reward must equal what the caller was charged"
+        );
+        assert_eq!(
+            beneficiary_credit,
+            U256::from(gas_price * (gas_limit - remaining - reservoir) as u128),
+            "beneficiary must not be paid for the unused reservoir"
         );
     }
 }
