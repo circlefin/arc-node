@@ -23,7 +23,7 @@ use crate::node::{CidrBlock, NodeName, SubnetName};
 
 /// Subnet index offset: user-defined subnets start at 172.21.x.x to avoid
 /// conflicting with the base Docker network at 172.19.x.x / 172.20.x.x.
-const SUBNET_INDEX_BASE: usize = 21;
+const SUBNET_INDEX_BASE: usize = 23;
 
 /// Subnets derived from the manifest.
 #[derive(Serialize, Clone, Debug, PartialEq, Default)]
@@ -353,8 +353,8 @@ mod tests {
         .into();
         let subnets = Subnets::new(&node_subnets);
         let cidr = subnets.cidr_map();
-        assert_eq!(cidr.get("A").unwrap(), "172.21.0.0/16");
-        assert_eq!(cidr.get("B").unwrap(), "172.22.0.0/16");
+        assert_eq!(cidr.get("A").unwrap(), "172.23.0.0/16");
+        assert_eq!(cidr.get("B").unwrap(), "172.24.0.0/16");
     }
 
     #[test]
@@ -368,7 +368,7 @@ mod tests {
         let subnets = Subnets::new(&node_subnets);
         assert_eq!(
             subnets.subnet_indexes_for("node2"),
-            vec![("A".to_string(), 21), ("B".to_string(), 22)]
+            vec![("A".to_string(), 23), ("B".to_string(), 24)]
         );
     }
 
