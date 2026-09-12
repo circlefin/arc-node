@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::retry::NoRetry;
+use crate::rpc::auth::Auth;
 use crate::rpc::errors::EngineApiRpcError;
 use crate::rpc::json_structs::{JsonRequestBody, JsonResponseBody};
 
@@ -34,7 +35,7 @@ pub struct RpcRequestBuilder<'a, B: Backoff = NoRetry> {
     method: &'a str,
     params: Option<Value>,
     timeout: Option<Duration>,
-    bearer_auth: Option<String>,
+    auth: Option<&'a Auth>,
     retry_policy: B,
 }
 
@@ -47,7 +48,7 @@ impl<'a> RpcRequestBuilder<'a> {
             method,
             params: None,
             timeout: None,
-            bearer_auth: None,
+            auth: None,
             retry_policy: NoRetry,
         }
     }
@@ -66,9 +67,14 @@ impl<'a, B: Backoff> RpcRequestBuilder<'a, B> {
         self
     }
 
-    /// Sets the Bearer token for authorization.
-    pub fn bearer_auth<S: Into<String>>(mut self, token: S) -> Self {
-        self.bearer_auth = Some(token.into());
+    /// Sets the source of the Bearer token for authorization.
+    ///
+    /// The token is minted per attempt rather than once for the builder. The
+    /// Engine API rejects a JWT whose `iat` is more than 60 seconds away from
+    /// the server's clock, so a request that is retried for longer than that
+    /// would otherwise keep resending a token the server can no longer accept.
+    pub fn auth(mut self, auth: &'a Auth) -> Self {
+        self.auth = Some(auth);
         self
     }
 
@@ -81,7 +87,7 @@ impl<'a, B: Backoff> RpcRequestBuilder<'a, B> {
             method: self.method,
             params: self.params,
             timeout: self.timeout,
-            bearer_auth: self.bearer_auth,
+            auth: self.auth,
             retry_policy: policy,
         }
     }
@@ -115,9 +121,9 @@ impl<'a, B: Backoff> RpcRequestBuilder<'a, B> {
                 request_builder = request_builder.timeout(timeout);
             }
 
-            // Apply Bearer token if one was provided
-            if let Some(token) = &self.bearer_auth {
-                request_builder = request_builder.bearer_auth(token);
+            // Mint a Bearer token for this attempt if an auth source was provided
+            if let Some(auth) = self.auth {
+                request_builder = request_builder.bearer_auth(auth.generate_token()?);
             }
 
             // Send the request
@@ -141,5 +147,76 @@ impl<'a, B: Backoff> RpcRequestBuilder<'a, B> {
                 warn!("RPC request failed: {e}, retrying in {dur:?}");
             })
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use alloy_rpc_types_engine::JwtSecret;
+    use backon::{BackoffBuilder, ConstantBuilder};
+    use wiremock::matchers::method as method_matcher;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::rpc::auth::Auth;
+
+    fn bearer(request: &wiremock::Request) -> String {
+        request
+            .headers
+            .get("authorization")
+            .expect("every attempt must carry an Authorization header")
+            .to_str()
+            .expect("header is ASCII")
+            .strip_prefix("Bearer ")
+            .expect("Bearer scheme")
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn each_retry_attempt_mints_a_fresh_token() {
+        let server = MockServer::start().await;
+        Mock::given(method_matcher("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let secret = JwtSecret::random();
+        let auth = Auth::new(secret);
+        let client = Client::new();
+        let url = Url::parse(&server.uri()).expect("mock server URI");
+
+        // One retry, spaced far enough apart that `iat`, which has one-second
+        // resolution, moves between the two attempts.
+        let policy = ConstantBuilder::new()
+            .with_delay(Duration::from_millis(1100))
+            .with_max_times(1);
+
+        let result: eyre::Result<Value> = RpcRequestBuilder::new(&client, &url, "eth_chainId")
+            .retry(policy.build())
+            .auth(&auth)
+            .send()
+            .await;
+        assert!(result.is_err(), "the mock server always fails");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording is on by default");
+        assert_eq!(requests.len(), 2, "one attempt plus one retry");
+
+        let first = bearer(&requests[0]);
+        let second = bearer(&requests[1]);
+
+        assert_ne!(
+            first, second,
+            "a retry must carry a newly minted token; reusing the first one means a \
+             request retried for longer than the 60s iat window can never authenticate"
+        );
+        assert!(secret.validate(&first).is_ok(), "first token must be valid");
+        assert!(
+            secret.validate(&second).is_ok(),
+            "second token must be valid"
+        );
     }
 }
