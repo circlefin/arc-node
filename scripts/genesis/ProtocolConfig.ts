@@ -44,6 +44,11 @@ const PROTOCOL_CONFIG_CONTROLLER_STORAGE_LOCATION = 0x958f8fec699b51a1249f513ece
 const PAUSABLE_STORAGE_LOCATION = 0x0642d7922329a434cf4fd17a3c95eb692c24fd95f9f94d0b55420a5d895f4a00n
 
 const maxUint64 = 18446744073709551615n
+const maxUint16 = 65535n
+// Packed into one storage slot as 8×uint16. Runtime updateConsensusParams also
+// requires each timeout (except targetBlockTimeMs) to be > 0.
+const schemaConsensusTimeoutMs = schemaBigInt.min(1n).max(maxUint16)
+const schemaTargetBlockTimeMs = schemaBigInt.min(0n).max(maxUint16)
 
 export const schemaProtocolConfig = z
   .object({
@@ -75,14 +80,14 @@ export const schemaProtocolConfig = z
     }),
     consensusParams: z
       .object({
-        timeoutProposeMs: schemaBigInt,
-        timeoutProposeDeltaMs: schemaBigInt,
-        timeoutPrevoteMs: schemaBigInt,
-        timeoutPrevoteDeltaMs: schemaBigInt,
-        timeoutPrecommitMs: schemaBigInt,
-        timeoutPrecommitDeltaMs: schemaBigInt,
-        timeoutRebroadcastMs: schemaBigInt,
-        targetBlockTimeMs: schemaBigInt,
+        timeoutProposeMs: schemaConsensusTimeoutMs,
+        timeoutProposeDeltaMs: schemaConsensusTimeoutMs,
+        timeoutPrevoteMs: schemaConsensusTimeoutMs,
+        timeoutPrevoteDeltaMs: schemaConsensusTimeoutMs,
+        timeoutPrecommitMs: schemaConsensusTimeoutMs,
+        timeoutPrecommitDeltaMs: schemaConsensusTimeoutMs,
+        timeoutRebroadcastMs: schemaConsensusTimeoutMs,
+        targetBlockTimeMs: schemaTargetBlockTimeMs,
       })
       .optional(),
   })
@@ -93,6 +98,15 @@ export const schemaProtocolConfig = z
       { key: 'controller', value: data.controller },
       { key: 'pauser', value: data.pauser },
     ])
+
+    // Match updateFeeParams: minBaseFee must not exceed maxBaseFee.
+    if (data.feeParams.minBaseFee > data.feeParams.maxBaseFee) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['feeParams', 'minBaseFee'],
+        message: 'minBaseFee must be <= maxBaseFee',
+      })
+    }
   })
 
 export type ProtocolConfigConfig = z.infer<typeof schemaProtocolConfig>

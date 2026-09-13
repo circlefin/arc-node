@@ -405,7 +405,7 @@ rm -rf ~/.arc
 
 > [!WARNING]
 > Running EL and CL on separate hosts requires the RPC/HTTP Engine API transport,
-> which will be deprecated in `v0.8.0` and will be removed in `v0.9.0`.
+> which is deprecated as of `v0.8.0` and will be removed in `v0.9.0`.
 > Run both layers on the same host and use IPC instead (see the
 > [Binaries](#binaries) section).
 > The consensus layer logs a startup warning when any RPC option is set.
