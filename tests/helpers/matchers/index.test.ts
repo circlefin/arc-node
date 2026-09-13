@@ -101,6 +101,7 @@ describe('matchers', () => {
   describe('skippable ', () => {
     it('skip compare', () => {
       expect('0x3').to.eq(skipCompare)
+      expect('0x3').to.hexEqual(skipCompare)
       expect('0x4e59b44847b379578588920cA78FbF26c0B4956C').to.be.eq(skipCompare)
       expect({ a: '0x3', b: 4n }).to.be.deep.eq(skipCompare)
     })
