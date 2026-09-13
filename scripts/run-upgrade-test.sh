@@ -41,7 +41,7 @@ Usage: $(basename "$0") [--from <version>] [--to <version>] [--hardfork <name>] 
 Trigger the nightly-upgrade workflow with image version overrides.
 
 Version values:
-  <version>  Published GHCR image ghcr.io/<org>/<repo>/<image>:<version> (e.g. 0.6.0-dev)
+  <version>  Published GHCR image ghcr.io/<org>/<repo>/<image>:<version> (e.g. 0.7.3-dev)
   latest     Published GHCR image ghcr.io/<org>/<repo>/<image>:latest
   local      Locally built image <image>:latest
 
