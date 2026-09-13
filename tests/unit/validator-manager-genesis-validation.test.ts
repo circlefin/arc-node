@@ -71,3 +71,34 @@ describe('ValidatorManager genesis validator-set validation', () => {
     expect(result.success).to.be.true
   })
 })
+
+describe('ValidatorManager genesis public-key validation', () => {
+  // ValidatorRegistry.registerValidator requires exactly 32 bytes; the schema
+  // has to say so too, or a bad key only fails later inside the alloc builder.
+  const PUBLIC_KEY_31 = `0x${'11'.repeat(31)}`
+  const PUBLIC_KEY_33 = `0x${'11'.repeat(33)}`
+
+  it('rejects a 31-byte public key at the schema', () => {
+    const result = schemaValidatorManager.safeParse(configWithValidators([validator(PUBLIC_KEY_31, CONTROLLER_A, 20n)]))
+
+    expect(result.success).to.be.false
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'validators.0.publicKey')).to.be.true
+    }
+  })
+
+  it('rejects a 33-byte public key at the schema', () => {
+    const result = schemaValidatorManager.safeParse(configWithValidators([validator(PUBLIC_KEY_33, CONTROLLER_A, 20n)]))
+
+    expect(result.success).to.be.false
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'validators.0.publicKey')).to.be.true
+    }
+  })
+
+  it('accepts a 32-byte public key', () => {
+    const result = schemaValidatorManager.safeParse(configWithValidators([validator(PUBLIC_KEY_A, CONTROLLER_A, 20n)]))
+
+    expect(result.success).to.be.true
+  })
+})
