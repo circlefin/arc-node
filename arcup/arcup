@@ -656,7 +656,16 @@ verify_checksum_file() {
     local archive_name="$3"
     local expected_checksum expected_name actual_checksum
 
-    if ! read -r expected_checksum expected_name < "$checksum_path"; then
+    if [[ ! -r "$checksum_path" ]]; then
+        error "Checksum file is missing or unreadable: $checksum_path"
+    fi
+
+    # `read` reports failure at EOF even when it populated the variables, which is
+    # what happens when the checksum file has no trailing newline. Inspect the parsed
+    # value rather than the exit status so a valid single-line file is still accepted.
+    read -r expected_checksum expected_name < "$checksum_path" || true
+
+    if [[ -z "$expected_checksum" ]]; then
         error "Checksum file is empty: $checksum_path"
     fi
 
