@@ -42,6 +42,13 @@ impl<ChainSpec> ArcBlockAssembler<ChainSpec> {
     }
 }
 
+fn storage_read_result<T, E>(result: Result<T, E>) -> Result<T, BlockExecutionError>
+where
+    E: core::error::Error + Send + Sync + 'static,
+{
+    result.map_err(BlockExecutionError::other)
+}
+
 impl<F, ChainSpec> BlockAssembler<F> for ArcBlockAssembler<ChainSpec>
 where
     F: for<'a> BlockExecutorFactory<
@@ -83,10 +90,11 @@ where
 
             // Read from state provider if the state is not changed.
             if value.is_none() {
-                value = input
-                    .state_provider
-                    .storage(SYSTEM_ACCOUNTING_ADDRESS, slot)
-                    .unwrap_or(None)
+                value = storage_read_result(
+                    input
+                        .state_provider
+                        .storage(SYSTEM_ACCOUNTING_ADDRESS, slot),
+                )?;
             }
 
             if let Some(value) = value {
@@ -109,6 +117,19 @@ mod tests {
     use super::*;
     use alloc::sync::Arc;
     use arc_execution_config::chainspec::LOCAL_DEV;
+
+    #[test]
+    fn storage_provider_error_is_propagated() {
+        let result: Result<Option<()>, std::io::Error> =
+            Err(std::io::Error::other("storage read failed"));
+
+        let error = match storage_read_result(result) {
+            Ok(_) => panic!("storage error should be propagated"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("storage read failed"));
+    }
 
     #[test]
     fn block_assembler_creation() {
