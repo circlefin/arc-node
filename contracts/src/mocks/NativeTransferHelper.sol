@@ -55,8 +55,13 @@ contract NativeTransferHelper {
 
     /// @notice Relays a call with value to the target, optionally requiring success
     function relay(address target, uint256 amount, bool requireSuccess, bytes calldata data) external payable {
-        (bool success,) = target.call{value: amount}(data);
-        require(success || !requireSuccess, "Relay reverted");
+        (bool success, bytes memory returndata) = target.call{value: amount}(data);
+        if (!success && requireSuccess) {
+            assembly ("memory-safe") {
+                let len := mload(returndata)
+                revert(add(returndata, 0x20), len)
+            }
+        }
     }
 
     /// @notice Self-destructs the contract, sending any remaining balance to the target address
