@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+import { z } from 'zod'
 import { expect } from 'chai'
 import { schemaValidatorManager } from '../../scripts/genesis/ValidatorManager'
 
@@ -16,6 +17,8 @@ const CONTROLLER_B = '0x7777777777777777777777777777777777777777'
 const PUBLIC_KEY_A = `0x${'11'.repeat(32)}`
 const PUBLIC_KEY_B = `0x${'22'.repeat(32)}`
 
+type ValidatorManagerConfig = z.infer<typeof schemaValidatorManager>
+
 const validator = (publicKey: string, controller: string, votingPower: bigint) => ({
   publicKey,
   votingPower,
@@ -27,7 +30,10 @@ const validator = (publicKey: string, controller: string, votingPower: bigint) =
   ],
 })
 
-const configWithValidators = (validators: ReturnType<typeof validator>[]) => ({
+const configWithValidators = (
+  validators: ReturnType<typeof validator>[],
+  overrides: Partial<ValidatorManagerConfig> = {},
+) => ({
   proxy: {
     admin: REGISTRY_ADMIN,
   },
@@ -40,6 +46,7 @@ const configWithValidators = (validators: ReturnType<typeof validator>[]) => ({
     pauser: PAUSER,
     validatorRegisterers: [REGISTERER],
   },
+  ...overrides,
 })
 
 describe('ValidatorManager genesis validator-set validation', () => {
@@ -69,5 +76,71 @@ describe('ValidatorManager genesis validator-set validation', () => {
     )
 
     expect(result.success).to.be.true
+  })
+
+  it('rejects duplicate public keys when hexadecimal casing differs', () => {
+    const publicKey = `0x${'Ab'.repeat(32)}`
+    const result = schemaValidatorManager.safeParse(
+      configWithValidators([validator(publicKey, CONTROLLER_A, 20n), validator(publicKey.toLowerCase(), CONTROLLER_B, 10n)]),
+    )
+
+    expect(result.success).to.be.false
+  })
+
+  it('rejects duplicate controllers when address casing differs', () => {
+    const controller = '0xAb00000000000000000000000000000000000001'
+    const result = schemaValidatorManager.safeParse(
+      configWithValidators([validator(PUBLIC_KEY_A, controller, 20n), validator(PUBLIC_KEY_B, controller.toLowerCase(), 10n)]),
+    )
+
+    expect(result.success).to.be.false
+  })
+
+  it('rejects duplicate validator registerers when address casing differs', () => {
+    const registerer = '0xAb00000000000000000000000000000000000002'
+    const result = schemaValidatorManager.safeParse(
+      configWithValidators([validator(PUBLIC_KEY_A, CONTROLLER_A, 20n)], {
+        PermissionedValidatorManager: {
+          proxy: { admin: PVM_ADMIN },
+          owner: OWNER,
+          pauser: PAUSER,
+          validatorRegisterers: [registerer, registerer.toLowerCase()],
+        },
+      }),
+    )
+
+    expect(result.success).to.be.false
+  })
+
+  it('rejects an operator colliding with the proxy admin when address casing differs', () => {
+    const proxyAdmin = '0xAb00000000000000000000000000000000000003'
+    const result = schemaValidatorManager.safeParse(
+      configWithValidators([validator(PUBLIC_KEY_A, CONTROLLER_A, 20n)], {
+        PermissionedValidatorManager: {
+          proxy: { admin: proxyAdmin },
+          owner: proxyAdmin.toLowerCase(),
+          pauser: PAUSER,
+          validatorRegisterers: [REGISTERER],
+        },
+      }),
+    )
+
+    expect(result.success).to.be.false
+  })
+
+  it('rejects a controller colliding with the PVM proxy admin when address casing differs', () => {
+    const proxyAdmin = '0xAb00000000000000000000000000000000000004'
+    const result = schemaValidatorManager.safeParse(
+      configWithValidators([validator(PUBLIC_KEY_A, proxyAdmin.toLowerCase(), 20n)], {
+        PermissionedValidatorManager: {
+          proxy: { admin: proxyAdmin },
+          owner: OWNER,
+          pauser: PAUSER,
+          validatorRegisterers: [REGISTERER],
+        },
+      }),
+    )
+
+    expect(result.success).to.be.false
   })
 })

@@ -159,8 +159,9 @@ export const enforceOperatorsNotProxyAdmin = (
   proxyAdmin: Address,
   operators: ReadonlyArray<{ key: string; value: Address }>,
 ) => {
+  const normalizedProxyAdmin = proxyAdmin.toLowerCase()
   for (const { key, value } of operators) {
-    if (value === proxyAdmin) {
+    if (value.toLowerCase() === normalizedProxyAdmin) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: `Operator ${key} cannot be the same as the proxy admin of ${contractName}`,

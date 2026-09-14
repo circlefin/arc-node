@@ -78,15 +78,16 @@ export const schemaNativeFiatToken = z
       })),
     ])
 
-    const minterSet = new Set()
+    const minterSet = new Set<string>()
     for (const minter of data.minters) {
-      if (minterSet.has(minter.address)) {
+      const normalized = minter.address.toLowerCase()
+      if (minterSet.has(normalized)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: `Minter ${minter.address} must be unique`,
         })
       }
-      minterSet.add(minter.address)
+      minterSet.add(normalized)
     }
   })
 

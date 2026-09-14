@@ -107,16 +107,18 @@ export const schemaValidatorManager = z
         message: 'At least one validator must have positive voting power',
       })
     }
-    // Verify the public keys are unique.
-    const publicKeySet = new Set()
+
+    // Verify the public keys are unique by their byte identity, not hex casing.
+    const publicKeySet = new Set<string>()
     for (const validator of data.validators) {
-      if (publicKeySet.has(validator.publicKey)) {
+      const normalizedPublicKey = validator.publicKey.toLowerCase()
+      if (publicKeySet.has(normalizedPublicKey)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: `Public key ${validator.publicKey} must be unique`,
         })
       }
-      publicKeySet.add(validator.publicKey)
+      publicKeySet.add(normalizedPublicKey)
     }
 
     const permissionedManager = data.PermissionedValidatorManager
@@ -138,29 +140,35 @@ export const schemaValidatorManager = z
       ...flattenedControllers.map(({ key, address }) => ({ key, value: address })),
     ])
 
-    // Verify addresses are unique for different roles.
-    const validatorRegistererSet = new Set()
+    // Verify addresses are unique for different roles by their byte identity.
+    const validatorRegistererSet = new Set<string>()
     for (const validatorRegisterer of permissionedManager.validatorRegisterers) {
-      if (validatorRegistererSet.has(validatorRegisterer)) {
+      const normalizedValidatorRegisterer = validatorRegisterer.toLowerCase()
+      if (validatorRegistererSet.has(normalizedValidatorRegisterer)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: `ValidatorRegisterer ${validatorRegisterer} must be unique`,
         })
       }
-      validatorRegistererSet.add(validatorRegisterer)
+      validatorRegistererSet.add(normalizedValidatorRegisterer)
     }
-    const controllerSet = new Set<Address>()
+
+    const controllerSet = new Set<string>()
     for (const { address, key } of flattenedControllers) {
-      if (controllerSet.has(address)) {
+      const normalizedAddress = address.toLowerCase()
+      if (controllerSet.has(normalizedAddress)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: `Controller ${address} (${key}) must be unique across all validators`,
         })
       }
-      controllerSet.add(address)
+      controllerSet.add(normalizedAddress)
     }
 
-    if (data.proxy.address != null && data.proxy.address !== DEFAULT_VALIDATOR_REGISTRY_PROXY_ADDRESS) {
+    if (
+      data.proxy.address != null &&
+      data.proxy.address.toLowerCase() !== DEFAULT_VALIDATOR_REGISTRY_PROXY_ADDRESS.toLowerCase()
+    ) {
       // the ValidatorRegistry address is hardcoded in the PermissionedValidatorManager.
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
