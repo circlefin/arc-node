@@ -215,6 +215,7 @@ precompile!(run_system_accounting, precompile_input, hardfork_flags; {
 
 /// Packs GasValues into a single 32-byte storage slot
 /// The layout is:
+/// - `nextBaseFee` (u64):     bytes [8..16]
 /// - `gasUsedSmoothed` (u64): bytes [16..24]
 /// - `gasUsed` (u64):         bytes [24..32]
 fn pack_gas_values_for_storage(g: GasValues) -> [u8; 32] {
