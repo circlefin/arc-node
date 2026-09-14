@@ -15,6 +15,7 @@
 // limitations under the License.
 
 import { isHex } from 'viem'
+import { isSkipCompare } from './skippable'
 
 /**
  * Reference the implementation of hexEqual in hardhat-chai-matchers.
@@ -28,6 +29,10 @@ export function supportHexEqual(Assertion: Chai.AssertionStatic, utils: Chai.Cha
     const subject = utils.flag(this, 'object') as unknown
     // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
     const isNegated = (this as any).__flags.negate === true
+
+    if (isSkipCompare(other)) {
+      return
+    }
 
     // check that both values are proper hex strings
     for (const element of [subject, other]) {
