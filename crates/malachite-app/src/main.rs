@@ -31,7 +31,7 @@ use arc_consensus_types::{
     SigningConfig,
 };
 use arc_node_consensus::hardcoded_config;
-use arc_node_consensus::node::{App, StartConfig};
+use arc_node_consensus::node::{App, StartConfig, SIGTERM_EXIT_CODE};
 use arc_node_consensus::store::migrations::MigrationCoordinator;
 use arc_node_consensus::store::{rollback_to_height, CERTIFICATES_TABLE, ROLLBACK_BATCH_SIZE};
 use arc_node_consensus_cli::{
@@ -298,8 +298,16 @@ fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<
     // Setup the application
     let app = App::new(config, args.get_home_dir()?, private_key_file, start_config);
 
-    // Start the node
-    rt.block_on(app.run())
+    // Start the node — map a SIGTERM-induced shutdown to the conventional exit
+    // code 143 (128 + SIGTERM) so the container orchestrator observes the correct
+    // termination reason.
+    match rt.block_on(app.run()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.to_string().contains("SIGTERM") => {
+            std::process::exit(SIGTERM_EXIT_CODE);
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn init(args: &Args, cmd: &InitCmd, _logging: config::LoggingConfig) -> Result<()> {
