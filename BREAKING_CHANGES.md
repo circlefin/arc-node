@@ -55,6 +55,7 @@ No breaking changes in this release.
   - Old (`v0.7.1`): `--rpc.gascap` default `50000000` (Reth stock default).
   - New (`v0.7.2`): `--rpc.gascap` default `30000000`.
   - `eth_call` and `eth_estimateGas` requests that need more than 30M gas now fail with a gas-cap error. Pass `--rpc.gascap 50000000` (or higher) to restore the previous budget. Operators who never set the flag and do not rely on calls above 30M gas are unaffected.
+  - Application developers should read [docs/public-testnet-rpc.md](docs/public-testnet-rpc.md) — post-Osaka (EIP-7825) the per-transaction gas limit is 16,777,216 (2²⁴), which undercuts this default for single-transaction estimates.
 
 - **[CLI] `arc-node-execution`: replay-unprotected (pre-EIP-155) transactions are rejected over JSON-RPC by default.**
   - Old (`v0.7.1`): pre-EIP-155 (replay-unprotected) transactions were accepted over JSON-RPC.
