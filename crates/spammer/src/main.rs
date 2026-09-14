@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
     let target_ws_urls = match cli.command {
         TargetCommand::Ws { targets } => {
             let target_nodes = targets.unwrap_or_else(|| vec![DEFAULT_WS_TARGET.to_string()]);
-            ws_urls_from_strings(target_nodes)
+            ws_urls_from_strings(target_nodes)?
         }
         TargetCommand::Nodes {
             nodes_path,
@@ -230,20 +230,20 @@ fn write_atomic(contents: &str, path: &Path, label: &str) -> Result<()> {
 }
 
 // Build the WebSocket URLs of the target nodes from the list of IP addresses and ports
-fn ws_urls_from_strings(target_nodes: Vec<String>) -> Vec<(String, Url)> {
+fn ws_urls_from_strings(target_nodes: Vec<String>) -> Result<Vec<(String, Url)>> {
     target_nodes
         .into_iter()
-        .map(|s| (s.clone(), ws_url_from_str(s)))
+        .map(|s| ws_url_from_str(s.clone()).map(|url| (s, url)))
         .collect()
 }
 
-fn ws_url_from_str(ip_port: String) -> Url {
+fn ws_url_from_str(ip_port: String) -> Result<Url> {
     let url_str = if !ip_port.starts_with("ws://") {
         format!("ws://{ip_port}")
     } else {
         ip_port
     };
-    Url::parse(&url_str).unwrap()
+    Url::parse(&url_str).wrap_err_with(|| format!("Invalid WebSocket target: {url_str}"))
 }
 
 // Read the file with node metadata and obtain the WebSocket URLs of the target nodes
@@ -313,14 +313,20 @@ mod tests {
 
     #[test]
     fn ws_url_from_str_adds_ws_scheme_if_missing() {
-        let url = ws_url_from_str("127.0.0.1:8546".to_string());
+        let url = ws_url_from_str("127.0.0.1:8546".to_string()).unwrap();
         assert_eq!(url.as_str(), "ws://127.0.0.1:8546/");
     }
 
     #[test]
     fn ws_url_from_str_parses_endpoint() {
-        let url = ws_url_from_str("ws://127.0.0.1:8546".to_string());
+        let url = ws_url_from_str("ws://127.0.0.1:8546".to_string()).unwrap();
         assert_eq!(url.as_str(), "ws://127.0.0.1:8546/");
+    }
+
+    #[test]
+    fn ws_url_from_str_rejects_invalid_endpoint() {
+        let err = ws_url_from_str("http://[::1".to_string()).unwrap_err();
+        assert!(err.to_string().contains("Invalid WebSocket target"));
     }
 
     #[test]
@@ -328,7 +334,8 @@ mod tests {
         let urls = ws_urls_from_strings(vec![
             "127.0.0.1:8546".to_string(),
             "ws://127.0.0.1:9546".to_string(),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(urls.len(), 2);
         assert_eq!(urls[0].0, "127.0.0.1:8546");
