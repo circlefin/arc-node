@@ -77,7 +77,7 @@ impl malachitebft_core_types::Height for Height {
     }
 
     fn decrement_by(&self, n: u64) -> Option<Self> {
-        Some(Self(self.0.saturating_sub(n)))
+        self.0.checked_sub(n).map(Self)
     }
 
     fn as_u64(&self) -> u64 {
@@ -219,9 +219,10 @@ mod tests {
         let decremented = height.decrement_by(10);
         assert_eq!(decremented.unwrap().as_u64(), 40);
 
-        // Test decrement_by with overflow
-        let decremented_overflow = height.decrement_by(100);
-        assert_eq!(decremented_overflow.unwrap().as_u64(), 0);
+        // decrement_by returns None when the result would go below the
+        // minimum, per the Height trait contract, rather than saturating to
+        // Some(0).
+        assert_eq!(height.decrement_by(100), None);
     }
 
     #[test]
@@ -256,5 +257,23 @@ mod tests {
         // Test decrement at max value
         let decremented = max_height.decrement().unwrap();
         assert_eq!(decremented.as_u64(), u64::MAX - 1);
+    }
+
+    #[test]
+    fn test_decrement_by_returns_none_on_underflow() {
+        // The Height trait documents decrement_by as returning None when the
+        // result would go below the minimum, and its default decrement()
+        // delegates here — so it must agree with the inherent decrement().
+        use malachitebft_core_types::Height as _;
+
+        assert_eq!(Height::new(5).decrement_by(5).map(|h| h.as_u64()), Some(0));
+        assert_eq!(Height::new(5).decrement_by(6), None);
+        assert_eq!(Height::ZERO.decrement_by(1), None);
+
+        // Trait decrement() (via decrement_by) must match inherent decrement().
+        assert_eq!(
+            <Height as malachitebft_core_types::Height>::decrement(&Height::ZERO),
+            Height::ZERO.decrement(),
+        );
     }
 }
