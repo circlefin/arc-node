@@ -848,6 +848,23 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn test_empty_node_subnets_are_rejected() {
+        let toml = r#"
+        [nodes.validator1]
+        subnets = ["trusted"]
+
+        [nodes.full1]
+        subnets = []
+        "#;
+
+        let err = Manifest::from_string(toml).unwrap_err().to_string();
+        assert!(
+            err.contains("Node 'full1' must belong to at least one subnet"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// el.config.trusted_peers round-trips through RawManifest → Manifest → RawManifest → Manifest.
     #[test]
     fn test_el_trusted_peers_roundtrip() {
