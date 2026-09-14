@@ -32,7 +32,7 @@ pub trait PendingProposalsRepository {
     ) -> Result<Vec<(Height, Round, BlockHash)>, Self::Error>;
 
     /// Return the total number of stored pending proposal parts.
-    async fn count(&self) -> Result<usize, StoreError>;
+    async fn count(&self) -> Result<usize, Self::Error>;
 }
 
 impl<T> PendingProposalsRepository for &T
@@ -51,7 +51,7 @@ where
             .await
     }
 
-    async fn count(&self) -> Result<usize, StoreError> {
+    async fn count(&self) -> Result<usize, Self::Error> {
         (**self).count().await
     }
 }
@@ -68,7 +68,46 @@ impl PendingProposalsRepository for Store {
             .await
     }
 
-    async fn count(&self) -> Result<usize, StoreError> {
+    async fn count(&self) -> Result<usize, Self::Error> {
         self.get_pending_proposal_parts_count().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("count failed")]
+    struct CountError;
+
+    /// An implementor whose error type is not `StoreError`, which is the point
+    /// of the associated `Error` type.
+    struct FailingCount;
+
+    impl PendingProposalsRepository for FailingCount {
+        type Error = CountError;
+
+        async fn enforce_limit(
+            &self,
+            _max_pending_proposals: usize,
+            _current_height: Height,
+        ) -> Result<Vec<(Height, Round, BlockHash)>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        async fn count(&self) -> Result<usize, Self::Error> {
+            Err(CountError)
+        }
+    }
+
+    #[tokio::test]
+    async fn count_reports_the_implementor_error_type() {
+        let repo = FailingCount;
+        assert!(matches!(repo.count().await, Err(CountError)));
+
+        // The blanket impl for `&T` forwards the same error type.
+        let by_ref = &repo;
+        assert!(matches!(by_ref.count().await, Err(CountError)));
     }
 }
