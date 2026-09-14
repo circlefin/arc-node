@@ -63,8 +63,8 @@ async fn check_mempool_with_providers<P: TxPoolApi>(providers: &[(String, P)]) -
         }
     });
 
-    // TODO: might want to make this parallel using tokio if the number of nodes to
-    // check is large.
+    // Poll all providers concurrently; each RPC request is independently bounded
+    // by REQUEST_TIMEOUT on the shared reqwest client.
     let results = join_all(futures).await;
 
     let checks = results
