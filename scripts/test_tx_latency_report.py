@@ -17,17 +17,20 @@ import sqlite3
 import tempfile
 import unittest
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 from tx_latency_report import (
     CsvStat,
     cache_is_fresh,
     connect,
+    csv_stat,
     default_db_path,
     ensure_db,
     fmt_opt,
     get_meta,
     has_table,
+    main,
     parse_time_ms,
     percentile_nearest_rank,
     query_latencies_ms,
@@ -307,6 +310,76 @@ class TestIntegration(unittest.TestCase):
             f.write(",".join(header) + "\n")
             for row in rows:
                 f.write(",".join(row) + "\n")
+
+    def _assert_csv_path_rejected(self, db_path, rebuild=False, direct=False):
+        self._write_csv([])
+        original = Path(self.csv_path).read_bytes()
+        try:
+            with self.assertRaisesRegex(ValueError, "--csv.*--db"):
+                if direct:
+                    rebuild_cache(self.csv_path, db_path, csv_stat(self.csv_path))
+                else:
+                    ensure_db(self.csv_path, db_path, rebuild=rebuild)
+        finally:
+            self.assertEqual(Path(self.csv_path).read_bytes(), original)
+
+    def test_ensure_db_rejects_csv_as_cache(self):
+        self._assert_csv_path_rejected(self.csv_path)
+
+    def test_ensure_db_rejects_csv_as_cache_when_rebuilding(self):
+        self._assert_csv_path_rejected(self.csv_path, rebuild=True)
+
+    def test_rebuild_cache_rejects_csv_as_cache(self):
+        self._assert_csv_path_rejected(self.csv_path, direct=True)
+
+    def test_ensure_db_rejects_relative_csv_aliases(self):
+        os.mkdir(os.path.join(self.tmpdir, "nested"))
+        previous_cwd = os.getcwd()
+        try:
+            os.chdir(self.tmpdir)
+            for db_path in ("test.csv", os.path.join("nested", "..", "test.csv")):
+                with self.subTest(db_path=db_path):
+                    self._assert_csv_path_rejected(db_path, rebuild=True)
+        finally:
+            os.chdir(previous_cwd)
+
+    def test_ensure_db_rejects_linked_csv_aliases(self):
+        self._write_csv([])
+        for name, make_link in (("hardlink", os.link), ("symlink", os.symlink)):
+            with self.subTest(link=name):
+                db_path = os.path.join(self.tmpdir, name)
+                try:
+                    make_link(self.csv_path, db_path)
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest(f"{name} unavailable: {exc}")
+                self._assert_csv_path_rejected(db_path, rebuild=True)
+
+    def test_main_rejects_csv_as_cache_without_changing_source(self):
+        self._write_csv([])
+        original = Path(self.csv_path).read_bytes()
+        try:
+            with patch("sys.stderr", new_callable=StringIO) as stderr:
+                result = main([
+                    "--csv", self.csv_path, "--db", self.csv_path, "--rebuild-db"
+                ])
+                self.assertNotEqual(result, 0)
+                self.assertIn("--csv", stderr.getvalue())
+                self.assertIn("--db", stderr.getvalue())
+        finally:
+            self.assertEqual(Path(self.csv_path).read_bytes(), original)
+
+    def test_main_reports_with_distinct_cache(self):
+        self._write_csv([["0xabc", "1000", "2000", "1", "0xblock", "1000"]])
+        original = Path(self.csv_path).read_bytes()
+        with patch("sys.stdout", new_callable=StringIO) as stdout:
+            result = main([
+                "--csv", self.csv_path, "--db", self.db_path, "--rebuild-db"
+            ])
+            self.assertEqual(result, 0)
+            self.assertIn("No. of txs=1", stdout.getvalue())
+            self.assertIn("Avg latency=1000ms", stdout.getvalue())
+        self.assertTrue(os.path.isfile(self.db_path))
+        self.assertEqual(Path(self.csv_path).read_bytes(), original)
 
     def test_rebuild_cache_creates_tables(self):
         """rebuild_cache creates required tables and indexes."""

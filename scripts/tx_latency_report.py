@@ -213,6 +213,12 @@ def cache_is_fresh(
     )
 
 
+def validate_cache_path(csv_path: str, db_path: str) -> None:
+    """Keep the source CSV separate from the writable SQLite cache."""
+    if os.path.exists(db_path) and os.path.samefile(csv_path, db_path):
+        raise ValueError("--csv and --db must refer to different files")
+
+
 def rebuild_cache(csv_path: str, db_path: str, csv_info: CsvStat) -> None:
     """
     Delete any existing cache and create a fresh SQLite database from the CSV.
@@ -221,6 +227,7 @@ def rebuild_cache(csv_path: str, db_path: str, csv_info: CsvStat) -> None:
     queries, inserts all rows from the CSV, and stores metadata for future
     freshness checks.
     """
+    validate_cache_path(csv_path, db_path)
     if os.path.exists(db_path):
         os.remove(db_path)
 
@@ -340,6 +347,7 @@ def ensure_db(csv_path: str, db_path: str, rebuild: bool) -> None:
     if the stored CSV metadata differs from the current CSV file.
     """
     csv_info = csv_stat(csv_path)
+    validate_cache_path(csv_path, db_path)
     if rebuild or not os.path.exists(db_path):
         rebuild_cache(csv_path, db_path, csv_info)
         return
@@ -537,7 +545,11 @@ def main(argv: list[str]) -> int:
     csv_path = args.csv
     db_path = args.db or default_db_path(csv_path)
 
-    ensure_db(csv_path, db_path, args.rebuild_db)
+    try:
+        ensure_db(csv_path, db_path, args.rebuild_db)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     conn = connect(db_path)
     try:
