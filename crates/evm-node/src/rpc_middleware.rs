@@ -463,21 +463,11 @@ fn is_raw_transaction_submission(method: &str) -> bool {
 
 /// Extracts the raw transaction bytes from a raw-tx submission request.
 ///
-/// Handles both positional (`[bytes]`) and object (`{"bytes": ...}`) params;
-/// returns `None` on any other shape or a parse failure.
+/// Object params read the named `bytes` field. Positional params read the first
+/// value, matching jsonrpsee's server-side argument decoding even when trailing
+/// values are present. Returns `None` on a missing value or parse failure.
 fn extract_raw_tx_bytes(req: &Request<'_>) -> Option<Bytes> {
-    #[derive(serde::Deserialize)]
-    struct SendRawTransactionParams {
-        bytes: Bytes,
-    }
-    if req.params().is_object() {
-        req.params()
-            .parse::<SendRawTransactionParams>()
-            .ok()
-            .map(|p| p.bytes)
-    } else {
-        req.params().parse::<(Bytes,)>().ok().map(|(bytes,)| bytes)
-    }
+    extract_param::<Bytes>(req.params(), &["bytes"])
 }
 
 /// Per-upstream relay clients plus the sticky-selection cursor.
@@ -1773,6 +1763,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rejects_pre_eip155_raw_transaction_with_extra_positional_param() {
+        let raw_hex = encode_legacy_raw(None);
+        for method in [
+            ETH_SEND_RAW_TRANSACTION_METHOD,
+            ETH_SEND_RAW_TRANSACTION_SYNC_METHOD,
+        ] {
+            let middleware = RejectUnprotectedTxsMiddleware::new(MockRpcService);
+            let request = raw_tx_request_with_params(
+                method,
+                format!("[\"{raw_hex}\",\"ignored\"]"),
+                1,
+            );
+            let response = middleware.call(request).await;
+
+            assert_unprotected_tx_rejected(response);
+        }
+    }
+
+    #[tokio::test]
     async fn test_rejects_pre_eip155_send_raw_transaction_object_hex_params() {
         let middleware = RejectUnprotectedTxsMiddleware::new(MockRpcService);
         let request = send_raw_tx_object_request(&encode_legacy_raw(None), 1);
@@ -1813,6 +1822,31 @@ mod tests {
         );
         let json: serde_json::Value = serde_json::from_str(response.into_json().get()).unwrap();
         assert_eq!(json["result"], "success");
+    }
+
+    #[tokio::test]
+    async fn test_allows_eip155_raw_transaction_with_extra_positional_param() {
+        let raw_hex = encode_legacy_raw(Some(1337));
+        for method in [
+            ETH_SEND_RAW_TRANSACTION_METHOD,
+            ETH_SEND_RAW_TRANSACTION_SYNC_METHOD,
+        ] {
+            let middleware = RejectUnprotectedTxsMiddleware::new(MockRpcService);
+            let request = raw_tx_request_with_params(
+                method,
+                format!("[\"{raw_hex}\",\"ignored\"]"),
+                2,
+            );
+            let response = middleware.call(request).await;
+
+            assert!(
+                response.as_error_code().is_none(),
+                "EIP-155-protected legacy tx with trailing positional params must be forwarded"
+            );
+            let json: serde_json::Value =
+                serde_json::from_str(response.into_json().get()).unwrap();
+            assert_eq!(json["result"], "success");
+        }
     }
 
     #[tokio::test]
@@ -1874,6 +1908,33 @@ mod tests {
         assert_eq!(responses[0]["error"]["message"], UNPROTECTED_TX_ERROR_MSG);
         assert_eq!(responses[1]["result"], "success");
         assert_eq!(responses[2]["result"], "success");
+    }
+
+    #[tokio::test]
+    async fn test_batch_rejects_unprotected_with_extra_positional_param() {
+        let middleware = RejectUnprotectedTxsMiddleware::new(MockRpcService);
+        let unprotected_hex = encode_legacy_raw(None);
+        let protected_hex = encode_legacy_raw(Some(1337));
+        let unprotected = send_raw_tx_request_with_params(
+            format!("[\"{unprotected_hex}\",\"ignored\"]"),
+            1,
+        );
+        let protected = send_raw_tx_request_with_params(
+            format!("[\"{protected_hex}\",\"ignored\"]"),
+            2,
+        );
+        let batch = Batch::from(vec![
+            Ok(BatchEntry::Call(unprotected)),
+            Ok(BatchEntry::Call(protected)),
+        ]);
+        let response = middleware.batch(batch).await;
+        let responses: Vec<serde_json::Value> =
+            serde_json::from_str(response.into_json().get()).unwrap();
+
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], UNPROTECTED_TX_ERROR_CODE);
+        assert_eq!(responses[0]["error"]["message"], UNPROTECTED_TX_ERROR_MSG);
+        assert_eq!(responses[1]["result"], "success");
     }
 
     #[tokio::test]
