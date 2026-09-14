@@ -202,6 +202,15 @@ impl DbMetrics {
     pub fn observe_delete_time(&self, duration: Duration) {
         self.delete_time.observe(duration.as_secs_f64());
     }
+
+    /// Total number of write operations recorded so far.
+    ///
+    /// Exposed for tests that assert each committed write transaction is counted
+    /// exactly once.
+    #[cfg(test)]
+    pub(crate) fn write_count(&self) -> u64 {
+        self.write_count.get()
+    }
 }
 
 impl Default for DbMetrics {

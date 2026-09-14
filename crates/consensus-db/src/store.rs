@@ -502,12 +502,16 @@ impl Db {
             blocks.insert(height, block_bytes)?;
         }
 
-        self.insert_certificate(
+        let certificate_bytes = self.insert_certificate(
             &tx,
             decided_block.certificate,
             CommitCertificateType::Minimal,
             Some(proposer),
         )?;
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            write_bytes += certificate_bytes;
+        }
 
         tx.commit()?;
 
@@ -573,7 +577,8 @@ impl Db {
             }
         }
 
-        self.insert_certificate(
+        let start = Instant::now();
+        let write_bytes = self.insert_certificate(
             &tx,
             certificate,
             CommitCertificateType::Extended,
@@ -582,18 +587,28 @@ impl Db {
 
         tx.commit()?;
 
+        // Measure through the commit: for redb the commit is where the durable
+        // write (fsync) cost lives, and `insert_decided_block` records its write
+        // the same way, so both paths feed `write_time` with the same scope.
+        self.update_write_metrics(write_bytes, start.elapsed());
+
         Ok(())
     }
 
+    /// Encode and insert `certificate` into the certificates table within the
+    /// caller's write transaction, returning the number of bytes written.
+    ///
+    /// This intentionally does not record write metrics: the caller owns and
+    /// commits the transaction, so it records a single write observation once
+    /// the commit succeeds. That keeps a decided block (block + certificate
+    /// committed together) counted as one write instead of two.
     fn insert_certificate(
         &self,
         tx: &WriteTransaction,
         certificate: CommitCertificate<ArcContext>,
         certificate_type: CommitCertificateType,
         proposer: Option<Address>,
-    ) -> Result<(), StoreError> {
-        let start = Instant::now();
-
+    ) -> Result<usize, StoreError> {
         let height = certificate.height;
 
         let stored = StoredCommitCertificate {
@@ -609,9 +624,8 @@ impl Db {
             let mut certificates = tx.open_table(CERTIFICATES_TABLE)?;
             certificates.insert(height, encoded_certificate)?;
         }
-        self.update_write_metrics(write_bytes, start.elapsed());
 
-        Ok(())
+        Ok(write_bytes)
     }
 
     /// Store misbehavior evidence for a given height.
@@ -2116,6 +2130,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_decided_block_counts_a_single_write() {
+        // Regression for #142: insert_decided_block observed the write metrics
+        // twice — once for the block and once inside insert_certificate — which
+        // double-counted the certificate write in the write_count and write_time
+        // metrics. A decided block is a single committed transaction, so it must
+        // be counted exactly once.
+        let dir = tempdir().unwrap();
+        let metrics = DbMetrics::default();
+        let store = Store::open(
+            dir.path().join("db"),
+            metrics.clone(),
+            DbUpgrade::Skip,
+            TEST_CACHE_SIZE,
+        )
+        .await
+        .unwrap();
+
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let payload = arbitrary_payload();
+        let block_hash = payload.payload_inner.payload_inner.block_hash;
+        let value_id = ValueId::new(block_hash);
+        let cert = CommitCertificate::<ArcContext>::new(height, round, value_id, vec![]);
+        let proposer = Address::new([0u8; 20]);
+
+        let writes_before = metrics.write_count();
+        store
+            .store_decided_block(cert, payload, proposer)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            metrics.write_count(),
+            writes_before + 1,
+            "a decided block is one committed transaction and must be counted once"
+        );
+    }
+
+    #[tokio::test]
     async fn test_store_extended_certificate() {
         use malachitebft_core_types::{NilOrVal, SignedMessage};
 
@@ -2179,6 +2232,62 @@ mod tests {
         assert_eq!(retrieved.certificate.round, cert.round);
         assert_eq!(retrieved.certificate.value_id, cert.value_id);
         assert_eq!(retrieved.certificate.commit_signatures.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn extend_certificate_counts_a_single_write() {
+        use malachitebft_core_types::{NilOrVal, SignedMessage};
+
+        // extend_certificate is the other path whose metric ownership this change
+        // touches (it now records the write itself instead of relying on
+        // insert_certificate). A certificate extension is one committed
+        // transaction, so it must be counted exactly once.
+        let dir = tempdir().unwrap();
+        let metrics = DbMetrics::default();
+        let store = Store::open(
+            dir.path().join("db"),
+            metrics.clone(),
+            DbUpgrade::Skip,
+            TEST_CACHE_SIZE,
+        )
+        .await
+        .unwrap();
+
+        let height = Height::new(1);
+        let round = Round::new(0);
+        let payload = arbitrary_payload();
+        let block_hash = payload.payload_inner.payload_inner.block_hash;
+        let value_id = ValueId::new(block_hash);
+
+        let signature = Signature::from_bytes([0xab; 64]);
+        let vote =
+            Vote::new_precommit(height, round, NilOrVal::Val(value_id), Address::new([1u8; 20]));
+        let cert = CommitCertificate::<ArcContext>::new(
+            height,
+            round,
+            value_id,
+            vec![SignedMessage::new(vote, signature)],
+        );
+
+        store
+            .store_decided_block(cert, payload, Address::new([0u8; 20]))
+            .await
+            .unwrap();
+
+        let mut stored = store.get_certificate(Some(height)).await.unwrap().unwrap();
+        stored.certificate.commit_signatures.push(CommitSignature::new(
+            Address::new([4u8; 20]),
+            Signature::from_bytes([0xcd; 64]),
+        ));
+
+        let writes_before = metrics.write_count();
+        store.extend_certificate(stored.certificate).await.unwrap();
+
+        assert_eq!(
+            metrics.write_count(),
+            writes_before + 1,
+            "extending a certificate is one committed transaction and must be counted once"
+        );
     }
 
     #[tokio::test]
