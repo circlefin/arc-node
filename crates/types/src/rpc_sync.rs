@@ -23,9 +23,9 @@ use url::Url;
 
 /// A parsed endpoint URL for RPC synchronization.
 ///
-/// This type holds an HTTP URL and an optional WebSocket URL/port for connecting
-/// to a sync endpoint. If no WebSocket URL/port is explicitly provided, one is
-/// derived from the HTTP URL by converting the scheme (`http` -> `ws`, `https` -> `wss`).
+/// This type holds an HTTP URL and its WebSocket URL for connecting to a sync
+/// endpoint. If no WebSocket URL/port is explicitly provided, one is derived
+/// while parsing by converting the scheme (`http` -> `ws`, `https` -> `wss`).
 ///
 /// # String Format
 ///
@@ -41,7 +41,7 @@ use url::Url;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncEndpointUrl {
     http: Url,
-    ws: Option<Url>,
+    ws: Url,
 }
 
 impl SyncEndpointUrl {
@@ -52,28 +52,31 @@ impl SyncEndpointUrl {
 
     /// Returns the WebSocket URL.
     ///
-    /// If an explicit WebSocket URL was provided during parsing, it is returned.
-    /// Otherwise, the WebSocket URL is derived from the HTTP URL by converting
-    /// the scheme (`http` -> `ws`, `https` -> `wss`). If the HTTP URL uses a
-    /// non-default port, the WebSocket port is set to HTTP port + 1.
+    /// If no explicit WebSocket URL was provided during parsing, this contains
+    /// the URL derived from the HTTP endpoint.
     pub fn websocket(&self) -> Url {
-        self.ws.clone().unwrap_or_else(|| {
-            let mut ws_url = self.http.clone();
-            let ws_scheme = http_to_ws_scheme(self.http.scheme());
-            ws_url
-                .set_scheme(ws_scheme)
-                .expect("valid WebSocket scheme");
-
-            // If HTTP uses a non-default port, set WS port to HTTP port + 1
-            if let Some(http_port) = self.http.port() {
-                ws_url
-                    .set_port(Some(http_port.checked_add(1).expect("port overflow")))
-                    .expect("valid port");
-            }
-
-            ws_url
-        })
+        self.ws.clone()
     }
+}
+
+fn derive_ws_url(http: &Url) -> Result<Url, eyre::Report> {
+    let mut ws_url = http.clone();
+    ws_url
+        .set_scheme(http_to_ws_scheme(http.scheme()))
+        .map_err(|_| eyre::eyre!("Failed to set derived WebSocket scheme"))?;
+
+    if let Some(http_port) = http.port() {
+        let ws_port = http_port.checked_add(1).ok_or_else(|| {
+            eyre::eyre!(
+                "Invalid HTTP URL port '{http_port}': derived WebSocket port would overflow."
+            )
+        })?;
+        ws_url
+            .set_port(Some(ws_port))
+            .map_err(|_| eyre::eyre!("Invalid derived WebSocket port '{ws_port}'"))?;
+    }
+
+    Ok(ws_url)
 }
 
 /// Converts an HTTP scheme to its WebSocket equivalent.
@@ -143,9 +146,10 @@ impl FromStr for SyncEndpointUrl {
 
         validate_http_scheme(http.scheme())?;
 
-        let ws = ws_part
-            .map(|part| parse_ws_override(part, &http))
-            .transpose()?;
+        let ws = match ws_part {
+            Some(part) => parse_ws_override(part, &http)?,
+            None => derive_ws_url(&http)?,
+        };
 
         Ok(Self { http, ws })
     }
@@ -199,6 +203,32 @@ mod tests {
         assert_eq!(url.http().as_str(), "http://localhost:8545/");
         // WS port is HTTP port + 1 when no override specified
         assert_eq!(url.websocket().as_str(), "ws://localhost:8546/");
+    }
+
+    #[test]
+    fn derived_and_equivalent_explicit_websocket_urls_compare_equal() {
+        let derived: SyncEndpointUrl = "http://localhost:8545".parse().unwrap();
+        let explicit: SyncEndpointUrl = "http://localhost:8545,ws=8546".parse().unwrap();
+
+        assert_eq!(derived, explicit);
+    }
+
+    #[test]
+    fn parse_rejects_derived_websocket_port_overflow() {
+        let err = "http://localhost:65535"
+            .parse::<SyncEndpointUrl>()
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("derived WebSocket port would overflow"));
+    }
+
+    #[test]
+    fn explicit_websocket_port_allows_maximum_http_port() {
+        let url: SyncEndpointUrl = "http://localhost:65535,ws=9000".parse().unwrap();
+
+        assert_eq!(url.websocket().as_str(), "ws://localhost:9000/");
     }
 
     #[test]
