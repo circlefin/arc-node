@@ -54,10 +54,10 @@ pub(crate) fn ensure_cl_image_supported(image_tag: Option<&str>) -> Result<()> {
 /// Extract a `(major, minor, patch)` tuple from an image tag.
 ///
 /// Returns `Some` only for explicit parseable versions such as `v0.6.0`,
-/// `arc_consensus:v0.5.1-rc1`, or `0.7.0`. Returns `None` for missing tags,
-/// the `"latest"` tag, or tags that do not fit the `MAJOR.MINOR.PATCH[-...]`
-/// pattern. [`apply_version_compat`] treats every `None` uniformly as
-/// "assume the target supports every flag".
+/// `arc_consensus:v0.5.1-rc1`, `v0.6.0+build.1`, or `0.7.0`. Returns `None`
+/// for missing tags, the `"latest"` tag, or tags that do not fit the
+/// `MAJOR.MINOR.PATCH[-...][+...]` pattern. [`apply_version_compat`] treats
+/// every `None` uniformly as "assume the target supports every flag".
 fn parse_image_semver(image_tag: Option<&str>) -> Option<(u64, u64, u64)> {
     let tag = image_tag?;
     let version_str = tag.rsplit(':').next().unwrap_or(tag);
@@ -66,12 +66,18 @@ fn parse_image_semver(image_tag: Option<&str>) -> Option<(u64, u64, u64)> {
     }
     let version_str = version_str.strip_prefix('v').unwrap_or(version_str);
     let parts: Vec<&str> = version_str.split('.').collect();
+    // Prerelease and build metadata may contain dot-separated identifiers
+    // (e.g. -rc.1 or +build.1), so extra segments after MAJOR.MINOR.PATCH
+    // are valid.
     if parts.len() < 3 {
         return None;
     }
     let major = parts[0].parse::<u64>().ok()?;
     let minor = parts[1].parse::<u64>().ok()?;
-    let patch_str = parts[2].split('-').next().unwrap_or(parts[2]);
+    let patch_str = parts[2]
+        .split(['-', '+'])
+        .next()
+        .unwrap_or(parts[2]);
     let patch = patch_str.parse::<u64>().ok()?;
     Some((major, minor, patch))
 }
@@ -189,6 +195,9 @@ mod tests {
             Some("arc_consensus:v0.6.0"),
             Some("arc_consensus:v1.0.0"),
             Some("v0.5.0-rc1"),
+            Some("v0.5.0-rc.1"),
+            Some("v0.5.0+build.1"),
+            Some("v0.5.0-rc1+build.1"),
             Some("arc_consensus:abc123"),
         ] {
             assert!(
@@ -207,6 +216,9 @@ mod tests {
             "v0.4.0",
             "0.4.0",
             "v0.4.0-rc1",
+            "v0.4.0-rc.1",
+            "v0.4.0+build.1",
+            "v0.4.0-rc1+build.1",
         ] {
             let err = ensure_cl_image_supported(Some(tag))
                 .expect_err(&format!("tag {tag} should be rejected"));
@@ -262,6 +274,10 @@ mod tests {
             "v0.6.0",
             "0.6.0",
             "v0.6.0-rc1",
+            "v0.6.0-rc.1",
+            "v0.6.0+build.1",
+            "v0.6.0+2026-08-26",
+            "v0.6.0-rc1+build.1",
         ] {
             let result = compat_flags(Some(tag));
             assert!(
@@ -283,6 +299,10 @@ mod tests {
             "v0.6.1",
             "0.6.1",
             "v0.6.1-rc1",
+            "v0.6.1-rc.1",
+            "v0.6.1+build.1",
+            "v0.6.1+2026-08-26",
+            "v0.6.1-rc1+build.1",
             "v0.7.0-beta",
         ] {
             let result = compat_flags(Some(tag));
