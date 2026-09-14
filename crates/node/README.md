@@ -96,6 +96,14 @@ For a complete list of available flags, see the [Reth CLI reference](https://ret
 arc-node-execution node --help
 ```
 
+Two inherited Reth flags control the size of `eth_getLogs` queries:
+
+- `--rpc.max-blocks-per-filter <N>` limits the block range scanned by one filter (default: `100000`).
+- `--rpc.max-logs-per-response <N>` limits the number of logs returned by one response (default: `20000`).
+
+These limits apply to a node's own RPC server. A public gateway or reverse proxy
+may enforce stricter limits independently.
+
 #### Custom flags
 
 In addition to standard Reth flags, `arc-node-execution` provides the following custom flags:
