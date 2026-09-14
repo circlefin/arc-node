@@ -119,6 +119,20 @@ test_checksum_validation() {
 
     printf '%s  other-asset.tar.gz\n' "$checksum" > "$checksum_file"
     expect_fail "checksum filename mismatch fails" verify_checksum_file "$archive" "$checksum_file" "$archive_name"
+
+    # A checksum file whose only line has no trailing newline is still valid.
+    printf '%s  %s' "$checksum" "$archive_name" > "$checksum_file"
+    verify_checksum_file "$archive" "$checksum_file" "$archive_name"
+    pass "checksum file without trailing newline passes"
+
+    # A genuinely empty checksum file must still be rejected.
+    : > "$checksum_file"
+    expect_fail "empty checksum file fails" verify_checksum_file "$archive" "$checksum_file" "$archive_name"
+
+    # A wrong hash without a trailing newline must still fail the comparison,
+    # not slip through the emptiness check.
+    printf '%s  %s' "0000000000000000000000000000000000000000000000000000000000000000" "$archive_name" > "$checksum_file"
+    expect_fail "mismatched checksum without trailing newline fails" verify_checksum_file "$archive" "$checksum_file" "$archive_name"
 }
 
 test_download_error_lists_assets() {
