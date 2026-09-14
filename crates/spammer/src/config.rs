@@ -251,8 +251,16 @@ impl TxTypeMix {
         ]
     }
 
+    pub fn checked_total_weight(&self) -> Option<u32> {
+        self.transfer
+            .checked_add(self.legacy)?
+            .checked_add(self.erc20)?
+            .checked_add(self.guzzler)
+    }
+
     pub fn total_weight(&self) -> u32 {
-        self.transfer + self.legacy + self.erc20 + self.guzzler
+        self.checked_total_weight()
+            .expect("TxTypeMix total weight must be validated before use")
     }
 }
 
@@ -285,6 +293,10 @@ impl FromStr for TxTypeMix {
                     ))
                 }
             }
+        }
+
+        if out.checked_total_weight().is_none() {
+            return Err("Invalid --mix: total weight exceeds u32::MAX".to_string());
         }
 
         Ok(out)
@@ -371,7 +383,10 @@ impl Config {
         if let Err(msg) = self.guzzler_fn_weights.validate_enabled_args() {
             eyre::bail!("{msg}");
         }
-        if self.tx_type_mix.total_weight() == 0 {
+        let Some(tx_type_mix_total) = self.tx_type_mix.checked_total_weight() else {
+            eyre::bail!("--mix total weight exceeds u32::MAX");
+        };
+        if tx_type_mix_total == 0 {
             eyre::bail!("--mix total weight is 0; at least one tx type must have weight > 0");
         }
         if self.tx_type_mix.guzzler > 0 && self.guzzler_fn_weights.total_weight() == 0 {
@@ -499,6 +514,38 @@ mod tests {
     fn tx_type_mix_rejects_invalid_weight() {
         let err = TxTypeMix::from_str("transfer=abc").expect_err("non-numeric should fail");
         assert!(err.contains("Invalid weight"));
+    }
+
+    #[test]
+    fn tx_type_mix_accepts_max_total() {
+        let mix = TxTypeMix::from_str("transfer=4294967295").expect("max total should parse");
+        assert_eq!(mix.total_weight(), u32::MAX);
+    }
+
+    #[test]
+    fn tx_type_mix_rejects_overflowing_total() {
+        let err = TxTypeMix::from_str("transfer=4294967295,legacy=1")
+            .expect_err("overflowing total should fail");
+        assert!(err.contains("--mix"));
+        assert!(err.contains("exceeds u32::MAX"));
+    }
+
+    #[test]
+    fn config_rejects_overflowing_mix_without_panicking() {
+        let config = Config {
+            tx_type_mix: TxTypeMix {
+                transfer: u32::MAX,
+                legacy: 1,
+                ..Default::default()
+            },
+            ..default_config()
+        };
+        let err = config
+            .validate()
+            .expect_err("overflowing total should be rejected");
+        assert!(err
+            .to_string()
+            .contains("--mix total weight exceeds u32::MAX"));
     }
 
     #[test]
