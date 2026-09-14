@@ -87,6 +87,9 @@ export function supportAddressEqual(Assertion: Chai.AssertionStatic, utils: Chai
 
   function addressEqual(this: Chai.AssertionPrototype, other: unknown, message: string = '') {
     const subject = utils.flag(this, 'object') as unknown
+    if (isSkipCompare(other)) {
+      return
+    }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
     const isNegated = (this as any).__flags.negate === true
 

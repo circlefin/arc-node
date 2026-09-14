@@ -96,6 +96,10 @@ describe('matchers', () => {
         /test prefix.*"0x3" is not a valid address or account/,
       )
     })
+
+    it('supports skipping the expected value', () => {
+      expect('0x4e59b44847b379578588920cA78FbF26c0B4956C').to.be.addressEqual(skipCompare)
+    })
   })
 
   describe('skippable ', () => {
