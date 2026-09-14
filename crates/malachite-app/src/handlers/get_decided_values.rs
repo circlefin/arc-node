@@ -157,13 +157,12 @@ async fn get_decided_values(
         //
         // Moreover, Malachite will perform a very similar over-approximation when checking
         // the response to GetDecidedValues, so this keeps our behavior consistent.
-        #[allow(clippy::arithmetic_side_effects)]
-        // Equivalent to `total_bytes + raw_bytes_len > max_response_size`,
-        // but rearranged so the subtraction cannot overflow (raw_bytes_len <= max_response_size
-        // is checked first, and max_response_size.0 - raw_bytes_len.0 is then non-negative).
-        if raw_bytes_len > max_response_size
-            || total_bytes.as_u64() > max_response_size.as_u64() - raw_bytes_len.as_u64()
-        {
+        let is_exceeded = max_response_size
+            .as_u64()
+            .checked_sub(raw_bytes_len.as_u64())
+            .map_or(true, |remaining_capacity| total_bytes.as_u64() > remaining_capacity);
+
+        if is_exceeded {
             warn!(
                 %height, %max_response_size, %raw_bytes_len,
                 "GetDecidedValues: Reached max total bytes limit for response, stopping here",
