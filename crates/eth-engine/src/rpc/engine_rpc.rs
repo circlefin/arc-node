@@ -87,7 +87,7 @@ impl EngineRpc {
             .params(params)
             .timeout(timeout)
             .retry(retry_policy)
-            .bearer_auth(self.auth.generate_token()?)
+            .auth(&self.auth)
             .send()
             .await
     }
