@@ -119,6 +119,24 @@ test_checksum_validation() {
 
     printf '%s  other-asset.tar.gz\n' "$checksum" > "$checksum_file"
     expect_fail "checksum filename mismatch fails" verify_checksum_file "$archive" "$checksum_file" "$archive_name"
+
+    # A checksum file with no trailing newline is still a valid single-line file;
+    # `read` reports EOF for it even though the fields parsed fine.
+    printf '%s  %s' "$checksum" "$archive_name" > "$checksum_file"
+    verify_checksum_file "$archive" "$checksum_file" "$archive_name"
+    pass "checksum file without trailing newline passes"
+
+    printf '%s' "$checksum" > "$checksum_file"
+    verify_checksum_file "$archive" "$checksum_file" "$archive_name"
+    pass "bare checksum without filename or newline passes"
+
+    : > "$checksum_file"
+    expect_fail "empty checksum file fails" verify_checksum_file "$archive" "$checksum_file" "$archive_name"
+
+    printf '\n' > "$checksum_file"
+    expect_fail "blank-line checksum file fails" verify_checksum_file "$archive" "$checksum_file" "$archive_name"
+
+    expect_fail "missing checksum file fails" verify_checksum_file "$archive" "$TEST_TMP/absent.sha256" "$archive_name"
 }
 
 test_download_error_lists_assets() {
