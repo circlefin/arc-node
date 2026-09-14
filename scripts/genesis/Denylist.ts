@@ -15,6 +15,7 @@
 // limitations under the License.
 
 import { z } from 'zod'
+import { zeroAddress } from 'viem'
 import {
   addressToBytes32,
   buildImplContractAlloc,
@@ -61,6 +62,37 @@ export const schemaDenylist = z
       { key: 'owner', value: data.owner },
       ...(data.denylisters ?? []).map((d, i) => ({ key: `denylisters[${i}]`, value: d })),
     ])
+
+    if (data.owner.toLowerCase() === zeroAddress.toLowerCase()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['owner'],
+        message: 'Owner cannot be the zero address',
+      })
+    }
+
+    const denylisterSet = new Set<string>()
+    for (let i = 0; i < (data.denylisters ?? []).length; i++) {
+      const denylister = data.denylisters![i]
+      const normalized = denylister.toLowerCase()
+
+      if (normalized === zeroAddress.toLowerCase()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['denylisters', i],
+          message: `Denylister ${denylister} cannot be the zero address`,
+        })
+      }
+
+      if (denylisterSet.has(normalized)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['denylisters', i],
+          message: `Denylister ${denylister} must be unique`,
+        })
+      }
+      denylisterSet.add(normalized)
+    }
   })
 
 export type DenylistConfig = z.infer<typeof schemaDenylist>
