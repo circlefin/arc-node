@@ -137,8 +137,17 @@ test-it: up ## Run integration tests
 	cargo install cargo-nextest --locked
 	cargo nextest run $(UNIT_TEST_ARGS) --features integration
 
+.PHONY: test-arcup
+test-arcup: ## Run arcup installer shell tests
+	@echo running arcup installer tests...
+	@for suite in arcup/test_*.sh arcup/*_test.sh; do \
+		[ -f "$$suite" ] || continue; \
+		echo "--- $$suite"; \
+		bash "$$suite" || exit 1; \
+	done
+
 .PHONY: test-all
-test-all: test-it test-unit-contract ## Run all tests
+test-all: test-it test-unit-contract test-arcup ## Run all tests
 	@echo running all tests...
 	make smoke LAUNCH_ARGS="--frozen --healthy-retry=130"
 
