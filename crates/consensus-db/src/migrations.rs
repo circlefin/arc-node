@@ -303,14 +303,19 @@ impl MigrationCoordinator {
 
         let mut stats = MigrationStats::default();
 
-        // start from the min height
-        let mut next_height = if let Some((min_height, _)) = self
-            .db
-            .begin_read()?
-            .open_table(CERTIFICATES_TABLE)?
-            .first()?
-        {
-            min_height.value()
+        // Start from the min height. A datadir that never wrote to this table has
+        // no table yet, and opening it in a read transaction fails outright. The
+        // undecided-block and pending-part migrations open theirs in a write
+        // transaction, which creates it, so treat a missing table as an empty one
+        // rather than aborting the whole migration.
+        let min_height = match self.db.begin_read()?.open_table(CERTIFICATES_TABLE) {
+            Ok(table) => table.first()?.map(|(key, _)| key.value()),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut next_height = if let Some(min_height) = min_height {
+            min_height
         } else {
             stats.tables_migrated += 1;
             return Ok(stats);
@@ -395,14 +400,16 @@ impl MigrationCoordinator {
 
         let mut stats = MigrationStats::default();
 
-        // start from the min height
-        let mut next_height = if let Some((min_height, _)) = self
-            .db
-            .begin_read()?
-            .open_table(DECIDED_BLOCKS_TABLE)?
-            .first()?
-        {
-            min_height.value()
+        // Start from the min height, treating a missing table as empty for the
+        // same reason as the certificates table above.
+        let min_height = match self.db.begin_read()?.open_table(DECIDED_BLOCKS_TABLE) {
+            Ok(table) => table.first()?.map(|(key, _)| key.value()),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut next_height = if let Some(min_height) = min_height {
+            min_height
         } else {
             stats.tables_migrated += 1;
             return Ok(stats);
@@ -1564,5 +1571,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(value4.value()[0], 1);
+    }
+
+    #[test]
+    fn test_migration_when_data_tables_are_missing() {
+        // A database file with no data tables: `Db::new` runs the migration before
+        // `Store::open` calls `create_tables`, so a first start interrupted between
+        // the two leaves exactly this on disk.
+        let (db, _path) = create_test_db();
+
+        let coordinator = MigrationCoordinator::new(db);
+
+        // An existing file with no schema version is recorded as v0 and migrated.
+        assert!(coordinator.needs_migration(true).unwrap());
+
+        let preview = coordinator
+            .preview_migrate()
+            .expect("dry run must not fail when the data tables are missing");
+        assert_eq!(preview.records_scanned, 0);
+        assert_eq!(preview.tables_migrated, 4);
+
+        let stats = coordinator
+            .migrate()
+            .expect("migration must not fail when the data tables are missing");
+        assert_eq!(stats.records_scanned, 0);
+        assert_eq!(stats.records_upgraded, 0);
+        assert_eq!(stats.tables_migrated, 4);
+
+        assert_eq!(
+            coordinator.current_schema_version().unwrap(),
+            Some(DB_SCHEMA_VERSION)
+        );
     }
 }
