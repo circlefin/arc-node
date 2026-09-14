@@ -31,7 +31,11 @@ use std::{
 
 use eyre::Result;
 use lz4::Decoder;
-use reqwest::{blocking::Client as BlockingClient, header::RANGE, Client, StatusCode};
+use reqwest::{
+    blocking::Client as BlockingClient,
+    header::{CONTENT_RANGE, RANGE},
+    Client, StatusCode,
+};
 use serde::Deserialize;
 use tar::Archive;
 use tokio::task;
@@ -442,13 +446,21 @@ fn parse_total_size(response: &reqwest::blocking::Response) -> Option<u64> {
     if response.status() == StatusCode::PARTIAL_CONTENT {
         response
             .headers()
-            .get("Content-Range")
+            .get(CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.split('/').next_back())
             .and_then(|v| v.parse().ok())
     } else {
         response.content_length()
     }
+}
+
+fn parse_content_range_start(response: &reqwest::blocking::Response) -> Option<u64> {
+    let range = response.headers().get(CONTENT_RANGE)?.to_str().ok()?;
+    let range = range.strip_prefix("bytes ")?;
+    let (range, _) = range.split_once('/')?;
+    let (start, _) = range.split_once('-')?;
+    start.parse().ok()
 }
 
 fn open_part_file(part_path: &Path, append: bool) -> Result<std::fs::File> {
@@ -506,6 +518,22 @@ fn attempt_download(client: &BlockingClient, url: &str, part_path: &Path) -> Res
     let mut response = request.send().and_then(|r| r.error_for_status())?;
 
     let is_partial = response.status() == StatusCode::PARTIAL_CONTENT;
+    if is_partial && existing_size > 0 {
+        let range_start = parse_content_range_start(&response)
+            .ok_or_else(|| eyre::eyre!("Server did not provide a valid Content-Range header"))?;
+        if range_start != existing_size {
+            std::fs::remove_file(part_path).map_err(|error| {
+                eyre::eyre!(
+                    "Failed to discard mismatched partial download {}: {error}",
+                    part_path.display()
+                )
+            })?;
+            return Err(eyre::eyre!(
+                "Server returned Content-Range starting at {range_start}, expected {existing_size}; discarded partial download"
+            ));
+        }
+    }
+
     let total = parse_total_size(&response).ok_or_else(|| {
         eyre::eyre!("Server did not provide Content-Length or Content-Range header")
     })?;
@@ -1139,6 +1167,95 @@ mod tests {
 
         assert_eq!(std::fs::read(path)?, b"prefix-rest");
         assert_eq!(total, 11);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumable_download_rejects_mismatched_content_range_start() -> Result<()> {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let url = format!("{}/snap/consensus.tar.lz4", server.uri());
+        let dir = tempfile::tempdir()?;
+        let (part_path, _) = seed_partial_download(dir.path(), &url, b"prefix-")?;
+        Mock::given(method("GET"))
+            .and(path("/snap/consensus.tar.lz4"))
+            .and(header("range", "bytes=7-"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .set_body_bytes(b"pref".to_vec())
+                    .append_header("Content-Range", "bytes 0-3/11"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let download_part_path = part_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = BlockingClient::new();
+            attempt_download(&client, &url, &download_part_path)
+        })
+        .await?;
+
+        assert!(
+            result.is_err(),
+            "mismatched Content-Range should not append to the existing .part file"
+        );
+        assert!(
+            !part_path.exists(),
+            "a mismatched partial response should discard the stale .part file"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumable_download_recovers_from_mismatched_content_range_start() -> Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let url = format!("{}/snap/consensus.tar.lz4", server.uri());
+        let dir = tempfile::tempdir()?;
+        let (part_path, marker_path) = seed_partial_download(dir.path(), &url, b"prefix-")?;
+
+        Mock::given(method("GET"))
+            .and(path("/snap/consensus.tar.lz4"))
+            .respond_with(|request: &wiremock::Request| {
+                if request.headers.contains_key("range") {
+                    ResponseTemplate::new(206)
+                        .set_body_bytes(b"pref".to_vec())
+                        .append_header("Content-Range", "bytes 0-3/11")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(b"prefix-rest".to_vec())
+                        .append_header("Content-Length", "11")
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let (downloaded_path, total) =
+            run_resumable_download(url, dir.path().to_path_buf()).await?;
+
+        let requests = server
+            .received_requests()
+            .await
+            .ok_or_else(|| eyre::eyre!("Request recording is disabled"))?;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("range")
+                .expect("first request should resume")
+                .to_str()?,
+            "bytes=7-"
+        );
+        assert!(!requests[1].headers.contains_key("range"));
+        assert_eq!(std::fs::read(downloaded_path)?, b"prefix-rest");
+        assert_eq!(total, 11);
+        assert!(!part_path.exists());
+        assert!(!marker_path.exists());
         Ok(())
     }
 
