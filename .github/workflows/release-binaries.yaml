@@ -188,6 +188,20 @@ jobs:
           name: release-assets
           path: release-assets/
 
+      - name: Generate SBOM from Dependency Graph
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { data } = await github.rest.dependencyGraph.exportSbom({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const name = `${context.repo.repo}_${process.env.TAG}_${context.sha.substr(0, 8)}.spdx.json`;
+            fs.writeFileSync(`release-assets/${name}`, JSON.stringify(data.sbom));
+
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
