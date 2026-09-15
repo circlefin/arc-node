@@ -105,6 +105,21 @@ fn validate_ws_scheme(scheme: &str) -> Result<(), eyre::Report> {
     Ok(())
 }
 
+fn validate_derived_ws_port(http: &Url, has_ws_override: bool) -> Result<(), eyre::Report> {
+    if has_ws_override {
+        return Ok(());
+    }
+
+    if matches!(http.port(), Some(u16::MAX)) {
+        return Err(eyre::eyre!(
+            "Invalid HTTP URL port '{}': derived WebSocket port would overflow.",
+            u16::MAX
+        ));
+    }
+
+    Ok(())
+}
+
 /// Parses a WebSocket override in the format `<scheme>=<value>`.
 ///
 /// The value after `=` can be:
@@ -142,6 +157,7 @@ impl FromStr for SyncEndpointUrl {
             Url::parse(http_part).map_err(|e| eyre::eyre!("Failed to parse HTTP URL: {e}"))?;
 
         validate_http_scheme(http.scheme())?;
+        validate_derived_ws_port(&http, ws_part.is_some())?;
 
         let ws = ws_part
             .map(|part| parse_ws_override(part, &http))
@@ -158,19 +174,26 @@ impl fmt::Display for SyncEndpointUrl {
         let ws_url = self.websocket();
         let ws_host = ws_url.host_str().expect("validated host");
 
-        write!(
-            f,
-            "{}://{host}:{http_port},{}=",
-            self.http.scheme(),
-            ws_url.scheme()
-        )?;
+        write!(f, "{}://{host}:{http_port}", self.http.scheme())?;
+        let http_path = self.http.path();
+        if http_path != "/" {
+            write!(f, "{http_path}")?;
+        }
+        if let Some(query) = self.http.query() {
+            write!(f, "?{query}")?;
+        }
+        if let Some(fragment) = self.http.fragment() {
+            write!(f, "#{fragment}")?;
+        }
+        write!(f, ",{}=", ws_url.scheme())?;
 
         let ws_path = ws_url.path();
         let has_path = ws_path != "/";
+        let has_suffix = has_path || ws_url.query().is_some() || ws_url.fragment().is_some();
 
-        if ws_host != host || has_path {
-            // Include the host when it differs or when a path is present
-            // (a bare port + path like `443/websocket` mis-parses as a hostname)
+        if ws_host != host || has_suffix {
+            // Include the host when it differs or when extra URL components are
+            // present (a bare port plus path/query/fragment mis-parses as a host).
             write!(f, "{ws_host}")?;
             if let Some(ws_port) = ws_url.port() {
                 write!(f, ":{ws_port}")?;
@@ -183,6 +206,12 @@ impl fmt::Display for SyncEndpointUrl {
 
         if has_path {
             write!(f, "{ws_path}")?;
+        }
+        if let Some(query) = ws_url.query() {
+            write!(f, "?{query}")?;
+        }
+        if let Some(fragment) = ws_url.fragment() {
+            write!(f, "#{fragment}")?;
         }
 
         Ok(())
@@ -347,6 +376,41 @@ mod tests {
             .unwrap();
         assert_eq!(url.http().as_str(), "https://example.com/");
         assert_eq!(url.websocket().as_str(), "wss://ws.example.com:1212/");
+    }
+
+    #[test]
+    fn parse_rejects_http_port_that_would_overflow_derived_websocket_port() {
+        let err = "http://localhost:65535"
+            .parse::<SyncEndpointUrl>()
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("derived WebSocket port would overflow"));
+    }
+
+    #[test]
+    fn display_preserves_http_and_websocket_path_query_and_fragment() {
+        let endpoint: SyncEndpointUrl =
+            "https://rpc.example.com/api/v1?key=value#http-fragment,wss=ws.example.com/websocket?token=abc#ws-fragment"
+                .parse()
+                .unwrap();
+
+        assert_eq!(
+            endpoint.to_string(),
+            "https://rpc.example.com:443/api/v1?key=value#http-fragment,wss=ws.example.com/websocket?token=abc#ws-fragment"
+        );
+        let reparsed: SyncEndpointUrl = endpoint.to_string().parse().unwrap();
+        assert_eq!(endpoint, reparsed);
+    }
+
+    #[test]
+    fn display_brackets_ipv6_hosts() {
+        let endpoint: SyncEndpointUrl = "http://[::1]:8545,ws=8546".parse().unwrap();
+
+        assert_eq!(endpoint.to_string(), "http://[::1]:8545,ws=8546");
+        let reparsed: SyncEndpointUrl = endpoint.to_string().parse().unwrap();
+        assert_eq!(endpoint, reparsed);
     }
 
     #[test]
