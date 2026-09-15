@@ -233,6 +233,7 @@ export class LocalDevAccountCreator {
 }
 
 const ED25519_PUBLIC_KEY_HEX_LENGTH = 66 // 0x prefix + 64 hex chars (32 bytes)
+const VALIDATOR_ID_REGEX = /^[1-9][0-9]*$/
 
 function parseOverridePublicKeys(input: string): Map<number, Hex> {
   const map = new Map<number, Hex>()
@@ -252,9 +253,12 @@ function parseOverridePublicKeys(input: string): Map<number, Hex> {
       throw new Error(`Invalid format in overridePublicKeys: ${entry} (missing ID or key)`)
     }
 
-    const id = Number(idStr)
+    if (!VALIDATOR_ID_REGEX.test(idStr)) {
+      throw new Error(`Invalid validator ID in overridePublicKeys: ${idStr}`)
+    }
 
-    if (isNaN(id) || id < 1) {
+    const id = Number(idStr)
+    if (!Number.isSafeInteger(id)) {
       throw new Error(`Invalid validator ID in overridePublicKeys: ${idStr}`)
     }
     if (map.has(id)) {
