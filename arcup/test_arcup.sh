@@ -810,6 +810,67 @@ test_install_binary_rejects_symlink() {
     pass "install_binary rejects symlink"
 }
 
+test_check_disk_space_rejects_insufficient() {
+    if ( check_disk_space "$TEST_TMP" 999999999 ) >"$TEST_TMP/disk-space.out" 2>&1; then
+        cat "$TEST_TMP/disk-space.out" >&2
+        fail "check_disk_space rejects insufficient space"
+    fi
+
+    grep -q "Insufficient disk space" "$TEST_TMP/disk-space.out" || {
+        cat "$TEST_TMP/disk-space.out" >&2
+        fail "check_disk_space rejects insufficient space"
+    }
+    pass "check_disk_space rejects insufficient space"
+}
+
+# Regression test for: check_disk_space was only ever called on BIN_DIR,
+# even though the archive is downloaded and extracted into TMP_DIR first
+# (mktemp -d, usually a different filesystem than BIN_DIR, e.g. a small
+# tmpfs in containers). A full disk there produced a raw curl/tar failure
+# instead of the friendly "Insufficient disk space" error. This drives
+# TMP_DIR (via TMPDIR) onto a fake-df'd path with plenty of space for
+# BIN_DIR but almost none for TMP_DIR, and asserts main() catches it.
+test_main_checks_tmp_dir_disk_space() {
+    local install_dir="$TEST_TMP/disk-space-install"
+    local scratch_dir="$TEST_TMP/disk-space-scratch"
+    mkdir -p "$install_dir" "$scratch_dir"
+
+    local fakebin="$TEST_TMP/disk-space-fakebin"
+    mkdir -p "$fakebin"
+    cat > "$fakebin/df" <<EOF
+#!/usr/bin/env bash
+dir="\${*: -1}"
+case "\$dir" in
+    "$scratch_dir"*)
+        echo "Filesystem 1K-blocks Used Available Use% Mounted on"
+        echo "tmpfs 102400 0 1024 1% \$dir"
+        ;;
+    *)
+        echo "Filesystem 1K-blocks Used Available Use% Mounted on"
+        echo "/dev/sda1 999999999 0 999999999 1% \$dir"
+        ;;
+esac
+EOF
+    chmod 755 "$fakebin/df"
+
+    if \
+        TMPDIR="$scratch_dir" \
+        PATH="$fakebin:$PATH" \
+        ARC_BIN_DIR="$install_dir" \
+        ARC_REPO="test/arc-node" \
+        "$ROOT_DIR/arcup/arcup" -i "1.2.3" \
+        >"$TEST_TMP/disk-space-main.out" 2>&1; then
+        cat "$TEST_TMP/disk-space-main.out" >&2
+        fail "main rejects insufficient TMP_DIR disk space"
+    fi
+
+    grep -q "Insufficient disk space" "$TEST_TMP/disk-space-main.out" || {
+        cat "$TEST_TMP/disk-space-main.out" >&2
+        fail "main rejects insufficient TMP_DIR disk space"
+    }
+    pass "main rejects insufficient TMP_DIR disk space"
+}
+
 test_version_normalization
 test_version_comparison
 test_target_mapping
@@ -827,3 +888,5 @@ test_fixture_install_matrix
 test_archive_path_traversal_fails
 test_archive_link_entries_fail
 test_install_binary_rejects_symlink
+test_check_disk_space_rejects_insufficient
+test_main_checks_tmp_dir_disk_space
