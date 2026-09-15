@@ -219,6 +219,17 @@ blah
 EOF
 ```
 
+A heredoc body may itself contain a line starting with ` ``` ` (e.g. a
+heredoc that writes out markdown) without being mistaken for the end of
+the code block:
+```sh {empty_output}
+$ cat > /tmp/md-exec-fence.txt << 'EOF'
+before
+```
+after
+EOF
+```
+
 ---
 
 ## Global Directives

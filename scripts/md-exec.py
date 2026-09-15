@@ -189,8 +189,13 @@ class MarkdownParser:
 
             stripped = line.strip()
 
-            # Detect Code Snippets
-            if stripped.startswith("```"):
+            # Detect Code Snippets. Skip fence detection while inside an
+            # open heredoc body -- the heredoc content may legitimately
+            # contain a line starting with ``` (e.g. a heredoc that writes
+            # out markdown), and treating it as a fence boundary would cut
+            # the code block short mid-heredoc, leaving the shell command
+            # truncated and the heredoc unterminated.
+            if stripped.startswith("```") and heredoc_delimiter is None:
                 if in_block:
                     # End of block: save pending test
                     if current_cmd:
