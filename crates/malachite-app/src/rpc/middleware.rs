@@ -114,4 +114,60 @@ mod tests {
             None
         );
     }
+
+    /// Builds a minimal router with only the `extract_version` middleware
+    /// attached, and returns the response status for a given `Accept` header
+    /// value. Isolated from the rest of the app's routes/state so these tests
+    /// exercise exactly the middleware's negotiation behavior end to end,
+    /// the same way a real request would reach it.
+    async fn status_for_accept(accept: &str) -> StatusCode {
+        use axum::body::Body;
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/test", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn(extract_version));
+
+        let req = Request::builder()
+            .uri("/test")
+            .header(header::ACCEPT, accept)
+            .body(Body::empty())
+            .unwrap();
+
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn test_accept_header_with_parameters() {
+        assert_eq!(
+            status_for_accept("application/vnd.arc.v1+json; q=0.9").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn test_accept_header_with_multiple_ranges() {
+        assert_eq!(
+            status_for_accept("text/html, application/vnd.arc.v1+json").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn test_accept_header_zero_quality_supported_version_is_not_acceptable() {
+        assert_eq!(
+            status_for_accept("application/vnd.arc.v1+json; q=0").await,
+            StatusCode::NOT_ACCEPTABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn test_accept_header_only_unsupported_versions_is_not_acceptable() {
+        assert_eq!(
+            status_for_accept("application/vnd.arc.v2+json, application/vnd.arc.v99+json").await,
+            StatusCode::NOT_ACCEPTABLE
+        );
+    }
 }
