@@ -28,7 +28,7 @@ const MAX_CONCURRENT_FETCHES: usize = 10;
 /// Returns `(node_name, raw_metrics_text)` pairs. Nodes that fail to respond
 /// return an empty string for their metrics text.
 ///
-/// Concurrency is capped at [`MAX_CONCURRENT_FETCHES`] to avoid overwhelming
+/// Concurrency is capped at `MAX_CONCURRENT_FETCHES` to avoid overwhelming
 /// narrow transports like SSM tunnels.
 pub async fn fetch_all_metrics(metrics_urls: &[(String, Url)]) -> Vec<(String, String)> {
     let mut sorted_urls: Vec<_> = metrics_urls.to_vec();

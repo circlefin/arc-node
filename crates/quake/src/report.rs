@@ -1160,7 +1160,7 @@ fn render_liveness_note(out: &mut String, liveness: &LivenessSection) {
     let _ = writeln!(out);
 }
 
-/// When a section failed, append the first few [`failures`] entries so the Summary
+/// When a section failed, append the first few `failures` entries so the Summary
 /// table explains *why* without reading the `## Failures` section. Values are
 /// single-lined and `|`-safe for markdown tables.
 fn format_summary_with_failures(summary: &str, passed: bool, failures: &[String]) -> String {

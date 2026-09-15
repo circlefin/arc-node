@@ -50,7 +50,7 @@ pub const CALL_FROM_ADDRESS: Address = address!("1800000000000000000000000000000
 ///
 /// Covers selector matching plus the fixed-size ABI head: 2 address words + 1 offset word +
 /// 1 length word. The dynamic `bytes data` payload is charged separately at
-/// [`COPY`] gas per 32-byte word (see [`abi_decode_gas`]).
+/// `COPY` gas per 32-byte word (see [`abi_decode_gas`]).
 pub const ABI_DECODE_BASE_GAS: u64 = 100;
 
 /// Computes total init_subcall gas: base overhead + ceil(data.len() / 32) * COPY.

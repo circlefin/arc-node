@@ -1277,7 +1277,7 @@ where
     /// Override `inspect_frame_init` to make subcall precompiles transparent in traces.
     ///
     /// For subcall precompiles (e.g. CallFrom): uses [`SubcallPrecompile::trace_child_call`]
-    /// to obtain the child's `CallInputs`, then passes them to [`ArcEvm::inspect_frame_init_impl`]
+    /// to obtain the child's `CallInputs`, then passes them to `ArcEvm::inspect_frame_init_impl`
     /// so the trace node shows the logical child call
     /// (spoofed_sender → target) instead of the precompile address.
     ///

@@ -117,7 +117,7 @@ pub fn build_default_arc_chain_spec() -> Arc<ArcChainSpec> {
 /// Build the ArcEvmFactory from a chain spec.
 ///
 /// Note: ArcEvmFactory::new takes a single arg (chain_spec).
-/// The struct is #[non_exhaustive] so the API may expand in the future.
+/// The struct is `#[non_exhaustive]` so the API may expand in the future.
 pub fn build_evm_factory(chain_spec: Arc<ArcChainSpec>) -> ArcEvmFactory {
     ArcEvmFactory::new(chain_spec)
 }

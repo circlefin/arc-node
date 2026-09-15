@@ -102,7 +102,7 @@ pub struct StartCmd {
     /// Gossipsub network load profile controlling mesh size and bandwidth.
     ///
     /// - low:     fewer mesh peers, lower bandwidth (mesh_n=3)
-    /// - average: balanced for typical deployments (mesh_n=6) [default]
+    /// - average: balanced for typical deployments (mesh_n=6) `[default]`
     /// - high:    more mesh peers, higher bandwidth (mesh_n=10)
     #[clap(
         long = "gossipsub.load",
@@ -471,10 +471,10 @@ pub struct StartCmd {
     /// (scheme http->ws / https->wss, port HTTP+1 if non-default).
     ///
     /// Examples:
-    ///   http://validator1:8545,ws=8546
-    ///   https://validator1:8545,wss=8546
-    ///   https://example.com,wss=ws.example.com
-    ///   https://example.com,wss=ws.example.com:1212
+    ///   `http://validator1:8545,ws=8546`
+    ///   `https://validator1:8545,wss=8546`
+    ///   `https://example.com,wss=ws.example.com`
+    ///   `https://example.com,wss=ws.example.com:1212`
     #[clap(long = "follow.endpoint", value_name = "ENDPOINT", requires = "follow")]
     #[serde(skip)]
     pub follow_endpoints: Vec<SyncEndpointUrl>,

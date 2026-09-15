@@ -15,7 +15,7 @@
 // limitations under the License.
 
 //! Arc validator
-//! fork from https://github.com/paradigmxyz/reth/blob/main/crates/ethereum/node/src/engine.rs
+//! fork from <https://github.com/paradigmxyz/reth/blob/main/crates/ethereum/node/src/engine.rs>
 //! - customize validate_payload_attributes_against_header to relax the timestamp constraint.
 
 use alloy_consensus::BlockHeader;
@@ -60,7 +60,7 @@ impl<ChainSpec> ArcEngineValidator<ChainSpec> {
     }
 }
 
-/// Type that validates an [`ExecutionPayload`].
+/// Type that validates an `ExecutionPayload`.
 impl<ChainSpec, Types> PayloadValidator<Types> for ArcEngineValidator<ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks + 'static,

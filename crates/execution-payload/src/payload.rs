@@ -402,7 +402,7 @@ fn dump_tx_data(bytes: &[u8]) -> String {
 }
 
 /// Arc's Custom payload builder based on upstream Reth:
-/// https://github.com/paradigmxyz/reth/blob/74351d98e906b8af5f118694529fb2b71d316946/crates/ethereum/payload/src/lib.rs#L138
+/// <https://github.com/paradigmxyz/reth/blob/74351d98e906b8af5f118694529fb2b71d316946/crates/ethereum/payload/src/lib.rs#L138>
 /// Enforces a time budget to avoid overruns under heavy mempool load.
 /// The rest is following the logic in EthereumPayloadBuilder.
 #[derive(Debug, Clone, PartialEq, Eq)]

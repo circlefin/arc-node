@@ -344,13 +344,13 @@ enum Commands {
     ///   warmup_s           30                   Seconds before first Prometheus scrape
     ///   duration_s         60                   Observation window / load duration
     ///   load_rate          50                   TPS during observation (0 = no load)
-    ///   load_targets       RPC_NODES            Node names and/or [node_groups] selectors (default group)
+    ///   load_targets       RPC_NODES            Node names and/or `node_groups` selectors (default group)
     ///   load_mix           transfer=100         Tx type mix
     ///   block_time_p50_ms  550                  Max p50 block time threshold for validators
     ///   block_time_p99_ms  1000                 Max p99 block time threshold for validators
     ///   sanity             true                 Run sanity phases
     ///   sync_speed         true                 Run sync speed test (destructive)
-    ///   arc_nodes          ARC_NODES group      Sanity target nodes (names and/or [node_groups])
+    ///   arc_nodes          ARC_NODES group      Sanity target nodes (names and/or `node_groups`)
     ///   snapshot_provider  full-circle-5        Snapshot source node
     ///   reference          validator-blue       Reference node for tip height
     ///   sync_nodes         full-quicknode-1     Nodes to sync-test
@@ -880,7 +880,7 @@ pub(crate) enum DownloadSubcommand {
         /// Metric names to download (all metrics if not specified)
         #[clap(last = true)]
         metric_names: Vec<String>,
-        /// Output file path (default: ./quake-metrics-<timestamp>.tar.gz)
+        /// Output file path (default: `./quake-metrics-<timestamp>.tar.gz`)
         #[clap(short = 'o', long)]
         output: Option<PathBuf>,
     },
@@ -897,7 +897,7 @@ pub(crate) enum DownloadSubcommand {
         /// Download only consensus layer (Malachite) data
         #[clap(long)]
         consensus_only: bool,
-        /// Output file path (default: ./quake-db-<timestamp>.tar.gz)
+        /// Output file path (default: `./quake-db-<timestamp>.tar.gz`)
         #[clap(short = 'o', long)]
         output: Option<PathBuf>,
     },
