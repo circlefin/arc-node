@@ -1,0 +1,124 @@
+name: Nightly Upgrade
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_version:
+        description: 'Starting image version for arc-execution and arc-consensus'
+        required: false
+        default: latest
+        type: string
+      to_version:
+        description: 'Upgrade target image version for arc-execution and arc-consensus'
+        required: false
+        default: latest
+        type: string
+      hardfork:
+        description: 'Next hardfork name to activate during the test'
+        required: false
+        default: zero8
+        type: string
+      load_duration:
+        description: 'Load test duration in seconds'
+        required: false
+        default: '90'
+        type: string
+      load_rate:
+        description: 'Load test transaction rate'
+        required: false
+        default: '100'
+        type: string
+
+concurrency:
+  group: nightly-upgrade-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nightly-upgrade:
+    name: Nightly upgrade scenario
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      IMAGE_REGISTRY_URL: docker.cloudsmith.io/circle/arc-network
+      FROM_VERSION: ${{ inputs.from_version || 'latest' }}
+      TO_VERSION: ${{ inputs.to_version || 'latest' }}
+      HARDFORK: ${{ inputs.hardfork || 'zero8' }}
+      LOAD_DURATION: ${{ inputs.load_duration || '90' }}
+      LOAD_RATE: ${{ inputs.load_rate || '100' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev zlib1g-dev jq
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Read Foundry version
+        id: foundry-version
+        run: echo "version=$(cat .foundry-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ steps.foundry-version.outputs.version }}
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-shared-key: rust-build
+
+      - name: Prepare upgrade scenario overrides
+        env:
+          SCENARIO: crates/quake/scenarios/nightly-upgrade.workflow.toml
+        run: |
+          cp crates/quake/scenarios/nightly-upgrade.toml "$SCENARIO"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          scenario = Path(os.environ['SCENARIO'])
+          text = scenario.read_text()
+          from_version = os.environ['FROM_VERSION']
+          to_version = os.environ['TO_VERSION']
+          registry = os.environ['IMAGE_REGISTRY_URL']
+
+          replacements = {
+              'image_cl="${IMAGE_REGISTRY_URL}/arc-consensus:latest"': f'image_cl="{registry}/arc-consensus:{from_version}"',
+              'image_el="${IMAGE_REGISTRY_URL}/arc-execution:latest"': f'image_el="{registry}/arc-execution:{from_version}"',
+              'image_cl_upgrade="arc_consensus:latest"': f'image_cl_upgrade="{registry}/arc-consensus:{to_version}"',
+              'image_el_upgrade="arc_execution:latest"': f'image_el_upgrade="{registry}/arc-execution:{to_version}"',
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'missing expected scenario line: {old}')
+              text = text.replace(old, new)
+          scenario.write_text(text)
+          PY
+          cat "$SCENARIO"
+
+      - name: Run nightly upgrade scenario
+        run: |
+          ./scripts/scenarios/nightly-upgrade.sh \
+            crates/quake/scenarios/nightly-upgrade.workflow.toml \
+            "$LOAD_DURATION" \
+            "$LOAD_RATE" \
+            "$HARDFORK"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-upgrade-results
+          path: target/test-results/
+          if-no-files-found: ignore
