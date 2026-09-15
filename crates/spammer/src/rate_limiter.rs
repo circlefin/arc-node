@@ -17,7 +17,12 @@
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use color_eyre::eyre::{self, Result, WrapErr};
 use governor::{Jitter, Quota};
+
+/// Highest rate `governor` can represent without rounding its per-token
+/// replenish interval down to zero nanoseconds.
+pub(crate) const MAX_TPS: u64 = 1_000_000_000;
 
 /// Token-bucket rate limiter for transaction sending.
 ///
@@ -32,22 +37,28 @@ pub(crate) struct RateLimiter {
 }
 
 impl RateLimiter {
-    pub fn new(tps: u64, max_num_txs: u64, num_senders: usize) -> Self {
-        let tps_u32 = u32::try_from(tps).expect("TPS must fit in u32");
-        let tps_nz = NonZeroU32::new(tps_u32).expect("TPS must be > 0");
+    pub fn new(tps: u64, max_num_txs: u64, num_senders: usize) -> Result<Self> {
+        if tps > MAX_TPS {
+            eyre::bail!("rate {tps} exceeds the maximum supported rate {MAX_TPS}");
+        }
+        let tps_u32 = u32::try_from(tps)
+            .wrap_err_with(|| format!("rate {tps} exceeds the maximum supported rate {MAX_TPS}"))?;
+        let tps_nz =
+            NonZeroU32::new(tps_u32).ok_or_else(|| eyre::eyre!("rate must be greater than 0"))?;
         let burst = (tps / num_senders.max(1) as u64).max(1);
-        let burst_nz = NonZeroU32::new(u32::try_from(burst).expect("burst must fit in u32"))
-            .expect("burst must be > 0");
+        let burst_u32 = u32::try_from(burst).wrap_err("rate limiter burst must fit in u32")?;
+        let burst_nz = NonZeroU32::new(burst_u32)
+            .ok_or_else(|| eyre::eyre!("rate limiter burst must be greater than 0"))?;
         let quota = Quota::per_second(tps_nz).allow_burst(burst_nz);
         let limiter = governor::RateLimiter::direct(quota);
         // Uniformly random jitter up to half the interval
         let jitter = Jitter::up_to(quota.replenish_interval() / 2);
-        Self {
+        Ok(Self {
             limiter,
             jitter,
             max_num_txs,
             total_counter: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Wait until the rate limiter permits the next send.
@@ -60,5 +71,25 @@ impl RateLimiter {
         }
         let prev = self.total_counter.fetch_add(1, Ordering::Relaxed);
         prev < self.max_num_txs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_accepts_max_supported_rate() {
+        assert!(RateLimiter::new(MAX_TPS, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn new_rejects_rate_above_supported_max() {
+        let err = RateLimiter::new(MAX_TPS + 1, 1, 1)
+            .err()
+            .expect("oversized rate must be rejected");
+        assert!(err
+            .to_string()
+            .contains("exceeds the maximum supported rate"));
     }
 }

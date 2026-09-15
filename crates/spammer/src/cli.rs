@@ -21,6 +21,7 @@ use clap::Args;
 use crate::{
     accounts::PartitionMode,
     config::{Erc20FnWeights, GuzzlerFnWeights, TxTypeMix},
+    rate_limiter::MAX_TPS,
     Config,
 };
 
@@ -83,7 +84,7 @@ pub struct SpammerArgs {
     #[clap(short = 'n', long, default_value_t = defaults::NUM_TXS, global = true)]
     pub num_txs: u64,
     /// Number of transactions to send per second (all generators combined)
-    #[clap(short = 'r', long, default_value_t = defaults::RATE, global = true, value_parser = clap::value_parser!(u64).range(1..))]
+    #[clap(short = 'r', long, default_value_t = defaults::RATE, global = true, value_parser = clap::value_parser!(u64).range(1..=MAX_TPS))]
     pub rate: u64,
     /// Maximum time in seconds to send transactions (applies to all generators) (0 for no limit)
     #[clap(short = 't', long, default_value_t = defaults::TIME, global = true)]

@@ -477,6 +477,20 @@ mod tests {
     }
 
     #[test]
+    fn cli_rejects_rate_above_supported_max() {
+        let max_rate = 1_000_000_000_u64.to_string();
+        Cli::try_parse_from(["spammer", "--rate", max_rate.as_str(), "ws"])
+            .expect("maximum representable rate should be accepted");
+
+        let oversized_rate = 1_000_000_001_u64.to_string();
+        let err = match Cli::try_parse_from(["spammer", "--rate", oversized_rate.as_str(), "ws"]) {
+            Ok(_) => panic!("rate above the supported maximum must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
     fn cli_parses_fire_and_forget_flag() {
         // Default: fire_and_forget is false (backpressure is the default)
         let cli = Cli::try_parse_from(["spammer", "ws"]).expect("parsing ws subcommand");
