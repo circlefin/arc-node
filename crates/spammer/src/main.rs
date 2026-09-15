@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
     let target_ws_urls = match cli.command {
         TargetCommand::Ws { targets } => {
             let target_nodes = targets.unwrap_or_else(|| vec![DEFAULT_WS_TARGET.to_string()]);
-            ws_urls_from_strings(target_nodes)
+            ws_urls_from_strings(target_nodes)?
         }
         TargetCommand::Nodes {
             nodes_path,
@@ -230,20 +230,31 @@ fn write_atomic(contents: &str, path: &Path, label: &str) -> Result<()> {
 }
 
 // Build the WebSocket URLs of the target nodes from the list of IP addresses and ports
-fn ws_urls_from_strings(target_nodes: Vec<String>) -> Vec<(String, Url)> {
+fn ws_urls_from_strings(target_nodes: Vec<String>) -> Result<Vec<(String, Url)>> {
     target_nodes
         .into_iter()
-        .map(|s| (s.clone(), ws_url_from_str(s)))
+        .map(|target| {
+            let url = ws_url_from_str(&target)?;
+            Ok((target, url))
+        })
         .collect()
 }
 
-fn ws_url_from_str(ip_port: String) -> Url {
-    let url_str = if !ip_port.starts_with("ws://") {
-        format!("ws://{ip_port}")
+fn ws_url_from_str(target: &str) -> Result<Url> {
+    let url_str = if target.contains("://") {
+        target.to_string()
     } else {
-        ip_port
+        format!("ws://{target}")
     };
-    Url::parse(&url_str).unwrap()
+    let url =
+        Url::parse(&url_str).wrap_err_with(|| format!("Invalid --targets entry {target:?}"))?;
+    if !matches!(url.scheme(), "ws" | "wss") {
+        eyre::bail!(
+            "Invalid --targets entry {target:?}: unsupported scheme {:?}; expected ws:// or wss://",
+            url.scheme()
+        );
+    }
+    Ok(url)
 }
 
 // Read the file with node metadata and obtain the WebSocket URLs of the target nodes
@@ -313,14 +324,34 @@ mod tests {
 
     #[test]
     fn ws_url_from_str_adds_ws_scheme_if_missing() {
-        let url = ws_url_from_str("127.0.0.1:8546".to_string());
+        let url = ws_url_from_str("127.0.0.1:8546").unwrap();
         assert_eq!(url.as_str(), "ws://127.0.0.1:8546/");
     }
 
     #[test]
     fn ws_url_from_str_parses_endpoint() {
-        let url = ws_url_from_str("ws://127.0.0.1:8546".to_string());
+        let url = ws_url_from_str("ws://127.0.0.1:8546").unwrap();
         assert_eq!(url.as_str(), "ws://127.0.0.1:8546/");
+    }
+
+    #[test]
+    fn ws_url_from_str_preserves_secure_websocket_scheme() {
+        let url = ws_url_from_str("wss://rpc.example:8546").unwrap();
+        assert_eq!(url.as_str(), "wss://rpc.example:8546/");
+    }
+
+    #[test]
+    fn ws_url_from_str_rejects_invalid_target_without_panicking() {
+        let err = ws_url_from_str("\u{200d}.example:8546").unwrap_err();
+        assert!(err.to_string().contains("Invalid --targets entry"));
+    }
+
+    #[test]
+    fn ws_url_from_str_rejects_unsupported_scheme() {
+        let err = ws_url_from_str("http://rpc.example:8545").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("unsupported scheme \"http\""));
+        assert!(message.contains("expected ws:// or wss://"));
     }
 
     #[test]
@@ -328,7 +359,8 @@ mod tests {
         let urls = ws_urls_from_strings(vec![
             "127.0.0.1:8546".to_string(),
             "ws://127.0.0.1:9546".to_string(),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(urls.len(), 2);
         assert_eq!(urls[0].0, "127.0.0.1:8546");
