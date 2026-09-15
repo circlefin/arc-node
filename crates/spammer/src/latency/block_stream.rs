@@ -68,7 +68,9 @@ struct HeaderNotification {
 /// header-arrival timestamp for latency measurement.
 pub(super) struct BlockEvent {
     pub block: RpcBlock,
-    /// Propagated from [`HeaderNotification::received_at`].
+    /// Wall-clock time at which this block was observed: propagated from
+    /// [`HeaderNotification::received_at`] for notified blocks, or captured at
+    /// fetch time for blocks recovered by a catch-up scan.
     pub received_at: u64,
 }
 
@@ -306,7 +308,6 @@ impl BlockStream {
                     &mut ws_client,
                     *next_expected_height,
                     height - 1,
-                    notification.received_at,
                     block_sender,
                 )
                 .await?;
@@ -345,13 +346,16 @@ impl BlockStream {
     /// Fetch blocks from `start_height` through `end_height`
     /// (inclusive) and send them as [`BlockEvent`]s.
     ///
+    /// Each block is timestamped with `timestamp_now()` at the moment it is
+    /// fetched, so a scan covering many heights does not collapse into a
+    /// single observation time.
+    ///
     /// Returns `Err` if a block cannot be fetched after retries, so
     /// the caller can rebuild the client and retry the scan.
     async fn catch_up_scan(
         ws_client: &mut WsClient,
         start_height: u64,
         end_height: u64,
-        received_at: u64,
         block_sender: &Sender<BlockEvent>,
     ) -> Result<()> {
         if start_height > end_height {
@@ -365,10 +369,11 @@ impl BlockStream {
             let hex_height = format!("0x{height:x}");
             match Self::fetch_block(ws_client, ETH_GET_BLOCK_BY_NUMBER, &hex_height).await {
                 FetchResult::Ok(block) => {
-                    // Send the block to the tracker.
-                    // The timestamp for catch-up blocks is the
-                    // arrival time of the first notification.
+                    // Send the block to the tracker, timestamped at the moment
+                    // it was actually observed rather than at the arrival time
+                    // of the notification that triggered the scan.
                     // TODO: should we use the blocks' timestamps?
+                    let received_at = timestamp_now();
                     if block_sender
                         .send(BlockEvent { block, received_at })
                         .await
