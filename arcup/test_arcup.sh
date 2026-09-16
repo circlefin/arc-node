@@ -47,6 +47,25 @@ expect_fail() {
     pass "$name"
 }
 
+# Like expect_fail, but also pins the message. Without this a test only proves the
+# call exited non-zero, which it already did before the fix for the wrong reason.
+expect_fail_message() {
+    local name="$1"
+    local expected="$2"
+    shift 2
+
+    if ( "$@" ) >"$TEST_TMP/expect_fail.out" 2>&1; then
+        cat "$TEST_TMP/expect_fail.out" >&2
+        fail "$name"
+    fi
+    if ! grep -qF "$expected" "$TEST_TMP/expect_fail.out"; then
+        printf 'expected message: %s\nactual output:\n' "$expected" >&2
+        cat "$TEST_TMP/expect_fail.out" >&2
+        fail "$name"
+    fi
+    pass "$name"
+}
+
 test_version_normalization() {
     assert_eq "v1.2.3" "$(normalize_version "1.2.3")" "normalizes missing v prefix"
     assert_eq "v1.2.3" "$(normalize_version "v1.2.3")" "keeps v-prefixed version"
@@ -131,12 +150,15 @@ test_checksum_validation() {
     pass "bare checksum without filename or newline passes"
 
     : > "$checksum_file"
-    expect_fail "empty checksum file fails" verify_checksum_file "$archive" "$checksum_file" "$archive_name"
+    expect_fail_message "empty checksum file fails" "Checksum file is empty" \
+        verify_checksum_file "$archive" "$checksum_file" "$archive_name"
 
     printf '\n' > "$checksum_file"
-    expect_fail "blank-line checksum file fails" verify_checksum_file "$archive" "$checksum_file" "$archive_name"
+    expect_fail_message "blank-line checksum file fails" "Checksum file is empty" \
+        verify_checksum_file "$archive" "$checksum_file" "$archive_name"
 
-    expect_fail "missing checksum file fails" verify_checksum_file "$archive" "$TEST_TMP/absent.sha256" "$archive_name"
+    expect_fail_message "missing checksum file fails" "Checksum file is missing or unreadable" \
+        verify_checksum_file "$archive" "$TEST_TMP/absent.sha256" "$archive_name"
 }
 
 test_download_error_lists_assets() {
