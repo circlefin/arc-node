@@ -654,11 +654,13 @@ verify_checksum_file() {
     local archive_path="$1"
     local checksum_path="$2"
     local archive_name="$3"
-    local expected_checksum expected_name actual_checksum
+    local expected_checksum expected_name actual_checksum line
 
-    if ! read -r expected_checksum expected_name < "$checksum_path"; then
+    line=$(tr -d '\r' < "$checksum_path" | head -n1)
+    if [[ -z "$line" ]]; then
         error "Checksum file is empty: $checksum_path"
     fi
+    read -r expected_checksum expected_name <<< "$line"
 
     if [[ ! "$expected_checksum" =~ ^[0-9A-Fa-f]{64}$ ]]; then
         error "Checksum file has invalid SHA-256 hash: $checksum_path"
@@ -670,6 +672,8 @@ verify_checksum_file() {
         if [[ "$expected_name" != "$archive_name" ]]; then
             error "Checksum file is for '$expected_name', expected '$archive_name'"
         fi
+    elif [[ -n "$archive_name" ]]; then
+        error "Checksum file contains no filename field; expected '$archive_name'"
     fi
 
     actual_checksum=$(compute_sha256 "$archive_path")
