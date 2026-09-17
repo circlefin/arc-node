@@ -70,6 +70,9 @@ const UNPROTECTED_TX_ERROR_MSG: &str =
     "only replay-protected (EIP-155) transactions allowed over RPC";
 const RELAY_UNAVAILABLE_ERROR_CODE: i32 = -32010;
 const RELAY_UNAVAILABLE_ERROR_MSG: &str = "all transaction relay upstreams are unreachable";
+const ETH_GET_LOGS_METHOD: &str = "eth_getLogs";
+/// <https://eips.ethereum.org/EIPS/eip-1474> – Invalid params
+const PENDING_LOGS_ERROR_CODE: i32 = -32602;
 
 /// Default maximum number of entries permitted in a JSON-RPC batch request.
 pub const ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT: usize = 100;
@@ -315,12 +318,56 @@ where
     }
 }
 
+/// Returns an error if the request is `eth_getLogs` with a `"pending"` block tag.
+///
+/// Reth resolves `"pending"` as `head + 1` for log queries and returns an empty
+/// result set rather than coercing to `"latest"`. Arc intentionally hides all
+/// pending-block state for public nodes, so surface this as an explicit
+/// `-32602 Invalid params` error instead of silently returning `[]`, which
+/// makes callers think no logs exist.
+fn pending_logs_error<'a>(req: &Request<'a>) -> Option<ErrorObject<'a>> {
+    if req.method_name() != ETH_GET_LOGS_METHOD {
+        return None;
+    }
+    // Parse the raw JSON rather than deserializing to alloy_rpc_types_eth::Filter
+    // to stay decoupled from proc-macro field names that can change across Reth
+    // versions. eth_getLogs accepts the filter either positionally ([{...}]) or
+    // under the "filter" key in object-form params.
+    let raw = req.params().as_str().unwrap_or("");
+    let value: serde_json::Value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+    let filter = match &value {
+        serde_json::Value::Array(arr) => arr.first().cloned(),
+        serde_json::Value::Object(obj) => obj.get("filter").cloned(),
+        _ => None,
+    };
+    let has_pending = |key_camel: &str, key_snake: &str| -> bool {
+        filter
+            .as_ref()
+            .and_then(|f| f.get(key_camel).or_else(|| f.get(key_snake)))
+            .and_then(|v| v.as_str())
+            .map(|s| s.eq_ignore_ascii_case("pending"))
+            .unwrap_or(false)
+    };
+    if has_pending("fromBlock", "from_block") || has_pending("toBlock", "to_block") {
+        Some(ErrorObjectOwned::owned::<()>(
+            PENDING_LOGS_ERROR_CODE,
+            r#""pending" block tag is not supported for eth_getLogs on Arc; use "latest" instead"#,
+            None,
+        ))
+    } else {
+        None
+    }
+}
+
 /// Intercepts pending-tx RPCs (error or null) or forwards to the inner service.
 async fn intercept_or_forward<'a, S>(service: &S, req: Request<'a>) -> MethodResponse
 where
     S: RpcServiceT<MethodResponse = MethodResponse> + Send + Sync,
 {
     if let Err(err) = error_if_pending_tx_rpc(&req) {
+        return MethodResponse::error(req.id(), err);
+    }
+    if let Some(err) = pending_logs_error(&req) {
         return MethodResponse::error(req.id(), err);
     }
     if is_pool_pending_tx_lookup(&req) || is_pending_block_query(&req) {
