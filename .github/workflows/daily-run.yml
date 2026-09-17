@@ -1,0 +1,11 @@
+name: Daily Run
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Daily ping
+        run: echo "Daily run triggered"
