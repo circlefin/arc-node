@@ -44,6 +44,12 @@ kit.getSupportedChains('bridge')
 kit.getSupportedChains('swap')
 ```
 
+Runtime discovery answers **API capability**, not whether a specific token
+direction has liquidity right now. Treat `INPUT_UNSUPPORTED_ROUTE (331001)` and
+`ONCHAIN_SIMULATION_FAILED` as normal route-unavailable outcomes: surface them
+to the caller and never replace a failed executable quote with a market-rate
+estimate. Prefer fail-closed behavior when no executable quote exists.
+
 ## Minimal examples
 
 ### Bridge USDC onto Arc Testnet
@@ -94,12 +100,17 @@ cirBTC. See [Swap](https://docs.arc.io/app-kit/swap).
 
 - **Kit key.** A Circle Console kit key is optional but recommended for
   production volume; without one, requests use a shared rate limit.
+- **Signing boundary.** Browser Viem / Ethers adapter paths keep signing in the
+  connected wallet and do not need a backend private key. Circle Wallets
+  server-side examples that use a developer-controlled key are a different
+  custody model. A public API process should not hold a signer that can act
+  against user-granted allowances.
 - **Adapters.** Pass a connected Viem / Ethers / Circle Wallets adapter in
-  `from` (and `to` when bridging). Browser-wallet flows do not require embedding
-  a backend private key in the client for App Kit itself; Circle Wallets
-  server-side examples do use developer-controlled wallets by design.
+  `from` (and `to` when bridging).
 - **Programmatic discovery.** Prefer `getSupportedChains(...)` over hard-coding
   when building chain pickers, so new networks do not require a docs republish.
+  Pair discovery with the route-unavailable handling above; capability listing
+  alone is not a guarantee that a quote will execute.
 - **Historical gap.** Early App Kit releases left Arc Testnet bridge/send paths
   poorly documented in-repo; current Circle docs cover them. If a method fails
   at runtime, confirm package versions and that the chain string is exactly
