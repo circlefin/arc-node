@@ -186,6 +186,7 @@ async fn test_engine() {
         std::time::Duration::from_secs(0), // disable rebroadcast in integration tests
         Vec::new(),
         DEFAULT_TX_RELAY_TIMEOUT,
+        None,
     );
     let node_handle = NodeBuilder::new(node_config)
         .testing_node(executor)

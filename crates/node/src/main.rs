@@ -355,6 +355,14 @@ struct ArcExtraCli {
         help_heading = "Profiling"
     )]
     pprof_heap_prof: bool,
+
+    /// Isolated IPC socket for `arc-consensus` (`eth_call` + `reth_subscribePersistedBlock`).
+    ///
+    /// Serves a second `EthApi` with its own `eth_call` semaphore so public
+    /// HTTP/WS traffic cannot starve consensus. Empty (default) keeps upstream
+    /// behaviour: consensus shares `--ipcpath`.
+    #[arg(long = "consensus-ipcpath", value_name = "PATH", help_heading = "IPC")]
+    consensus_ipcpath: Option<String>,
 }
 
 /// Build [`AddressesDenylistConfig`] for the chain being run.
@@ -625,6 +633,7 @@ fn main() {
                     rebroadcast_interval,
                     tx_relays,
                     tx_relay_timeout,
+                    ext.consensus_ipcpath.clone(),
                 ))
                 .launch_with_debug_capabilities()
                 .await?;
@@ -1098,6 +1107,21 @@ mod tests {
         assert_eq!(
             tx_relay_timeout_from_args(&["--arc.tx.relays.timeout", "15"]),
             std::time::Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn test_consensus_ipcpath_defaults_unset() {
+        assert!(ext_from_args([]).consensus_ipcpath.is_none());
+    }
+
+    #[test]
+    fn test_consensus_ipcpath_parses() {
+        assert_eq!(
+            ext_from_args(["--consensus-ipcpath", "/sockets/consensus.ipc"])
+                .consensus_ipcpath
+                .as_deref(),
+            Some("/sockets/consensus.ipc")
         );
     }
 

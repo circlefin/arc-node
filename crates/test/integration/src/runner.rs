@@ -731,6 +731,7 @@ async fn spawn_execution_layer(
         std::time::Duration::from_secs(0),
         Vec::new(),
         DEFAULT_TX_RELAY_TIMEOUT,
+        None,
     );
 
     let reth_handle = NodeBuilder::new(node_config)

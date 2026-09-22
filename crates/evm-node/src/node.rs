@@ -32,6 +32,7 @@ use reth_ethereum::{node::EthEngineTypes, node::EthEvmConfig};
 use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadAttributes};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
+use reth_ipc::server::Builder as IpcServerBuilder;
 use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, PeersInfo};
 use reth_node_api::{
     AddOnsContext, FullNodeComponents, HeaderTy, NodeAddOns, PayloadAttributesBuilder,
@@ -56,7 +57,7 @@ use reth_rpc::{
     eth::core::{EthApiFor, EthRpcConverterFor},
     ValidationApi,
 };
-use reth_rpc_api::servers::BlockSubmissionValidationApiServer;
+use reth_rpc_api::servers::{BlockSubmissionValidationApiServer, EthApiServer, RethApiServer};
 use reth_rpc_builder::{
     config::RethRpcServerConfig, middleware::RethRpcMiddleware, TransportRpcModules,
 };
@@ -67,7 +68,7 @@ use reth_rpc_eth_api::{
     },
     RpcConvert, RpcTypes, SignableTxRequest,
 };
-use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
+use reth_rpc_eth_types::{error::FromEvmError, EthApiError, EthStateCache};
 use reth_rpc_server_types::RethRpcModule;
 use reth_tracing::tracing::{info, warn};
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
@@ -86,6 +87,10 @@ use crate::rpc_middleware::{
     ArcRpcLayer, ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT, DEFAULT_TX_RELAY_TIMEOUT,
 };
 use crate::ArcEngineValidator;
+
+/// Concurrent `eth_call` permits on the consensus-only IPC socket. Public
+/// HTTP/WS keep Reth's `--rpc.max-blocking-io-requests` (default 256).
+const CONSENSUS_IPC_MAX_BLOCKING_IO: usize = 16;
 
 /// Bundle RPC methods that Arc never exposes on public RPC transports.
 const BUNDLE_RPC_METHODS: [&str; 6] = [
@@ -136,6 +141,9 @@ pub struct ArcNode {
     pub tx_relays: Vec<String>,
     /// Connection timeout for relays, and request timeout for async relayed submissions.
     pub tx_relay_timeout: std::time::Duration,
+    /// Optional second IPC socket reserved for `arc-consensus`. Empty/`None` keeps
+    /// upstream behaviour (consensus shares the public `--ipcpath` EthApi).
+    pub consensus_ipcpath: Option<String>,
 }
 
 impl ArcNode {
@@ -154,6 +162,7 @@ impl ArcNode {
             rebroadcast_interval: crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
             tx_relays: Vec::new(),
             tx_relay_timeout: DEFAULT_TX_RELAY_TIMEOUT,
+            consensus_ipcpath: None,
         }
     }
 
@@ -172,6 +181,7 @@ impl ArcNode {
         rebroadcast_interval: std::time::Duration,
         tx_relays: Vec<String>,
         tx_relay_timeout: std::time::Duration,
+        consensus_ipcpath: Option<String>,
     ) -> Self {
         Self {
             rpc_cfg,
@@ -186,6 +196,7 @@ impl ArcNode {
             rebroadcast_interval,
             tx_relays,
             tx_relay_timeout,
+            consensus_ipcpath,
         }
     }
 
@@ -315,6 +326,7 @@ pub struct ArcAddOns<
 > {
     inner: RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>,
     arc_rpc: ArcRpcConfig,
+    consensus_ipcpath: Option<String>,
 }
 
 impl<N, EthB, PVB, EB, EVB, RpcMiddleware> ArcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
@@ -327,7 +339,11 @@ where
         inner: RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>,
         arc_rpc: ArcRpcConfig,
     ) -> Self {
-        Self { inner, arc_rpc }
+        Self {
+            inner,
+            arc_rpc,
+            consensus_ipcpath: None,
+        }
     }
 }
 
@@ -369,8 +385,16 @@ where
     where
         T: Send,
     {
-        let Self { inner, arc_rpc } = self;
-        ArcAddOns::new(inner.with_engine_api(engine_api_builder), arc_rpc)
+        let Self {
+            inner,
+            arc_rpc,
+            consensus_ipcpath,
+        } = self;
+        ArcAddOns {
+            inner: inner.with_engine_api(engine_api_builder),
+            arc_rpc,
+            consensus_ipcpath,
+        }
     }
 
     /// Replace the payload validator builder.
@@ -378,11 +402,16 @@ where
         self,
         payload_validator_builder: T,
     ) -> ArcAddOns<N, EthB, T, EB, EVB, RpcMiddleware> {
-        let Self { inner, arc_rpc } = self;
-        ArcAddOns::new(
-            inner.with_payload_validator(payload_validator_builder),
+        let Self {
+            inner,
             arc_rpc,
-        )
+            consensus_ipcpath,
+        } = self;
+        ArcAddOns {
+            inner: inner.with_payload_validator(payload_validator_builder),
+            arc_rpc,
+            consensus_ipcpath,
+        }
     }
 
     /// Sets rpc middleware
@@ -390,21 +419,43 @@ where
     where
         T: Send,
     {
-        let Self { inner, arc_rpc } = self;
-        ArcAddOns::new(inner.with_rpc_middleware(rpc_middleware), arc_rpc)
+        let Self {
+            inner,
+            arc_rpc,
+            consensus_ipcpath,
+        } = self;
+        ArcAddOns {
+            inner: inner.with_rpc_middleware(rpc_middleware),
+            arc_rpc,
+            consensus_ipcpath,
+        }
     }
 
     /// Sets the tokio runtime for the RPC servers.
     ///
     /// Caution: This runtime must not be created from within asynchronous context.
     pub fn with_tokio_runtime(self, tokio_runtime: Option<tokio::runtime::Handle>) -> Self {
-        let Self { inner, arc_rpc } = self;
-        Self::new(inner.with_tokio_runtime(tokio_runtime), arc_rpc)
+        let Self {
+            inner,
+            arc_rpc,
+            consensus_ipcpath,
+        } = self;
+        Self {
+            inner: inner.with_tokio_runtime(tokio_runtime),
+            arc_rpc,
+            consensus_ipcpath,
+        }
     }
 
     /// Replace entire ARC RPC config.
     pub fn with_arc_rpc_config(mut self, cfg: ArcRpcConfig) -> Self {
         self.arc_rpc = cfg;
+        self
+    }
+
+    /// IPC path for the consensus-only EthApi. Empty/`None` disables the extra server.
+    pub fn with_consensus_ipcpath(mut self, path: Option<String>) -> Self {
+        self.consensus_ipcpath = path.filter(|p| !p.is_empty());
         self
     }
 }
@@ -446,7 +497,21 @@ where
         let eth_config =
             EthConfigHandler::new(ctx.node.provider().clone(), ctx.node.evm_config().clone());
 
-        self.inner
+        let Self {
+            inner,
+            arc_rpc,
+            consensus_ipcpath,
+        } = self;
+
+        let consensus_eth_rpc_config = ctx
+            .config
+            .rpc
+            .eth_config()
+            .max_blocking_io_requests(CONSENSUS_IPC_MAX_BLOCKING_IO);
+        let engine_handle = ctx.beacon_engine_handle.clone();
+        let node = ctx.node.clone();
+
+        let handle = inner
             .launch_add_ons_with(ctx, move |container| {
                 container.modules.merge_if_module_configured(
                     RethRpcModule::Flashbots,
@@ -460,9 +525,9 @@ where
                 // from externally reachable transports while retaining trusted local IPC access.
                 remove_public_bundle_rpc_methods(container.modules);
 
-                if self.arc_rpc.enabled {
+                if arc_rpc.enabled {
                     if let Ok(arc_module) =
-                        crate::rpc::arc::build_arc_rpc_module(self.arc_rpc.upstream_url.clone())
+                        crate::rpc::arc::build_arc_rpc_module(arc_rpc.upstream_url.clone())
                     {
                         container.modules.merge_configured(arc_module)?;
                     }
@@ -470,7 +535,50 @@ where
 
                 Ok(())
             })
-            .await
+            .await?;
+
+        if let Some(path) = consensus_ipcpath.filter(|p| !p.is_empty()) {
+            let cache = EthStateCache::spawn_with(
+                node.provider().clone(),
+                consensus_eth_rpc_config.cache.clone(),
+                node.task_executor().clone(),
+            );
+            let consensus_eth = EthB::default()
+                .build_eth_api(EthApiCtx {
+                    components: &node,
+                    config: consensus_eth_rpc_config,
+                    cache,
+                    engine_handle,
+                })
+                .await?;
+
+            let mut module = consensus_eth.into_rpc();
+            module
+                .merge(handle.rpc_registry.reth_api().into_rpc())
+                .map_err(|err| {
+                    eyre::eyre!("failed to merge reth methods onto consensus IPC: {err}")
+                })?;
+
+            info!(
+                target: "arc::rpc",
+                path,
+                max_blocking_io = CONSENSUS_IPC_MAX_BLOCKING_IO,
+                "starting consensus IPC server with isolated eth_call queue"
+            );
+
+            let ipc_handle = IpcServerBuilder::default()
+                .build(path)
+                .start(module)
+                .await
+                .map_err(|err| eyre::eyre!("failed to start consensus IPC server: {err}"))?;
+
+            node.task_executor()
+                .spawn_critical_task("consensus-ipc", async move {
+                    ipc_handle.stopped().await;
+                });
+        }
+
+        Ok(handle)
     }
 }
 
@@ -559,6 +667,7 @@ where
     fn add_ons(&self) -> Self::AddOns {
         ArcAddOns::default()
             .with_arc_rpc_config(self.rpc_cfg.clone())
+            .with_consensus_ipcpath(self.consensus_ipcpath.clone())
             .with_rpc_middleware(ArcRpcLayer::new(
                 self.filter_pending_txs,
                 self.allow_unprotected_txs,
@@ -831,6 +940,7 @@ mod tests {
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
             Vec::new(),
             DEFAULT_TX_RELAY_TIMEOUT,
+            None,
         );
 
         assert!(!node.rpc_cfg.enabled);
@@ -863,6 +973,7 @@ mod tests {
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
             Vec::new(),
             DEFAULT_TX_RELAY_TIMEOUT,
+            None,
         );
         assert_eq!(
             node.addresses_denylist_config.contract_address(),
@@ -902,6 +1013,7 @@ mod tests {
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
             Vec::new(),
             DEFAULT_TX_RELAY_TIMEOUT,
+            None,
         );
         assert!(!node.filter_pending_txs);
     }
@@ -938,6 +1050,7 @@ mod tests {
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
             Vec::new(),
             DEFAULT_TX_RELAY_TIMEOUT,
+            None,
         );
         assert!(!node.wait_for_payload);
     }
@@ -974,8 +1087,10 @@ mod tests {
             std::time::Duration::ZERO,
             Vec::new(),
             DEFAULT_TX_RELAY_TIMEOUT,
+            None,
         );
         assert!(node.rebroadcast_interval.is_zero());
+        assert!(node.consensus_ipcpath.is_none());
     }
 
     #[test]
