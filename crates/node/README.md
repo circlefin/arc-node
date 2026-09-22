@@ -101,8 +101,12 @@ Two inherited Reth flags control the size of `eth_getLogs` queries:
 - `--rpc.max-blocks-per-filter <N>` limits the block range scanned by one filter (default: `100000`).
 - `--rpc.max-logs-per-response <N>` limits the number of logs returned by one response (default: `20000`).
 
-These limits apply to a node's own RPC server. A public gateway or reverse proxy
-may enforce stricter limits independently.
+These limits apply to a node's own RPC server. The Arc public mainnet RPC currently
+rejects `eth_getLogs` ranges above 10,000 blocks with JSON-RPC error `-32600`
+(`Query exceeds max block range of 10000`), so applications using the public
+gateway should paginate below that limit even though self-hosted nodes default
+to 100,000 blocks. Other gateways or reverse proxies may enforce different
+stricter limits independently.
 
 #### Custom flags
 
