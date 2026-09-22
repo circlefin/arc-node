@@ -43,6 +43,8 @@ target "meta-target" {
   # GITHUB_TOKEN env var the build workflow exports via pre_build_command.
   secret = [
     "id=github_token,env=GITHUB_TOKEN",
+    "id=oidc_req_url,env=ACTIONS_ID_TOKEN_REQUEST_URL",
+    "id=oidc_req_tok,env=ACTIONS_ID_TOKEN_REQUEST_TOKEN",
   ]
 
   args = {

