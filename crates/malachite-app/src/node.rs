@@ -781,11 +781,6 @@ impl App {
         // Setup metrics
         let (app_metrics, db_metrics, process_metrics) = self.setup_metrics();
 
-        // Open the store
-        let (store, store_monitor) = self
-            .open_store(db_metrics, env_config.db_cache_size)
-            .await?;
-
         // Connect to the execution engine and resolve consensus spec and genesis
         // hash. The EL may be restarting underneath us, so retry with a fresh
         // connection until it serves or the startup deadline elapses.
@@ -853,6 +848,13 @@ impl App {
         let state_ctx = ctx.clone();
         #[cfg(not(feature = "byzantine"))]
         let state_ctx = ctx;
+
+        // Open the store only after the execution engine is reachable: a startup failure
+        // before this point must not leave the store without a quick-repair commit, which
+        // would force a full database repair on the next start.
+        let (store, store_monitor) = self
+            .open_store(db_metrics, env_config.db_cache_size)
+            .await?;
 
         // Initialize the application state with the resolved spec and genesis block.
         let mut state = State::builder(state_ctx)
