@@ -31,3 +31,15 @@ impl Display for UnprocessableTransactionError {
 }
 
 impl std::error::Error for UnprocessableTransactionError {}
+
+/// Error type for when cumulative gas accounting overflows a `u64` while building a payload.
+#[derive(Debug)]
+pub struct CumulativeGasOverflowError;
+
+impl Display for CumulativeGasOverflowError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "cumulative gas accounting overflowed u64 while building payload")
+    }
+}
+
+impl std::error::Error for CumulativeGasOverflowError {}

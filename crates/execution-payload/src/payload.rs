@@ -66,6 +66,7 @@ use std::{
 };
 use tracing::{debug, error, info, trace, warn};
 
+use crate::builder::CumulativeGasOverflowError;
 use crate::builder::UnprocessableTransactionError;
 use crate::metrics::PayloadBuildMetrics;
 use arc_execution_txpool::InvalidTxList;
@@ -760,12 +761,12 @@ where
             break;
         }
 
-        // ensure we still have capacity for this transaction
-        if block_gas_limit
-            < cumulative_gas_used
-                .checked_add(pool_tx.gas_limit())
-                .expect("total gas shouldn't overflow")
-        {
+        // ensure we still have capacity for this transaction. Treat an overflow of the
+        // addition the same as "doesn't fit": it can never fit in a bounded block anyway.
+        let fits_in_block = cumulative_gas_used
+            .checked_add(pool_tx.gas_limit())
+            .is_some_and(|total| total <= block_gas_limit);
+        if !fits_in_block {
             // we can't fit this transaction into the block, so we need to mark it as invalid
             // which also removes all dependent transaction from the iterator before we can
             // continue
@@ -873,7 +874,7 @@ where
         }
         cumulative_gas_used = cumulative_gas_used
             .checked_add(gas_used)
-            .expect("total gas shouldn't overflow");
+            .ok_or_else(|| PayloadBuilderError::other(CumulativeGasOverflowError))?;
     }
 
     PayloadBuildMetrics::record_stage_tx_execution(loop_started.elapsed());
