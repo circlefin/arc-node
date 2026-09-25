@@ -22,7 +22,7 @@ import {
   enforceOperatorsNotProxyAdmin,
   schemaAddress,
   schemaBigInt,
-  schemaHex,
+  schemaBytes32,
   slotForAddressMap,
   slotForBytes32Map,
   slotIndex,
@@ -54,7 +54,11 @@ export const schemaValidatorManager = z
      */
     validators: z.array(
       z.object({
-        publicKey: schemaHex,
+        /**
+         * Ed25519 public key, exactly 32 bytes. ValidatorRegistry.registerValidator
+         * rejects any other length with InvalidPublicKeyFormat, so the schema does too.
+         */
+        publicKey: schemaBytes32,
         votingPower: schemaBigInt.max(UINT64_MAX),
         /**
          * Controllers authorized to manage this validator. Each controller is
@@ -217,12 +221,8 @@ export const buildValidatorManagerGenesisAllocs = async (ctx: BuilderContext, co
         const idSetArraySlot = fromHex(keccak256(slotIndex(REGISTRY_STORAGE_LOCATION + 1n)), 'bigint') + BigInt(index)
         const idSetMapSlotHex = slotForBytes32Map(REGISTRY_STORAGE_LOCATION + 2n, registrationId)
         const validatorSlot = fromHex(slotForBytes32Map(REGISTRY_STORAGE_LOCATION + 0n, registrationId), 'bigint')
-        const publicKeyLength = BigInt(fromHex(validator.publicKey, 'bytes').length)
-
-        if (publicKeyLength !== 32n) {
-          // Only support 32 bytes public key now.
-          throw new Error(`Public key must be 32 bytes`)
-        }
+        // schemaBytes32 already guarantees the key is exactly 32 bytes.
+        const publicKeyLength = 32n
 
         return [
           // _validatorsByRegistrationId, mapping(uint256 => Validator = (enum, bytes, uint64))
