@@ -79,9 +79,6 @@ use arc_execution_config::chainspec::ArcChainSpec;
 use arc_execution_payload::payload::ArcNetworkPayloadBuilderBuilder;
 use arc_execution_txpool::{ArcPoolBuilder, InvalidTxList, InvalidTxListConfig};
 
-// FIXME use the ethereum chain spec temporary, we need to define Arc chain spec
-// original traits for ChainSpec in this file `Hardforks + EthereumHardforks + EthExecutorSpec`
-
 use crate::rpc_middleware::{
     ArcRpcLayer, ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT, DEFAULT_TX_RELAY_TIMEOUT,
 };
