@@ -142,6 +142,11 @@ test-all: test-it test-unit-contract ## Run all tests
 	@echo running all tests...
 	make smoke LAUNCH_ARGS="--frozen --healthy-retry=130"
 
+.PHONY: test-finalize-release
+test-finalize-release: ## Run release finalizer shell tests
+	@echo running finalize-release tests...
+	@bash .github/scripts/test-finalize-release.sh
+
 .PHONY: cov-unit
 cov-unit: genesis ## Run unit tests with coverage
 	rm -f $(COV_FILE)
