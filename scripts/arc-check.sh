@@ -173,12 +173,17 @@ if [[ -n "$EL_RPC_URL" ]]; then
       "$EL_RPC_URL" || return 1
   }
 
-  el_peers_json=$(el_rpc "admin_peers") || die "Failed to fetch admin_peers from ${EL_RPC_URL}"
-  el_peer_count=$(echo "$el_peers_json" | jq '.result | length')
+  if ! el_peers_json=$(el_rpc "admin_peers"); then
+    echo "$(yellow "WARN: could not reach ${EL_RPC_URL} (admin_peers) — skipping")"
+  elif el_err=$(echo "$el_peers_json" | jq -r '.error.message // empty') && [[ -n "$el_err" ]]; then
+    echo "$(yellow "WARN: admin_peers unavailable: ${el_err} (is the admin namespace enabled?)")"
+  else
+    el_peer_count=$(echo "$el_peers_json" | jq '.result | length')
 
-  echo "Connected: ${el_peer_count} peers"
-  echo "$el_peers_json" | jq -r '.result[] |
-    "  \(.name // "unknown")  \(if .network.inbound then "inbound" else "outbound" end)  \(.enode | split("@")[1])"'
+    echo "Connected: ${el_peer_count} peers"
+    echo "$el_peers_json" | jq -r '.result[] |
+      "  \(.name // "unknown")  \(if .network.inbound then "inbound" else "outbound" end)  \(.enode | split("@")[1])"'
+  fi
 fi
 
 # --- proposal history -------------------------------------------------------
@@ -187,6 +192,7 @@ section "Proposal History (last $HISTORY_DEPTH heights)"
 
 proposed_count=0
 failed_count=0
+unavailable_count=0
 start_height=$((height - HISTORY_DEPTH + 1))
 if [[ $start_height -lt 1 ]]; then start_height=1; fi
 total_checked=$((height - start_height + 1))
@@ -195,12 +201,13 @@ BAR_WIDTH=30
 
 progress_bar() {
   local done=$1 total=$2
+  [[ "$total" -eq 0 ]] && return
   local pct=$((done * 100 / total))
   local filled=$((done * BAR_WIDTH / total))
   local empty=$((BAR_WIDTH - filled))
   printf '\r  [%s%s] %3d%% (%d/%d)' \
-    "$(printf '#%.0s' $(seq 1 "$filled") 2>/dev/null)" \
-    "$(printf '.%.0s' $(seq 1 "$empty") 2>/dev/null)" \
+    "$(printf '%*s' "$filled" '' | tr ' ' '#')" \
+    "$(printf '%*s' "$empty" '' | tr ' ' '.')" \
     "$pct" "$done" "$total" >&2
 }
 
@@ -215,7 +222,10 @@ for (( h = start_height; h <= height; h++ )); do
   scan_i=$((h - start_height + 1))
   progress_bar "$scan_i" "$total_checked"
 
-  pm=$(rpc_get "/proposal-monitor?height=$h" 2>/dev/null) || continue
+  if ! pm=$(rpc_get "/proposal-monitor?height=$h" 2>/dev/null); then
+    unavailable_count=$((unavailable_count + 1))
+    continue
+  fi
 
   pm_proposer=$(echo "$pm" | jq -r '.proposer')
   pm_success=$(echo "$pm" | jq -r '.successful // "null"')
@@ -238,23 +248,37 @@ for (( h = start_height; h <= height; h++ )); do
 done
 printf '\r\033[K' >&2
 
+checked=$((total_checked - unavailable_count))
+
 echo ""
-if [[ $total_checked -gt 0 ]]; then
-  pct=$(echo "scale=1; $proposed_count * 100 / $total_checked" | bc)
+if [[ $unavailable_count -gt 0 ]]; then
+  echo "Proposal data unavailable for ${unavailable_count}/${total_checked} heights $(yellow "(not counted)")"
+fi
+
+if [[ $checked -gt 0 ]]; then
+  pct=$(echo "scale=1; $proposed_count * 100 / $checked" | bc)
 else
   pct="0.0"
 fi
 
-if [[ $proposed_count -eq 0 ]]; then
-  echo "Proposed ${proposed_count}/${total_checked} blocks — $(red "never selected as proposer")"
+if [[ $checked -eq 0 ]]; then
+  echo "Proposed: $(yellow "no proposal data available")"
+elif [[ $proposed_count -gt 0 ]]; then
+  echo "Proposed ${proposed_count}/${checked} blocks (${pct}%) — $(green "ok")"
+elif [[ -z "$my_pk" ]]; then
+  echo "Proposed ${proposed_count}/${checked} blocks — $(yellow "not in validator set (expected for non-validator nodes)")"
 else
-  echo "Proposed ${proposed_count}/${total_checked} blocks (${pct}%) — $(green "ok")"
+  echo "Proposed ${proposed_count}/${checked} blocks — $(red "never selected as proposer")"
 fi
 
-if [[ $failed_count -eq 0 ]]; then
-  echo "All ${total_checked} proposals decided successfully: $(green "yes")"
+checked_str="${checked} proposals"
+[[ $unavailable_count -gt 0 ]] && checked_str="${checked} checked proposals"
+if [[ $checked -eq 0 ]]; then
+  echo "All checked proposals decided successfully: $(yellow "no proposal data available")"
+elif [[ $failed_count -eq 0 ]]; then
+  echo "All ${checked_str} decided successfully: $(green "yes")"
 else
-  echo "All ${total_checked} proposals decided successfully: $(red "no") (${failed_count} failed)"
+  echo "All ${checked_str} decided successfully: $(red "no") (${failed_count} failed)"
 fi
 
 # --- live monitoring --------------------------------------------------------
