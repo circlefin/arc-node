@@ -8,10 +8,8 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-default = ["signer-local"]
 arbitrary = ["dep:arbitrary"]
 byzantine = ["dep:malachitebft-engine-byzantine"]
-signer-local = ["dep:malachitebft-signing-ed25519"]
 
 [dependencies]
 
@@ -43,7 +41,7 @@ malachitebft-core-types = { workspace = true, features = ["serde"] }
 malachitebft-engine-byzantine = { workspace = true, optional = true }
 malachitebft-proto = { workspace = true }
 malachitebft-signing = { workspace = true }
-malachitebft-signing-ed25519 = { workspace = true, optional = true, features = ["rand", "serde"] }
+malachitebft-signing-ed25519 = { workspace = true, features = ["rand", "serde"] }
 malachitebft-sync = { workspace = true }
 
 prost = { workspace = true }
