@@ -131,7 +131,7 @@ impl Region {
 /// Regions ordered alphabetically by AWS region name.
 ///
 /// Note: Values are ONE-WAY latencies (RTT / 2).
-/// Source: https://www.cloudping.co/ (P50 median, 1 month) which reports RTT values.
+/// Source: <https://www.cloudping.co/> (P50 median, 1 month) which reports RTT values.
 /// We divide by 2 because `tc netem delay` applies one-way delay per direction.
 #[rustfmt::skip]
 pub(crate) const AWS_LATENCY_MATRIX: [[u32; 14]; 14] = [

@@ -61,7 +61,7 @@ pub struct CommonArgs {
     /// Timeout for Ethereum JSON-RPC requests used by this command, in milliseconds (must be >= 1).
     #[arg(long, value_name = "MILLISECONDS", default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub eth_rpc_timeout_ms: u64,
-    /// Output directory for CSV artifacts. Defaults to target/engine-bench/<mode>-<timestamp>.
+    /// Output directory for CSV artifacts. Defaults to `target/engine-bench/<mode>-<timestamp>`.
     #[arg(long, short, value_name = "OUTPUT_DIR")]
     pub output: Option<PathBuf>,
 }

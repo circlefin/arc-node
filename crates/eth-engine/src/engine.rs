@@ -125,7 +125,7 @@ pub trait EthereumAPI: Send + Sync {
 pub type IsOsakaActiveFn = Arc<dyn Fn(u64) -> bool + Send + Sync>;
 
 /// Ethereum engine implementation.
-/// Spec: https://github.com/ethereum/execution-apis/tree/main/src/engine
+/// Spec: <https://github.com/ethereum/execution-apis/tree/main/src/engine>
 #[derive(Clone)]
 pub struct Engine(Arc<Inner>);
 
