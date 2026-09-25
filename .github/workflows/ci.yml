@@ -67,6 +67,39 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # Workspace-scoped checks unify features across members, so a crate's own
+  # feature set is only ever validated in combination. cargo-hack decomposes
+  # --workspace into per-package runs, which is what catches features that
+  # build only because another member supplied the missing dependency.
+  rust-feature-matrix:
+    name: Rust Feature Matrix
+    needs: rust-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev zlib1g-dev
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-shared-key: rust-feature-matrix
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      - name: Check each feature per crate
+        run: cargo hack check --each-feature --workspace --exclude arc-signer --locked
+
+      # arc-signer is checked separately: its `compile_error!` guard rejects the
+      # empty provider set by design, so only the bare --no-default-features run
+      # is dropped. Every individual feature of the crate is still checked.
+      - name: Check each feature for arc-signer
+        run: cargo hack check --each-feature --exclude-no-default-features -p arc-signer --locked
+
   rust-test:
     name: Rust Unit Tests
     needs: rust-lint
