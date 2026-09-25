@@ -36,8 +36,12 @@ use std::time::Duration;
 use bytesize::ByteSize;
 use eyre::Context;
 use rand::rngs::OsRng;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::signal::unix::SignalKind;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -122,6 +126,10 @@ pub struct Handle {
     graceful_shutdown: CancellationToken,
     /// Fires when the EL IPC watchdog triggered shutdown (as opposed to SIGTERM or normal halt).
     el_watchdog_triggered: oneshot::Receiver<()>,
+    /// Tracks SIGTERM cleanup completion so `Node::run` can keep the runtime alive
+    /// until the handler finishes instead of racing against it.
+    pub(crate) sigterm_done: Arc<Notify>,
+    pub(crate) sigterm_received: Arc<AtomicBool>,
     /// Kept alive to prevent the app request channel from closing when RPC is disabled.
     _tx_app_req: mpsc::Sender<AppRequest>,
 }
@@ -883,6 +891,8 @@ impl App {
         let tx_event = channels.events.clone();
         let cancel_token = CancellationToken::new();
         let graceful_shutdown = CancellationToken::new();
+        let sigterm_done = Arc::new(Notify::new());
+        let sigterm_received = Arc::new(AtomicBool::new(false));
 
         // Watchdog: on unexpected EL IPC close, signal the run loop and cancel the app task;
         // the run loop performs the bounded Node stop and the process exit.
@@ -933,6 +943,8 @@ impl App {
             cancel_token,
             graceful_shutdown,
             el_watchdog_triggered: el_watchdog_rx,
+            sigterm_done,
+            sigterm_received,
             _tx_app_req: tx_app_req,
         })
     }
@@ -965,6 +977,16 @@ impl App {
 
         // Wait for the application to finish
         let result = handles.app.await?;
+
+        // SIGTERM handover: if `sigterm_received` was set by the handler, await
+        // the one-shot `sigterm_done` Notify until cleanup (engine stop +
+        // savepoint) completes. Without this, `run` would return immediately
+        // after the app future resolves and drop the Tokio runtime, killing the
+        // handler task mid-cleanup.
+        if handles.sigterm_received.load(Ordering::SeqCst) {
+            handles.sigterm_done.notified().await;
+            return Err(eyre::eyre!("Received SIGTERM signal"));
+        }
 
         // EL IPC closed: stop the Node actor with a bounded timeout, then exit non-zero so
         // the orchestrator restarts the container.
@@ -1013,7 +1035,7 @@ const EL_IPC_SHUTDOWN_EXIT_CODE: i32 = 1;
 
 /// Exit code for a SIGTERM-triggered shutdown: 143 = 128 + SIGTERM (15), the conventional
 /// exit status for a process terminated by SIGTERM.
-const SIGTERM_EXIT_CODE: i32 = 143;
+pub const SIGTERM_EXIT_CODE: i32 = 143;
 
 /// Grace period for in-flight tasks to finish after teardown, before the process exits.
 const SHUTDOWN_DRAIN_DELAY: Duration = Duration::from_millis(500);
@@ -1135,6 +1157,8 @@ fn install_sigterm_handler(handle: &Handle) {
     let store = handle.store.clone();
     let cancel_token = handle.cancel_token.clone();
     let graceful_shutdown = handle.graceful_shutdown.clone();
+    let sigterm_done = handle.sigterm_done.clone();
+    let sigterm_received = handle.sigterm_received.clone();
 
     let mut sigterm = signal(SignalKind::terminate()).expect("inside Tokio runtime");
 
@@ -1142,6 +1166,11 @@ fn install_sigterm_handler(handle: &Handle) {
         sigterm.recv().await;
 
         warn!("Received SIGTERM, shutting down...");
+
+        // Mark as received before teardown so `Node::run` knows to wait on the
+        // one-shot `Notify` rather than returning immediately and dropping the
+        // runtime.
+        sigterm_received.store(true, Ordering::SeqCst);
 
         stop_node_and_teardown(
             node.stop_and_wait(
@@ -1154,6 +1183,13 @@ fn install_sigterm_handler(handle: &Handle) {
         .await;
 
         drain_before_exit(|| store.savepoint()).await;
+        sigterm_done.notify_one();
+        // Keep the direct exit for the `HaltAndWait` path where `Node::run`
+        // is parked in `sleep(Duration::MAX)` and not awaiting the `Notify`.
+        // For the normal path, `Node::run` observes the `Notify` and returns
+        // `Err("SIGTERM")` — `main::start` maps it to 143, so either exit path
+        // yields the correct K8s code. The `Notify` handshake guarantees the
+        // runtime stays alive until this point.
         std::process::exit(SIGTERM_EXIT_CODE);
     });
 }
