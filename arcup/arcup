@@ -6,7 +6,7 @@ set -euo pipefail
 
 # NOTE: if you make modifications to this script, please increment the version number.
 # WARNING: the SemVer pattern: major.minor.patch must be followed as we use it to determine if the script is up to date.
-ARCUP_INSTALLER_VERSION="0.2.0"
+ARCUP_INSTALLER_VERSION="0.2.1"
 
 REPO="${ARC_REPO:-circlefin/arc-node}"
 if [[ -n "${ARC_REPO:-}" ]] && [[ ! "$ARC_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
@@ -264,6 +264,22 @@ version_gt() {
     # Remove 'v' prefix if present
     local ver1="${1#v}"
     local ver2="${2#v}"
+
+    # Build metadata never affects precedence (SemVer 10), and it may itself
+    # contain '-', so it has to go before the pre-release split below.
+    ver1="${ver1%%+*}"
+    ver2="${ver2%%+*}"
+
+    # Keep the pre-release tags aside: SemVer orders a release above any
+    # pre-release of the same major.minor.patch.
+    local pre1="" pre2=""
+    if [[ "$ver1" == *-* ]]; then
+        pre1="${ver1#*-}"
+    fi
+    if [[ "$ver2" == *-* ]]; then
+        pre2="${ver2#*-}"
+    fi
+
     ver1="${ver1%%-*}"
     ver2="${ver2%%-*}"
 
@@ -281,6 +297,73 @@ EOF
     [ "$patch1" -gt "$patch2" ] && return 0
     [ "$patch1" -lt "$patch2" ] && return 1
 
+    # Same major.minor.patch. A release outranks any pre-release of it, so
+    # 0.3.0 is newer than 0.3.0-rc.1 (SemVer 11.3). Two pre-releases are
+    # ordered identifier by identifier (SemVer 11.4).
+    if [ -z "$pre1" ] && [ -z "$pre2" ]; then
+        return 1
+    fi
+    if [ -z "$pre1" ]; then
+        return 0
+    fi
+    if [ -z "$pre2" ]; then
+        return 1
+    fi
+    prerelease_gt "$pre1" "$pre2"
+}
+
+# Order two dot-separated pre-release identifier lists (SemVer 11.4).
+# Returns 0 when the first ranks higher, 1 otherwise.
+prerelease_gt() {
+    local a="$1" b="$2"
+    local ia ib na nb
+    # Byte-wise comparison for the alphanumeric case; the locale must not
+    # decide whether "beta" sorts above "alpha".
+    local LC_ALL=C
+
+    while [ -n "$a" ] || [ -n "$b" ]; do
+        # With every shared identifier equal, the shorter list ranks lower
+        # (11.4.4): 1.0.0-alpha < 1.0.0-alpha.1.
+        if [ -z "$a" ]; then
+            return 1
+        fi
+        if [ -z "$b" ]; then
+            return 0
+        fi
+
+        ia="${a%%.*}"
+        ib="${b%%.*}"
+        if [ "$a" = "$ia" ]; then a=""; else a="${a#*.}"; fi
+        if [ "$b" = "$ib" ]; then b=""; else b="${b#*.}"; fi
+
+        if [ "$ia" = "$ib" ]; then
+            continue
+        fi
+
+        na=0; nb=0
+        case "$ia" in ''|*[!0-9]*) ;; *) na=1 ;; esac
+        case "$ib" in ''|*[!0-9]*) ;; *) nb=1 ;; esac
+
+        # Both numeric: compare as numbers, so rc.11 is newer than rc.2 (11.4.1).
+        if [ "$na" = 1 ] && [ "$nb" = 1 ]; then
+            if [ "$ia" -gt "$ib" ]; then
+                return 0
+            fi
+            return 1
+        fi
+        # A numeric identifier ranks below an alphanumeric one (11.4.3).
+        if [ "$na" = 1 ]; then
+            return 1
+        fi
+        if [ "$nb" = 1 ]; then
+            return 0
+        fi
+        # Both alphanumeric: ASCII order (11.4.2).
+        if [[ "$ia" > "$ib" ]]; then
+            return 0
+        fi
+        return 1
+    done
     return 1
 }
 

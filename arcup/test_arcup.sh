@@ -64,6 +64,83 @@ test_version_comparison() {
         fail "same prerelease base is not newer"
     fi
     pass "same prerelease base is not newer"
+
+    if ! version_gt "0.3.0" "0.3.0-rc.1"; then
+        fail "release is newer than its prerelease"
+    fi
+    pass "release is newer than its prerelease"
+
+    if ! version_gt "v0.3.0" "v0.3.0-rc.2"; then
+        fail "release is newer than its prerelease with v prefix"
+    fi
+    pass "release is newer than its prerelease with v prefix"
+}
+
+# The precedence chain semver.org gives for section 11.4, checked link by link
+# in both directions, plus the two pre-release comparisons #205 asks for.
+test_prerelease_precedence() {
+    local chain=(
+        "1.0.0-alpha"
+        "1.0.0-alpha.1"
+        "1.0.0-alpha.beta"
+        "1.0.0-beta"
+        "1.0.0-beta.2"
+        "1.0.0-beta.11"
+        "1.0.0-rc.1"
+        "1.0.0"
+    )
+    local i lower higher
+    for ((i = 1; i < ${#chain[@]}; i++)); do
+        lower="${chain[i-1]}"
+        higher="${chain[i]}"
+        if ! version_gt "$higher" "$lower"; then
+            fail "$higher is newer than $lower"
+        fi
+        if version_gt "$lower" "$higher"; then
+            fail "$lower is not newer than $higher"
+        fi
+    done
+    pass "orders the semver.org 11.4 chain"
+
+    if ! version_gt "0.3.0-rc.2" "0.3.0-rc.1"; then
+        fail "later release candidate is newer"
+    fi
+    pass "later release candidate is newer"
+
+    if ! version_gt "1.0.0-beta.11" "1.0.0-beta.2"; then
+        fail "numeric identifiers compare as numbers, not strings"
+    fi
+    pass "numeric identifiers compare as numbers, not strings"
+
+    if version_gt "1.0.0-rc.1" "1.0.0-rc.1"; then
+        fail "equal prereleases are not newer"
+    fi
+    pass "equal prereleases are not newer"
+}
+
+test_build_metadata_is_ignored() {
+    if version_gt "1.0.0+build.9" "1.0.0+build.1"; then
+        fail "build metadata does not order releases"
+    fi
+    pass "build metadata does not order releases"
+
+    if version_gt "1.0.0+build-1" "1.0.0"; then
+        fail "a hyphen inside build metadata is not a prerelease"
+    fi
+    if version_gt "1.0.0" "1.0.0+build-1"; then
+        fail "a hyphen inside build metadata is not a prerelease"
+    fi
+    pass "a hyphen inside build metadata is not a prerelease"
+
+    if ! version_gt "1.0.1+build-1" "1.0.0"; then
+        fail "the core still compares under build metadata"
+    fi
+    pass "the core still compares under build metadata"
+
+    if ! version_gt "1.0.0-rc.2+b1" "1.0.0-rc.1+b99"; then
+        fail "prerelease decides when both carry build metadata"
+    fi
+    pass "prerelease decides when both carry build metadata"
 }
 
 test_target_mapping() {
@@ -812,6 +889,8 @@ test_install_binary_rejects_symlink() {
 
 test_version_normalization
 test_version_comparison
+test_prerelease_precedence
+test_build_metadata_is_ignored
 test_target_mapping
 test_unknown_architecture_fails
 test_github_api_url_rejects_non_https
