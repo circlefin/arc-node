@@ -196,6 +196,15 @@ and `--rpc.max-subscriptions-per-connection` (default `32`) if clients see
 `MaxConnections` or `TooManySubscriptions` errors. The defaults bound WebSocket
 log-fanout memory growth and should only be raised, not lowered.
 
+For `eth_getLogs`, `--rpc.max-blocks-per-filter` limits the block range scanned
+by one filter (default `100000`), while `--rpc.max-logs-per-response` limits the
+number of logs returned by one response (default `20000`). These inherited Reth
+limits apply to the node itself. The Arc public mainnet RPC currently rejects
+ranges above 10,000 blocks with JSON-RPC error `-32600`
+(`Query exceeds max block range of 10000`), so clients using the public gateway
+should paginate below that limit. Other gateways or reverse proxies may enforce
+different stricter limits independently.
+
 ### Start consensus layer
 
 After starting the [execution layer](#start-execution-layer), in a different terminal, start the consensus layer:
