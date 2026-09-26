@@ -6,7 +6,7 @@ set -euo pipefail
 
 # NOTE: if you make modifications to this script, please increment the version number.
 # WARNING: the SemVer pattern: major.minor.patch must be followed as we use it to determine if the script is up to date.
-ARCUP_INSTALLER_VERSION="0.2.0"
+ARCUP_INSTALLER_VERSION="0.2.1"
 
 REPO="${ARC_REPO:-circlefin/arc-node}"
 if [[ -n "${ARC_REPO:-}" ]] && [[ ! "$ARC_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
@@ -350,7 +350,7 @@ download_file_with_github_api() {
     download_url=$(resolve_github_asset_download_url "$asset_api_url") || return 1
 
     if curl "${CURL_RETRY_ARGS[@]}" -fL --max-time 900 -o "$output_path" "$download_url" >/dev/null 2>&1; then
-        [[ -f "$output_path" ]] && return 0
+        [[ -s "$output_path" ]] && return 0
     fi
 
     rm -f "$output_path"

@@ -72,7 +72,7 @@ main() {
         error "curl not found. Please install curl."
     fi
 
-    if ! curl_with_headers -#fL --max-time 300 -o "$_INSTALL_TMP_FILE" "$ARCUP_URL" ; then
+    if ! curl_with_headers -#fL --max-time 300 -o "$_INSTALL_TMP_FILE" "$ARCUP_URL" || [[ ! -s "$_INSTALL_TMP_FILE" ]]; then
         error "failed to download arcup from '$ARCUP_URL'"
     fi
 
