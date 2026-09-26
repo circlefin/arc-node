@@ -51,29 +51,75 @@ impl ApiVersion {
 
     /// Parses an Accept header value to extract the API version
     ///
-    /// Supported formats:
+    /// Supported formats include comma-separated media ranges and parameters:
     /// - `application/vnd.arc.v1+json` -> V1
+    /// - `application/vnd.arc.v1+json; q=0.9` -> V1
+    /// - `text/html, application/vnd.arc.v1+json` -> V1
     /// - `application/json` -> default (V1)
+    /// - `*/*` -> default (V1)
     /// - Missing/empty -> default (V1)
     ///
-    /// Returns `None` if the header specifies an unsupported version or the
-    /// format is unrecognized/malformed (e.g. "text/html")
+    /// Media ranges with `q=0` are ignored. Returns `None` when no supported,
+    /// acceptable media range is present.
     pub fn from_accept_header(value: &str) -> Option<Self> {
         let trimmed = value.trim();
 
-        // Empty or generic JSON defaults to V1
-        if trimmed.is_empty() || trimmed == MEDIA_TYPE_JSON || trimmed == MEDIA_TYPE_ANY {
+        if trimmed.is_empty() {
             return Some(Self::default());
         }
 
-        // Parse versioned media type
-        if let Some(version_part) = trimmed.strip_prefix(MEDIA_TYPE_PREFIX) {
-            if let Some(version_str) = version_part.strip_suffix("+json") {
-                return ApiVersion::from_str(version_str).ok();
+        for range in trimmed.split(',') {
+            let mut parts = range.split(';');
+            let media_type = parts.next()?.trim().to_ascii_lowercase();
+
+            if media_type.is_empty() {
+                continue;
+            }
+
+            let mut acceptable = true;
+            for parameter in parts {
+                let parameter = parameter.trim();
+                if parameter.is_empty() {
+                    continue;
+                }
+
+                let Some((name, value)) = parameter.split_once('=') else {
+                    continue;
+                };
+
+                if name.trim().eq_ignore_ascii_case("q") {
+                    match value.trim().parse::<f32>() {
+                        Ok(quality) if (0.0..=1.0).contains(&quality) => {
+                            if quality == 0.0 {
+                                acceptable = false;
+                                break;
+                            }
+                        }
+                        _ => {
+                            acceptable = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !acceptable {
+                continue;
+            }
+
+            if media_type == MEDIA_TYPE_JSON || media_type == MEDIA_TYPE_ANY {
+                return Some(Self::default());
+            }
+
+            if let Some(version_part) = media_type.strip_prefix(MEDIA_TYPE_PREFIX) {
+                if let Some(version_str) = version_part.strip_suffix("+json") {
+                    if let Ok(version) = ApiVersion::from_str(version_str) {
+                        return Some(version);
+                    }
+                }
             }
         }
 
-        // Unrecognized/malformed format defaults to None
         None
     }
 }
@@ -136,6 +182,60 @@ mod tests {
     }
 
     #[test]
+    fn test_from_accept_header_with_parameters() {
+        assert_eq!(
+            ApiVersion::from_accept_header("application/vnd.arc.v1+json; q=0.9"),
+            Some(ApiVersion::V1)
+        );
+        assert_eq!(
+            ApiVersion::from_accept_header("application/json; charset=utf-8; q=0.5"),
+            Some(ApiVersion::V1)
+        );
+    }
+
+    #[test]
+    fn test_from_accept_header_with_multiple_ranges() {
+        assert_eq!(
+            ApiVersion::from_accept_header("text/html, application/vnd.arc.v1+json"),
+            Some(ApiVersion::V1)
+        );
+        assert_eq!(
+            ApiVersion::from_accept_header("text/html,  application/json ; q=0.8"),
+            Some(ApiVersion::V1)
+        );
+        assert_eq!(
+            ApiVersion::from_accept_header("text/html, */*;q=0.1"),
+            Some(ApiVersion::V1)
+        );
+    }
+
+    #[test]
+    fn test_from_accept_header_ignores_zero_quality_ranges() {
+        assert_eq!(
+            ApiVersion::from_accept_header("application/vnd.arc.v1+json; q=0"),
+            None
+        );
+        assert_eq!(
+            ApiVersion::from_accept_header(
+                "application/vnd.arc.v1+json; q=0, application/json; q=0.5"
+            ),
+            Some(ApiVersion::V1)
+        );
+    }
+
+    #[test]
+    fn test_from_accept_header_rejects_malformed_quality() {
+        assert_eq!(
+            ApiVersion::from_accept_header("application/vnd.arc.v1+json; q=bogus"),
+            None
+        );
+        assert_eq!(
+            ApiVersion::from_accept_header("application/json; q=1.5"),
+            None
+        );
+    }
+
+    #[test]
     fn test_from_accept_header_generic_json() {
         assert_eq!(
             ApiVersion::from_accept_header("application/json"),
@@ -162,6 +262,10 @@ mod tests {
         );
         assert_eq!(
             ApiVersion::from_accept_header("application/vnd.arc.v2+json"),
+            None
+        );
+        assert_eq!(
+            ApiVersion::from_accept_header("application/vnd.arc.v2+json, text/html"),
             None
         );
     }
