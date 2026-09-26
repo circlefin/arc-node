@@ -172,6 +172,13 @@ fn generate_tc_script(
 
     script.push_str("set -e\n\n");
 
+    // WSL2's kernel does not provide the qdisc modules used by tc/netem in this setup.
+    // Skip latency emulation there so localdev can still start without manual script edits.
+    script.push_str("if grep -qi microsoft-standard /proc/sys/kernel/osrelease 2>/dev/null; then\n");
+    script.push_str("  echo \"WSL2 detected; skipping latency emulation because required tc qdisc modules are unavailable.\"\n");
+    script.push_str("  exit 0\n");
+    script.push_str("fi\n\n");
+
     // Install iproute2 and iptables if ip or tc commands are missing (e.g. release images)
     script.push_str("if [ -f /etc/debian_version ] && ! which ip tc > /dev/null; then\n");
     script.push_str("  (apt-get update -qq && apt-get install -y -qq --no-install-recommends iproute2 iptables) >/dev/null 2>&1\n");
