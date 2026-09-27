@@ -694,13 +694,14 @@ impl StartCmd {
         let has_ipc_options = self.eth_socket.is_some() || self.execution_socket.is_some();
         let has_rpc_options = self.eth_rpc_endpoint.is_some()
             || self.execution_endpoint.is_some()
+            || self.execution_ws_endpoint.is_some()
             || self.execution_jwt.is_some();
 
         if has_ipc_options && has_rpc_options {
             return Err(eyre::eyre!(
                 "Conflicting options detected: Cannot specify both IPC and RPC options simultaneously.\n\
                 IPC options: --eth-socket, --execution-socket\n\
-                RPC options: --eth-rpc-endpoint, --execution-endpoint, --execution-jwt\n\
+                RPC options: --eth-rpc-endpoint, --execution-endpoint, --execution-ws-endpoint, --execution-jwt\n\
                 Please choose either IPC (for local communication) or RPC (for remote communication)."
             ));
         }
@@ -938,6 +939,21 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Conflicting options detected"));
+    }
+
+    #[test]
+    fn validate_err_when_mixing_ipc_and_execution_ws_endpoint() {
+        let mut cmd = new_start_cmd();
+        cmd.eth_socket = Some("/tmp/reth.ipc".to_string());
+        cmd.execution_socket = Some("/tmp/reth-auth.ipc".to_string());
+        cmd.execution_ws_endpoint = Some(dummy_url());
+
+        let err = cmd
+            .validate()
+            .expect_err("--execution-ws-endpoint must conflict with IPC transport options");
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Conflicting options detected"));
+        assert!(err_msg.contains("--execution-ws-endpoint"));
     }
 
     #[test]
