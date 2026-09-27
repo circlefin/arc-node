@@ -162,6 +162,21 @@ assert decode(header.extra_data) == expected
 
 This replaces the current `parent.extra_data → child.base_fee` check with a post-execution invariant: the proposer's `extra_data` must match the deterministic output of execution.
 
+### Effective base-fee floor vs `minBaseFee`
+
+`arc_calc_next_block_base_fee` guarantees a minimum **increase** of 1 when utilization is above target, but the **decrease** path truncates to zero with no equivalent floor. For `k_rate > 0`, an empty block stops lowering the fee once `base_fee * k_rate < 10_000`. Under sustained empty blocks at production-scale gas limits, the resting value is therefore:
+
+```text
+resting_value = ceil(10000 / kRate) - 1
+effective_floor ≈ max(minBaseFee, resting_value)
+```
+
+`10000 / kRate` is the truncation *threshold*; the fee comes to rest one wei below it (e.g. `kRate = 1250` ⇒ threshold 8, rest 7; `kRate = 200` ⇒ threshold 50, rest 49; `kRate = 10000` ⇒ rest 0, so a single empty block reaches zero before the output clamp). Operators reading only `feeParams.minBaseFee` can miss this interaction.
+
+This is a **forward-looking governance risk**, not a past Arc-curve incident: since the Arc fee curve has been live on testnet (`kRate = 200` from block ~21,659,090), `minBaseFee` has stayed well above the resting value (49 wei). The 7 wei floor observed earlier on testnet came from plain EIP-1559 dynamics (`/8`), not from Arc `kRate` truncation — do not treat that history as evidence the Arc curve already gapped. A future `updateFeeParams` that lowers `minBaseFee` below `ceil(10000/kRate) - 1` (or raises that resting value above `minBaseFee`) would create the gap. See #367.
+
+Also note: `assets/testnet/config.json` / `assets/devnet/config.json` fee params (`kRate: 25`, `minBaseFee: 1`) are **historical genesis values** (predicted Arc resting value 399). Live testnet `ProtocolConfig.feeParams()` currently matches the mainnet-like set (`kRate: 200`).
+
 ## Consequences
 
 ### Positive
