@@ -225,6 +225,9 @@ companion execution layer.
 The consensus layer operates in the **follow** mode.
 We provide three endpoints from which the node retrieves finalized blocks.
 
+Application developers using public JSON-RPC (gas caps, rate limits, fallback URLs)
+should see [Public Testnet RPC](public-testnet-rpc.md).
+
 ### Verify operation
 
 After starting both the consensus and execution layer, wait about 30 seconds.
