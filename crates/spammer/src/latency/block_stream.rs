@@ -64,11 +64,11 @@ struct HeaderNotification {
     received_at: u64,
 }
 
-/// A full block fetched by the consumer, carrying the original
-/// header-arrival timestamp for latency measurement.
+/// A full block fetched by the consumer, carrying the event timestamp
+/// used for latency measurement.
 pub(super) struct BlockEvent {
     pub block: RpcBlock,
-    /// Propagated from [`HeaderNotification::received_at`].
+    /// Time when the block became available to the tracker.
     pub received_at: u64,
 }
 
@@ -306,7 +306,6 @@ impl BlockStream {
                     &mut ws_client,
                     *next_expected_height,
                     height - 1,
-                    notification.received_at,
                     block_sender,
                 )
                 .await?;
@@ -351,7 +350,6 @@ impl BlockStream {
         ws_client: &mut WsClient,
         start_height: u64,
         end_height: u64,
-        received_at: u64,
         block_sender: &Sender<BlockEvent>,
     ) -> Result<()> {
         if start_height > end_height {
@@ -365,10 +363,7 @@ impl BlockStream {
             let hex_height = format!("0x{height:x}");
             match Self::fetch_block(ws_client, ETH_GET_BLOCK_BY_NUMBER, &hex_height).await {
                 FetchResult::Ok(block) => {
-                    // Send the block to the tracker.
-                    // The timestamp for catch-up blocks is the
-                    // arrival time of the first notification.
-                    // TODO: should we use the blocks' timestamps?
+                    let received_at = timestamp_now();
                     if block_sender
                         .send(BlockEvent { block, received_at })
                         .await
@@ -426,6 +421,11 @@ impl BlockStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
+    use url::Url;
 
     #[test]
     fn parse_hex_u64_table() {
@@ -450,5 +450,77 @@ mod tests {
                 input
             );
         }
+    }
+
+    #[tokio::test]
+    async fn catch_up_scan_timestamps_each_fetched_block_individually() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            for height in [0x10_u64, 0x11] {
+                let msg = socket.next().await.unwrap().unwrap();
+                let Message::Text(request) = msg else {
+                    panic!("expected text JSON-RPC request");
+                };
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                let hex_height = format!("0x{height:x}");
+
+                assert_eq!(request["method"], ETH_GET_BLOCK_BY_NUMBER);
+                assert_eq!(request["params"], json!([hex_height, false]));
+
+                if height == 0x11 {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"].clone(),
+                    "result": {
+                        "number": format!("0x{height:x}"),
+                        "hash": format!("0x{height:064x}"),
+                        "timestamp": "0x1",
+                        "transactions": [],
+                    },
+                });
+
+                socket
+                    .send(Message::Text(Utf8Bytes::from(response.to_string())))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let url = Url::parse(&format!("ws://{addr}")).unwrap();
+        let mut ws_client = WsClientBuilder::new(url, Duration::from_secs(1))
+            .build()
+            .await
+            .unwrap();
+        let (block_sender, mut block_receiver) = mpsc::channel::<BlockEvent>(2);
+        let stale_received_at = 42;
+
+        BlockStream::catch_up_scan(&mut ws_client, 0x10, 0x11, &block_sender)
+            .await
+            .unwrap();
+        drop(block_sender);
+
+        let first = block_receiver.recv().await.unwrap();
+        let second = block_receiver.recv().await.unwrap();
+
+        assert_eq!(parse_hex_u64(&first.block.height), Some(0x10));
+        assert_eq!(parse_hex_u64(&second.block.height), Some(0x11));
+        assert!(
+            first.received_at > stale_received_at,
+            "catch-up block reused stale notification timestamp"
+        );
+        assert!(
+            second.received_at > first.received_at,
+            "each catch-up block should be timestamped after it is fetched"
+        );
+
+        server.await.unwrap();
     }
 }
