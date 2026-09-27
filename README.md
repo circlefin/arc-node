@@ -16,19 +16,20 @@
 > [!IMPORTANT]
 > Arc is currently in testnet, and this is alpha software currently undergoing audits.
 
-Arc is an open EVM-compatible layer 1 built on [Malachite](https://github.com/circlefin/malachite) consensus, delivering the performance and reliability needed to meet the new demands of the global internet economy. 
+Arc is an open EVM-compatible layer 1 built on [Malachite](https://github.com/circlefin/malachite) consensus, delivering the performance and reliability needed to meet the new demands of the global internet economy.
 
 ## Features
 
-- **USDC as Gas** - Pay gas in USDC for low, predictable fees on any transaction  
-- **Deterministic Sub-second Finality** - Near-instant settlement finality powered by Malachite BFT consensus engine  
-- **Circle Platform Integration** - Integrates with Circle’s full-stack platform (e.g., USDC, Wallets, CCTP, Gateway) to help you go from prototype to production faster  
+- **USDC as Gas** - Pay gas in USDC for low, predictable fees on any transaction
+- **Deterministic Sub-second Finality** - Near-instant settlement finality powered by Malachite BFT consensus engine
+- **Circle Platform Integration** - Integrates with Circle’s full-stack platform (e.g., USDC, Wallets, CCTP, Gateway) to help you go from prototype to production faster
 - **(Coming soon) Opt-in Configurable Privacy** - Native privacy tooling enables selective shielding of sensitive financial data while preserving auditability
 
 ## Documentation
 
 - 🚀 **[Execution](crates/node/README.md)** - Execution binary and configuration
 - 🗳️ **[Consensus](crates/malachite-app/README.md)** - Consensus binary and configuration
+- 🌐 **[RPC Endpoints](docs/rpc-endpoints.md)** - Public Arc Testnet endpoints, request limits and client fallback setup
 - More: see Arc [developer docs](https://docs.arc.io/arc/concepts/welcome-to-arc) for guides, APIs, and specs
 
 ## Install and Run a Node
