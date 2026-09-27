@@ -55,6 +55,23 @@ No breaking changes in this release.
   - Old (`v0.7.1`): `--rpc.gascap` default `50000000` (Reth stock default).
   - New (`v0.7.2`): `--rpc.gascap` default `30000000`.
   - `eth_call` and `eth_estimateGas` requests that need more than 30M gas now fail with a gas-cap error. Pass `--rpc.gascap 50000000` (or higher) to restore the previous budget. Operators who never set the flag and do not rely on calls above 30M gas are unaffected.
+  - Post-Osaka (Arc Testnet), the effective single-transaction ceiling is `min(--rpc.gascap, 16_777_216)` under EIP-7825 — raising `--rpc.gascap` alone cannot make a transaction above 2²⁴ gas valid.
+
+### For Application Developers
+
+- **[RPC] `arc-node-execution`: JSON-RPC gas cap default lowered.**
+  - Old (`v0.7.1`): `--rpc.gascap` default `50000000` (Reth stock default).
+  - New (`v0.7.2`): `--rpc.gascap` default `30000000`.
+  - Three separate limits apply — do not conflate them:
+    1. **RPC simulation cap (`--rpc.gascap`)** — node-local; bounds `eth_call`, `eth_estimateGas`, and `eth_createAccessList` only. Two nodes on the same chain can return different results for the same call.
+    2. **Per-transaction protocol cap** — enforced at consensus. On Arc Testnet post-Osaka this is **16,777,216 (EIP-7825)** regardless of RPC provider.
+    3. **Block gas limit** — header `gasLimit` (30M on Arc Testnet), shared across multiple transactions per block.
+  - Hitting `--rpc.gascap` during simulation means *this node refused to simulate above the cap* — not necessarily that Arc cannot execute the transaction on-chain. Retry against a node with a higher cap, or ask the operator to raise `--rpc.gascap`.
+  - Observable error shapes (pattern-match; no distinct JSON-RPC code):
+    - Cap-side: `gas required exceeds allowance (<limit>)` or `out of gas: gas required exceeds: <limit>` — compare `<limit>` to the node's `--rpc.gascap` and to 16,777,216.
+    - Balance-side: same `allowance (<N>)` family when `N` is the sender's gas budget (usually ≠ 2²⁴).
+    - Revert: `execution reverted` (optionally with revert data) — unrelated to the RPC cap.
+  - **Do not treat an `eth_estimateGas` failure above 16,777,216 as proof that a higher gas limit would succeed on-chain** — it would not under EIP-7825.
 
 - **[CLI] `arc-node-execution`: replay-unprotected (pre-EIP-155) transactions are rejected over JSON-RPC by default.**
   - Old (`v0.7.1`): pre-EIP-155 (replay-unprotected) transactions were accepted over JSON-RPC.
