@@ -400,9 +400,14 @@ fn build_tx_relays(ext: &ArcExtraCli) -> eyre::Result<Vec<String>> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| {
-            url::Url::parse(s)
-                .map(|_| s.to_string())
-                .map_err(|e| eyre::eyre!("invalid --arc.tx.relays entry {s:?}: {e}"))
+            let url = url::Url::parse(s)
+                .map_err(|e| eyre::eyre!("invalid --arc.tx.relays entry {s:?}: {e}"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(eyre::eyre!(
+                    "invalid --arc.tx.relays entry {s:?}: transaction relay upstreams must use HTTP or HTTPS"
+                ));
+            }
+            Ok(s.to_string())
         })
         .collect()
 }
@@ -1028,10 +1033,10 @@ mod tests {
     #[test]
     fn test_build_tx_relays_parses_csv_in_order() {
         let relays =
-            tx_relays_from_args(&["--arc.tx.relays", "http://a:8545,http://b:8545"]).unwrap();
+            tx_relays_from_args(&["--arc.tx.relays", "http://a:8545,https://b.example"]).unwrap();
         assert_eq!(
             relays,
-            vec!["http://a:8545".to_string(), "http://b:8545".to_string()]
+            vec!["http://a:8545".to_string(), "https://b.example".to_string()]
         );
     }
 
@@ -1045,6 +1050,23 @@ mod tests {
     fn test_build_tx_relays_rejects_invalid_url() {
         let err = tx_relays_from_args(&["--arc.tx.relays", "not-a-url"]).unwrap_err();
         assert!(err.to_string().contains("invalid --arc.tx.relays entry"));
+    }
+
+    #[test]
+    fn test_build_tx_relays_rejects_non_http_urls() {
+        for relay in [
+            "file:///tmp/upstream",
+            "ftp://relay.example",
+            "ws://relay.example",
+            "wss://relay.example",
+        ] {
+            let err = tx_relays_from_args(&["--arc.tx.relays", relay])
+                .expect_err("transaction relay upstreams must use HTTP or HTTPS");
+            assert!(
+                err.to_string().contains("must use HTTP or HTTPS"),
+                "unexpected error for {relay}: {err}"
+            );
+        }
     }
 
     #[test]
