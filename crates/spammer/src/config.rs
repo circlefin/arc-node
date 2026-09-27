@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use crate::accounts::PartitionMode;
+use crate::{accounts::PartitionMode, rate_limiter::MAX_TPS};
 use color_eyre::eyre::{self, Result};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -356,6 +356,12 @@ impl Config {
         if self.num_generators == 0 {
             eyre::bail!("num_generators must be greater than 0");
         }
+        if self.max_rate > MAX_TPS {
+            eyre::bail!(
+                "--rate ({}) exceeds the maximum supported rate ({MAX_TPS})",
+                self.max_rate
+            );
+        }
         if !self.max_num_accounts.is_multiple_of(self.num_generators) {
             eyre::bail!(
                 "Expected max_num_accounts ({}) to be divisible by num_generators ({})",
@@ -459,6 +465,28 @@ mod tests {
             tx_latency: false,
             csv_dir: None,
         }
+    }
+
+    #[test]
+    fn config_accepts_max_supported_rate() {
+        Config {
+            max_rate: MAX_TPS,
+            ..default_config()
+        }
+        .validate()
+        .expect("maximum representable rate should be supported");
+    }
+
+    #[test]
+    fn config_rejects_rate_above_supported_max() {
+        let err = Config {
+            max_rate: MAX_TPS + 1,
+            ..default_config()
+        }
+        .validate()
+        .expect_err("oversized rate must be rejected");
+        assert!(err.to_string().contains("--rate"));
+        assert!(err.to_string().contains(&MAX_TPS.to_string()));
     }
 
     #[test]

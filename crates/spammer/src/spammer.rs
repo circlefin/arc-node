@@ -267,7 +267,7 @@ impl Spammer {
             config.max_rate,
             config.max_num_txs,
             config.num_generators,
-        ));
+        )?);
 
         // Create transaction generators and senders
         let (tx_generators, tx_senders, tx_ack_receivers) = if config.fire_and_forget {
@@ -689,7 +689,7 @@ impl Spammer {
             config.max_rate,
             config.max_num_txs,
             num_generators,
-        ));
+        )?);
 
         let mut tx_generators = Vec::new();
         let mut tx_senders = Vec::new();
