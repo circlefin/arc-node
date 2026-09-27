@@ -57,6 +57,7 @@ alloy-genesis.workspace = true
 alloy-rpc-types-trace.workspace = true
 arc-execution-config = { workspace = true, features = ["test-utils"] }
 arc-precompiles.workspace = true
+reth-trie-common.workspace = true
 revm-inspectors.workspace = true
 rstest.workspace = true
 

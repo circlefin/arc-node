@@ -219,6 +219,7 @@ reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0"
 reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
 reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
 reth-trie-parallel = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
 
 # revm

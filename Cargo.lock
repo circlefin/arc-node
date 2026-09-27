@@ -1241,6 +1241,7 @@ dependencies = [
  "reth-evm",
  "reth-node-api",
  "reth-primitives-traits",
+ "reth-trie-common",
  "revm",
  "revm-context-interface",
  "revm-handler",
