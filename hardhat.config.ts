@@ -17,6 +17,7 @@
 import { HardhatUserConfig } from 'hardhat/config'
 import '@nomicfoundation/hardhat-foundry'
 import '@nomicfoundation/hardhat-toolbox-viem'
+import '@nomicfoundation/hardhat-verify'
 
 import './tests/helpers/matchers/plugin'
 import './scripts/hardhat/tasks/genesis'
@@ -78,6 +79,27 @@ const config: HardhatUserConfig = {
   },
   mocha: {
     timeout: 20000,
+  },
+  // Arcscan is Blockscout-based. A non-empty apiKey is required by
+  // hardhat-verify even though Blockscout ignores the value. Sourcify is
+  // disabled so it does not race Arcscan verification.
+  etherscan: {
+    apiKey: {
+      arcTestnet: 'empty',
+    },
+    customChains: [
+      {
+        network: 'arcTestnet',
+        chainId: 5042002,
+        urls: {
+          apiURL: 'https://testnet.arcscan.app/api',
+          browserURL: 'https://testnet.arcscan.app',
+        },
+      },
+    ],
+  },
+  sourcify: {
+    enabled: false,
   },
   paths: {
     sources: './contracts/src',

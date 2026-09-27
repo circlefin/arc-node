@@ -12,6 +12,20 @@ The genesis builder (`contracts/scripts/ArtifactHelper.s.sol`), all CREATE2-sens
 tests (`tests/localdev/genesis.test.ts`) all read from `contracts/out/forge/`. 
 Hardhat's compile output is **not** consumed for any CREATE2-sensitive path.
 
+## Verifying contracts on Arcscan
+
+Arc Testnet's explorer ([testnet.arcscan.app](https://testnet.arcscan.app)) is
+Blockscout-based. The repo `hardhat.config.ts` already registers the Arc Testnet
+chain for `@nomicfoundation/hardhat-verify`:
+
+```bash
+npx hardhat verify --network testnet <address> [constructorArgs...]
+```
+
+Set `ARC_TESTNET_RPC_URL` before verifying. Foundry users can instead follow the
+`arc-forge verify-contract` flow in the
+[Deploy on Arc](https://docs.arc.io/arc/tutorials/deploy-on-arc) tutorial.
+
 ## Foundry
 
 **Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
