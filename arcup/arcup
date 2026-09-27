@@ -6,7 +6,7 @@ set -euo pipefail
 
 # NOTE: if you make modifications to this script, please increment the version number.
 # WARNING: the SemVer pattern: major.minor.patch must be followed as we use it to determine if the script is up to date.
-ARCUP_INSTALLER_VERSION="0.2.0"
+ARCUP_INSTALLER_VERSION="0.3.0"
 
 REPO="${ARC_REPO:-circlefin/arc-node}"
 if [[ -n "${ARC_REPO:-}" ]] && [[ ! "$ARC_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
@@ -19,7 +19,9 @@ GPG_KEYSERVER="keyserver.ubuntu.com"
 ARC_DIR="${ARC_DIR:-${ARC_HOME:-$HOME/.arc}}"
 BIN_DIR="${ARC_BIN_DIR:-$ARC_DIR/bin}"
 # Self-update always uses the canonical repo to prevent hijack via ARC_REPO
-ARCUP_BIN_URL="https://raw.githubusercontent.com/circlefin/arc-node/main/arcup/arcup"
+ARCUP_SELF_UPDATE_REPO="circlefin/arc-node"
+# Installer published as a release asset, next to its SHA-256 checksum file
+ARCUP_ASSET_NAME="arcup"
 ARCUP_BIN_PATH="$BIN_DIR/arcup"
 GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
 case "$GITHUB_API_URL" in
@@ -146,13 +148,17 @@ resolve_github_asset_download_url() {
     printf '%s\n' "$location"
 }
 
+require_sha256_tool() {
+    if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+        error "No SHA-256 tool found. Please install sha256sum or shasum."
+    fi
+}
+
 require_install_prerequisites() {
     require_command curl "curl not found. Please install curl."
     require_command tar "tar not found. Please install tar."
 
-    if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
-        error "No SHA-256 tool found. Please install sha256sum or shasum."
-    fi
+    require_sha256_tool
 }
 
 extract_json_string_field() {
@@ -211,40 +217,45 @@ extract_asset_api_url() {
 
 fetch_release_json() {
     local tag="$1"
-    local api_url="$GITHUB_API_URL/repos/$REPO/releases/tags/$tag"
+    local repo="${2:-$REPO}"
+    local api_url="$GITHUB_API_URL/repos/$repo/releases/tags/$tag"
 
     curl_github_api_json -fsSL "$api_url"
 }
 
 fetch_latest_release_json() {
-    local api_url="$GITHUB_API_URL/repos/$REPO/releases/latest"
+    local repo="${1:-$REPO}"
+    local api_url="$GITHUB_API_URL/repos/$repo/releases/latest"
 
     curl_github_api_json -fsSL "$api_url"
 }
 
 fetch_latest_release_json_anonymous() {
-    local api_url="$GITHUB_API_URL/repos/$REPO/releases/latest"
+    local repo="${1:-$REPO}"
+    local api_url="$GITHUB_API_URL/repos/$repo/releases/latest"
 
     curl_github_api_json_anonymous -fsSL "$api_url"
 }
 
 list_release_assets() {
     local tag="$1"
+    local repo="${2:-$REPO}"
 
-    fetch_release_json "$tag" 2>/dev/null | extract_arc_asset_names || true
+    fetch_release_json "$tag" "$repo" 2>/dev/null | extract_arc_asset_names || true
 }
 
 download_error() {
     local tag="$1"
     local filename="$2"
     local url="$3"
+    local repo="${4:-$REPO}"
     local assets
 
     echo -e "${RED}error${NC}: Failed to download $filename from $url" >&2
-    echo "  repository: $REPO" >&2
+    echo "  repository: $repo" >&2
     echo "  tag:        $tag" >&2
     echo "  target:     ${TARGET:-unknown}" >&2
-    assets="$(list_release_assets "$tag")"
+    assets="$(list_release_assets "$tag" "$repo")"
     if [[ -n "$assets" ]]; then
         echo "Available arc-node release assets for $tag:" >&2
         while IFS= read -r asset; do
@@ -309,24 +320,25 @@ download_file() {
     local tag="$1"
     local filename="$2"
     local output_dir="$3"
+    local repo="${4:-$REPO}"
 
-    local url="https://github.com/${REPO}/releases/download/${tag}/${filename}"
+    local url="https://github.com/${repo}/releases/download/${tag}/${filename}"
     local output_path="$output_dir/$filename"
 
     require_command curl "curl not found. Please install curl."
 
     info "Downloading $filename..."
-    if download_file_with_github_api "$tag" "$filename" "$output_dir"; then
+    if download_file_with_github_api "$tag" "$filename" "$output_dir" "$repo"; then
         return
     fi
 
-    if download_file_with_gh "$tag" "$filename" "$output_dir"; then
+    if download_file_with_gh "$tag" "$filename" "$output_dir" "$repo"; then
         return
     fi
 
     if ! curl_with_headers -#fL --max-time 900 -o "$output_path" "$url"; then
         rm -f "$output_path"
-        download_error "$tag" "$filename" "$url"
+        download_error "$tag" "$filename" "$url" "$repo"
     fi
 }
 
@@ -334,6 +346,7 @@ download_file_with_github_api() {
     local tag="$1"
     local filename="$2"
     local output_dir="$3"
+    local repo="${4:-$REPO}"
     local output_path="$output_dir/$filename"
     local release_json asset_api_url download_url
 
@@ -341,7 +354,7 @@ download_file_with_github_api() {
         return 1
     fi
 
-    release_json=$(fetch_release_json "$tag" 2>/dev/null) || return 1
+    release_json=$(fetch_release_json "$tag" "$repo" 2>/dev/null) || return 1
     asset_api_url=$(printf '%s\n' "$release_json" | extract_asset_api_url "$filename")
     if [[ -z "$asset_api_url" ]]; then
         return 1
@@ -361,6 +374,7 @@ download_file_with_gh() {
     local tag="$1"
     local filename="$2"
     local output_dir="$3"
+    local repo="${4:-$REPO}"
     local output_path="$output_dir/$filename"
 
     if ! command -v gh >/dev/null 2>&1; then
@@ -369,7 +383,7 @@ download_file_with_gh() {
 
     if GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
         gh release download "$tag" \
-            --repo "$REPO" \
+            --repo "$repo" \
             --pattern "$filename" \
             --dir "$output_dir" \
             --clobber \
@@ -407,17 +421,50 @@ check_disk_space() {
     fi
 }
 
+# Read the installer version declared by an arcup script
+read_installer_version() {
+    awk -F'"' '/^ARCUP_INSTALLER_VERSION=/ {print $2; exit}' "$1"
+}
+
+# Download the installer published with the latest canonical release into $1 and
+# verify it against the checksum published in the same release. Prints the release
+# tag on success.
+#
+# The body runs in a subshell so that a failed download or a failed verification
+# returns non-zero to the caller instead of exiting the script. Callers decide
+# whether that is fatal.
+fetch_verified_arcup() {
+    local dest_dir="$1"
+
+    (
+        local tag asset_path
+        tag=$(get_latest_version "$ARCUP_SELF_UPDATE_REPO")
+
+        download_file "$tag" "$ARCUP_ASSET_NAME" "$dest_dir" "$ARCUP_SELF_UPDATE_REPO"
+        download_file "$tag" "${ARCUP_ASSET_NAME}.sha256" "$dest_dir" "$ARCUP_SELF_UPDATE_REPO"
+
+        asset_path="$dest_dir/$ARCUP_ASSET_NAME"
+        verify_checksum_file "$asset_path" "${asset_path}.sha256" "$ARCUP_ASSET_NAME"
+        verify_gpg_signature "$tag" "$asset_path" "$ARCUP_ASSET_NAME" "$ARCUP_SELF_UPDATE_REPO"
+
+        printf '%s\n' "$tag"
+    )
+}
+
 # Check if arcup installer is up to date
 check_installer_up_to_date() {
-    require_command curl "curl not found. Please install curl."
+    local check_dir="$TMP_DIR/installer-check"
+    mkdir -p "$check_dir"
 
-    local response
+    # Advisory only. Stay quiet when the published installer cannot be fetched or
+    # verified, so this check never blocks or slows down an install.
+    fetch_verified_arcup "$check_dir" >/dev/null 2>&1 || return 0
+
     local remote_version
-    response=$(curl_with_headers -fsSL "$ARCUP_BIN_URL" 2>/dev/null || true)
-    remote_version=$(printf '%s\n' "$response" | awk -F'"' '/^ARCUP_INSTALLER_VERSION=/ {print $2; exit}')
+    remote_version=$(read_installer_version "$check_dir/$ARCUP_ASSET_NAME")
 
     if [[ -z "$remote_version" ]]; then
-        return
+        return 0
     fi
 
     if version_gt "$remote_version" "$ARCUP_INSTALLER_VERSION"; then
@@ -429,21 +476,27 @@ check_installer_up_to_date() {
     fi
 }
 
-# Update arcup itself
+# Update arcup itself from the installer published with the latest release
 update_arcup() {
     info "Updating arcup..."
 
     require_command curl "curl not found. Please install curl."
+    require_sha256_tool
 
-    _ARCUP_TMP_FILE=$(mktemp)
+    local update_dir="$TMP_DIR/self-update"
+    mkdir -p "$update_dir"
 
-    info "Downloading latest arcup..."
-    if ! curl_with_headers -fsSL -o "$_ARCUP_TMP_FILE" "$ARCUP_BIN_URL"; then
-        error "Failed to download arcup update"
+    local remote_tag
+    if ! remote_tag=$(fetch_verified_arcup "$update_dir"); then
+        error "Refusing to self-update: no verified arcup installer available.
+  arcup only replaces itself with a release asset whose SHA-256 matches the
+  checksum published in the same release, so nothing was changed.
+  Releases:  https://github.com/$ARCUP_SELF_UPDATE_REPO/releases
+  Reinstall: https://github.com/$ARCUP_SELF_UPDATE_REPO/blob/main/docs/installation.md"
     fi
 
     local remote_version
-    remote_version=$(grep '^ARCUP_INSTALLER_VERSION=' "$_ARCUP_TMP_FILE" | sed -E 's/ARCUP_INSTALLER_VERSION="(.+)"/\1/')
+    remote_version=$(read_installer_version "$update_dir/$ARCUP_ASSET_NAME")
 
     if [[ -z "$remote_version" ]]; then
         error "Failed to determine remote version"
@@ -454,12 +507,24 @@ update_arcup() {
         exit 0
     fi
 
-    info "Updating from $ARCUP_INSTALLER_VERSION to $remote_version..."
-    if cp "$_ARCUP_TMP_FILE" "$ARCUP_BIN_PATH" 2>/dev/null; then
-        chmod 755 "$ARCUP_BIN_PATH"
-    else
+    info "Updating from $ARCUP_INSTALLER_VERSION to $remote_version ($remote_tag)..."
+
+    # Stage the new installer next to the current one so the final move is a rename
+    # within one filesystem: it replaces arcup in a single step and it cannot leave
+    # a half-written executable behind if the process dies.
+    if ! _ARCUP_TMP_FILE=$(mktemp "$ARCUP_BIN_PATH.XXXXXX" 2>/dev/null); then
+        error "Failed to stage the arcup update in '$BIN_DIR' — ensure it is writable"
+    fi
+
+    if ! cp "$update_dir/$ARCUP_ASSET_NAME" "$_ARCUP_TMP_FILE" 2>/dev/null; then
+        error "Failed to stage the arcup update in '$BIN_DIR' — ensure it is writable"
+    fi
+    chmod 755 "$_ARCUP_TMP_FILE"
+
+    if ! mv -f "$_ARCUP_TMP_FILE" "$ARCUP_BIN_PATH" 2>/dev/null; then
         error "Failed to update arcup at '$ARCUP_BIN_PATH' — ensure it is writable"
     fi
+    _ARCUP_TMP_FILE=""
 
     echo ""
     info "Arcup updated successfully to version $remote_version"
@@ -510,54 +575,6 @@ uninstall() {
     info "You may also want to remove the PATH entries from your shell config (~/.zshenv, ~/.bashrc, etc.)."
     exit 0
 }
-
-# Parse command-line arguments
-VERSION=""
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -v|--version)
-            version
-            ;;
-        -i|--install)
-            if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
-                error "--install requires a version argument (for example: arcup --install v1.0.0)"
-            fi
-            VERSION="$2"
-            shift 2
-            ;;
-        -U|--self-update)
-            update_arcup
-            ;;
-        --uninstall)
-            uninstall
-            ;;
-        -h|--help)
-            echo "Usage: arcup [OPTIONS]"
-            echo ""
-            echo "Options:"
-            echo "  -v, --version         Print arcup installer version"
-            echo "  -i, --install <VER>   Install specific arc-node version (e.g., v1.0.0)"
-            echo "  -U, --self-update     Update arcup to the latest version"
-            echo "      --uninstall       Remove arc binaries and env files"
-            echo "  -h, --help            Show this help message"
-            echo ""
-            echo "Examples:"
-            echo "  arcup                   # Install latest release"
-            echo "  arcup -i v1.0.0         # Install specific version"
-            echo "  arcup -v                # Print installer version"
-            echo "  arcup --self-update     # Update arcup itself"
-            echo "  arcup --uninstall       # Remove arc installation"
-            exit 0
-            ;;
-        *)
-            error "Unknown option: $1. Use --help for usage information."
-            ;;
-    esac
-done
-
-if [[ -n "$VERSION" ]]; then
-    VERSION="$(normalize_version "$VERSION")"
-fi
 
 # Detect platform
 detect_platform() {
@@ -630,13 +647,14 @@ detect_target() {
 get_latest_version() {
     require_command curl "curl not found. Please install curl."
 
+    local repo="${1:-$REPO}"
     local response token_error
-    if ! response=$(fetch_latest_release_json 2>&1); then
+    if ! response=$(fetch_latest_release_json "$repo" 2>&1); then
         token_error="$(safe_curl_error "$response")"
-        if [[ -n "$GITHUB_AUTH_TOKEN" ]] && response=$(fetch_latest_release_json_anonymous 2>&1); then
+        if [[ -n "$GITHUB_AUTH_TOKEN" ]] && response=$(fetch_latest_release_json_anonymous "$repo" 2>&1); then
             :
         else
-            error "Failed to fetch latest version from '$GITHUB_API_URL/repos/$REPO/releases/latest': $token_error"
+            error "Failed to fetch latest version from '$GITHUB_API_URL/repos/$repo/releases/latest': $token_error"
         fi
     fi
 
@@ -678,6 +696,48 @@ verify_checksum_file() {
         error "Checksum verification failed
   Expected: $expected_checksum
   Actual:   $actual_checksum"
+    fi
+}
+
+# Verify a downloaded asset against the detached GPG signature published with the
+# same release. Does nothing until a release signing key is pinned in
+# GPG_KEY_FINGERPRINT, so wiring a key on the release side turns this on
+# everywhere it is called, with no further code change.
+verify_gpg_signature() {
+    local tag="$1"
+    local asset_path="$2"
+    local asset_name="$3"
+    local repo="${4:-$REPO}"
+    local output_dir
+    output_dir="$(dirname "$asset_path")"
+
+    if [[ -z "$GPG_KEY_FINGERPRINT" ]]; then
+        return 0
+    fi
+
+    if ! command -v gpg >/dev/null 2>&1; then
+        warn "gpg not found. Skipping signature verification."
+        warn "Install gpg to enable signature verification of releases."
+        return 0
+    fi
+
+    info "Verifying GPG signature..."
+    download_file "$tag" "${asset_name}.asc" "$output_dir" "$repo"
+
+    if ! gpg --list-keys "$GPG_KEY_FINGERPRINT" >/dev/null 2>&1; then
+        info "Fetching Arc release signing key from $GPG_KEYSERVER..."
+        if ! gpg --keyserver "$GPG_KEYSERVER" --recv-keys "$GPG_KEY_FINGERPRINT" 2>/dev/null; then
+            warn "Failed to fetch GPG key from keyserver. Skipping signature verification."
+            warn "You can manually import the key: gpg --keyserver $GPG_KEYSERVER --recv-keys $GPG_KEY_FINGERPRINT"
+        fi
+    fi
+
+    if gpg --list-keys "$GPG_KEY_FINGERPRINT" >/dev/null 2>&1; then
+        if gpg --batch --verify "$output_dir/${asset_name}.asc" "$asset_path" 2>/dev/null; then
+            info "GPG signature verified"
+        else
+            error "GPG signature verification failed. The binary may have been tampered with."
+        fi
     fi
 }
 
@@ -784,32 +844,7 @@ main() {
 
     info "Checksum verified"
 
-    # GPG signature verification
-    if [[ -n "$GPG_KEY_FINGERPRINT" ]]; then
-        if command -v gpg >/dev/null 2>&1; then
-            info "Verifying GPG signature..."
-            download_file "$VERSION_TAG" "${ARCHIVE_NAME}.asc" "$TMP_DIR"
-
-            if ! gpg --list-keys "$GPG_KEY_FINGERPRINT" >/dev/null 2>&1; then
-                info "Fetching Arc release signing key from $GPG_KEYSERVER..."
-                if ! gpg --keyserver "$GPG_KEYSERVER" --recv-keys "$GPG_KEY_FINGERPRINT" 2>/dev/null; then
-                    warn "Failed to fetch GPG key from keyserver. Skipping signature verification."
-                    warn "You can manually import the key: gpg --keyserver $GPG_KEYSERVER --recv-keys $GPG_KEY_FINGERPRINT"
-                fi
-            fi
-
-            if gpg --list-keys "$GPG_KEY_FINGERPRINT" >/dev/null 2>&1; then
-                if gpg --batch --verify "$TMP_DIR/${ARCHIVE_NAME}.asc" "$ARCHIVE_PATH" 2>/dev/null; then
-                    info "GPG signature verified"
-                else
-                    error "GPG signature verification failed. The binary may have been tampered with."
-                fi
-            fi
-        else
-            warn "gpg not found. Skipping signature verification."
-            warn "Install gpg to enable signature verification of releases."
-        fi
-    fi
+    verify_gpg_signature "$VERSION_TAG" "$ARCHIVE_PATH" "$ARCHIVE_NAME"
 
     validate_archive_contents "$ARCHIVE_PATH"
 
@@ -835,6 +870,56 @@ main() {
         info "Run 'arc-node-execution --version' to verify installation"
     fi
 }
+
+# Parse command-line arguments. This runs after every function definition so that
+# each option handler can use the download and verification helpers below: bash
+# only defines a function once it has read it.
+VERSION=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -v|--version)
+            version
+            ;;
+        -i|--install)
+            if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+                error "--install requires a version argument (for example: arcup --install v1.0.0)"
+            fi
+            VERSION="$2"
+            shift 2
+            ;;
+        -U|--self-update)
+            update_arcup
+            ;;
+        --uninstall)
+            uninstall
+            ;;
+        -h|--help)
+            echo "Usage: arcup [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  -v, --version         Print arcup installer version"
+            echo "  -i, --install <VER>   Install specific arc-node version (e.g., v1.0.0)"
+            echo "  -U, --self-update     Update arcup to the latest version"
+            echo "      --uninstall       Remove arc binaries and env files"
+            echo "  -h, --help            Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  arcup                   # Install latest release"
+            echo "  arcup -i v1.0.0         # Install specific version"
+            echo "  arcup -v                # Print installer version"
+            echo "  arcup --self-update     # Update arcup itself"
+            echo "  arcup --uninstall       # Remove arc installation"
+            exit 0
+            ;;
+        *)
+            error "Unknown option: $1. Use --help for usage information."
+            ;;
+    esac
+done
+
+if [[ -n "$VERSION" ]]; then
+    VERSION="$(normalize_version "$VERSION")"
+fi
 
 if [[ "${ARCUP_SKIP_MAIN:-}" != "1" ]]; then
     main

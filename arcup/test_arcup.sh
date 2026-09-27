@@ -641,6 +641,227 @@ EOF
     pass "download_file falls back to curl"
 }
 
+file_inode() {
+    ls -i "$1" | awk '{print $1}'
+}
+
+# Installs a stub arcup at <work>/bin/arcup and creates <work>/tmp.
+seed_installed_arcup() {
+    local work="$1"
+
+    mkdir -p "$work/bin" "$work/tmp"
+    printf '#!/usr/bin/env bash\nARCUP_INSTALLER_VERSION="0.3.0"\n' > "$work/bin/arcup"
+    chmod 755 "$work/bin/arcup"
+}
+
+# Publishes an installer asset with a matching checksum file, the way the release
+# workflow does.
+publish_installer_asset() {
+    local release_dir="$1"
+    local version="$2"
+
+    mkdir -p "$release_dir"
+    printf '#!/usr/bin/env bash\nARCUP_INSTALLER_VERSION="%s"\n' "$version" > "$release_dir/arcup"
+    printf '%s  arcup\n' "$(compute_sha256 "$release_dir/arcup")" > "$release_dir/arcup.sha256"
+}
+
+# Runs update_arcup against the fake release served by write_self_update_fakebin.
+run_self_update() {
+    local work="$1"
+    local fakebin="$2"
+    local release_dir="$3"
+    local out="$4"
+    local repo="${5:-$REPO}"
+
+    (
+        PATH="$fakebin:$PATH"
+        export SELF_UPDATE_RELEASE_DIR="$release_dir"
+        export SELF_UPDATE_TAG="v1.2.3"
+        GITHUB_AUTH_TOKEN=""
+        CURL_HEADERS=()
+        REPO="$repo"
+        TMP_DIR="$work/tmp"
+        BIN_DIR="$work/bin"
+        ARCUP_BIN_PATH="$work/bin/arcup"
+        update_arcup
+    ) >"$out" 2>&1
+}
+
+# Writes fake curl and gh binaries that serve the canonical repo's latest release
+# tag and the assets found in $SELF_UPDATE_RELEASE_DIR. Any other URL fails, so a
+# request aimed at another repository cannot succeed.
+write_self_update_fakebin() {
+    local fakebin="$1"
+
+    mkdir -p "$fakebin"
+
+    cat > "$fakebin/gh" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod 755 "$fakebin/gh"
+
+    cat > "$fakebin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+out=""
+url=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o)
+            out="$2"
+            shift 2
+            ;;
+        -H | --retry | --retry-delay | --connect-timeout | --max-time)
+            shift 2
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            url="$1"
+            shift
+            ;;
+    esac
+done
+case "$url" in
+    *api.github.com/repos/circlefin/arc-node/releases/latest)
+        printf '{"tag_name":"%s"}\n' "$SELF_UPDATE_TAG"
+        ;;
+    *raw.githubusercontent.com/circlefin/arc-node/main/arcup/arcup)
+        # Served on purpose. Self-update must not trust the mutable branch, so any
+        # change that reads the installer from here again fails these tests.
+        if [[ ! -f "$SELF_UPDATE_RELEASE_DIR/mutable-arcup" ]]; then
+            printf 'no mutable branch copy for this test\n' >&2
+            exit 22
+        fi
+        if [[ -n "$out" ]]; then
+            cp "$SELF_UPDATE_RELEASE_DIR/mutable-arcup" "$out"
+        else
+            cat "$SELF_UPDATE_RELEASE_DIR/mutable-arcup"
+        fi
+        ;;
+    *github.com/circlefin/arc-node/releases/download/*)
+        name="${url##*/}"
+        if [[ ! -f "$SELF_UPDATE_RELEASE_DIR/$name" ]]; then
+            printf 'asset not published: %s\n' "$name" >&2
+            exit 22
+        fi
+        cp "$SELF_UPDATE_RELEASE_DIR/$name" "$out"
+        ;;
+    *)
+        printf 'unexpected curl URL: %s\n' "$url" >&2
+        exit 22
+        ;;
+esac
+EOF
+    chmod 755 "$fakebin/curl"
+}
+
+test_self_update_installs_verified_release() {
+    local work="$TEST_TMP/self-update-ok"
+    local fakebin="$work/fakebin"
+    local release_dir="$work/release"
+    local out="$TEST_TMP/self-update-ok.out"
+    local before_inode
+
+    seed_installed_arcup "$work"
+    write_self_update_fakebin "$fakebin"
+    publish_installer_asset "$release_dir" "9.9.9"
+    before_inode="$(file_inode "$work/bin/arcup")"
+
+    if ! run_self_update "$work" "$fakebin" "$release_dir" "$out"; then
+        cat "$out" >&2
+        fail "self-update installs the verified release asset"
+    fi
+
+    assert_eq "$(cat "$release_dir/arcup")" "$(cat "$work/bin/arcup")" \
+        "self-update installs the verified release asset"
+
+    [[ -x "$work/bin/arcup" ]] || fail "self-update keeps arcup executable"
+    pass "self-update keeps arcup executable"
+
+    if [[ "$before_inode" == "$(file_inode "$work/bin/arcup")" ]]; then
+        fail "self-update replaces arcup by rename"
+    fi
+    pass "self-update replaces arcup by rename"
+}
+
+test_self_update_rejects_tampered_installer() {
+    local work="$TEST_TMP/self-update-tampered"
+    local fakebin="$work/fakebin"
+    local release_dir="$work/release"
+    local out="$TEST_TMP/self-update-tampered.out"
+    local before
+
+    seed_installed_arcup "$work"
+    write_self_update_fakebin "$fakebin"
+    publish_installer_asset "$release_dir" "9.9.9"
+    before="$(cat "$work/bin/arcup")"
+
+    # Same checksum file, different installer: what a compromised delivery path
+    # would serve. The mutable branch serves the same payload, so an installer that
+    # trusts the branch installs it.
+    printf '#!/usr/bin/env bash\nARCUP_INSTALLER_VERSION="9.9.9"\necho "unverified installer ran" >&2\n' \
+        > "$release_dir/arcup"
+    cp "$release_dir/arcup" "$release_dir/mutable-arcup"
+
+    if run_self_update "$work" "$fakebin" "$release_dir" "$out"; then
+        cat "$out" >&2
+        fail "self-update rejects a tampered installer"
+    fi
+
+    grep -q "Checksum verification failed" "$out" || fail "self-update reports the checksum mismatch"
+    grep -q "Refusing to self-update" "$out" || fail "self-update refuses to install"
+    assert_eq "$before" "$(cat "$work/bin/arcup")" "self-update keeps the installed arcup on mismatch"
+}
+
+test_self_update_rejects_missing_installer_asset() {
+    local work="$TEST_TMP/self-update-missing"
+    local fakebin="$work/fakebin"
+    local release_dir="$work/release"
+    local out="$TEST_TMP/self-update-missing.out"
+    local before
+
+    seed_installed_arcup "$work"
+    write_self_update_fakebin "$fakebin"
+    mkdir -p "$release_dir"
+    # No installer asset in the release, but the mutable branch still answers.
+    printf '#!/usr/bin/env bash\nARCUP_INSTALLER_VERSION="9.9.9"\necho "unverified installer ran" >&2\n' \
+        > "$release_dir/mutable-arcup"
+    before="$(cat "$work/bin/arcup")"
+
+    if run_self_update "$work" "$fakebin" "$release_dir" "$out"; then
+        cat "$out" >&2
+        fail "self-update fails closed without a published installer"
+    fi
+
+    grep -q "Refusing to self-update" "$out" || fail "self-update explains why it refused"
+    assert_eq "$before" "$(cat "$work/bin/arcup")" \
+        "self-update keeps the installed arcup when nothing is published"
+}
+
+test_self_update_ignores_arc_repo() {
+    local work="$TEST_TMP/self-update-arc-repo"
+    local fakebin="$work/fakebin"
+    local release_dir="$work/release"
+    local out="$TEST_TMP/self-update-arc-repo.out"
+
+    seed_installed_arcup "$work"
+    write_self_update_fakebin "$fakebin"
+    publish_installer_asset "$release_dir" "9.9.9"
+
+    # The fake curl only answers for circlefin/arc-node, so this only passes if
+    # self-update ignored ARC_REPO.
+    if ! run_self_update "$work" "$fakebin" "$release_dir" "$out" "attacker/arc-node"; then
+        cat "$out" >&2
+        fail "self-update ignores ARC_REPO"
+    fi
+
+    assert_eq "$(cat "$release_dir/arcup")" "$(cat "$work/bin/arcup")" "self-update ignores ARC_REPO"
+}
+
 test_fixture_install_matrix() {
     local fixture_dir="$TEST_TMP/fixture"
     local fakebin="$TEST_TMP/fakebin"
@@ -663,6 +884,9 @@ test_fixture_install_matrix() {
         tar -czf "$archive" -C "$fixture_dir/build" "${BINARIES[@]}"
         printf '%s  %s\n' "$(compute_sha256 "$archive")" "$archive_name" > "$checksum_file"
     done
+
+    # Every release also publishes the installer, which the up-to-date check reads.
+    publish_installer_asset "$release_dir" "$ARCUP_INSTALLER_VERSION"
 
     cat > "$fakebin/uname" <<'EOF'
 #!/usr/bin/env bash
@@ -706,8 +930,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$url" in
-    *raw.githubusercontent.com/circlefin/arc-node/main/arcup/arcup)
-        data='ARCUP_INSTALLER_VERSION="0.2.0"'
+    *api.github.com/repos/circlefin/arc-node/releases/latest)
+        data='{"tag_name":"v1.2.3"}'
+        ;;
+    *releases/download/v1.2.3/arcup*)
+        name="${url##*/}"
+        cp "$FIXTURE_RELEASE_DIR/$name" "$out"
+        exit 0
         ;;
     *releases/download/v1.2.3/arc-node-v1.2.3-*.tar.gz*)
         name="${url##*/}"
@@ -823,6 +1052,10 @@ test_latest_version_retries_anonymous_after_token_failure
 test_latest_version_redacts_authenticated_failure
 test_download_file_uses_gh_when_available
 test_download_file_falls_back_to_curl
+test_self_update_installs_verified_release
+test_self_update_rejects_tampered_installer
+test_self_update_rejects_missing_installer_asset
+test_self_update_ignores_arc_repo
 test_fixture_install_matrix
 test_archive_path_traversal_fails
 test_archive_link_entries_fail
