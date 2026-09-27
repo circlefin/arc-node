@@ -48,6 +48,9 @@ const config: HardhatUserConfig = {
         enabled: true,
         runs: 200,
       },
+      // Prague EVM is enabled from genesis on all Arc networks (localdev, devnet, testnet, mainnet).
+      // Verified: assets/*/genesis.json all set "pragueTime": 0.
+      // Ref: https://github.com/circlefin/arc-node/issues/96
       evmVersion: 'prague',
     },
   },
