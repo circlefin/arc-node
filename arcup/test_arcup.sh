@@ -119,6 +119,8 @@ test_checksum_validation() {
 
     printf '%s  other-asset.tar.gz\n' "$checksum" > "$checksum_file"
     expect_fail "checksum filename mismatch fails" verify_checksum_file "$archive" "$checksum_file" "$archive_name"
+    printf '%s\n' "$checksum" > "$checksum_file"
+    expect_fail "checksum file without filename field fails" verify_checksum_file "$archive" "$checksum_file" "$archive_name"
 }
 
 test_download_error_lists_assets() {

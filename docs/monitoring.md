@@ -276,8 +276,11 @@ Also confirm that the SSH tunnel is still running.
 
 ### Prometheus is restarting with a permissions error
 
-If Prometheus logs include an error about `queries.active` or write permission
-under `/prometheus`, fix the ownership of the local data directory:
+The `compose.yaml` above runs Prometheus with `user: "0"` (root), which prevents
+this error in most configurations. If you removed `user: "0"` to run Prometheus
+as a non-root user, or if Prometheus logs an error about `queries.active` or write
+permission under `/prometheus`, restore ownership of the data directory to match
+Prometheus's default UID:
 
 ```sh
 sudo chown -R 65534:65534 "$ARC_MONITORING"/prometheus-data
