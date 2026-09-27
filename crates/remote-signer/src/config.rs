@@ -75,6 +75,10 @@ impl RemoteSigningConfig {
             return Err("TLS enabled but no certificate path provided".to_string());
         }
 
+        self.retry_config
+            .validate()
+            .map_err(|e| format!("Invalid retry configuration: {e}"))?;
+
         Ok(())
     }
 }
@@ -202,5 +206,33 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn remote_config_rejects_invalid_retry_backoff_order() {
+        let retry_config = RetryConfig::new(3, Duration::from_secs(10), Duration::from_secs(1));
+
+        assert!(retry_config.validate().is_err());
+
+        let config = RemoteSigningConfig::default().with_retry_config(retry_config);
+
+        assert!(
+            config.validate().is_err(),
+            "RemoteSigningConfig accepted initial_backoff greater than max_backoff"
+        );
+    }
+
+    #[test]
+    fn remote_config_rejects_invalid_retry_multiplier() {
+        let retry_config = RetryConfig::default().with_backoff_multiplier(0.5);
+
+        assert!(retry_config.validate().is_err());
+
+        let config = RemoteSigningConfig::default().with_retry_config(retry_config);
+
+        assert!(
+            config.validate().is_err(),
+            "RemoteSigningConfig accepted backoff_multiplier below 1.0"
+        );
     }
 }
