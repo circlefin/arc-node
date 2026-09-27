@@ -225,6 +225,43 @@ companion execution layer.
 The consensus layer operates in the **follow** mode.
 We provide three endpoints from which the node retrieves finalized blocks.
 
+> **Public testnet RPC methods are not identical across providers.** Note the
+> differing WebSocket paths in the command above when swapping providers.
+>
+> Follow sync needs `eth_getBlockByNumber`, `arc_getCertificate` (batched per
+> height), `eth_call`, `eth_chainId`, `net_listening`, and
+> `eth_subscribe("newHeads")` over the `wss=` URL.
+> `rpc.blockdaemon.testnet.arc.io` has no certificates below block 41,863,835
+> (2026-05-12), while still serving the blocks themselves. This is a fixed
+> floor, not a rolling window — it was unchanged across 2026-09-09 and
+> 2026-09-10 while the head advanced ~162k blocks — so use
+> `rpc.testnet.arc.io` or `rpc.drpc.testnet.arc.io` when catching up from
+> genesis or from any height below it. A missing certificate fails the whole
+> follow batch, not just that height.
+>
+> Application clients that need EIP-1186 proofs or access lists also see method
+> gaps. Observed 2026-09-09 against the wider public fleet (not only the three
+> follow endpoints above; see #371):
+>
+> | Endpoint | `eth_getProof` | `eth_createAccessList` |
+> |---|---|---|
+> | `rpc.testnet.arc.io` | unsupported (codes flip) | unsupported (`-32601`) |
+> | `rpc.drpc.testnet.arc.io` | OK | OK |
+> | `rpc.quicknode.testnet.arc.io` | unsupported (codes flip) | unsupported (`-32601`) |
+> | `rpc.blockdaemon.testnet.arc.io` | OK | filtered (`-32003`); a batch containing it is rejected in full, losing unrelated calls |
+>
+> Prefer `rpc.drpc.testnet.arc.io` when you need proofs or access lists. Some
+> hosts return `-32601` (method unsupported) for one call and `-32014` (data
+> unavailable) for the next, for the same request. Do not branch on the code —
+> treat any error from a capability probe as "unsupported on this host" and
+> fail over.
+>
+> ```bash
+> curl -s -X POST -H 'Content-Type: application/json' \
+>   --data '{"jsonrpc":"2.0","id":1,"method":"eth_getProof","params":["0x3600000000000000000000000000000000000000",["0x0"],"latest"]}' \
+>   https://rpc.testnet.arc.io
+> ```
+
 ### Verify operation
 
 After starting both the consensus and execution layer, wait about 30 seconds.
