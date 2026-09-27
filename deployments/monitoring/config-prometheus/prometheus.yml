@@ -21,7 +21,7 @@ scrape_configs:
     metrics_path: "/"
     scrape_interval: 1s
     static_configs:
-      - targets: ['host.docker.internal:9100']
+      - targets: ['host.docker.internal:9001']
         labels:
           client_name: "reth"
           client_type: "execution"
@@ -37,7 +37,7 @@ scrape_configs:
     metrics_path: "/"
     scrape_interval: 1s
     static_configs:
-      - targets: ['host.docker.internal:9102']
+      - targets: ['host.docker.internal:9201']
         labels:
           client_name: "reth"
           client_type: "execution"
@@ -45,7 +45,7 @@ scrape_configs:
     metrics_path: "/"
     scrape_interval: 1s
     static_configs:
-      - targets: ['host.docker.internal:9103']
+      - targets: ['host.docker.internal:9301']
         labels:
           client_name: "reth"
           client_type: "execution"
@@ -53,7 +53,7 @@ scrape_configs:
     metrics_path: "/"
     scrape_interval: 1s
     static_configs:
-      - targets: ['host.docker.internal:9104']
+      - targets: ['host.docker.internal:9401']
         labels:
           client_name: "reth"
           client_type: "execution"
@@ -70,7 +70,7 @@ scrape_configs:
     metrics_path: "/metrics"
     scrape_interval: 1s
     static_configs:
-      - targets: ['host.docker.internal:29001']
+      - targets: ['host.docker.internal:29100']
         labels:
           client_name: "malachite"
           client_type: "consensus"
@@ -78,7 +78,7 @@ scrape_configs:
     metrics_path: "/metrics"
     scrape_interval: 1s
     static_configs:
-      - targets: ['host.docker.internal:29002']
+      - targets: ['host.docker.internal:29200']
         labels:
           client_name: "malachite"
           client_type: "consensus"
@@ -86,7 +86,7 @@ scrape_configs:
     metrics_path: "/metrics"
     scrape_interval: 1s
     static_configs:
-      - targets: ['host.docker.internal:29003']
+      - targets: ['host.docker.internal:29300']
         labels:
           client_name: "malachite"
           client_type: "consensus"
@@ -94,7 +94,7 @@ scrape_configs:
     metrics_path: "/metrics"
     scrape_interval: 1s
     static_configs:
-      - targets: ['host.docker.internal:29004']
+      - targets: ['host.docker.internal:29400']
         labels:
           client_name: "malachite"
           client_type: "consensus"
