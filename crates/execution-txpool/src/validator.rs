@@ -487,6 +487,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eoa_self_call_with_calldata_is_valid() {
+        let sender = Address::from([0x11u8; 20]);
+
+        let mut tx = MockTransaction::legacy()
+            .with_sender(sender)
+            .with_gas_limit(30_000)
+            .with_gas_price(1_000_000_000)
+            .with_value(U256::ZERO)
+            .with_input("Hello".as_bytes().to_vec().into());
+
+        match &mut tx {
+            MockTransaction::Legacy { to, .. } => {
+                *to = sender.into();
+            }
+            _ => unreachable!("expected legacy transaction"),
+        }
+
+        let provider = MockEthProvider::default();
+        provider.add_account(sender, ExtendedAccount::new(0, U256::MAX));
+
+        let arc_validator = create_arc_validator_for_test(provider);
+
+        let outcome = arc_validator
+            .validate_one_with_state(TransactionOrigin::External, tx, &mut None)
+            .await;
+
+        assert!(
+            matches!(outcome, TransactionValidationOutcome::Valid { .. }),
+            "EOA self-call with non-empty calldata should be valid"
+        );
+    }
+
+    #[tokio::test]
     async fn test_validate_one_with_state() {
         let test_cases = [
             BlocklistTestCase {
