@@ -641,6 +641,162 @@ EOF
     pass "download_file falls back to curl"
 }
 
+# --- Regression tests for the curl 8.14.0/8.14.1 exit-code bug (issue #309) ---
+# On these versions, curl with --retry set but not triggered (permanent
+# failures like 404) can exit 0 while leaving an empty/absent output file.
+# These tests simulate exactly that shape: exit 0, empty file.
+
+test_download_file_rejects_empty_success_from_curl_fallback() {
+    local fakebin="$TEST_TMP/empty-success-fakebin"
+    local output_dir="$TEST_TMP/empty-success-output"
+    local asset_name="arc-node-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+    mkdir -p "$fakebin" "$output_dir"
+
+    # gh not available, so download_file falls through to the bare curl call.
+    cat > "$fakebin/gh" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod 755 "$fakebin/gh"
+
+    cat > "$fakebin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+out=""
+url=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o)
+            out="$2"
+            shift 2
+            ;;
+        --retry | --retry-delay | --connect-timeout | --max-time)
+            shift 2
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            url="$1"
+            shift
+            ;;
+    esac
+done
+
+: > "$out"
+exit 0
+EOF
+    chmod 755 "$fakebin/curl"
+
+    if (
+        PATH="$fakebin:$PATH"
+        GITHUB_AUTH_TOKEN=""
+        CURL_HEADERS=()
+        REPO="test/arc-node"
+        download_file "v1.2.3" "$asset_name" "$output_dir"
+    ) >"$TEST_TMP/empty-success.out" 2>&1; then
+        cat "$TEST_TMP/empty-success.out" >&2
+        fail "download_file rejects curl's empty-file success (8.14.x bug)"
+    fi
+
+    if [[ -e "$output_dir/$asset_name" ]]; then
+        fail "download_file must not leave an empty file behind"
+    fi
+
+    pass "download_file rejects curl's empty-file success (8.14.x bug)"
+}
+
+test_download_file_with_github_api_rejects_empty_success() {
+    local fakebin="$TEST_TMP/empty-token-api-fakebin"
+    local output_dir="$TEST_TMP/empty-token-api-output"
+    local asset_name="arc-node-v1.2.3-aarch64-apple-darwin.tar.gz"
+
+    mkdir -p "$fakebin" "$output_dir"
+
+    cat > "$fakebin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+out=""
+dump=""
+url=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o)
+            out="$2"
+            shift 2
+            ;;
+        -D)
+            dump="$2"
+            shift 2
+            ;;
+        -H | --retry | --retry-delay | --connect-timeout | --max-time)
+            shift 2
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            url="$1"
+            shift
+            ;;
+    esac
+done
+
+case "$url" in
+    *api.github.com/repos/test/arc-node/releases/tags/v1.2.3)
+        data='{"assets":[{"url":"https://api.github.com/repos/test/arc-node/releases/assets/123","name":"arc-node-v1.2.3-aarch64-apple-darwin.tar.gz"}]}'
+        ;;
+    *api.github.com/repos/test/arc-node/releases/assets/123)
+        if [[ "$dump" == "-" ]]; then
+            printf 'HTTP/1.1 302 Found\r\nLocation: https://objects.example/arc-node-v1.2.3-aarch64-apple-darwin.tar.gz\r\n\r\n'
+            exit 0
+        fi
+        exit 22
+        ;;
+    *objects.example/arc-node-v1.2.3-aarch64-apple-darwin.tar.gz)
+        # curl 8.14.x bug: exits 0 on the final asset download even
+        # though the permanent-failure response body is empty.
+        : > "$out"
+        exit 0
+        ;;
+    *)
+        printf 'unexpected curl URL: %s\n' "$url" >&2
+        exit 22
+        ;;
+esac
+
+if [[ -n "$out" ]]; then
+    printf '%s\n' "$data" > "$out"
+else
+    printf '%s\n' "$data"
+fi
+EOF
+    chmod 755 "$fakebin/curl"
+
+    (
+        PATH="$fakebin:$PATH"
+        GITHUB_AUTH_TOKEN="test-token"
+        CURL_HEADERS=()
+        REPO="test/arc-node"
+        if download_file_with_github_api "v1.2.3" "$asset_name" "$output_dir"; then
+            exit 1
+        fi
+        exit 0
+    ) >"$TEST_TMP/empty-token-api.out" 2>&1 || {
+        cat "$TEST_TMP/empty-token-api.out" >&2
+        fail "download_file_with_github_api rejects curl's empty-file success (8.14.x bug)"
+    }
+
+    if [[ -e "$output_dir/$asset_name" ]]; then
+        fail "download_file_with_github_api must not leave an empty file behind"
+    fi
+
+    pass "download_file_with_github_api rejects curl's empty-file success (8.14.x bug)"
+}
+
 test_fixture_install_matrix() {
     local fixture_dir="$TEST_TMP/fixture"
     local fakebin="$TEST_TMP/fakebin"
@@ -810,6 +966,58 @@ test_install_binary_rejects_symlink() {
     pass "install_binary rejects symlink"
 }
 
+# --- Regression test for arcup/install's own curl call (issue #309) ---
+
+test_install_rejects_empty_arcup_download() {
+    local fakebin="$TEST_TMP/install-empty-fakebin"
+    local arc_dir="$TEST_TMP/install-empty-arc-dir"
+
+    mkdir -p "$fakebin"
+
+    cat > "$fakebin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+out=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o)
+            out="$2"
+            shift 2
+            ;;
+        --retry | --retry-delay | --connect-timeout | --max-time)
+            shift 2
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+: > "$out"
+exit 0
+EOF
+    chmod 755 "$fakebin/curl"
+
+    if (
+        PATH="$fakebin:$PATH"
+        ARC_DIR="$arc_dir"
+        bash "$ROOT_DIR/arcup/install"
+    ) >"$TEST_TMP/install-empty.out" 2>&1; then
+        cat "$TEST_TMP/install-empty.out" >&2
+        fail "install rejects empty arcup download (8.14.x bug)"
+    fi
+
+    if [[ -x "$arc_dir/bin/arcup" ]]; then
+        fail "install must not leave an empty executable behind"
+    fi
+
+    pass "install rejects empty arcup download (8.14.x bug)"
+}
+
 test_version_normalization
 test_version_comparison
 test_target_mapping
@@ -823,7 +1031,10 @@ test_latest_version_retries_anonymous_after_token_failure
 test_latest_version_redacts_authenticated_failure
 test_download_file_uses_gh_when_available
 test_download_file_falls_back_to_curl
+test_download_file_rejects_empty_success_from_curl_fallback
+test_download_file_with_github_api_rejects_empty_success
 test_fixture_install_matrix
 test_archive_path_traversal_fails
 test_archive_link_entries_fail
 test_install_binary_rejects_symlink
+test_install_rejects_empty_arcup_download
