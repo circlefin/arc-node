@@ -41,3 +41,26 @@ pub fn rpc_get_version() -> RpcResult<RpcVersionInfo> {
         cargo_version: arc_version::SHORT_VERSION.to_string(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_get_version_returns_populated_fields() {
+        let info = rpc_get_version().expect("version info");
+        assert!(!info.git_version.is_empty(), "git_version");
+        assert!(!info.git_commit.is_empty(), "git_commit");
+        assert!(!info.git_short_hash.is_empty(), "git_short_hash");
+        assert!(!info.cargo_version.is_empty(), "cargo_version");
+        assert!(
+            info.git_commit.starts_with(&info.git_short_hash),
+            "git_short_hash should be a prefix of git_commit"
+        );
+        assert!(
+            info.cargo_version.contains(&info.git_short_hash)
+                || info.cargo_version.contains(&info.git_version),
+            "cargo_version should reference a git identifier"
+        );
+    }
+}
