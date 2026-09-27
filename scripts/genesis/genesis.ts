@@ -176,11 +176,14 @@ export const buildGenesis = async (ctx: BuilderContext, config: GenesisConfig) =
   } = parsed
 
   const allocs: Record<Address, GenesisAccountAlloc> = {}
+  const allocatedAddresses = new Set<string>()
   const insert = ([account, alloc]: [string, GenesisAccountAlloc]) => {
-    if (account in allocs) {
+    const normalizedAddress = account.toLowerCase()
+    if (allocatedAddresses.has(normalizedAddress)) {
       throw new Error(`Duplicate account: ${account}`)
     }
     allocs[schemaAddress.parse(account)] = alloc
+    allocatedAddresses.add(normalizedAddress)
   }
 
   Object.entries(await buildNativeFiatTokenGenesisAllocs(ctx, nativeFiatToken)).forEach(insert)
