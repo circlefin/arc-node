@@ -252,13 +252,21 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
             )?;
             let current_total_supply = U256::from_be_slice(&total_supply_output);
 
-            // Write new total supply
-            // Underflow cannot happen due to the balance check
+            // Write new total supply.
+            // Underflow is impossible here: balance_decr above already verified
+            // that `args.from` holds at least `args.amount`, and total_supply is
+            // always >= any individual account balance by construction. We use
+            // checked_sub rather than saturating_sub so that a bug or storage
+            // corruption that violates this invariant is surfaced as a hard revert
+            // instead of silently clamping total_supply to zero.
+            let new_total_supply = current_total_supply
+                .checked_sub(args.amount)
+                .ok_or_else(|| new_reverted_with_early_penalty(gas_counter, reservoir, ERR_OVERFLOW))?;
             write(
                 &mut precompile_input.internals,
                 NATIVE_COIN_AUTHORITY_ADDRESS,
                 TOTAL_SUPPLY_STORAGE_KEY,
-                &current_total_supply.saturating_sub(args.amount).to_be_bytes_vec(),
+                &new_total_supply.to_be_bytes_vec(),
                 &mut gas_counter,
                 reservoir,
             )?;
@@ -2328,6 +2336,127 @@ mod tests {
                 "{case_name} ({hardfork_flags:?}): expected initial supply returned",
             );
         }
+    }
+
+    // =========================================================================
+    // K-1 regression tests: burn must use checked_sub for total supply update
+    // =========================================================================
+
+    /// Verifies that a normal burn correctly decrements total_supply by exactly
+    /// the burned amount (no silent saturation to zero).
+    #[test]
+    fn burn_decrements_total_supply_correctly() {
+        let hardfork_flags = baseline_flags();
+        let mut ctx = mock_context(hardfork_flags);
+        let initial_supply = U256::from(1_000_000u64);
+        let burn_amount = U256::from(400_000u64);
+        setup_initial_state(&mut ctx, initial_supply);
+
+        let inputs = CallInputs {
+            scheme: CallScheme::Call,
+            target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+            bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
+            caller: ALLOWED_CALLER_ADDRESS,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(
+                INativeCoinAuthority::burnCall {
+                    from: ADDRESS_A,
+                    amount: burn_amount,
+                }
+                .abi_encode()
+                .into(),
+            ),
+            gas_limit: TEST_GAS_LIMIT,
+            is_static: false,
+            return_memory_offset: 0..0,
+            reservoir: 0,
+        };
+
+        let result = call_native_coin_authority(&mut ctx, &inputs, hardfork_flags)
+            .expect("call must not error")
+            .expect("result must be Some");
+        assert_eq!(result.result, InstructionResult::Return, "burn must succeed");
+
+        // Verify total_supply was reduced by exactly burn_amount, not saturated.
+        let supply_slot = ctx
+            .journal_mut()
+            .sload(NATIVE_COIN_AUTHORITY_ADDRESS, TOTAL_SUPPLY_STORAGE_KEY.into())
+            .expect("sload must succeed")
+            .data
+            .present_value();
+        assert_eq!(
+            supply_slot,
+            initial_supply - burn_amount,
+            "total_supply must be initial_supply - burn_amount, not saturated to zero"
+        );
+    }
+
+    /// Verifies that burn reverts (rather than silently saturating to zero) when
+    /// the stored total_supply is somehow lower than the burn amount — i.e. the
+    /// invariant `total_supply >= account_balance` has been violated by storage
+    /// corruption.  With `saturating_sub` this would have silently set
+    /// total_supply to 0; with `checked_sub` it reverts with ERR_OVERFLOW.
+    #[test]
+    fn burn_reverts_on_total_supply_underflow_instead_of_saturating() {
+        let hardfork_flags = baseline_flags();
+        let mut ctx = mock_context(hardfork_flags);
+        let burn_amount = U256::from(1_000u64);
+
+        // Give ADDRESS_A enough balance so balance_decr passes.
+        ctx.journal_mut()
+            .load_account(ADDRESS_A)
+            .expect("Cannot load account");
+        ctx.journal_mut()
+            .balance_incr(ADDRESS_A, burn_amount)
+            .expect("balance_incr failed");
+
+        // Corrupt total_supply: set it LOWER than burn_amount (e.g. 1 wei).
+        // This simulates an invariant violation / storage corruption.
+        ctx.journal_mut()
+            .sstore(
+                NATIVE_COIN_AUTHORITY_ADDRESS,
+                TOTAL_SUPPLY_STORAGE_KEY.into(),
+                U256::from(1u64),
+            )
+            .expect("sstore total_supply failed");
+
+        let inputs = CallInputs {
+            scheme: CallScheme::Call,
+            target_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+            bytecode_address: NATIVE_COIN_AUTHORITY_ADDRESS,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
+            caller: ALLOWED_CALLER_ADDRESS,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(
+                INativeCoinAuthority::burnCall {
+                    from: ADDRESS_A,
+                    amount: burn_amount,
+                }
+                .abi_encode()
+                .into(),
+            ),
+            gas_limit: TEST_GAS_LIMIT,
+            is_static: false,
+            return_memory_offset: 0..0,
+            reservoir: 0,
+        };
+
+        let result = call_native_coin_authority(&mut ctx, &inputs, hardfork_flags)
+            .expect("call must not fatal-error")
+            .expect("result must be Some");
+
+        // Must revert with ERR_OVERFLOW — NOT silently clamp total_supply to zero.
+        assert_eq!(
+            result.result,
+            InstructionResult::Revert,
+            "burn must revert on total_supply underflow, not silently saturate to zero"
+        );
+        let output_str = std::str::from_utf8(&result.output[4..]).unwrap_or("");
+        assert!(
+            output_str.contains(ERR_OVERFLOW),
+            "revert reason must be ERR_OVERFLOW, got: {output_str:?}"
+        );
     }
 
     #[test]
