@@ -1999,6 +1999,7 @@ version = "0.0.1"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
+ "proptest",
  "revm",
  "revm-interpreter",
  "slh-dsa",

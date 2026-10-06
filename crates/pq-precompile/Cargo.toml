@@ -16,5 +16,8 @@ revm.workspace = true
 revm-interpreter.workspace = true
 slh-dsa.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true
