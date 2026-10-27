@@ -196,6 +196,8 @@ and `--rpc.max-subscriptions-per-connection` (default `32`) if clients see
 `MaxConnections` or `TooManySubscriptions` errors. The defaults bound WebSocket
 log-fanout memory growth and should only be raised, not lowered.
 
+A database read transaction held longer than `--db.read-transaction-timeout` seconds (default `60`) is aborted, and the request that opened it fails. This is usually a slow `eth_call`, `eth_getLogs`, or trace over old state. Raise it for heavy archive or tracing workloads; `0` removes the limit and is not recommended on public endpoints.
+
 ### Start consensus layer
 
 After starting the [execution layer](#start-execution-layer), in a different terminal, start the consensus layer:
@@ -937,6 +939,27 @@ For production monitoring, scrape the Prometheus metrics endpoints with Grafana:
 |----------|-------------|
 | `localhost:9001/metrics` | Execution Layer metrics |
 | `localhost:29000/metrics` | Consensus Layer metrics |
+
+### Sync tuning
+
+This section covers how a node in follow mode fetches blocks, and what to change when an endpoint is remote or slow.
+
+For each range of heights, the node sends two JSON-RPC batch requests to one endpoint: `arc_getCertificate` for the commit certificates and `eth_getBlockByNumber` for the blocks, with full transaction bodies. Certificates are verified against the validator set before the blocks reach the execution layer, so an endpoint is trusted for availability, not correctness — but it must serve the [`arc` namespace](#arc-rpc-extension). A `newHeads` WebSocket subscription per endpoint is what tells the node an endpoint is ahead; if no header arrives within `--follow.stale-timeout` (default `30s`) the node treats the subscription as stale, reconnects, and increments `arc_rpc_sync_ws_stale_total`.
+
+Repeat `--follow.endpoint` for multiple endpoints, as the [example above](#start-consensus-layer) does, and use at least two in production. A single endpoint is both the only peer a failed range can be retried against and the only source of head notifications, so sync stalls for as long as that one provider is unhealthy. With `--follow` and no `--follow.endpoint`, the node resolves a single built-in default for its chain: testnet has one, mainnet does not, so on mainnet at least one endpoint is required or startup fails.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `ARC_SYNC_BATCH_SIZE` | `5` | Maximum heights per sync request. |
+| `ARC_SYNC_REQUEST_TIMEOUT` | `10s` | How long to wait for a request before cancelling the fetch and re-requesting the range. |
+
+The defaults suit a remote or public endpoint, so most operators need no tuning. Raise the timeout further, to `30s`, if requests still miss it over a very high-latency link or against consistently large blocks.
+
+Both are read once at startup, so changes need a restart. Applied overrides are listed in the `Applied environment variable overrides to consensus config` log line.
+
+What misses the deadline is response size, not request count, so a smaller batch helps and a larger one hurts. A longer timeout only bounds a slow attempt and costs nothing when fetches are healthy. A node that keeps missing the deadline re-requests the same range indefinitely: repeated `Fetch failed` warnings while local `eth_blockNumber` stays flat. Up to `ARC_SYNC_PARALLEL_REQUESTS` (default `5`) requests are in flight at once, so the batch size also scales what a rate-limited endpoint sees.
+
+Set them on the consensus process: `Environment=` lines alongside `Environment=RUST_LOG=info` in the [consensus layer service](#consensus-layer-service), or an `environment:` block on the consensus service under [Docker Compose](#download-the-compose-file).
 
 ### Pruning
 

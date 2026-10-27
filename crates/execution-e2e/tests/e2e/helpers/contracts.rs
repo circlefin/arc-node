@@ -195,6 +195,93 @@ pub fn call_target_with_value_contract_deploy_code() -> Bytes {
     deploy_code(&runtime)
 }
 
+/// Contract making `calls` zero-gas CALLs to `target`, each passing memory[0..args_len].
+///
+/// Pseudocode, repeated `calls` times: `pop(call(0, target, 0, 0, args_len, 0, 0))`
+pub fn repeated_call_contract_deploy_code(target: Address, calls: usize, args_len: u16) -> Bytes {
+    let [len_hi, len_lo] = args_len.to_be_bytes();
+    let mut runtime = Vec::new();
+    for _ in 0..calls {
+        #[rustfmt::skip]
+        runtime.extend_from_slice(&[
+            PUSH1, 0x00,              // retLength
+            PUSH1, 0x00,              // retOffset
+            PUSH2, len_hi, len_lo,    // argsLength
+            PUSH1, 0x00,              // argsOffset
+            PUSH1, 0x00,              // value
+            PUSH20,                   // target address follows
+        ]);
+        runtime.extend_from_slice(target.as_slice());
+        runtime.extend_from_slice(&[PUSH1, 0x00, CALL, POP]); // gas=0
+    }
+    runtime.push(STOP);
+    deploy_code(&runtime)
+}
+
+/// Contract that sends `amount` to `recipient`, burns gas down to a 1000-gas floor, then
+/// returns `size` zero bytes, where `size` is the 32-byte word in calldata[0..32] (>= 32).
+///
+/// Memory is expanded before the transfer and the burn, so the final RETURN costs no
+/// memory gas and the call succeeds with little gas left: the caller then pays for the
+/// returndata with its own retained gas.
+///
+/// ```eas
+/// push1 0x00       ;; [0]                       — calldata offset
+/// calldataload     ;; [size]
+/// push1 0x00       ;; [0, size]                 — value to store
+/// push1 0x20       ;; [32, 0, size]
+/// dup3             ;; [size, 32, 0, size]
+/// sub              ;; [size-32, 0, size]
+/// mstore           ;; [size]                    — mstore(size-32, 0): expand memory
+/// push1 0x00 (x4)  ;; [0, 0, 0, 0, size]        — retLength, retOffset, argsLength, argsOffset
+/// push8 amount     ;; [amount, 0, 0, 0, 0, size]
+/// push20 recipient ;; [recipient, amount, 0, 0, 0, 0, size]
+/// gas              ;; [gas, recipient, amount, 0, 0, 0, 0, size]
+/// call             ;; [success, size]
+/// push1 0x39       ;; [loop, success, size]
+/// jumpi            ;; [size]                    — success → loop, else fall through
+/// push1 0x00       ;; [0, size]
+/// dup1             ;; [0, 0, size]
+/// revert           ;;                           — revert(0, 0): transfer failed
+/// jumpdest         ;; [size]                    — loop (offset 0x39)
+/// gas              ;; [gas, size]
+/// push2 0x03e8     ;; [1000, gas, size]
+/// lt               ;; [1000 < gas, size]
+/// push1 0x39       ;; [loop, 1000 < gas, size]
+/// jumpi            ;; [size]                    — keep burning while gas > 1000
+/// push1 0x00       ;; [0, size]
+/// return           ;;                           — return(0, size)
+/// ```
+pub fn transfer_burn_gas_return_contract_deploy_code(recipient: Address, amount: u64) -> Bytes {
+    let mut runtime = Vec::new();
+    #[rustfmt::skip]
+    runtime.extend_from_slice(&[
+        PUSH1, 0x00, CALLDATALOAD,      // size
+        PUSH1, 0x00, PUSH1, 0x20, DUP3,
+        SUB, MSTORE,                    // mstore(size-32, 0)
+        PUSH1, 0x00,                    // retLength
+        PUSH1, 0x00,                    // retOffset
+        PUSH1, 0x00,                    // argsLength
+        PUSH1, 0x00,                    // argsOffset
+        PUSH8,                          // amount follows
+    ]);
+    runtime.extend_from_slice(&amount.to_be_bytes());
+    runtime.push(PUSH20); // recipient follows
+    runtime.extend_from_slice(recipient.as_slice());
+    #[rustfmt::skip]
+    runtime.extend_from_slice(&[
+        GAS, CALL,                      // call(gas, recipient, amount, 0, 0, 0, 0)
+        PUSH1, 0x39, JUMPI,             // success → loop
+        PUSH1, 0x00, DUP1, REVERT,      // revert(0, 0)
+        JUMPDEST,                       // loop (offset 0x39)
+        GAS, PUSH2, 0x03, 0xe8, LT,     // 1000 < gas
+        PUSH1, 0x39, JUMPI,
+        PUSH1, 0x00, RETURN,            // return(0, size)
+    ]);
+    assert_eq!(runtime[0x39], JUMPDEST, "loop offset drifted");
+    deploy_code(&runtime)
+}
+
 /// Contract that attempts CREATE2 with value=1, then checks the balance of an
 /// expected CREATE2 address passed in calldata.
 /// - stores the CREATE2 return value in slot 0.

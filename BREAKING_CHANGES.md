@@ -12,6 +12,59 @@ Entries are split by audience. A change appears under `### For Validators` when 
 
 Compare and release-notes links resolve once the corresponding tag is published at [`circlefin/arc-node`](https://github.com/circlefin/arc-node).
 
+## [v0.8.2]
+
+**Changes:** [v0.8.1...v0.8.2](https://github.com/circlefin/arc-node/compare/v0.8.1...v0.8.2) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.2)
+
+This release has no hardfork activation and no database migration, and v0.8.2 nodes run alongside v0.8.0 and v0.8.1 nodes on the same network. Node operators can upgrade the binary on their own schedule.
+
+### For Node Operators
+
+- **[Format] `arc-node-consensus` height-range RPC responses are now a paged object instead of a JSON array.**
+  - Applies to `/commit`, `/misbehavior-evidence`, `/proposal-monitor`, and `/invalid-payloads` when `count` is greater than `1`. Single-height requests (`count` omitted or `1`) still return the per-height object unchanged.
+  - Old: `[ { "height": 100, ... }, { "height": 101, ... } ]`. New: `{ "items": [ { "height": 100, ... }, { "height": 101, ... } ], "next": { "height": 102 } }`.
+  - A page can cover fewer than `count` heights. It stops before the first height whose stored records would push the page past a 4 MiB budget (a single height larger than the budget is still returned on its own), and `next` holds the first height it did not cover. `next` is absent once the requested range is exhausted.
+  - To read a whole range, repeat the request with `height` set to `next.height` and `count` covering the heights still wanted, until `next` is absent.
+  - A range that extends past the latest decided height can now return `200` with `next` set, when the budget stops the page before the head. Continuing from `next` returns the `400` `above_current_head` error.
+  - The `count` cap rises from `1000` to `10000`. Requests above the cap still return `400` with reason `over_limit`.
+  - The response shape does not depend on the API version negotiated through the `Accept` header, so no media type returns the previous array. Clients that parse range responses as an array must read `items` and follow `next`.
+  - A client that also queries nodes on an earlier release can branch on the response type: an array is the previous form, an object with `items` is the new one. Keep `count` at `1000` or below for those nodes, since they reject larger values with `over_limit`.
+- **[CLI] `arc-node-execution` limits `eth_callMany` work per JSON-RPC request.**
+  - `--arc.rpc.max-call-many-calls` (default `10`) caps the calls in one JSON-RPC request. The budget covers every bundle and, in a batch, every entry, so batching cannot multiply it. Each `eth_callMany` costs at least one call even when it runs nothing, so at the default one batch holds at most 10 `eth_callMany` entries.
+  - `--arc.rpc.max-call-many-state-overrides` (default `100`) caps the accounts a single `eth_callMany` may override. It applies to each `eth_callMany` on its own, not to a batch total.
+  - A request above either limit is rejected with JSON-RPC error `-32602` before any call runs. A batch is rejected as a whole.
+  - Clients that send larger requests must split them, or the operator must raise the limits. Both values must be `>= 1`.
+- **[CLI] `arc-node-execution` limits the calldata an RPC tracer records per transaction.**
+  - `--arc.rpc.max-trace-bytes` (default `67108864`, 64 MiB) bounds the calldata a tracer copies while tracing one transaction, including the calldata of internal calls.
+  - It applies to every RPC that runs with an inspector: `debug_trace*`, `trace_*`, `ots_*`, and `eth_createAccessList`.
+  - A transaction past the limit fails with `trace byte limit of <BYTES> exceeded` instead of returning a partial trace. Block execution is unaffected.
+  - Operators who serve heavy tracing workloads can raise the limit. The value must be `>= 1`.
+- **[Config] `arc-node-execution` aborts database read transactions after 60 seconds.**
+  - The `node` subcommand now defaults `--db.read-transaction-timeout` to `60` seconds. The previous default was reth's `300`.
+  - A read transaction held longer is aborted, and the request that opened it fails. This is usually a slow `eth_call`, `eth_getLogs`, or trace over old state.
+  - Archive or tracing nodes that need longer reads can set the flag explicitly. `0` removes the limit and is not recommended on public endpoints. Operators who already set the flag are unaffected.
+- **[Config] `arc-node-consensus` value-sync defaults changed.**
+  - `ARC_SYNC_BATCH_SIZE`: from `10` to `5` heights per request.
+  - `ARC_SYNC_REQUEST_TIMEOUT`: from `1s` to `10s`.
+  - `ARC_SYNC_MAX_RESPONSE_SIZE`: from `10 MiB` to `16 MiB`. The same limit now also bounds P2P RPC transport messages.
+  - Operators who set these variables explicitly are unaffected.
+  - Nodes on earlier releases keep syncing from v0.8.2 nodes. A request for more heights than the serving node's batch size is shortened to that size, not refused.
+- **[Config] `arc-node-consensus` limits inbound sync requests from peers.**
+  - `ARC_SYNC_INBOUND_RATE_LIMIT_WINDOW` (default `10s`): the window over which the node counts sync requests from each peer.
+  - `ARC_SYNC_MAX_INBOUND_REQUESTS_PER_WINDOW` (default `1000`): sync requests the node accepts from one peer in each window.
+  - `ARC_SYNC_MAX_CONCURRENT_INBOUND_REQUESTS` (default `1`): sync requests the node serves at once.
+  - `ARC_SYNC_MAX_PENDING_INBOUND_REQUESTS` (default `128`): sync requests that wait for a free slot. `0` disables the queue.
+  - The node answers requests over the per-peer rate, or beyond the pending queue, with an empty response. No action is needed to keep the defaults.
+- **[Config] `ARC_CONSENSUS_WAL_REPLAY_DELAY` was removed.**
+  - `arc-node-consensus` no longer reads this variable, and the setting no longer exists. A value that is still set is ignored.
+  - Remove it from the consensus environment.
+
+## [v0.8.1]
+
+**Changes:** [v0.8.0...v0.8.1](https://github.com/circlefin/arc-node/compare/v0.8.0...v0.8.1) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.1)
+
+No breaking changes in this release.
+
 ## [v0.8.0]
 
 **Changes:** [v0.7.3...v0.8.0](https://github.com/circlefin/arc-node/compare/v0.7.3...v0.8.0) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.0)

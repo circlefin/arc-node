@@ -88,8 +88,9 @@
 /// - Conversion of `PrecompileErrorOrRevert` into the final `Result`
 ///
 /// ABI decoding, gas accounting, and output encoding remain the arm body's job; use
-/// `helpers::abi_decode_raw_validated` on the supplied calldata bytes when
-/// you need the decoded arguments.
+/// `arc_shared::precompile::abi_decode_raw_borrowed` on the supplied calldata bytes when
+/// you need the decoded arguments. It returns `bytes` arguments as slices of the
+/// calldata, so charge for them before copying any.
 #[macro_export]
 macro_rules! precompile {
     ($fn_name:ident, $precompile_input:ident, $hardfork_flags:ident; {

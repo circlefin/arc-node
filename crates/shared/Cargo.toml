@@ -13,10 +13,12 @@ repository.workspace = true
 # No features
 
 [dependencies]
+alloy-sol-types.workspace = true
 metrics.workspace = true
 
 [dev-dependencies]
-# No dev-dependencies
+alloy-primitives.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true

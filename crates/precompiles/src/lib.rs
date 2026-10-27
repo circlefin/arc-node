@@ -106,7 +106,7 @@
 //!             let mut gas_counter = Gas::new(precompile_input.gas);
 //!             let mut precompile_input = precompile_input;
 //!
-//!             let args = abi_decode_raw_validated::<IMyPrecompile::myFunctionCall>(input)
+//!             let (param,) = abi_decode_raw_borrowed::<IMyPrecompile::myFunctionCall>(input)
 //!                 .map_err(|_| PrecompileErrorOrRevert::new_reverted_with_penalty(
 //!                     gas_counter,
 //!                     PRECOMPILE_EARLY_REVERT_GAS_PENALTY,

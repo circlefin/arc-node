@@ -23,13 +23,14 @@ use alloy_primitives::Bytes;
 use alloy_sol_types::sol;
 use alloy_sol_types::SolCall;
 use reth_evm::Evm;
+use revm::context::result::EVMError;
 use revm::handler::SYSTEM_ADDRESS;
 use revm::DatabaseCommit;
 use revm_primitives::Address;
 
 /// Error types for ProtocolConfig contract interactions
 #[derive(Debug, thiserror::Error)]
-pub enum ProtocolConfigError<H> {
+pub enum ProtocolConfigError<H, EvmErr> {
     #[error("System call execution failed: {0:?}")]
     SystemCallFailed(revm::context::result::ExecutionResult<H>),
     #[error("ProtocolConfig contract returned empty output")]
@@ -37,7 +38,33 @@ pub enum ProtocolConfigError<H> {
     #[error("Failed to decode contract response: {0}")]
     DecodingError(#[from] alloy_sol_types::Error),
     #[error("EVM execution error: {0}")]
-    EvmError(String),
+    EvmError(EvmErr),
+}
+
+/// Extract the inner database/provider error from an EVM error.
+///
+/// Implemented for [`EVMError`] so callers can match `Database` via
+/// `E::Error: EvmErrorExt` without adding a `DbErr` type parameter to
+/// `ArcBlockExecutor` (an `Error = EVMError<E::DB::Error>` bound cycles).
+pub trait EvmErrorExt: Sized {
+    type Database: core::error::Error + Send + Sync + 'static;
+
+    /// `Ok` if this is `EVMError::Database`.
+    fn into_database(self) -> Result<Self::Database, Self>;
+}
+
+impl<DbErr, TxErr> EvmErrorExt for EVMError<DbErr, TxErr>
+where
+    DbErr: core::error::Error + Send + Sync + 'static,
+{
+    type Database = DbErr;
+
+    fn into_database(self) -> Result<DbErr, Self> {
+        match self {
+            Self::Database(err) => Ok(err),
+            other => Err(other),
+        }
+    }
 }
 
 // Constants
@@ -91,14 +118,51 @@ pub fn determine_bounded_base_fee(fee_params: &IProtocolConfig::FeeParams, base_
     }
 }
 
-/// Query the ProtocolConfig system contract for the configured fee parameters
+/// Query the ProtocolConfig system contract for the configured fee parameters.
 ///
-/// Returns the fee parameters if successfully queried,
-/// or `Err(ProtocolConfigError)` if there was an error during execution,
-/// contract deployment issues, or empty output.
+/// Returns `Ok(Some(params))` when the system call succeeds.
+/// [`EVMError::Database`] is a transient node-local fault and is returned as `Err`.
+/// `SystemCallFailed`, `EmptyOutput`, `DecodingError`, and other EVM errors
+/// return `Ok(None)` so callers can use chainspec defaults.
+///
+/// [`alloy_sol_types::Error::Reserve`] is not treated as a database abort. Its
+/// `AllocError` case (typical OOM, could be transient) cannot be separated from
+/// `CapacityOverflow` on stable Rust because `TryReserveErrorKind` and `kind()`
+/// are unstable. The current `FeeParams` ABI has no dynamic arrays, so `Reserve`
+/// is unreachable on today's decode path.
 pub fn retrieve_fee_params<E>(
     evm: &mut E,
-) -> Result<IProtocolConfig::FeeParams, ProtocolConfigError<E::HaltReason>>
+) -> Result<Option<IProtocolConfig::FeeParams>, <E::Error as EvmErrorExt>::Database>
+where
+    E: Evm,
+    E::DB: DatabaseCommit,
+    E::Error: EvmErrorExt + core::fmt::Display,
+{
+    match query_fee_params(evm) {
+        Ok(params) => Ok(Some(params)),
+        Err(ProtocolConfigError::EvmError(evm_error)) => match evm_error.into_database() {
+            Ok(error) => Err(error),
+            Err(evm_error) => {
+                tracing::warn!(
+                    error = %evm_error,
+                    "Failed to retrieve fee params from ProtocolConfig"
+                );
+                Ok(None)
+            }
+        },
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Failed to retrieve fee params from ProtocolConfig"
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn query_fee_params<E>(
+    evm: &mut E,
+) -> Result<IProtocolConfig::FeeParams, ProtocolConfigError<E::HaltReason, E::Error>>
 where
     E: Evm,
     E::DB: DatabaseCommit,
@@ -111,7 +175,7 @@ where
             PROTOCOL_CONFIG_ADDRESS,
             Bytes::from(call_data),
         )
-        .map_err(|e| ProtocolConfigError::EvmError(format!("{e:?}")))?;
+        .map_err(ProtocolConfigError::EvmError)?;
 
     if !result_and_state.result.is_success() {
         return Err(ProtocolConfigError::SystemCallFailed(
@@ -124,10 +188,8 @@ where
         .output()
         .ok_or(ProtocolConfigError::EmptyOutput)?;
 
-    let fee_params = IProtocolConfig::feeParamsCall::abi_decode_returns(output)
-        .map_err(ProtocolConfigError::DecodingError)?;
-
-    Ok(fee_params)
+    IProtocolConfig::feeParamsCall::abi_decode_returns(output)
+        .map_err(ProtocolConfigError::DecodingError)
 }
 
 #[cfg(test)]

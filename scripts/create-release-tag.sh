@@ -173,6 +173,18 @@ configure_tag_identity() {
   fi
 }
 
+verify_public_malachite_for_final() {
+  local tag="$1"
+  local target_ref="$2"
+  local version
+
+  [[ -n "${RELEASE_DOMAIN}" ]] && return
+  version="$(tag_version "${tag}")"
+  [[ "${version}" =~ -rc[0-9]+$ ]] && return
+
+  python3 "${SCRIPT_DIR}/check_public_malachite_release.py" --ref "${target_ref}"
+}
+
 latest_release_branch() {
   local branches latest
   branches="$(
@@ -605,8 +617,9 @@ if [[ -n "${RELEASE_KIND}" ]]; then
   validate_tag "${TAG}" || { echo "Generated invalid tag: ${TAG}" >&2; exit 1; }
   if git rev-parse --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
     TAG_TARGET_SHA="$(git rev-parse "${TAG_TARGET_REF}^{commit}")"
-    ensure_candidate_has_diff_from_previous_final "${TAG}" "${TAG_TARGET_SHA}"
     if tag_points_to_ref "${TAG}" "${TAG_TARGET_REF}"; then
+      verify_public_malachite_for_final "${TAG}" "${TAG_TARGET_SHA}"
+      ensure_candidate_has_diff_from_previous_final "${TAG}" "${TAG_TARGET_SHA}"
       echo "Tag already exists at target commit: ${TAG}" >&2
     else
       echo "Tag already exists: ${TAG}" >&2
@@ -622,6 +635,7 @@ if [[ -n "${RELEASE_KIND}" ]]; then
     fi
     configure_tag_identity
     TAG_TARGET_SHA="$(git rev-parse "${TAG_TARGET_REF}^{commit}")"
+    verify_public_malachite_for_final "${TAG}" "${TAG_TARGET_SHA}"
     ensure_candidate_has_diff_from_previous_final "${TAG}" "${TAG_TARGET_SHA}"
     git -c tag.gpgSign=false tag -a "${TAG}" -m "Release ${TAG}" "${TAG_TARGET_SHA}"
     CREATED_NEW_TAG=true
@@ -632,6 +646,7 @@ else
     echo "Explicit tag does not exist: ${TAG}" >&2
     exit 1
   fi
+  verify_public_malachite_for_final "${TAG}" "${TAG}"
   RESOLVED_SOURCE_REF="${TAG}"
   SOURCE_BRANCH="$(normalize_branch_name "${TAG}")"
 fi

@@ -24,6 +24,7 @@
 use crate::payload::ArcLocalPayloadAttributesBuilder;
 use alloy_network::Ethereum;
 use alloy_rpc_types_engine::ExecutionData;
+use arc_evm::evm::MAX_TRACE_BYTES_DEFAULT;
 use arc_evm::{ArcEvmConfig, ArcEvmFactory};
 use arc_execution_validation::ArcConsensus;
 use reth_chainspec::{EthereumHardforks, Hardforks};
@@ -68,22 +69,23 @@ use reth_rpc_eth_api::{
     RpcConvert, RpcTypes, SignableTxRequest,
 };
 use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
-use reth_rpc_server_types::RethRpcModule;
+use reth_rpc_server_types::{constants::gas_oracle::RPC_DEFAULT_GAS_CAP, RethRpcModule};
 use reth_tracing::tracing::{info, warn};
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
 use revm::context::TxEnv;
-use std::{default::Default, marker::PhantomData, sync::Arc};
+use std::{default::Default, marker::PhantomData, num::NonZeroUsize, sync::Arc};
 
 use arc_execution_config::addresses_denylist::AddressesDenylistConfig;
 use arc_execution_config::chainspec::ArcChainSpec;
 use arc_execution_payload::payload::ArcNetworkPayloadBuilderBuilder;
 use arc_execution_txpool::{ArcPoolBuilder, InvalidTxList, InvalidTxListConfig};
+use eyre::WrapErr;
 
 // FIXME use the ethereum chain spec temporary, we need to define Arc chain spec
 // original traits for ChainSpec in this file `Hardforks + EthereumHardforks + EthExecutorSpec`
 
 use crate::rpc_middleware::{
-    ArcRpcLayer, ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT, DEFAULT_TX_RELAY_TIMEOUT,
+    ArcRpcLayer, CallManyLimits, ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT, DEFAULT_TX_RELAY_TIMEOUT,
 };
 use crate::ArcEngineValidator;
 
@@ -102,6 +104,25 @@ fn remove_public_bundle_rpc_methods(modules: &mut TransportRpcModules) {
     modules.remove_ws_methods(BUNDLE_RPC_METHODS);
 }
 
+fn register_arc_rpc_namespace<F>(
+    modules: &mut TransportRpcModules,
+    cfg: &ArcRpcConfig,
+    build: F,
+) -> eyre::Result<()>
+where
+    F: FnOnce(
+        Option<String>,
+    ) -> eyre::Result<jsonrpsee::RpcModule<crate::rpc::arc::DefaultArcApiImpl>>,
+{
+    if !cfg.enabled {
+        return Ok(());
+    }
+    let arc_module =
+        build(cfg.upstream_url.clone()).wrap_err("failed to build `arc` RPC namespace")?;
+    modules.merge_configured(arc_module)?;
+    Ok(())
+}
+
 /// Type configuration for a regular Arc node.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -116,7 +137,9 @@ pub struct ArcNode {
     pub wait_for_payload: bool,
     /// When true (default), pending-tx RPCs are restricted
     /// (`eth_subscribe("newPendingTransactions")`, `eth_newPendingTransactionFilter`,
-    /// `eth_getBlockByNumber("pending")`, and `eth_getTransactionBySenderAndNonce`).
+    /// `eth_getBlockByNumber("pending")`). `eth_getTransactionBySenderAndNonce`
+    /// is forwarded, then pending answers are removed
+    /// so committed sender+nonce lookups still succeed.
     /// When false, all requests are forwarded.
     /// CLI users opt out of the default via `--arc.expose-pending-txs`.
     /// `--public-api` also forces this to `true` (and conflicts with `--arc.expose-pending-txs`).
@@ -129,13 +152,19 @@ pub struct ArcNode {
     /// Maximum batch response size in bytes, mirrors `--rpc.max-response-size`.
     pub max_response_body_size: u32,
     /// Maximum number of entries permitted in a JSON-RPC batch request.
-    pub max_batch_entries: usize,
+    pub max_batch_entries: std::num::NonZeroUsize,
+    /// Limits on `eth_callMany` work.
+    pub call_many_limits: CallManyLimits,
     /// Interval between tx rebroadcast rounds. Zero disables rebroadcast.
     pub rebroadcast_interval: std::time::Duration,
     /// Upstream RPC URLs for transaction relay, in priority order. Empty disables relaying.
     pub tx_relays: Vec<String>,
     /// Connection timeout for relays, and request timeout for async relayed submissions.
     pub tx_relay_timeout: std::time::Duration,
+    /// Per-transaction cap on call input bytes passed to an RPC tracer.
+    pub max_trace_bytes: NonZeroUsize,
+    /// Mirrors `--rpc.gascap`; bounds block gas-limit overrides on simulation RPCs.
+    pub rpc_gas_cap: u64,
 }
 
 impl ArcNode {
@@ -151,9 +180,12 @@ impl ArcNode {
             allow_unprotected_txs: false,
             max_response_body_size: 160 * 1024 * 1024,
             max_batch_entries: ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
+            call_many_limits: CallManyLimits::default(),
             rebroadcast_interval: crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
             tx_relays: Vec::new(),
             tx_relay_timeout: DEFAULT_TX_RELAY_TIMEOUT,
+            max_trace_bytes: MAX_TRACE_BYTES_DEFAULT,
+            rpc_gas_cap: RPC_DEFAULT_GAS_CAP,
         }
     }
 
@@ -168,7 +200,8 @@ impl ArcNode {
         filter_pending_txs: bool,
         allow_unprotected_txs: bool,
         max_response_body_size: u32,
-        max_batch_entries: usize,
+        max_batch_entries: std::num::NonZeroUsize,
+        call_many_limits: CallManyLimits,
         rebroadcast_interval: std::time::Duration,
         tx_relays: Vec<String>,
         tx_relay_timeout: std::time::Duration,
@@ -183,10 +216,25 @@ impl ArcNode {
             allow_unprotected_txs,
             max_response_body_size,
             max_batch_entries,
+            call_many_limits,
             rebroadcast_interval,
             tx_relays,
             tx_relay_timeout,
+            max_trace_bytes: MAX_TRACE_BYTES_DEFAULT,
+            rpc_gas_cap: RPC_DEFAULT_GAS_CAP,
         }
+    }
+
+    /// Sets the per-transaction cap on call input bytes passed to an RPC tracer.
+    pub fn with_max_trace_bytes(mut self, max_trace_bytes: NonZeroUsize) -> Self {
+        self.max_trace_bytes = max_trace_bytes;
+        self
+    }
+
+    /// Sets the `--rpc.gascap` value the RPC middleware bounds block gas-limit overrides by.
+    pub fn with_rpc_gas_cap(mut self, rpc_gas_cap: u64) -> Self {
+        self.rpc_gas_cap = rpc_gas_cap;
+        self
     }
 
     /// Returns a [`ComponentsBuilder`] configured for a regular Arc node.
@@ -196,6 +244,7 @@ impl ArcNode {
         payload_builder_deadline_ms: Option<u64>,
         wait_for_payload: bool,
         rebroadcast_interval: std::time::Duration,
+        max_trace_bytes: NonZeroUsize,
     ) -> ComponentsBuilder<
         Node,
         ArcPoolBuilder,
@@ -231,7 +280,7 @@ impl ArcNode {
                 invalid_tx_list_opt,
                 addresses_denylist_config.clone(),
             ))
-            .executor(ArcExecutorBuilder::default())
+            .executor(ArcExecutorBuilder::new(max_trace_bytes))
             .payload(BasicPayloadServiceBuilder::new(pb_builder))
             .network(ArcNetworkBuilder::default().with_rebroadcast_interval(rebroadcast_interval))
             .consensus(ArcConsensusBuilder::default())
@@ -459,14 +508,11 @@ where
                 // Reth includes eth_callBundle in the eth namespace. Remove the full bundle API
                 // from externally reachable transports while retaining trusted local IPC access.
                 remove_public_bundle_rpc_methods(container.modules);
-
-                if self.arc_rpc.enabled {
-                    if let Ok(arc_module) =
-                        crate::rpc::arc::build_arc_rpc_module(self.arc_rpc.upstream_url.clone())
-                    {
-                        container.modules.merge_configured(arc_module)?;
-                    }
-                }
+                register_arc_rpc_namespace(
+                    container.modules,
+                    &self.arc_rpc,
+                    crate::rpc::arc::build_arc_rpc_module,
+                )?;
 
                 Ok(())
             })
@@ -553,6 +599,7 @@ where
             self.payload_builder_deadline_ms,
             self.wait_for_payload,
             self.rebroadcast_interval,
+            self.max_trace_bytes,
         )
     }
 
@@ -564,6 +611,8 @@ where
                 self.allow_unprotected_txs,
                 self.max_response_body_size as usize,
                 self.max_batch_entries,
+                self.call_many_limits,
+                self.rpc_gas_cap,
                 self.tx_relays.clone(),
                 self.tx_relay_timeout,
             ))
@@ -585,9 +634,19 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for ArcNode {
 }
 
 /// A regular Arc evm and executor builder.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct ArcExecutorBuilder;
+pub struct ArcExecutorBuilder {
+    /// Per-transaction cap on call input bytes passed to an RPC tracer.
+    max_trace_bytes: NonZeroUsize,
+}
+
+impl ArcExecutorBuilder {
+    /// Creates an executor builder with the given trace input cap.
+    pub fn new(max_trace_bytes: NonZeroUsize) -> Self {
+        Self { max_trace_bytes }
+    }
+}
 
 impl<Types, Node> ExecutorBuilder<Node> for ArcExecutorBuilder
 where
@@ -599,7 +658,7 @@ where
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
         let evm_config = EthEvmConfig::new_with_evm_factory(
             ctx.chain_spec().clone(),
-            ArcEvmFactory::new(ctx.chain_spec().clone()),
+            ArcEvmFactory::new(ctx.chain_spec().clone()).with_max_trace_bytes(self.max_trace_bytes),
         );
         Ok(ArcEvmConfig::new(evm_config))
     }
@@ -734,6 +793,23 @@ mod tests {
         module
     }
 
+    fn empty_transport_modules() -> TransportRpcModules {
+        let module = RpcModule::new(());
+        TransportRpcModules::default()
+            .with_http(module.clone())
+            .with_ws(module.clone())
+            .with_ipc(module)
+    }
+
+    fn http_has_method(modules: &TransportRpcModules, method: &str) -> bool {
+        modules
+            .http_methods(|name| name == method)
+            .unwrap()
+            .method_names()
+            .next()
+            .is_some()
+    }
+
     #[test]
     fn removes_bundle_rpc_methods_from_public_transports_only() {
         let module = module_with_bundle_methods();
@@ -786,6 +862,50 @@ mod tests {
     }
 
     #[test]
+    fn register_arc_rpc_namespace_skips_build_when_disabled() {
+        let mut modules = empty_transport_modules();
+        let cfg = ArcRpcConfig::default();
+        register_arc_rpc_namespace(&mut modules, &cfg, |_| {
+            panic!("builder must not run when the namespace is disabled")
+        })
+        .unwrap();
+        assert!(!http_has_method(&modules, "arc_getVersion"));
+        assert!(!http_has_method(&modules, "arc_getCertificate"));
+    }
+
+    #[test]
+    fn register_arc_rpc_namespace_merges_methods_when_enabled() {
+        let mut modules = empty_transport_modules();
+        let cfg = ArcRpcConfig::new(true, Some("http://127.0.0.1:1".into()));
+        register_arc_rpc_namespace(&mut modules, &cfg, crate::rpc::arc::build_arc_rpc_module)
+            .unwrap();
+        assert!(http_has_method(&modules, "arc_getVersion"));
+        assert!(http_has_method(&modules, "arc_getCertificate"));
+    }
+
+    #[test]
+    fn register_arc_rpc_namespace_wraps_build_error_without_upstream_url() {
+        let mut modules = empty_transport_modules();
+        let cfg = ArcRpcConfig::new(
+            true,
+            Some("http://alice:s3cret@malachite.example:31000/rpc".into()),
+        );
+        let err = register_arc_rpc_namespace(&mut modules, &cfg, |_| {
+            Err(eyre::eyre!("client build failed"))
+        })
+        .expect_err("build failure must abort registration");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("failed to build `arc` RPC namespace"), "{msg}");
+        assert!(
+            !["upstream=", "malachite.example", "alice", "s3cret"]
+                .iter()
+                .any(|s| msg.contains(s)),
+            "{msg}"
+        );
+        assert!(msg.contains("client build failed"), "{msg}");
+    }
+
+    #[test]
     fn arc_rpc_config_construction() {
         let disabled = ArcRpcConfig::default();
         assert!(!disabled.enabled);
@@ -828,6 +948,7 @@ mod tests {
             false,
             160 * 1024 * 1024,
             ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
+            CallManyLimits::default(),
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
             Vec::new(),
             DEFAULT_TX_RELAY_TIMEOUT,
@@ -860,6 +981,7 @@ mod tests {
             false,
             160 * 1024 * 1024,
             ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
+            CallManyLimits::default(),
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
             Vec::new(),
             DEFAULT_TX_RELAY_TIMEOUT,
@@ -899,6 +1021,7 @@ mod tests {
             false,
             160 * 1024 * 1024,
             ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
+            CallManyLimits::default(),
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
             Vec::new(),
             DEFAULT_TX_RELAY_TIMEOUT,
@@ -935,6 +1058,7 @@ mod tests {
             false,
             160 * 1024 * 1024,
             ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
+            CallManyLimits::default(),
             crate::rebroadcast::DEFAULT_REBROADCAST_INTERVAL,
             Vec::new(),
             DEFAULT_TX_RELAY_TIMEOUT,
@@ -971,6 +1095,7 @@ mod tests {
             false,
             160 * 1024 * 1024,
             ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
+            CallManyLimits::default(),
             std::time::Duration::ZERO,
             Vec::new(),
             DEFAULT_TX_RELAY_TIMEOUT,

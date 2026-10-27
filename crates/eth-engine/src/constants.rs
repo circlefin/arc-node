@@ -71,7 +71,8 @@ pub const ETH_BATCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 // IPC client-level timeout (upper-bound safety net set at jsonrpsee Client construction)
 pub const IPC_CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 
-// Retry policy for eth_call requests (validator set, consensus params).
+// Retry policy for eth_call requests (validator set, consensus params,
+// blocklist check).
 pub const ETH_CALL_RETRY: backon::FibonacciBuilder = backon::FibonacciBuilder::new()
     .with_max_times(5)
     .with_min_delay(Duration::from_millis(100))

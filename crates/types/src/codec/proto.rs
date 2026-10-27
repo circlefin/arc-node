@@ -27,6 +27,7 @@ use malachitebft_core_types::{
 use malachitebft_proto::{Error as ProtoError, Protobuf};
 use malachitebft_signing_ed25519::Signature;
 use malachitebft_sync::{self as sync, PeerId};
+use tracing::debug;
 
 use crate::{decode_votetype, encode_votetype, proto, StoredCommitCertificate};
 use crate::{
@@ -42,6 +43,10 @@ const MAX_SIGNATURES_PER_CERTIFICATE: usize = 1_000;
 
 /// Upper bound on values in a single sync response.
 const MAX_SYNC_VALUES: usize = 1_000;
+
+/// Length of the random salt in an encoded stream message. The gossip message ID hashes
+/// the message in 8-byte words, and any 16 contiguous bytes cover one full word.
+pub(crate) const STREAM_MESSAGE_SALT_LEN: usize = 16;
 
 #[derive(Copy, Clone, Debug)]
 pub struct ProtobufCodec;
@@ -318,12 +323,16 @@ impl Codec<StreamMessage<ProposalPart>> for ProtobufCodec {
                 }
                 StreamContent::Fin => Some(proto::stream_message::Content::Fin(true)),
             },
+            salt: Bytes::copy_from_slice(&rand::random::<[u8; STREAM_MESSAGE_SALT_LEN]>()),
         };
 
         Ok(Bytes::from(proto.encode_to_vec()))
     }
 }
 
+// The codec is the one layer that still reads and writes the deprecated `valid_round`
+// wire field; the deprecation targets its consumers.
+#[allow(deprecated)]
 impl Codec<ProposedValue<ArcContext>> for ProtobufCodec {
     type Error = ProtoError;
 
@@ -338,10 +347,20 @@ impl Codec<ProposedValue<ArcContext>> for ProtobufCodec {
             .value
             .ok_or_else(|| ProtoError::missing_field::<proto::ProposedValue>("value"))?;
 
+        let height = Height::new(proto.height);
+        let round = Round::new(proto.round);
+
+        if let Some(valid_round) = proto.valid_round {
+            debug!(
+                %height, %round, valid_round,
+                "Unexpected non-nil deprecated valid_round field on proposed value",
+            );
+        }
+
         Ok(ProposedValue {
-            height: Height::new(proto.height),
-            round: Round::new(proto.round),
-            valid_round: proto.valid_round.map(Round::new).unwrap_or(Round::Nil),
+            height,
+            round,
+            valid_round: Round::Nil,
             proposer: Address::from_proto(proposer)?,
             value: Value::from_proto(value)?,
             validity: Validity::from_bool(proto.validity),
@@ -1348,5 +1367,52 @@ mod tests {
         };
 
         assert!(decode_sync_response(proto_response).is_ok());
+    }
+
+    #[test]
+    #[allow(deprecated)] // exercises the deprecated valid_round wire field on purpose
+    fn proposed_value_decode_pins_valid_round_to_nil() {
+        let codec = ProtobufCodec;
+
+        for valid_round in [None, Some(0), Some(1), Some(u32::MAX)] {
+            let proto_value = proto::ProposedValue {
+                height: 4,
+                round: 2,
+                valid_round,
+                proposer: Some(Address::new([1u8; 20]).to_proto().unwrap()),
+                value: Some(Value::new(BlockHash::from([2u8; 32])).to_proto().unwrap()),
+                validity: true,
+            };
+
+            let bytes = Bytes::from(proto_value.encode_to_vec());
+            let decoded: ProposedValue<ArcContext> = codec.decode(bytes).unwrap();
+
+            assert_eq!(
+                decoded.valid_round,
+                Round::Nil,
+                "valid_round {valid_round:?} must decode as nil"
+            );
+            assert_eq!(decoded.round, Round::new(2));
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // asserts the deprecated valid_round wire field stays unset
+    fn proposed_value_encode_omits_valid_round() {
+        let codec = ProtobufCodec;
+
+        let value = ProposedValue::<ArcContext> {
+            height: Height::new(4),
+            round: Round::new(2),
+            valid_round: Round::Nil,
+            proposer: Address::new([1u8; 20]),
+            value: Value::new(BlockHash::from([2u8; 32])),
+            validity: Validity::Valid,
+        };
+
+        let bytes = codec.encode(&value).unwrap();
+        let proto_value = proto::ProposedValue::decode(bytes.as_ref()).unwrap();
+
+        assert_eq!(proto_value.valid_round, None);
     }
 }

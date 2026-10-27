@@ -31,7 +31,10 @@ const ARC_SYNC_MAX_RESPONSE_SIZE: &str = "ARC_SYNC_MAX_RESPONSE_SIZE";
 const ARC_SYNC_PARALLEL_REQUESTS: &str = "ARC_SYNC_PARALLEL_REQUESTS";
 const ARC_SYNC_INACTIVE_THRESHOLD: &str = "ARC_SYNC_INACTIVE_THRESHOLD";
 const ARC_SYNC_BATCH_SIZE: &str = "ARC_SYNC_BATCH_SIZE";
-const ARC_CONSENSUS_WAL_REPLAY_DELAY: &str = "ARC_CONSENSUS_WAL_REPLAY_DELAY";
+const ARC_SYNC_INBOUND_RATE_LIMIT_WINDOW: &str = "ARC_SYNC_INBOUND_RATE_LIMIT_WINDOW";
+const ARC_SYNC_MAX_INBOUND_REQUESTS_PER_WINDOW: &str = "ARC_SYNC_MAX_INBOUND_REQUESTS_PER_WINDOW";
+const ARC_SYNC_MAX_CONCURRENT_INBOUND_REQUESTS: &str = "ARC_SYNC_MAX_CONCURRENT_INBOUND_REQUESTS";
+const ARC_SYNC_MAX_PENDING_INBOUND_REQUESTS: &str = "ARC_SYNC_MAX_PENDING_INBOUND_REQUESTS";
 const ARC_CONSENSUS_QUEUE_CAPACITY: &str = "ARC_CONSENSUS_QUEUE_CAPACITY";
 const ARC_CONSENSUS_QUEUE_PER_HEIGHT_CAPACITY: &str = "ARC_CONSENSUS_QUEUE_PER_HEIGHT_CAPACITY";
 const ARC_DISCOVERY_EPHEMERAL_CONNECTION_TIMEOUT: &str =
@@ -64,7 +67,7 @@ pub struct EnvConfig {
     pub value_sync_request_timeout: Option<Duration>,
     /// Overrides `value_sync::MAX_REQUEST_SIZE` if set.
     pub value_sync_max_request_size: Option<ByteSize>,
-    /// Overrides `value_sync::MAX_RESPONSE_SIZE` if set.
+    /// Overrides `value_sync::MAX_RESPONSE_SIZE` and the P2P RPC transport limit if set.
     pub value_sync_max_response_size: Option<ByteSize>,
     /// Overrides `value_sync::PARALLEL_REQUESTS` if set.
     pub value_sync_parallel_requests: Option<usize>,
@@ -72,8 +75,14 @@ pub struct EnvConfig {
     pub value_sync_inactive_threshold: Option<Duration>,
     /// Overrides `value_sync::BATCH_SIZE` if set.
     pub value_sync_batch_size: Option<usize>,
-    /// Overrides `consensus::WAL_REPLAY_DELAY` if set.
-    pub wal_replay_delay: Option<Duration>,
+    /// Overrides `value_sync::INBOUND_REQUEST_RATE_LIMIT_WINDOW` if set.
+    pub value_sync_inbound_request_rate_limit_window: Option<Duration>,
+    /// Overrides `value_sync::MAX_INBOUND_REQUESTS_PER_WINDOW` if set.
+    pub value_sync_max_inbound_requests_per_window: Option<u32>,
+    /// Overrides `value_sync::MAX_CONCURRENT_INBOUND_REQUESTS` if set.
+    pub value_sync_max_concurrent_inbound_requests: Option<usize>,
+    /// Overrides `value_sync::MAX_PENDING_INBOUND_REQUESTS` if set.
+    pub value_sync_max_pending_inbound_requests: Option<usize>,
     /// Overrides `consensus::QUEUE_CAPACITY` if set.
     pub queue_capacity: Option<usize>,
     /// Overrides `consensus::QUEUE_PER_HEIGHT_CAPACITY` if set.
@@ -141,6 +150,11 @@ fn env_nonzero_usize(key: &str) -> eyre::Result<Option<usize>> {
     reject_zero(key, env_parse::<usize>(key)?, |&n| n == 0)
 }
 
+/// Parse an environment variable as a `u32` that must be strictly positive.
+fn env_nonzero_u32(key: &str) -> eyre::Result<Option<u32>> {
+    reject_zero(key, env_parse::<u32>(key)?, |&n| n == 0)
+}
+
 /// Parse an environment variable as a `ByteSize` that must be strictly positive.
 fn env_nonzero_bytesize(key: &str) -> eyre::Result<Option<ByteSize>> {
     reject_zero(key, env_parse::<ByteSize>(key)?, |b| b.as_u64() == 0)
@@ -169,7 +183,7 @@ impl EnvConfig {
     /// - `ARC_HALT_AT_BLOCK_HEIGHT`: parsed as `u64`; 0 and unset both mean *no halt*.
     /// - `ARC_CONSENSUS_DB_CACHE_SIZE_BYTES`: parsed via `bytesize`; unset means 1 GiB; 0 rejected.
     /// - `ARC_SYNC_STATUS_UPDATE_INTERVAL`: parsed via `humantime`; `0s` means *update every block*.
-    /// - `ARC_CONSENSUS_WAL_REPLAY_DELAY`: parsed via `humantime`; `0s` means *no replay delay*.
+    /// - `ARC_SYNC_MAX_PENDING_INBOUND_REQUESTS`: `0` means *no waiting queue*.
     pub fn from_env() -> eyre::Result<Self> {
         Ok(Self {
             halt_height: env_parse::<u64>(ARC_HALT_AT_BLOCK_HEIGHT)?
@@ -187,7 +201,18 @@ impl EnvConfig {
             value_sync_parallel_requests: env_nonzero_usize(ARC_SYNC_PARALLEL_REQUESTS)?,
             value_sync_inactive_threshold: env_nonzero_duration(ARC_SYNC_INACTIVE_THRESHOLD)?,
             value_sync_batch_size: env_nonzero_usize(ARC_SYNC_BATCH_SIZE)?,
-            wal_replay_delay: env_duration(ARC_CONSENSUS_WAL_REPLAY_DELAY)?,
+            value_sync_inbound_request_rate_limit_window: env_nonzero_duration(
+                ARC_SYNC_INBOUND_RATE_LIMIT_WINDOW,
+            )?,
+            value_sync_max_inbound_requests_per_window: env_nonzero_u32(
+                ARC_SYNC_MAX_INBOUND_REQUESTS_PER_WINDOW,
+            )?,
+            value_sync_max_concurrent_inbound_requests: env_nonzero_usize(
+                ARC_SYNC_MAX_CONCURRENT_INBOUND_REQUESTS,
+            )?,
+            value_sync_max_pending_inbound_requests: env_parse::<usize>(
+                ARC_SYNC_MAX_PENDING_INBOUND_REQUESTS,
+            )?,
             queue_capacity: env_nonzero_usize(ARC_CONSENSUS_QUEUE_CAPACITY)?,
             queue_per_height_capacity: env_nonzero_usize(ARC_CONSENSUS_QUEUE_PER_HEIGHT_CAPACITY)?,
             ephemeral_connection_timeout: env_nonzero_duration(
@@ -212,7 +237,10 @@ impl Default for EnvConfig {
             value_sync_parallel_requests: None,
             value_sync_inactive_threshold: None,
             value_sync_batch_size: None,
-            wal_replay_delay: None,
+            value_sync_inbound_request_rate_limit_window: None,
+            value_sync_max_inbound_requests_per_window: None,
+            value_sync_max_concurrent_inbound_requests: None,
+            value_sync_max_pending_inbound_requests: None,
             queue_capacity: None,
             queue_per_height_capacity: None,
             ephemeral_connection_timeout: None,
@@ -241,7 +269,10 @@ mod tests {
         ARC_SYNC_PARALLEL_REQUESTS,
         ARC_SYNC_INACTIVE_THRESHOLD,
         ARC_SYNC_BATCH_SIZE,
-        ARC_CONSENSUS_WAL_REPLAY_DELAY,
+        ARC_SYNC_INBOUND_RATE_LIMIT_WINDOW,
+        ARC_SYNC_MAX_INBOUND_REQUESTS_PER_WINDOW,
+        ARC_SYNC_MAX_CONCURRENT_INBOUND_REQUESTS,
+        ARC_SYNC_MAX_PENDING_INBOUND_REQUESTS,
         ARC_CONSENSUS_QUEUE_CAPACITY,
         ARC_CONSENSUS_QUEUE_PER_HEIGHT_CAPACITY,
         ARC_DISCOVERY_EPHEMERAL_CONNECTION_TIMEOUT,
@@ -446,7 +477,10 @@ mod tests {
         assert_eq!(cfg.value_sync_parallel_requests, None);
         assert_eq!(cfg.value_sync_inactive_threshold, None);
         assert_eq!(cfg.value_sync_batch_size, None);
-        assert_eq!(cfg.wal_replay_delay, None);
+        assert_eq!(cfg.value_sync_inbound_request_rate_limit_window, None);
+        assert_eq!(cfg.value_sync_max_inbound_requests_per_window, None);
+        assert_eq!(cfg.value_sync_max_concurrent_inbound_requests, None);
+        assert_eq!(cfg.value_sync_max_pending_inbound_requests, None);
         assert_eq!(cfg.queue_capacity, None);
         assert_eq!(cfg.queue_per_height_capacity, None);
         assert_eq!(cfg.ephemeral_connection_timeout, None);
@@ -464,7 +498,10 @@ mod tests {
             std::env::set_var(ARC_SYNC_PARALLEL_REQUESTS, "7");
             std::env::set_var(ARC_SYNC_INACTIVE_THRESHOLD, "90s");
             std::env::set_var(ARC_SYNC_BATCH_SIZE, "25");
-            std::env::set_var(ARC_CONSENSUS_WAL_REPLAY_DELAY, "3s");
+            std::env::set_var(ARC_SYNC_INBOUND_RATE_LIMIT_WINDOW, "30s");
+            std::env::set_var(ARC_SYNC_MAX_INBOUND_REQUESTS_PER_WINDOW, "500");
+            std::env::set_var(ARC_SYNC_MAX_CONCURRENT_INBOUND_REQUESTS, "4");
+            std::env::set_var(ARC_SYNC_MAX_PENDING_INBOUND_REQUESTS, "256");
             std::env::set_var(ARC_CONSENSUS_QUEUE_CAPACITY, "32");
             std::env::set_var(ARC_CONSENSUS_QUEUE_PER_HEIGHT_CAPACITY, "750");
             std::env::set_var(ARC_DISCOVERY_EPHEMERAL_CONNECTION_TIMEOUT, "8s");
@@ -480,7 +517,13 @@ mod tests {
             Some(Duration::from_secs(90))
         );
         assert_eq!(cfg.value_sync_batch_size, Some(25));
-        assert_eq!(cfg.wal_replay_delay, Some(Duration::from_secs(3)));
+        assert_eq!(
+            cfg.value_sync_inbound_request_rate_limit_window,
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(cfg.value_sync_max_inbound_requests_per_window, Some(500));
+        assert_eq!(cfg.value_sync_max_concurrent_inbound_requests, Some(4));
+        assert_eq!(cfg.value_sync_max_pending_inbound_requests, Some(256));
         assert_eq!(cfg.queue_capacity, Some(32));
         assert_eq!(cfg.queue_per_height_capacity, Some(750));
         assert_eq!(
@@ -519,6 +562,8 @@ mod tests {
         for key in [
             ARC_SYNC_PARALLEL_REQUESTS,
             ARC_SYNC_BATCH_SIZE,
+            ARC_SYNC_MAX_INBOUND_REQUESTS_PER_WINDOW,
+            ARC_SYNC_MAX_CONCURRENT_INBOUND_REQUESTS,
             ARC_CONSENSUS_QUEUE_CAPACITY,
             ARC_CONSENSUS_QUEUE_PER_HEIGHT_CAPACITY,
             ARC_SYNC_MAX_REQUEST_SIZE,
@@ -545,6 +590,7 @@ mod tests {
             ARC_SYNC_CATCH_UP_THRESHOLD,
             ARC_SYNC_REQUEST_TIMEOUT,
             ARC_SYNC_INACTIVE_THRESHOLD,
+            ARC_SYNC_INBOUND_RATE_LIMIT_WINDOW,
             ARC_DISCOVERY_EPHEMERAL_CONNECTION_TIMEOUT,
             ARC_REMOTE_SIGNING_TIMEOUT,
         ] {
@@ -559,17 +605,24 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_env_zero_durations_allowed_where_meaningful() {
+    fn test_env_zero_status_update_interval_is_allowed() {
         let _guard = EnvGuard::new();
 
-        // `0` is a valid setting for these durations and must be preserved.
-        unsafe {
-            std::env::set_var(ARC_SYNC_STATUS_UPDATE_INTERVAL, "0s");
-            std::env::set_var(ARC_CONSENSUS_WAL_REPLAY_DELAY, "0s");
-        }
+        // `0` means update on every block and must be preserved.
+        unsafe { std::env::set_var(ARC_SYNC_STATUS_UPDATE_INTERVAL, "0s") };
         let cfg = EnvConfig::from_env().unwrap();
         assert_eq!(cfg.status_update_interval, Some(Duration::ZERO));
-        assert_eq!(cfg.wal_replay_delay, Some(Duration::ZERO));
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_zero_max_pending_inbound_requests_is_allowed() {
+        let _guard = EnvGuard::new();
+
+        // `0` disables the waiting queue: requests beyond the concurrency cap are rejected.
+        unsafe { std::env::set_var(ARC_SYNC_MAX_PENDING_INBOUND_REQUESTS, "0") };
+        let cfg = EnvConfig::from_env().unwrap();
+        assert_eq!(cfg.value_sync_max_pending_inbound_requests, Some(0));
     }
 
     #[test]
@@ -587,7 +640,10 @@ mod tests {
         assert_eq!(cfg.value_sync_parallel_requests, None);
         assert_eq!(cfg.value_sync_inactive_threshold, None);
         assert_eq!(cfg.value_sync_batch_size, None);
-        assert_eq!(cfg.wal_replay_delay, None);
+        assert_eq!(cfg.value_sync_inbound_request_rate_limit_window, None);
+        assert_eq!(cfg.value_sync_max_inbound_requests_per_window, None);
+        assert_eq!(cfg.value_sync_max_concurrent_inbound_requests, None);
+        assert_eq!(cfg.value_sync_max_pending_inbound_requests, None);
         assert_eq!(cfg.queue_capacity, None);
         assert_eq!(cfg.queue_per_height_capacity, None);
         assert_eq!(cfg.ephemeral_connection_timeout, None);

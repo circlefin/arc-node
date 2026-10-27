@@ -27,7 +27,7 @@ use reth_ethereum::{
     provider::BlockExecutionResult,
 };
 use reth_evm::eth::EthBlockExecutionCtx;
-use revm::{context::Block, context_interface::result::ResultAndState};
+use revm::{context::Block, context_interface::result::ResultAndState, DatabaseCommit};
 
 use alloy_consensus::transaction::Transaction;
 use alloy_consensus::transaction::TransactionEnvelope;
@@ -52,11 +52,10 @@ use arc_execution_config::gas_fee::{
 use arc_execution_config::native_coin_control::{
     compute_is_blocklisted_storage_slot, is_blocklisted_status,
 };
-use arc_execution_config::protocol_config;
+use arc_execution_config::protocol_config::{self, EvmErrorExt};
 use arc_precompiles::helpers::ERR_BLOCKED_ADDRESS;
 use arc_precompiles::system_accounting;
 use reth_evm::block::StateChangePostBlockSource;
-use revm::DatabaseCommit;
 
 const ERR_BLOCK_NUMBER_CONVERSION_FAILED: &str = "Failed to convert block number to u64";
 
@@ -205,6 +204,7 @@ where
     E: Evm<
         DB: alloy_evm::block::state::StateDB,
         Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>,
+        Error: EvmErrorExt + core::fmt::Display,
     >,
     Spec:
         EthExecutorSpec + Hardforks + EthChainSpec + BlockGasLimitProvider + BaseFeeConfigProvider,
@@ -227,14 +227,7 @@ where
         let block_number = self.block_number_u64()?;
 
         let fee_params = protocol_config::retrieve_fee_params(&mut self.evm)
-            .inspect_err(|e| {
-                tracing::error!(
-                    error = %e,
-                    block_number,
-                    "Failed to retrieve fee params from ProtocolConfig"
-                );
-            })
-            .ok();
+            .map_err(BlockExecutionError::other)?;
         let gas_values = self.compute_gas_values(block_number, fee_params)?;
 
         // ADR-004: enforce extra_data matches what is computed, but only when executing an
@@ -354,6 +347,7 @@ where
     E: Evm<
         DB: alloy_evm::block::state::StateDB,
         Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>,
+        Error: EvmErrorExt + core::fmt::Display,
     >,
     Spec:
         EthExecutorSpec + Hardforks + EthChainSpec + BlockGasLimitProvider + BaseFeeConfigProvider,
@@ -383,10 +377,7 @@ where
         // ADR-0003: Stateful gas limit validation against ProtocolConfig.
         let block_gas_limit = self.evm.block().gas_limit();
         let fee_params = protocol_config::retrieve_fee_params(&mut self.evm)
-            .inspect_err(|err| {
-                tracing::warn!(error = ?err, block_number, "Failed to get fee params from ProtocolConfig for gas limit validation");
-            })
-            .ok();
+            .map_err(BlockExecutionError::other)?;
 
         let gas_limit_config = self.chain_spec.block_gas_limit_config(block_number);
         let expected = protocol_config::expected_gas_limit(fee_params.as_ref(), &gas_limit_config);
@@ -554,6 +545,7 @@ mod tests {
     use super::*;
 
     use reth_ethereum::evm::revm::db::State;
+    use rstest::rstest;
 
     use alloy_genesis::Genesis;
     use alloy_primitives::address;
@@ -562,6 +554,7 @@ mod tests {
     use alloy_primitives::KECCAK256_EMPTY;
     use arc_execution_config::hardforks::ArcHardfork;
     use reth_chainspec::{EthChainSpec, ForkCondition};
+    use reth_ethereum::evm::revm_spec_by_timestamp_and_block_number;
     use reth_evm::ConfigureEvm;
     use reth_evm::EvmEnv;
 
@@ -575,7 +568,8 @@ mod tests {
     use revm_primitives::{StorageKey, StorageValue};
 
     use arc_execution_config::chainspec::{
-        localdev_with_hardforks, ArcChainSpec, BaseFeeConfigProvider, LOCAL_DEV,
+        localdev_with_block_gas_limit, localdev_with_hardforks,
+        localdev_with_protocol_config_reverts, ArcChainSpec, BaseFeeConfigProvider, LOCAL_DEV,
     };
 
     // Build env from localdev genesis so ProtocolConfig is available
@@ -1118,6 +1112,185 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::matches(50_000_000u64, true)]
+    #[case::mismatches(50_000_001u64, false)]
+    fn test_gas_limit_validation(#[case] gas_limit: u64, #[case] expect_match: bool) {
+        // Configure an on-chain blockGasLimit distinct from BlockGasLimitConfig::default()
+        // (30_000_000), so a passing "matches" case proves validation reads the stateful
+        // ProtocolConfig value rather than the default it would otherwise fall back to.
+        let chain_spec = localdev_with_block_gas_limit(50_000_000);
+
+        let mut db = InMemoryDB::default();
+        insert_alloc_into_db(&mut db, chain_spec.genesis());
+
+        let evm_config = create_evm_config(chain_spec.clone());
+
+        let mut block_env = get_mock_block_env();
+        block_env.number = U256::from(1u64);
+        block_env.beneficiary = Address::from([1u8; 20]);
+        block_env.gas_limit = gas_limit;
+
+        let spec = revm_spec_by_timestamp_and_block_number(
+            chain_spec.as_ref(),
+            block_env.timestamp.saturating_to(),
+            block_env.number.saturating_to(),
+        );
+        let cfg_env = CfgEnv::new()
+            .with_chain_id(chain_spec.chain_id())
+            .with_spec_and_mainnet_gas_params(spec);
+        let evm_env = EvmEnv { cfg_env, block_env };
+
+        let mut state = State::builder().with_database(db).build();
+        let evm = evm_config.evm_with_env(&mut state, evm_env);
+        let ctx = get_mock_execution_ctx();
+        let mut executor = ArcBlockExecutor::new(
+            evm,
+            ctx,
+            chain_spec.as_ref(),
+            evm_config.inner.executor_factory.receipt_builder(),
+        );
+
+        let result = executor.apply_pre_execution_changes();
+        if expect_match {
+            result.expect("gas_limit matches on-chain configured value; validation should pass");
+        } else {
+            match result {
+                Err(BlockExecutionError::Validation(err)) => {
+                    let err_msg = err.to_string();
+                    assert!(
+                        err_msg.contains("does not match expected"),
+                        "Expected 'does not match expected' in error, got: {err_msg}"
+                    );
+                }
+                other => panic!(
+                    "Expected BlockExecutionError::Validation with gas limit mismatch, got: {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_gas_limit_validation_falls_back_to_default_when_protocol_config_unavailable() {
+        // ProtocolConfig reverts → fee_params=None → expected = chain default (30_000_000)
+        let chain_spec = localdev_with_protocol_config_reverts();
+
+        let mut db = InMemoryDB::default();
+        insert_alloc_into_db(&mut db, chain_spec.genesis());
+
+        let evm_config = create_evm_config(chain_spec.clone());
+
+        // Default beneficiary (zero) is not blocklisted; beneficiary check warn-and-continues when
+        // ProtocolConfig reverts.
+        let block_env = get_mock_block_env(); // gas_limit = 30_000_000 = chain default
+
+        let spec = revm_spec_by_timestamp_and_block_number(
+            chain_spec.as_ref(),
+            block_env.timestamp.saturating_to(),
+            block_env.number.saturating_to(),
+        );
+        let cfg_env = CfgEnv::new()
+            .with_chain_id(chain_spec.chain_id())
+            .with_spec_and_mainnet_gas_params(spec);
+        let evm_env = EvmEnv { cfg_env, block_env };
+
+        let mut state = State::builder().with_database(db).build();
+        let evm = evm_config.evm_with_env(&mut state, evm_env);
+        let ctx = get_mock_execution_ctx();
+        let mut executor = ArcBlockExecutor::new(
+            evm,
+            ctx,
+            chain_spec.as_ref(),
+            evm_config.inner.executor_factory.receipt_builder(),
+        );
+
+        let result = executor.apply_pre_execution_changes();
+        result.expect(
+            "gas_limit falls back to chain default when ProtocolConfig is unavailable; validation should pass",
+        );
+    }
+
+    fn overwrite_protocol_config_code(db: &mut InMemoryDB, code: Option<alloy_primitives::Bytes>) {
+        let (code_hash, code) = match code {
+            Some(code) => (keccak256(&code), Some(Bytecode::new_raw(code))),
+            None => (KECCAK256_EMPTY, None),
+        };
+        db.insert_account_info(
+            protocol_config::PROTOCOL_CONFIG_ADDRESS,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 0,
+                code_hash,
+                code,
+                account_id: None,
+            },
+        );
+    }
+
+    fn assert_gas_limit_validation_falls_back_when_protocol_config_unreadable(db: InMemoryDB) {
+        let chain_spec = LOCAL_DEV.clone();
+        let evm_config = create_evm_config(chain_spec.clone());
+        let block_env = get_mock_block_env();
+        let spec = revm_spec_by_timestamp_and_block_number(
+            chain_spec.as_ref(),
+            block_env.timestamp.saturating_to(),
+            block_env.number.saturating_to(),
+        );
+        let cfg_env = CfgEnv::new()
+            .with_chain_id(chain_spec.chain_id())
+            .with_spec_and_mainnet_gas_params(spec);
+        let evm_env = EvmEnv { cfg_env, block_env };
+        let mut state = State::builder().with_database(db).build();
+        let evm = evm_config.evm_with_env(&mut state, evm_env);
+        let ctx = get_mock_execution_ctx();
+        let mut executor = ArcBlockExecutor::new(
+            evm,
+            ctx,
+            chain_spec.as_ref(),
+            evm_config.inner.executor_factory.receipt_builder(),
+        );
+
+        let fee_params = protocol_config::retrieve_fee_params(executor.evm_mut())
+            .expect("contract-level ProtocolConfig failures are not database faults");
+        assert!(
+            fee_params.is_none(),
+            "expected Ok(None) fallback, got Some(FeeParams)"
+        );
+
+        executor.apply_pre_execution_changes().expect(
+            "gas_limit falls back to chain default when ProtocolConfig output is unusable; validation should pass",
+        );
+    }
+
+    #[test]
+    fn test_gas_limit_validation_falls_back_when_protocol_config_account_absent() {
+        // Empty ProtocolConfig code: CALL succeeds with empty bytes. query_fee_params
+        // treats that as DecodingError (output() is Some(&[])), not EmptyOutput
+        // (output() is None). Both return Ok(None).
+        let chain_spec = LOCAL_DEV.clone();
+        let mut db = InMemoryDB::default();
+        insert_alloc_into_db(&mut db, chain_spec.genesis());
+        overwrite_protocol_config_code(&mut db, None);
+
+        assert_gas_limit_validation_falls_back_when_protocol_config_unreadable(db);
+    }
+
+    #[test]
+    fn test_gas_limit_validation_falls_back_when_protocol_config_output_undecodable() {
+        // PUSH1 0x01 PUSH1 0x00 RETURN — success with 1 byte, not a FeeParams ABI payload.
+        let chain_spec = LOCAL_DEV.clone();
+        let mut db = InMemoryDB::default();
+        insert_alloc_into_db(&mut db, chain_spec.genesis());
+        overwrite_protocol_config_code(
+            &mut db,
+            Some(alloy_primitives::Bytes::from(vec![
+                0x60, 0x01, 0x60, 0x00, 0xf3,
+            ])),
+        );
+
+        assert_gas_limit_validation_falls_back_when_protocol_config_unreadable(db);
+    }
+
     #[derive(Debug, thiserror::Error)]
     #[error("forced blocklist storage read failure")]
     struct ForcedBlocklistReadError;
@@ -1211,6 +1384,153 @@ mod tests {
             }
             other => panic!("Expected BlockExecutionError::Internal(Other), got: {other:?}"),
         }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("forced ProtocolConfig database read failure")]
+    struct ForcedProtocolConfigReadError;
+    impl revm::database_interface::DBErrorMarker for ForcedProtocolConfigReadError {}
+
+    #[derive(Debug)]
+    struct ProtocolConfigReadFailingDb {
+        inner: InMemoryDB,
+    }
+
+    impl ProtocolConfigReadFailingDb {
+        fn new(inner: InMemoryDB) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl revm::Database for ProtocolConfigReadFailingDb {
+        type Error = ForcedProtocolConfigReadError;
+
+        fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            if address == protocol_config::PROTOCOL_CONFIG_ADDRESS {
+                return Err(ForcedProtocolConfigReadError);
+            }
+            <InMemoryDB as revm::Database>::basic(&mut self.inner, address)
+                .map_err(|infallible: core::convert::Infallible| match infallible {})
+        }
+
+        fn code_by_hash(&mut self, code_hash: AlloyB256) -> Result<Bytecode, Self::Error> {
+            <InMemoryDB as revm::Database>::code_by_hash(&mut self.inner, code_hash)
+                .map_err(|infallible: core::convert::Infallible| match infallible {})
+        }
+
+        fn storage(
+            &mut self,
+            address: Address,
+            index: StorageKey,
+        ) -> Result<StorageValue, Self::Error> {
+            if address == protocol_config::PROTOCOL_CONFIG_ADDRESS {
+                return Err(ForcedProtocolConfigReadError);
+            }
+            <InMemoryDB as revm::Database>::storage(&mut self.inner, address, index)
+                .map_err(|infallible: core::convert::Infallible| match infallible {})
+        }
+
+        fn block_hash(&mut self, number: u64) -> Result<AlloyB256, Self::Error> {
+            <InMemoryDB as revm::Database>::block_hash(&mut self.inner, number)
+                .map_err(|infallible: core::convert::Infallible| match infallible {})
+        }
+    }
+
+    fn assert_protocol_config_db_fault_is_internal(result: Result<(), BlockExecutionError>) {
+        match result {
+            Err(BlockExecutionError::Internal(
+                internal_err @ InternalBlockExecutionError::Other(_),
+            )) => {
+                assert!(
+                    internal_err
+                        .to_string()
+                        .contains("forced ProtocolConfig database read failure"),
+                    "Expected the underlying DB error to be preserved, got: {internal_err}"
+                );
+            }
+            other => panic!("Expected BlockExecutionError::Internal(Other), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_gas_limit_validation_database_error_is_internal_not_fallback() {
+        // On-chain gas limit differs from the chainspec default so a mistaken
+        // ADR-0004 fallback would become Validation (50M header vs 30M default)
+        // rather than silently succeeding.
+        let chain_spec = localdev_with_block_gas_limit(50_000_000);
+
+        let mut base_db = InMemoryDB::default();
+        insert_alloc_into_db(&mut base_db, chain_spec.genesis());
+
+        let db = ProtocolConfigReadFailingDb::new(base_db);
+        let evm_config = create_evm_config(chain_spec.clone());
+
+        let mut block_env = get_mock_block_env();
+        block_env.number = U256::from(1u64);
+        block_env.beneficiary = Address::from([1u8; 20]);
+        block_env.gas_limit = 50_000_000;
+
+        let spec = revm_spec_by_timestamp_and_block_number(
+            chain_spec.as_ref(),
+            block_env.timestamp.saturating_to(),
+            block_env.number.saturating_to(),
+        );
+        let cfg_env = CfgEnv::new()
+            .with_chain_id(chain_spec.chain_id())
+            .with_spec_and_mainnet_gas_params(spec);
+        let evm_env = EvmEnv { cfg_env, block_env };
+
+        let mut state = State::builder().with_database(db).build();
+        let evm = evm_config.evm_with_env(&mut state, evm_env);
+        let ctx = get_mock_execution_ctx();
+        let mut executor = ArcBlockExecutor::new(
+            evm,
+            ctx,
+            chain_spec.as_ref(),
+            evm_config.inner.executor_factory.receipt_builder(),
+        );
+
+        assert_protocol_config_db_fault_is_internal(executor.apply_pre_execution_changes());
+    }
+
+    #[test]
+    fn test_post_block_database_error_is_internal_not_extra_data_validation() {
+        // extra_data is the clamped 20 gwei floor. ADR-0004 fallback skips that
+        // clamp and would Validation-mismatch; Database must Internal first.
+        let chain_spec = LOCAL_DEV.clone();
+
+        let mut base_db = InMemoryDB::default();
+        insert_alloc_into_db(&mut base_db, chain_spec.genesis());
+
+        let db = ProtocolConfigReadFailingDb::new(base_db);
+        let evm_config = create_evm_config(chain_spec.clone());
+        let block_env = get_mock_block_env();
+
+        let cfg_env = CfgEnv::new()
+            .with_chain_id(chain_spec.chain_id())
+            .with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
+        let evm_env = EvmEnv { cfg_env, block_env };
+
+        let mut state = State::builder().with_database(db).build();
+        let evm = evm_config.evm_with_env(&mut state, evm_env);
+        let ctx = reth_evm::eth::EthBlockExecutionCtx {
+            parent_hash: AlloyB256::ZERO,
+            parent_beacon_block_root: None,
+            ommers: &[],
+            withdrawals: None,
+            extra_data: gas_fee::encode_base_fee_to_bytes(GENESIS_MIN_BASE_FEE),
+            tx_count_hint: None,
+            slot_number: None,
+        };
+        let executor = ArcBlockExecutor::new(
+            evm,
+            ctx,
+            chain_spec.as_ref(),
+            evm_config.inner.executor_factory.receipt_builder(),
+        );
+
+        let result = executor.finish().map(|_| ());
+        assert_protocol_config_db_fault_is_internal(result);
     }
 
     /// Regression guard for sparse-trie post-block error handling.

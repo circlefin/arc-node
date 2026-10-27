@@ -27,6 +27,7 @@
 //! - **Bundle RPCs unavailable** — all six Reth bundle methods return method-not-found
 //! - **Sensitive namespaces disabled** — txpool, debug, trace, admin, flashbots, mev, ots
 //! - **Mempool nonce lookup blocked** — `eth_getTransactionBySenderAndNonce` returns no data
+//!   for the account's current (unused) nonce
 
 use std::time::Duration;
 

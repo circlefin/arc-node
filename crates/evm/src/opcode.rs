@@ -247,17 +247,18 @@ fn is_blocklisted<WIRE: InterpreterTypes, H: Host + ?Sized>(
     }
 }
 
-/// Checks the source and target addresses are valid or not, and return target is cold or warm if the target account is loaded.
+/// Checks the source and target addresses are valid or not, and returns whether the target account is cold or warm.
 ///
 /// Checking rules
 /// - source and target is not the same
 /// - source and target are not blocklisted.
 /// - target is not self-destructed.
 ///
-/// - returns Ok(None) pass the check, and we did not load the target account.
-/// - returns Ok(bool) pass the check, return `true` if the account is cold, `false` if it is warm.
+/// - returns Ok(Some(bool)) pass the check, return `true` if the account is cold, `false` if it is warm.
+/// - returns Ok(None) if the account is not loaded. Currently, this is never returned. Every success path loads the target account.
 /// - returns Err(()) if the source or target account is invalid. The error should update in the context.interpreter.
 /// - returns Err(()) if a fail-closed blocklist load fails; the interpreter is halted fatally.
+/// - returns Err(()) if the target cold load is skipped for insufficient gas; the interpreter is halted out-of-gas.
 fn check_selfdestruct_accounts<WIRE: InterpreterTypes, DB: Database>(
     context: &mut InstructionContext<'_, EthEvmContext<DB>, WIRE>,
     source: alloy_primitives::Address,

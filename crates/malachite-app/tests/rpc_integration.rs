@@ -26,14 +26,21 @@ use arc_consensus_types::{
     signing::PrivateKey, Address, BlockHash, CommitCertificateType, Height, Round, ValidatorSet,
     ValueId,
 };
-use arc_node_consensus::request::{AppRequest, CommitCertificateInfo, HeightRangeRequest, Status};
-use arc_node_consensus::store::{RangeFailureReason, RangeQueryResult};
+use arc_node_consensus::request::{
+    AppRequest, CommitCertificateInfo, Health, HeightRangeRequest, Status,
+};
+use arc_node_consensus::store::{HeightRangePage, RangeFailureReason, RangeQueryResult};
 use arc_node_consensus::utils::sync_state::SyncState;
 use malachitebft_app_channel::{ConsensusRequest, NetworkRequest};
 use malachitebft_core_types::CommitCertificate;
 
 mod common;
 use common::TestServer;
+
+/// A page covering the whole range, as an unbounded read returns.
+fn whole_page<T>(items: Vec<T>) -> HeightRangePage<T> {
+    HeightRangePage::new(RangeQueryResult::Complete(items), None)
+}
 
 /// Build a stand-in `CommitCertificateInfo` at `height` for mock range replies.
 ///
@@ -85,8 +92,8 @@ async fn test_health_endpoint_ok() {
 
     // Respond to health check request
     server.expect_app_request(|req| match req {
-        AppRequest::GetHealth(reply) => {
-            reply.send(()).ok();
+        AppRequest::GetHealth { reply, .. } => {
+            reply.send(Health::Ok).ok();
         }
         _ => panic!("Unexpected request type"),
     });
@@ -102,6 +109,31 @@ async fn test_health_endpoint_ok() {
 
     let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
     assert_eq!(body.get("status").unwrap(), "ok");
+}
+
+/// Test the /health endpoint reports a wedged consensus event loop.
+#[tokio::test]
+async fn test_health_endpoint_event_loop_stalled() {
+    let server = TestServer::start().await;
+
+    server.expect_app_request(|req| match req {
+        AppRequest::GetHealth { reply, .. } => {
+            reply.send(Health::EventLoopStalled).ok();
+        }
+        _ => panic!("Unexpected request type"),
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{}/health", server.url()))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), 503);
+
+    let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+    assert_eq!(body.get("status").unwrap(), "event_loop_stalled");
 }
 
 /// Test the /version endpoint returns version information
@@ -134,7 +166,7 @@ async fn test_status_endpoint() {
 
     // Respond to status request
     server.expect_app_request(|req| match req {
-        AppRequest::GetStatus(reply) => {
+        AppRequest::GetStatus { reply, .. } => {
             let public_key = PrivateKey::from([0x11; 32]).public_key();
             let status = Status {
                 height: Height::new(100),
@@ -199,13 +231,63 @@ async fn test_commit_endpoint_with_height() {
     assert_eq!(response.status(), 404); // Not found since we returned None
 }
 
-/// count > 1 returns an ordered JSON array over real HTTP.
+/// A single height answers with the record itself, not the range envelope.
 #[tokio::test]
-async fn test_commit_range_returns_array() {
+async fn test_commit_endpoint_single_height_returns_the_record() {
     let server = TestServer::start().await;
 
     server.expect_app_request(|req| match req {
-        AppRequest::GetCertificateRange(range, reply) => {
+        AppRequest::GetCertificate { height, reply, .. } => {
+            assert_eq!(height, Some(Height::new(7)));
+            reply.send(Some(a_commit_cert_info_at(7))).ok();
+        }
+        _ => panic!("Unexpected request type"),
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{}/commit?height=7", server.url()))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+    assert_eq!(body["height"].as_u64(), Some(7));
+    assert!(
+        body.get("items").is_none(),
+        "a single height is not wrapped in the range envelope"
+    );
+}
+
+/// Assert a body is the shared range envelope and return the heights it
+/// covered. Every range endpoint is held to this shape.
+fn page_heights(body: &serde_json::Value) -> Vec<u64> {
+    let keys: Vec<&str> = body
+        .as_object()
+        .expect("range body is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        keys.iter().all(|k| matches!(*k, "items" | "next")),
+        "range body carries only items and next, got {keys:?}"
+    );
+    body["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .map(|e| e["height"].as_u64().expect("item carries its height"))
+        .collect()
+}
+
+/// count > 1 returns the shared page envelope over real HTTP.
+#[tokio::test]
+async fn test_commit_range_returns_page() {
+    let server = TestServer::start().await;
+
+    server.expect_app_request(|req| match req {
+        AppRequest::GetCertificateRange { range, reply, .. } => {
             assert_eq!(
                 range,
                 HeightRangeRequest {
@@ -214,7 +296,7 @@ async fn test_commit_range_returns_array() {
                 }
             );
             reply
-                .send(Some(RangeQueryResult::Complete(vec![
+                .send(Some(whole_page(vec![
                     a_commit_cert_info_at(7),
                     a_commit_cert_info_at(8),
                 ])))
@@ -232,13 +314,7 @@ async fn test_commit_range_returns_array() {
 
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
-    let heights: Vec<u64> = body
-        .as_array()
-        .expect("array body")
-        .iter()
-        .map(|c| c.get("height").unwrap().as_u64().unwrap())
-        .collect();
-    assert_eq!(heights, vec![7, 8]);
+    assert_eq!(page_heights(&body), vec![7, 8]);
 }
 
 /// An over-limit range is rejected pre-send with the structured 400 body.
@@ -250,7 +326,7 @@ async fn test_commit_range_over_limit_structured_error() {
 
     let client = reqwest::Client::new();
     let response = client
-        .get(format!("{}/commit?height=10&count=1001", server.url()))
+        .get(format!("{}/commit?height=10&count=10001", server.url()))
         .send()
         .await
         .expect("Failed to send request");
@@ -261,7 +337,7 @@ async fn test_commit_range_over_limit_structured_error() {
         body,
         serde_json::json!({
             "error": "partial range unavailable",
-            "requested": {"from": 10, "to": 1010},
+            "requested": {"from": 10, "to": 10010},
             "reason": "over_limit"
         })
     );
@@ -274,12 +350,15 @@ async fn test_commit_range_above_head_structured_error() {
     let server = TestServer::start().await;
 
     server.expect_app_request(|req| match req {
-        AppRequest::GetCertificateRange(_, reply) => {
+        AppRequest::GetCertificateRange { reply, .. } => {
             reply
-                .send(Some(RangeQueryResult::Unavailable {
-                    reason: RangeFailureReason::AboveCurrentHead,
-                    failed_heights: vec![Height::new(11), Height::new(12)],
-                }))
+                .send(Some(HeightRangePage::new(
+                    RangeQueryResult::Unavailable {
+                        reason: RangeFailureReason::AboveCurrentHead,
+                        failed_heights: vec![Height::new(11), Height::new(12)],
+                    },
+                    None,
+                )))
                 .ok();
         }
         _ => panic!("Unexpected request type"),
@@ -312,9 +391,9 @@ async fn test_response_gzip_round_trip() {
     let server = TestServer::start().await;
 
     server.expect_app_request(|req| match req {
-        AppRequest::GetCertificateRange(_, reply) => {
+        AppRequest::GetCertificateRange { reply, .. } => {
             reply
-                .send(Some(RangeQueryResult::Complete(vec![
+                .send(Some(whole_page(vec![
                     a_commit_cert_info_at(7),
                     a_commit_cert_info_at(8),
                 ])))
@@ -339,13 +418,7 @@ async fn test_response_gzip_round_trip() {
     let mut json = String::new();
     std::io::Read::read_to_string(&mut decoder, &mut json).expect("Failed to gunzip");
     let body: serde_json::Value = serde_json::from_str(&json).expect("Failed to parse JSON");
-    let heights: Vec<u64> = body
-        .as_array()
-        .expect("array body")
-        .iter()
-        .map(|c| c.get("height").unwrap().as_u64().unwrap())
-        .collect();
-    assert_eq!(heights, vec![7, 8]);
+    assert_eq!(page_heights(&body), vec![7, 8]);
 }
 
 /// Test the /commit endpoint without height parameter
@@ -556,7 +629,7 @@ async fn test_status_response_structure() {
 
     // Respond to status request with real data
     server.expect_app_request(|req| match req {
-        AppRequest::GetStatus(reply) => {
+        AppRequest::GetStatus { reply, .. } => {
             let public_key = PrivateKey::from([0xAB; 32]).public_key();
             let status = Status {
                 height: Height::new(12345),
@@ -633,7 +706,7 @@ async fn test_no_misbehavior_evidence_endpoint_with_height() {
     let client = reqwest::Client::new();
 
     server.expect_app_request(|req| match req {
-        AppRequest::GetMisbehaviorEvidence(height, reply) => {
+        AppRequest::GetMisbehaviorEvidence { height, reply, .. } => {
             assert_eq!(height, Some(Height::new(100)));
             reply.send(None).ok();
         }
@@ -656,7 +729,7 @@ async fn test_no_misbehavior_evidence_endpoint_without_height() {
     let client = reqwest::Client::new();
 
     server.expect_app_request(|req| match req {
-        AppRequest::GetMisbehaviorEvidence(height, reply) => {
+        AppRequest::GetMisbehaviorEvidence { height, reply, .. } => {
             assert_eq!(height, None);
             reply.send(None).ok();
         }

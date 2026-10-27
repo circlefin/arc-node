@@ -21,7 +21,8 @@
 //! 1. Manages WebSocket subscriptions to RPC endpoints for real-time block notifications
 //! 2. Sends `NetworkEvent::Status` to malachite when peer heights update
 //! 3. Handles `OutgoingRequest` from malachite's sync and fetches blocks via RPC
-//! 4. Returns blocks via `NetworkEvent::SyncResponse`
+//! 4. Handles `CancelRequest` from malachite's sync and aborts the matching in-flight fetch
+//! 5. Returns blocks via `NetworkEvent::SyncResponse`
 //!
 //! ## Architecture
 //!
@@ -32,9 +33,14 @@
 //!  ┌─────────────────┐   NetworkEvent::Status    ┌─────────────────┐
 //!  │  Network Actor  │ ────────────────────────▶ │   Sync Actor    │
 //!  │                 │ ◀──────────────────────── │                 │
-//!  └────────┬────────┘     OutgoingRequest       └────────▲────────┘
+//!  │                 │     OutgoingRequest       │                 │
+//!  │                 │ ◀──────────────────────── │                 │
+//!  └────────┬────────┘     CancelRequest         └────────▲────────┘
+//!           │           (aborts in-flight                 │
+//!           │            fetch, no reply)                 │
 //!           │                                             │
-//!           │ (fetch blocks via RPC)                      │
+//!           │ (fetch blocks via RPC,                      │
+//!           │  per OutgoingRequest)                       │
 //!           │                                             │
 //!           └──────── NetworkEvent::SyncResponse ─────────┤
 //!                                                         │
@@ -44,11 +50,14 @@
 //!                                                └─────────────────┘
 //! ```
 
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_consensus_types::rpc_sync::SyncEndpointUrl;
 use eyre::{eyre, Context};
+use parking_lot::Mutex;
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -75,16 +84,24 @@ pub struct RpcNetworkState {
     peers: RpcPeers,
     /// Cancellation token for background tasks
     cancel_token: CancellationToken,
+    /// Request-local cancellation tokens for in-flight RPC fetches
+    pending_requests: PendingRequests,
     /// Request ID counter
     next_request_id: u64,
     /// Whether WebSocket forwarding has been started
     ws_started: bool,
+    /// Staleness bound applied to each `newHeads` WebSocket subscription
+    ws_stale_timeout: Duration,
 }
+
+type PendingRequests = Arc<Mutex<BTreeMap<OutboundRequestId, CancellationToken>>>;
 
 /// Arguments for spawning the RPC Network actor
 pub struct RpcNetworkArgs {
     /// RPC endpoint URLs
     pub endpoints: Vec<SyncEndpointUrl>,
+    /// Staleness bound applied to each `newHeads` WebSocket subscription
+    pub ws_stale_timeout: Duration,
 }
 
 /// RPC Network Actor
@@ -116,13 +133,17 @@ impl RpcNetworkActor {
 /// - `mpsc::Sender<NetworkMsg<ArcContext>>`: Channel for the app to send network messages
 pub async fn spawn_rpc_network_actor(
     endpoints: Vec<SyncEndpointUrl>,
+    ws_stale_timeout: Duration,
 ) -> eyre::Result<(NetworkRef<ArcContext>, mpsc::Sender<NetworkMsg<ArcContext>>)> {
     // Create RPC client and shared output port
     let rpc_client = RpcSyncClient::new();
     let output_port = Arc::new(OutputPort::with_capacity(256));
 
     let actor = RpcNetworkActor::new(output_port.clone(), rpc_client);
-    let args = RpcNetworkArgs { endpoints };
+    let args = RpcNetworkArgs {
+        endpoints,
+        ws_stale_timeout,
+    };
 
     let (actor_ref, _handle) = Actor::spawn(Some("rpc-network".to_string()), actor, args)
         .await
@@ -195,8 +216,10 @@ impl Actor for RpcNetworkActor {
         Ok(RpcNetworkState {
             peers,
             cancel_token,
+            pending_requests: Arc::new(Mutex::new(BTreeMap::new())),
             next_request_id: 1,
             ws_started: false,
+            ws_stale_timeout: args.ws_stale_timeout,
         })
     }
 
@@ -220,6 +243,10 @@ impl Actor for RpcNetworkActor {
                     &self.output_port,
                     &self.rpc_client,
                 );
+            }
+
+            NetworkActorMsg::CancelRequest(request_id) => {
+                on_cancel_request(state, request_id);
             }
 
             // These messages are not used in RPC sync mode
@@ -287,10 +314,8 @@ fn on_subscribe(
     info!("Starting WebSocket subscriptions (first subscriber registered)");
 
     // Create and start WebSocket subscription manager
-    let (mut ws_manager, mut ws_update_rx) = WsSubscriptionManager::new();
-
-    // Override the default cancellation token
-    ws_manager.set_cancel_token(state.cancel_token.clone());
+    let (ws_manager, mut ws_update_rx) =
+        WsSubscriptionManager::new(state.ws_stale_timeout, state.cancel_token.clone());
 
     // Clone peers for the async task (we keep the original for URL lookups)
     let peers = state.peers.clone();
@@ -301,7 +326,7 @@ fn on_subscribe(
 
     tokio::spawn(async move {
         // Start WebSocket subscriptions
-        ws_manager.start_subscriptions(&peers).await;
+        ws_manager.start_subscriptions(&peers);
 
         // Forward updates to consensus via NetworkEvent::Status
         loop {
@@ -370,10 +395,26 @@ fn on_outgoing_request(
     let range = value_req.range.clone();
     let rpc_client = rpc_client.clone();
     let output_port = output_port.clone();
-    let cancel_token = state.cancel_token.clone();
+    let cancel_token = state.cancel_token.child_token();
+    let pending_requests = state.pending_requests.clone();
+
+    pending_requests
+        .lock()
+        .insert(request_id.clone(), cancel_token.clone());
 
     tokio::spawn(async move {
         let result = fetch_range(&rpc_client, &endpoint, &range, &cancel_token).await;
+
+        remove_pending_request(&pending_requests, &request_id);
+
+        // A racing CancelRequest can still slip through here (if it observes
+        // the map entry already removed by the line above and so does not
+        // fire the token). The malachite sync actor drops late responses for
+        // evicted request IDs, so this is safe.
+        if cancel_token.is_cancelled() {
+            debug!(%request_id, "RPC sync fetch cancelled; dropping response");
+            return;
+        }
 
         match result {
             Ok(values) if !values.is_empty() => {
@@ -409,4 +450,66 @@ fn on_outgoing_request(
             }
         }
     });
+}
+
+/// Cancel an in-flight RPC sync request.
+fn on_cancel_request(state: &mut RpcNetworkState, request_id: OutboundRequestId) {
+    let cancel_token = state.pending_requests.lock().remove(&request_id);
+
+    match cancel_token {
+        Some(cancel_token) => {
+            cancel_token.cancel();
+            debug!(%request_id, "Cancelled in-flight RPC sync request");
+        }
+        None => {
+            debug!(%request_id, "Cancel requested for unknown RPC sync request");
+        }
+    }
+}
+
+fn remove_pending_request(pending_requests: &PendingRequests, request_id: &OutboundRequestId) {
+    pending_requests.lock().remove(request_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> RpcNetworkState {
+        RpcNetworkState {
+            peers: RpcPeers::new(Vec::new()),
+            cancel_token: CancellationToken::new(),
+            pending_requests: Arc::new(Mutex::new(BTreeMap::new())),
+            next_request_id: 1,
+            ws_started: false,
+            ws_stale_timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn cancel_request_cancels_and_removes_pending_request() {
+        let mut state = test_state();
+        let request_id = OutboundRequestId::new("req1");
+        let cancel_token = CancellationToken::new();
+
+        state
+            .pending_requests
+            .lock()
+            .insert(request_id.clone(), cancel_token.clone());
+
+        on_cancel_request(&mut state, request_id.clone());
+
+        assert!(cancel_token.is_cancelled());
+        assert!(!state.pending_requests.lock().contains_key(&request_id));
+    }
+
+    #[test]
+    fn cancel_unknown_request_is_noop() {
+        let mut state = test_state();
+        let request_id = OutboundRequestId::new("missing");
+
+        on_cancel_request(&mut state, request_id);
+
+        assert!(state.pending_requests.lock().is_empty());
+    }
 }

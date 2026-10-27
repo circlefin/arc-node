@@ -62,7 +62,8 @@ message CommitCertificate {
 message ProposedValue {
   uint64 height = 1;
   uint32 round = 2;
-  optional uint32 valid_round = 3;
+  // Always unset. Receivers discard it on decode. Retained for wire compatibility.
+  optional uint32 valid_round = 3 [deprecated = true];
   arc.consensus.v1.Address proposer = 4;
   arc.consensus.v1.Value value = 5;
   bool validity = 6;

@@ -38,6 +38,7 @@ use crate::subcall::{
 };
 use alloy_primitives::{address, Address, B256, U256};
 use alloy_sol_types::{sol, SolCall};
+use arc_shared::precompile::abi_decode_borrowed;
 use revm::bytecode::Bytecode;
 use revm::handler::FrameResult;
 use revm::interpreter::interpreter_action::{CallInput, CallInputs, CallScheme, CallValue};
@@ -100,12 +101,8 @@ fn decode_child_call(inputs: &CallInputs) -> Result<(CallInputs, u64), SubcallEr
             ));
         }
     };
-    let decoded = ICallFrom::callFromCall::abi_decode_validate(input_bytes)
+    let (sender, target, calldata) = abi_decode_borrowed::<ICallFrom::callFromCall>(input_bytes)
         .map_err(|e| SubcallError::AbiDecodeError(format!("callFrom: {e}")))?;
-
-    let sender = decoded.sender;
-    let target = decoded.target;
-    let calldata = decoded.data;
 
     // init_subcall overhead: fixed base + per-word charge for the dynamic `bytes data`.
     let overhead = abi_decode_gas(calldata.len());
@@ -132,7 +129,8 @@ fn decode_child_call(inputs: &CallInputs) -> Result<(CallInputs, u64), SubcallEr
         bytecode_address: target,
         known_bytecode: (B256::ZERO, Bytecode::default()),
         value: CallValue::Transfer(U256::ZERO),
-        input: CallInput::Bytes(calldata),
+        // `calldata` borrows from `input_bytes`, so this shares its buffer instead of copying.
+        input: CallInput::Bytes(input_bytes.slice_ref(calldata)),
         gas_limit: child_gas_limit,
         is_static: false,
         caller: sender,
@@ -230,8 +228,9 @@ mod tests {
     /// Both methods share `decode_child_call`, but if someone bypasses it in one
     /// path, the trace identity would silently drift from the executed identity.
     /// This test asserts that caller, target, scheme, value, and calldata match.
-    /// Gas limit is intentionally excluded — `init_subcall` applies EIP-150
-    /// 63/64ths forwarding while `trace_child_call` passes through the raw limit.
+    /// Gas limit is intentionally excluded — `ArcEvm::init_subcall` recomputes the
+    /// child's limit after account access costs, and the trace node reports the gas
+    /// forwarded to the precompile instead.
     #[test]
     fn trace_child_call_matches_init_subcall() {
         use alloy_primitives::address;
@@ -441,6 +440,29 @@ mod tests {
                 Err(SubcallError::InsufficientGas(_))
             ),
             "nonempty data: gas below base+per-word overhead must return InsufficientGas"
+        );
+    }
+
+    #[test]
+    fn init_subcall_child_input_shares_parent_buffer() {
+        let precompile = CallFromPrecompile;
+        let data = vec![0x42; 100];
+        let inputs = call_from_inputs(data.clone(), 100_000);
+        let result = precompile
+            .init_subcall(&inputs)
+            .expect("valid callFrom input should succeed");
+
+        let (CallInput::Bytes(parent), CallInput::Bytes(child)) =
+            (&inputs.input, &result.child_inputs.input)
+        else {
+            panic!("callFrom inputs are bytes");
+        };
+        assert_eq!(child.as_ref(), data.as_slice());
+        let parent = parent.as_ptr_range();
+        let child = child.as_ptr_range();
+        assert!(
+            parent.start <= child.start && child.end <= parent.end,
+            "child calldata was copied out of the parent input"
         );
     }
 }

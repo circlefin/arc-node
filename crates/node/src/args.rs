@@ -34,6 +34,10 @@ pub(crate) const ARC_DEFAULT_NODE_FLAGS: &[&str] = &[
     // stays well below every chainspec ceiling. Operators raise it via
     // `--rpc.gascap N`.
     "--rpc.gascap=30000000",
+    // Aborts a database read transaction held longer than this many seconds,
+    // failing the request that opened it. Reth's 300 s default let slow RPC
+    // reads hold transactions for minutes. `0` removes the limit.
+    "--db.read-transaction-timeout=60",
 ];
 
 // Subcommand name for the `node` subcommand.
@@ -79,6 +83,7 @@ mod tests {
         expected.insert("rpc.pending-block", "none");
         expected.insert("rpc.txfeecap", "1000");
         expected.insert("rpc.gascap", "30000000");
+        expected.insert("db.read-transaction-timeout", "60");
 
         assert_eq!(
             overrides, expected,

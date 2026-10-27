@@ -75,7 +75,8 @@ message ProposalInit {
   uint64 height = 1;
   uint32 round = 2;
   Address proposer = 4;
-  optional uint32 pol_round = 5;
+  // Always unset. Receivers discard it on decode. Retained for wire compatibility.
+  optional uint32 pol_round = 5 [deprecated = true];
 }
 
 message ProposalData {
@@ -100,6 +101,10 @@ message StreamMessage {
     // Fin must be set to true.
     bool fin = 4;
   }
+  // Fresh random bytes on every encoding, so the gossip message ID of a
+  // stream message cannot be predicted from its content.
+  // It is part of the hashed bytes, so it affects the message ID, but decoders ignore it.
+  bytes salt = 5;
 }
 
 message ValidatorProof {

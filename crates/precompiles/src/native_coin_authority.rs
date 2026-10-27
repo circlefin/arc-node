@@ -20,10 +20,10 @@
 //! transfer, and total supply management.
 
 use crate::helpers::{
-    abi_decode_raw_validated, balance_decr, balance_incr, check_delegatecall, check_gas_remaining,
-    check_staticcall, emit_event, new_reverted_with_early_penalty, read, transfer, write,
-    PrecompileErrorOrRevert, ERR_BLOCKED_ADDRESS, ERR_EXECUTION_REVERTED,
-    NATIVE_FIAT_TOKEN_ADDRESS, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, PRECOMPILE_SLOAD_GAS_COST,
+    balance_decr, balance_incr, check_delegatecall, check_gas_remaining, check_staticcall,
+    emit_event, new_reverted_with_early_penalty, read, transfer, write, PrecompileErrorOrRevert,
+    ERR_BLOCKED_ADDRESS, ERR_EXECUTION_REVERTED, NATIVE_FIAT_TOKEN_ADDRESS,
+    PRECOMPILE_EARLY_REVERT_GAS_PENALTY, PRECOMPILE_SLOAD_GAS_COST,
 };
 use crate::native_coin_control::{compute_is_blocklisted_storage_slot, UNBLOCKLISTED_STATUS};
 use crate::precompile;
@@ -31,6 +31,7 @@ use crate::NATIVE_COIN_CONTROL_ADDRESS;
 use alloy_evm::EvmInternals;
 use alloy_primitives::{address, Address, StorageKey, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
+use arc_shared::precompile::abi_decode_raw_borrowed;
 use reth_ethereum::evm::revm::precompile::PrecompileOutput;
 use revm_interpreter::Gas;
 
@@ -111,10 +112,11 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
             )?;
 
             // Decode arguments passed to mint function
-            let args = abi_decode_raw_validated::<INativeCoinAuthority::mintCall>(input)
+            let (to, amount) = abi_decode_raw_borrowed::<INativeCoinAuthority::mintCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED)
+                        gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
+                    )
                 )?;
 
             if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
@@ -133,17 +135,17 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
                 hardfork_flags,
             )?;
 
-            if args.to == Address::ZERO {
+            if to == Address::ZERO {
                 return Err(new_reverted_with_early_penalty(gas_counter, reservoir, ERR_ZERO_ADDRESS));
             }
 
             // Check blocklist
-            if is_blocklisted(&mut precompile_input.internals, args.to, &mut gas_counter, reservoir)? {
+            if is_blocklisted(&mut precompile_input.internals, to, &mut gas_counter, reservoir)? {
                 return Err(new_reverted_with_early_penalty(gas_counter, reservoir, ERR_BLOCKED_ADDRESS));
             }
 
             // Validate amount
-            if args.amount == U256::ZERO {
+            if amount == U256::ZERO {
                 return Err(new_reverted_with_early_penalty(gas_counter, reservoir, ERR_ZERO_AMOUNT));
             }
 
@@ -158,7 +160,7 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
             let current_total_supply = U256::from_be_slice(&total_supply_output);
 
             // Check for overflow
-            let new_total_supply = match current_total_supply.checked_add(args.amount) {
+            let new_total_supply = match current_total_supply.checked_add(amount) {
                 Some(new_total_supply) => new_total_supply,
                 None => return Err(new_reverted_with_early_penalty(gas_counter, reservoir, ERR_OVERFLOW)),
             };
@@ -174,15 +176,15 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
             )?;
 
             // Update account balance
-            balance_incr(&mut precompile_input.internals, args.to, args.amount, &mut gas_counter, reservoir)?;
+            balance_incr(&mut precompile_input.internals, to, amount, &mut gas_counter, reservoir)?;
 
             // Address::ZERO as `from` follows the ERC-20 convention for minting. This is
             // intentionally allowed here even though CALL/CREATE value transfers reject
             // Address::ZERO (see check_blocklist_and_create_log in evm.rs).
             emit_event(&mut precompile_input.internals, SYSTEM_ADDRESS, &Transfer {
                 from: Address::ZERO,
-                to: args.to,
-                value: args.amount,
+                to,
+                value: amount,
             }, &mut gas_counter, reservoir)?;
 
             let output = true.abi_encode();
@@ -202,7 +204,7 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
             )?;
 
             // Decode arguments passed to burn function
-            let args = abi_decode_raw_validated::<INativeCoinAuthority::burnCall>(input)
+            let (from, amount) = abi_decode_raw_borrowed::<INativeCoinAuthority::burnCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
                         gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
@@ -225,22 +227,22 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
                 hardfork_flags,
             )?;
 
-            if args.from == Address::ZERO {
+            if from == Address::ZERO {
                 return Err(new_reverted_with_early_penalty(gas_counter, reservoir, ERR_ZERO_ADDRESS));
             }
 
             // Check blocklist
-            if is_blocklisted(&mut precompile_input.internals, args.from, &mut gas_counter, reservoir)? {
+            if is_blocklisted(&mut precompile_input.internals, from, &mut gas_counter, reservoir)? {
                 return Err(new_reverted_with_early_penalty(gas_counter, reservoir, ERR_BLOCKED_ADDRESS));
             }
 
             // Validate amount
-            if args.amount == U256::ZERO {
+            if amount == U256::ZERO {
                 return Err(new_reverted_with_early_penalty(gas_counter, reservoir, ERR_ZERO_AMOUNT));
             }
 
             // Check balance and burn tokens
-            balance_decr(&mut precompile_input.internals, args.from, args.amount, &mut gas_counter, reservoir, hardfork_flags)?;
+            balance_decr(&mut precompile_input.internals, from, amount, &mut gas_counter, reservoir, hardfork_flags)?;
 
             // Adjust total supply
             let total_supply_output = read(
@@ -258,7 +260,7 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
                 &mut precompile_input.internals,
                 NATIVE_COIN_AUTHORITY_ADDRESS,
                 TOTAL_SUPPLY_STORAGE_KEY,
-                &current_total_supply.saturating_sub(args.amount).to_be_bytes_vec(),
+                &current_total_supply.saturating_sub(amount).to_be_bytes_vec(),
                 &mut gas_counter,
                 reservoir,
             )?;
@@ -267,9 +269,9 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
             // intentionally allowed here even though CALL/CREATE value transfers reject
             // Address::ZERO (see check_blocklist_and_create_log in evm.rs).
             emit_event(&mut precompile_input.internals, SYSTEM_ADDRESS, &Transfer {
-                from: args.from,
+                from,
                 to: Address::ZERO,
-                value: args.amount,
+                value: amount,
             }, &mut gas_counter, reservoir)?;
 
             // Return response
@@ -290,7 +292,7 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
             )?;
 
             // Decode arguments passed to transfer function
-            let args = abi_decode_raw_validated::<INativeCoinAuthority::transferCall>(input)
+            let (from, to, amount) = abi_decode_raw_borrowed::<INativeCoinAuthority::transferCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
                         gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
@@ -313,31 +315,31 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
                 hardfork_flags,
             )?;
 
-            if args.from == Address::ZERO || args.to == Address::ZERO {
+            if from == Address::ZERO || to == Address::ZERO {
                 return Err(new_reverted_with_early_penalty(gas_counter, reservoir, ERR_ZERO_ADDRESS));
             }
 
             // Check blocklist
-            if is_blocklisted(&mut precompile_input.internals, args.from, &mut gas_counter, reservoir)? {
+            if is_blocklisted(&mut precompile_input.internals, from, &mut gas_counter, reservoir)? {
                 return Err(new_reverted_with_early_penalty(gas_counter, reservoir, ERR_BLOCKED_ADDRESS));
             }
-            if is_blocklisted(&mut precompile_input.internals, args.to, &mut gas_counter, reservoir)? {
+            if is_blocklisted(&mut precompile_input.internals, to, &mut gas_counter, reservoir)? {
                 return Err(new_reverted_with_early_penalty(gas_counter, reservoir, ERR_BLOCKED_ADDRESS));
             }
 
             // Zero amount transfers are allowed, but do not emit an event
-            if args.amount != U256::ZERO {
+            if amount != U256::ZERO {
                 // Note on self-transfers (from == to): REVM's transfer_loaded() early-returns
                 // without touching balances for self-transfers. Here we still call transfer()
                 // which performs balance_decr + balance_incr (net zero change).
-                transfer(&mut precompile_input.internals, args.from, args.to, args.amount, &mut gas_counter, reservoir, hardfork_flags)?;
+                transfer(&mut precompile_input.internals, from, to, amount, &mut gas_counter, reservoir, hardfork_flags)?;
 
                 // EIP-7708: self-transfers (from == to) do not emit a log.
-                if args.from != args.to {
+                if from != to {
                     emit_event(&mut precompile_input.internals, SYSTEM_ADDRESS, &Transfer {
-                        from: args.from,
-                        to: args.to,
-                        value: args.amount,
+                        from,
+                        to,
+                        value: amount,
                     }, &mut gas_counter, reservoir)?;
                 }
             }
@@ -353,10 +355,11 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
             let reservoir = precompile_input.reservoir;
             let mut precompile_input = precompile_input;
 
-            abi_decode_raw_validated::<INativeCoinAuthority::totalSupplyCall>(input)
+            abi_decode_raw_borrowed::<INativeCoinAuthority::totalSupplyCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED)
+                        gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
+                    )
                 )?;
 
             // Early return if not enough gas

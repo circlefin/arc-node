@@ -23,23 +23,24 @@
 //!   `arc_payload_total_duration_seconds`
 //!
 //! Outcome counters use a single counter family with an `outcome` label:
-//!   `arc_payload_build_outcome_total{outcome="better|aborted|cancelled"}`
+//!   `arc_payload_build_outcome_total{outcome="better|aborted|cancelled|failed"}`
 //!
 //! Outcome semantics:
 //! - **better**: built payload had higher total fees than current best; payload was sealed and returned.
 //! - **aborted**: built candidate was not better than current best (by fees); candidate was discarded.
 //! - **cancelled**: build was cancelled (e.g. job cancelled) before completion.
+//! - **failed**: build returned an error (assembly, execution, or other payload-builder failure).
 
 use std::time::{Duration, Instant};
 
 /// Metric name constants.
 const STAGE_DURATION: &str = "arc_payload_stage_duration_seconds";
 const TOTAL_DURATION: &str = "arc_payload_total_duration_seconds";
-const BUILD_OUTCOME: &str = "arc_payload_build_outcome_total";
+pub(crate) const BUILD_OUTCOME: &str = "arc_payload_build_outcome_total";
 
 /// Label keys.
 const STAGE_LABEL: &str = "stage";
-const OUTCOME_LABEL: &str = "outcome";
+pub(crate) const OUTCOME_LABEL: &str = "outcome";
 
 /// Stage label values.
 const STATE_SETUP_STAGE: &str = "state_setup";
@@ -52,6 +53,7 @@ const ASSEMBLY_AND_SEALING_STAGE: &str = "assembly_and_sealing";
 const BETTER_OUTCOME: &str = "better";
 const ABORTED_OUTCOME: &str = "aborted";
 const CANCELLED_OUTCOME: &str = "cancelled";
+pub(crate) const FAILED_OUTCOME: &str = "failed";
 
 /// Records payload build metrics to Prometheus.
 ///
@@ -114,5 +116,9 @@ impl PayloadBuildMetrics {
 
     pub fn record_outcome_cancelled() {
         metrics::counter!(BUILD_OUTCOME, OUTCOME_LABEL => CANCELLED_OUTCOME).increment(1);
+    }
+
+    pub fn record_outcome_failed() {
+        metrics::counter!(BUILD_OUTCOME, OUTCOME_LABEL => FAILED_OUTCOME).increment(1);
     }
 }

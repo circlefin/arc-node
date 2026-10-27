@@ -18,6 +18,7 @@
 //! cryptographic library used for signing.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use arc_consensus_types::rpc_sync::SyncEndpointUrl;
 use backon::{BackoffBuilder, Retryable};
@@ -96,7 +97,7 @@ pub struct EthRpcConfig<'a> {
 }
 
 /// Configuration parameters for the start.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct StartConfig {
     /// The persistent peers to connect to on startup
     pub persistent_peers: Vec<Multiaddr>,
@@ -136,9 +137,44 @@ pub struct StartConfig {
     pub rpc_sync_enabled: bool,
     /// RPC endpoints to fetch blocks from (only used in RPC sync mode)
     pub rpc_sync_endpoints: Vec<SyncEndpointUrl>,
+    /// Staleness bound for the `newHeads` WebSocket subscription. If no header arrives within
+    /// this interval, the subscription is declared stale and the outer backoff loop reconnects.
+    pub rpc_sync_stale_timeout: Duration,
+}
+
+/// Written by hand rather than derived: the derive would leave
+/// `rpc_sync_stale_timeout` at zero, which declares every subscription stale on
+/// the first `recv`.
+impl Default for StartConfig {
+    fn default() -> Self {
+        Self {
+            persistent_peers: Vec::new(),
+            persistent_peers_only: false,
+            gossipsub_overrides: GossipSubOverrides::default(),
+            eth_socket: None,
+            execution_socket: None,
+            eth_rpc_endpoint: None,
+            execution_endpoint: None,
+            execution_ws_endpoint: None,
+            execution_jwt: None,
+            pprof_bind_address: None,
+            pprof_heap_prof: false,
+            suggested_fee_recipient: None,
+            skip_db_upgrade: false,
+            validator: false,
+            rpc_sync_enabled: false,
+            rpc_sync_endpoints: Vec::new(),
+            rpc_sync_stale_timeout: Self::DEFAULT_RPC_SYNC_STALE_TIMEOUT,
+        }
+    }
 }
 
 impl StartConfig {
+    /// Default staleness bound for the `newHeads` WebSocket subscription. Chosen well above
+    /// devnet/testnet block times (~0.5s) while still detecting a stale upstream within 30s,
+    /// letting the existing backoff loop recover without operator intervention.
+    pub const DEFAULT_RPC_SYNC_STALE_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Check if RPC sync mode is enabled
     pub fn is_rpc_sync_mode(&self) -> bool {
         self.rpc_sync_enabled
@@ -287,25 +323,21 @@ mod tests {
             .contains("No default follow endpoint"));
     }
 
+    /// A zero timeout declares the subscription stale on the first `recv`, so an
+    /// in-process caller that builds a config from `Default` must get the real bound.
+    #[test]
+    fn default_carries_the_documented_stale_timeout() {
+        assert_eq!(
+            StartConfig::default().rpc_sync_stale_timeout,
+            StartConfig::DEFAULT_RPC_SYNC_STALE_TIMEOUT
+        );
+    }
+
     #[test]
     fn resolve_defaults_populates_empty_endpoints() {
         let mut config = StartConfig {
-            persistent_peers: Vec::new(),
-            persistent_peers_only: false,
-            gossipsub_overrides: Default::default(),
-            eth_socket: None,
-            execution_socket: None,
-            eth_rpc_endpoint: None,
-            execution_endpoint: None,
-            execution_ws_endpoint: None,
-            execution_jwt: None,
-            pprof_bind_address: None,
-            pprof_heap_prof: false,
-            suggested_fee_recipient: None,
-            skip_db_upgrade: false,
-            validator: false,
             rpc_sync_enabled: true,
-            rpc_sync_endpoints: Vec::new(),
+            ..Default::default()
         };
 
         config
@@ -322,22 +354,9 @@ mod tests {
     fn resolve_defaults_preserves_explicit_endpoints() {
         let explicit: SyncEndpointUrl = "http://my-validator:8545".parse().unwrap();
         let mut config = StartConfig {
-            persistent_peers: Vec::new(),
-            persistent_peers_only: false,
-            gossipsub_overrides: Default::default(),
-            eth_socket: None,
-            execution_socket: None,
-            eth_rpc_endpoint: None,
-            execution_endpoint: None,
-            execution_ws_endpoint: None,
-            execution_jwt: None,
-            pprof_bind_address: None,
-            pprof_heap_prof: false,
-            suggested_fee_recipient: None,
-            skip_db_upgrade: false,
-            validator: false,
             rpc_sync_enabled: true,
             rpc_sync_endpoints: vec![explicit.clone()],
+            ..Default::default()
         };
 
         config
@@ -350,22 +369,8 @@ mod tests {
     #[test]
     fn resolve_defaults_noop_when_disabled() {
         let mut config = StartConfig {
-            persistent_peers: Vec::new(),
-            persistent_peers_only: false,
-            gossipsub_overrides: Default::default(),
-            eth_socket: None,
-            execution_socket: None,
-            eth_rpc_endpoint: None,
-            execution_endpoint: None,
-            execution_ws_endpoint: None,
-            execution_jwt: None,
-            pprof_bind_address: None,
-            pprof_heap_prof: false,
-            suggested_fee_recipient: None,
-            skip_db_upgrade: false,
-            validator: false,
             rpc_sync_enabled: false,
-            rpc_sync_endpoints: Vec::new(),
+            ..Default::default()
         };
 
         config
@@ -377,22 +382,8 @@ mod tests {
     #[test]
     fn resolve_defaults_errors_on_unsupported_chain() {
         let mut config = StartConfig {
-            persistent_peers: Vec::new(),
-            persistent_peers_only: false,
-            gossipsub_overrides: Default::default(),
-            eth_socket: None,
-            execution_socket: None,
-            eth_rpc_endpoint: None,
-            execution_endpoint: None,
-            execution_ws_endpoint: None,
-            execution_jwt: None,
-            pprof_bind_address: None,
-            pprof_heap_prof: false,
-            suggested_fee_recipient: None,
-            skip_db_upgrade: false,
-            validator: false,
             rpc_sync_enabled: true,
-            rpc_sync_endpoints: Vec::new(),
+            ..Default::default()
         };
 
         let result = config.resolve_default_rpc_sync_endpoints(999);

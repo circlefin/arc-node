@@ -74,7 +74,7 @@ This application exposes Prometheus metrics on the `/metrics` endpoint. The foll
 - **`arc_malachite_app_rpc_request_time`** (Histogram)
   - **Description:** Time taken to serve RPC requests, in seconds.
   - **Labels:**
-    - `endpoint`: The RPC endpoint path.
+    - `endpoint`: The RPC endpoint path (`/commit`, `/health`, `/ready`, `/status`, …).
   - **Buckets:** Provides a histogram of RPC request times with exponential buckets from 0.001 to 2.0 seconds.
 
   The `app_request_*` metric names below intentionally render with `app_app` in
@@ -84,18 +84,23 @@ This application exposes Prometheus metrics on the `/metrics` endpoint. The foll
 - **`arc_malachite_app_app_request_full_count`** (Counter)
   - **Description:** Number of app requests rejected because the app request channel was full.
   - **Labels:**
+    - `request`: The app request type (`get_certificate`, `get_certificate_range`, …).
+
+- **`arc_malachite_app_app_request_skipped_count`** (Counter)
+  - **Description:** Number of app requests skipped because the caller dropped the reply before handling started.
+  - **Labels:**
     - `request`: The app request type.
 
 - **`arc_malachite_app_app_request_queue_time`** (Histogram)
-  - **Description:** Time app requests spend waiting in the app request channel, in seconds.
+  - **Description:** Time an app request spends waiting before its handler starts, in seconds.
   - **Labels:**
-    - `request`: The app request type.
+    - `request`: The app request type (`get_certificate`, `get_certificate_range`, …).
   - **Buckets:** Provides a histogram of app request queue times with exponential buckets from 0.001 to 2.0 seconds.
 
 - **`arc_malachite_app_app_request_process_time`** (Histogram)
   - **Description:** Time taken to process app requests, in seconds.
   - **Labels:**
-    - `request`: The app request type.
+    - `request`: The app request type (`get_certificate`, `get_certificate_range`, …).
   - **Buckets:** Provides a histogram of app request processing times with exponential buckets from 0.001 to 2.0 seconds.
 
 - **`arc_malachite_app_height_restart_count`** (Counter)

@@ -165,18 +165,29 @@ async fn decide(
     let round = certificate.round;
     let value_id = certificate.value_id;
 
-    // NOTE: here the node searches for the block with maching value_id from any round
-    // It needs to read the complete undecided blocks table, but the expectation is it should be small.
+    // Prefer a valid block across rounds. If none exists, retain any matching row so
+    // the checks below can distinguish an invalid block from a missing payload.
     let block = match undecided_blocks
-        .get_by_hash(height, value_id.block_hash())
+        .get_valid_by_hash(height, value_id.block_hash())
         .await
     {
         Ok(Some(block)) => block,
-        Ok(None) => {
-            return Err(eyre!(
-                "Cannot find undecided block for certificate with height={height}, round={round}, value_id={value_id}"
-            ));
-        }
+        Ok(None) => match undecided_blocks
+            .get_by_hash(height, value_id.block_hash())
+            .await
+        {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                return Err(eyre!(
+                    "Cannot find undecided block for certificate with height={height}, round={round}, value_id={value_id}"
+                ));
+            }
+            Err(e) => {
+                return Err(eyre!(
+                    "Failed to retrieve undecided block for certificate with height={height}, round={round}, value_id={value_id}: {e}"
+                ));
+            }
+        },
         Err(e) => {
             return Err(eyre!(
                 "Failed to retrieve undecided block for certificate with height={height}, round={round}, value_id={value_id}: {e}"
@@ -435,7 +446,7 @@ mod tests {
         ConsensusBlock {
             height: Height::new(height),
             round: Round::new(round),
-            valid_round: Round::new(0),
+            valid_round: Round::Nil,
             proposer: Address::default(),
             validity: Validity::Valid,
             execution_payload: test_execution_payload(height, timestamp),
@@ -487,7 +498,7 @@ mod tests {
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
         undecided_blocks
-            .expect_get_by_hash()
+            .expect_get_valid_by_hash()
             .with(eq(Height::new(height)), eq(block_hash))
             .return_once(move |_, _| Ok(Some(consensus_block.clone())));
 
@@ -575,7 +586,7 @@ mod tests {
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
         undecided_blocks
-            .expect_get_by_hash()
+            .expect_get_valid_by_hash()
             .with(eq(Height::new(height)), eq(block_hash))
             .return_once(move |_, _| Ok(Some(consensus_block.clone())));
 
@@ -624,7 +635,7 @@ mod tests {
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
         undecided_blocks
-            .expect_get_by_hash()
+            .expect_get_valid_by_hash()
             .with(eq(Height::new(height)), eq(block_hash))
             .return_once(move |_, _| Ok(Some(consensus_block.clone())));
 
@@ -677,6 +688,9 @@ mod tests {
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
         undecided_blocks
+            .expect_get_valid_by_hash()
+            .return_once(|_, _| Ok(None));
+        undecided_blocks
             .expect_get_by_hash()
             .return_once(move |_, _| Ok(Some(consensus_block.clone())));
 
@@ -717,6 +731,9 @@ mod tests {
         consensus_block.validity = Validity::Invalid;
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
+        undecided_blocks
+            .expect_get_valid_by_hash()
+            .return_once(|_, _| Ok(None));
         undecided_blocks
             .expect_get_by_hash()
             .return_once(move |_, _| Ok(Some(consensus_block.clone())));
@@ -762,7 +779,7 @@ mod tests {
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
         undecided_blocks
-            .expect_get_by_hash()
+            .expect_get_valid_by_hash()
             .return_once(move |_, _| Ok(Some(consensus_block.clone())));
 
         let mut decided_blocks = MockDecidedBlocksRepository::new();
@@ -818,6 +835,10 @@ mod tests {
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
         undecided_blocks
+            .expect_get_valid_by_hash()
+            .with(eq(Height::new(height)), eq(block_hash))
+            .return_once(|_, _| Ok(None));
+        undecided_blocks
             .expect_get_by_hash()
             .with(eq(Height::new(height)), eq(block_hash))
             .return_once(|_, _| Ok(None));
@@ -857,6 +878,10 @@ mod tests {
         consensus_block.validity = Validity::Invalid;
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
+        undecided_blocks
+            .expect_get_valid_by_hash()
+            .with(eq(Height::new(height)), eq(block_hash))
+            .return_once(|_, _| Ok(None));
         undecided_blocks
             .expect_get_by_hash()
             .with(eq(Height::new(height)), eq(block_hash))
@@ -899,7 +924,7 @@ mod tests {
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
         undecided_blocks
-            .expect_get_by_hash()
+            .expect_get_valid_by_hash()
             .with(eq(Height::new(height)), eq(block_hash))
             .return_once(|_, _| Err(std::io::Error::other("Database error")));
 
@@ -938,7 +963,7 @@ mod tests {
 
         let mut undecided_blocks = MockUndecidedBlocksRepository::new();
         undecided_blocks
-            .expect_get_by_hash()
+            .expect_get_valid_by_hash()
             .with(eq(Height::new(height)), eq(block_hash))
             .return_once(move |_, _| Ok(Some(consensus_block.clone())));
 

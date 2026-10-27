@@ -138,10 +138,16 @@ pub async fn make_proposal_parts(
 
     // Init
     {
+        debug_assert!(
+            block.valid_round.is_nil(),
+            "valid_round must be nil, got {}",
+            block.valid_round
+        );
+
         parts.push(ProposalPart::Init(ProposalInit::new(
             block.height,
             block.round,
-            block.valid_round,
+            Round::Nil,
             block.proposer,
         )));
 
@@ -276,7 +282,7 @@ pub fn assemble_block_from_parts(parts: &ProposalParts) -> eyre::Result<Consensu
     let consensus_block = ConsensusBlock {
         height: parts.height(),
         round: parts.round(),
-        valid_round: parts.init().pol_round,
+        valid_round: Round::Nil,
         proposer: parts.proposer(),
         validity: Validity::Valid,
         execution_payload,
@@ -458,10 +464,10 @@ mod tests {
         assert!(!validate_proposal_parts(&parts, resolved, &provider).await);
     }
 
-    /// A block carrying a non-Nil valid_round validates when restreamed: the parts
-    /// keep the round and proposer the block was stored with.
+    /// Restreamed parts carry a nil pol_round and keep the round, proposer and
+    /// signature the block was stored with.
     #[tokio::test]
-    async fn restreamed_parts_with_valid_round_pass_validation() {
+    async fn restreamed_parts_pin_pol_round_to_nil_and_pass_validation() {
         use alloy_rpc_types_engine::ExecutionPayloadV3;
         use arbitrary::{Arbitrary, Unstructured};
 
@@ -473,15 +479,8 @@ mod tests {
 
         let height = Height::new(1);
         let round = Round::new(2);
-        let valid_round = Round::new(0);
 
         let round_proposer = selector.select_proposer(&validator_set, height, round);
-        let valid_round_proposer = selector.select_proposer(&validator_set, height, valid_round);
-
-        assert_ne!(
-            round_proposer.address, valid_round_proposer.address,
-            "Test requires different proposers for round and valid_round"
-        );
 
         let signing_key = keys
             .iter()
@@ -492,7 +491,7 @@ mod tests {
         let mut block = ConsensusBlock {
             height,
             round,
-            valid_round,
+            valid_round: Round::Nil,
             proposer: round_proposer.address,
             validity: Validity::Valid,
             execution_payload: payload,
@@ -507,32 +506,48 @@ mod tests {
         let (raw_parts, _) = make_proposal_parts(&provider, &block).await.unwrap();
         let parts = ProposalParts::new(raw_parts).unwrap();
 
-        assert_eq!(parts.init().pol_round, valid_round);
+        assert_eq!(parts.init().pol_round, Round::Nil);
 
         let resolved = resolve_expected_proposer(&selector, &validator_set, &parts);
         assert_eq!(resolved.address, round_proposer.address);
         assert!(validate_proposal_parts(&parts, resolved, &provider).await);
     }
 
-    /// assemble_block_from_parts must preserve pol_round as valid_round.
+    /// A stream whose Init carries a non-nil pol_round still assembles to a nil
+    /// valid_round, and its signature verifies either way because pol_round is unsigned.
     #[tokio::test]
-    async fn assemble_block_preserves_valid_round_from_pol_round() {
+    async fn assemble_block_pins_valid_round_to_nil_for_non_nil_init() {
         use alloy_rpc_types_engine::ExecutionPayloadV3;
         use arbitrary::{Arbitrary, Unstructured};
 
         let mut u = Unstructured::new(&[0u8; 512]);
         let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
 
-        let (keys, _) = make_validator_set(1);
-        let signing_key = &keys[0];
-        let proposer = Address::from_public_key(&signing_key.public_key());
+        let selector = RoundRobin;
+        let (keys, validator_set) = make_validator_set(3);
 
+        let height = Height::new(10);
+        let round = Round::new(3);
         let pol_round = Round::new(1);
 
+        let round_proposer = selector.select_proposer(&validator_set, height, round);
+        let pol_round_proposer = selector.select_proposer(&validator_set, height, pol_round);
+
+        assert_ne!(
+            round_proposer.address, pol_round_proposer.address,
+            "Test requires round and pol_round to select different proposers"
+        );
+
+        let proposer = round_proposer.address;
+        let signing_key = keys
+            .iter()
+            .find(|k| Address::from_public_key(&k.public_key()) == proposer)
+            .unwrap();
+
         let block = ConsensusBlock {
-            height: Height::new(10),
-            round: Round::new(3),
-            valid_round: pol_round,
+            height,
+            round,
+            valid_round: Round::Nil,
             proposer,
             validity: Validity::Valid,
             execution_payload: payload,
@@ -541,16 +556,33 @@ mod tests {
 
         let provider = LocalSigningProvider::new(signing_key.clone());
         let (raw_parts, _sig) = make_proposal_parts(&provider, &block).await.unwrap();
-        let parts = ProposalParts::new(raw_parts).unwrap();
 
-        // Sanity: Init carries the pol_round we set
+        // Rebuild the stream with a non-nil pol_round, leaving the data and signature intact
+        let mutated = raw_parts
+            .into_iter()
+            .map(|part| match part {
+                ProposalPart::Init(_) => {
+                    ProposalPart::Init(ProposalInit::new(height, round, pol_round, proposer))
+                }
+                part @ (ProposalPart::Data(_) | ProposalPart::Fin(_)) => part,
+            })
+            .collect::<Vec<_>>();
+        let parts = ProposalParts::new(mutated).unwrap();
+
         assert_eq!(parts.init().pol_round, pol_round);
 
-        let assembled = assemble_block_from_parts(&parts).unwrap();
+        let resolved = resolve_expected_proposer(&selector, &validator_set, &parts);
         assert_eq!(
-            assembled.valid_round, pol_round,
-            "assemble_block_from_parts must propagate pol_round as valid_round"
+            resolved.address, round_proposer.address,
+            "proposer selection must use parts.round(), not the mutated pol_round"
         );
+        assert!(
+            validate_proposal_parts(&parts, resolved, &provider).await,
+            "pol_round is outside the signed digest, so the signature still verifies"
+        );
+
+        let assembled = assemble_block_from_parts(&parts).unwrap();
+        assert_eq!(assembled.valid_round, Round::Nil);
     }
 
     #[tokio::test]

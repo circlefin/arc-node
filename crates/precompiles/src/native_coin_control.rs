@@ -20,22 +20,23 @@
 //! blocklisting and unblocklisting addresses from receiving native coin transfers.
 
 use crate::helpers::{
-    abi_decode_raw_validated, check_delegatecall, check_gas_remaining, check_staticcall,
-    emit_event, new_reverted_with_early_penalty, read, write, PrecompileErrorOrRevert,
-    ERR_EXECUTION_REVERTED, LOG_BASE_COST, LOG_TOPIC_COST, NATIVE_FIAT_TOKEN_ADDRESS,
-    PRECOMPILE_EARLY_REVERT_GAS_PENALTY, PRECOMPILE_SLOAD_GAS_COST, PRECOMPILE_SSTORE_GAS_COST,
+    check_delegatecall, check_gas_remaining, check_staticcall, emit_event,
+    new_reverted_with_early_penalty, read, write, PrecompileErrorOrRevert, ERR_EXECUTION_REVERTED,
+    LOG_BASE_COST, LOG_TOPIC_COST, NATIVE_FIAT_TOKEN_ADDRESS, PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+    PRECOMPILE_SLOAD_GAS_COST, PRECOMPILE_SSTORE_GAS_COST,
 };
 use crate::precompile;
-use alloy_primitives::{address, Address, StorageKey, U256};
+use alloy_primitives::{Address, StorageKey, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
 use arc_execution_config::hardforks::ArcHardfork;
 use arc_execution_config::native_coin_control as native_coin_control_config;
+use arc_shared::precompile::abi_decode_raw_borrowed;
 use reth_ethereum::evm::revm::precompile::PrecompileOutput;
 use revm_interpreter::Gas;
 
-// Native coin control precompile address
-pub const NATIVE_COIN_CONTROL_ADDRESS: Address =
-    address!("0x1800000000000000000000000000000000000001");
+// Native coin control precompile address. Canonical definition lives in
+// arc-execution-config alongside the blocklist storage-slot helpers.
+pub use arc_execution_config::native_coin_control::NATIVE_COIN_CONTROL_ADDRESS;
 
 // Allowed caller form NativeFiatToken
 const ALLOWED_CALLER_ADDRESS: Address = NATIVE_FIAT_TOKEN_ADDRESS;
@@ -111,7 +112,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             )?;
 
             // Decode arguments passed to blocklist function
-            let args = abi_decode_raw_validated::<INativeCoinControl::blocklistCall>(input)
+            let (account,) = abi_decode_raw_borrowed::<INativeCoinControl::blocklistCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
                         gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
@@ -153,7 +154,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             }
 
             // Add to blocklist
-            let storage_slot = compute_is_blocklisted_storage_slot(args.account);
+            let storage_slot = compute_is_blocklisted_storage_slot(account);
             write(
                 &mut precompile_input.internals,
                 NATIVE_COIN_CONTROL_ADDRESS,
@@ -168,7 +169,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                 &mut precompile_input.internals,
                 NATIVE_COIN_CONTROL_ADDRESS,
                 &Blocklisted {
-                    account: args.account,
+                    account,
                 },
                 &mut gas_counter,
                 reservoir,
@@ -186,8 +187,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             let mut precompile_input = precompile_input;
 
             // Decode arguments passed to isBlocklisted function
-            let args =
-                abi_decode_raw_validated::<INativeCoinControl::isBlocklistedCall>(input)
+            let (account,) = abi_decode_raw_borrowed::<INativeCoinControl::isBlocklistedCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
                         gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
@@ -198,7 +198,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             check_gas_remaining(&gas_counter, reservoir, IS_BLOCKLISTED_GAS_COST)?;
 
             // Check if address is blocklisted
-            let storage_slot = compute_is_blocklisted_storage_slot(args.account);
+            let storage_slot = compute_is_blocklisted_storage_slot(account);
             let storage_output = read(
                 &mut precompile_input.internals,
                 NATIVE_COIN_CONTROL_ADDRESS,
@@ -229,7 +229,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             )?;
 
             // Decode arguments passed to unBlocklist function
-            let args = abi_decode_raw_validated::<INativeCoinControl::unBlocklistCall>(input)
+            let (account,) = abi_decode_raw_borrowed::<INativeCoinControl::unBlocklistCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
                         gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
@@ -271,7 +271,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             }
 
             // Remove from blocklist
-            let storage_slot = compute_is_blocklisted_storage_slot(args.account);
+            let storage_slot = compute_is_blocklisted_storage_slot(account);
             write(
                 &mut precompile_input.internals,
                 NATIVE_COIN_CONTROL_ADDRESS,
@@ -286,7 +286,7 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                 &mut precompile_input.internals,
                 NATIVE_COIN_CONTROL_ADDRESS,
                 &UnBlocklisted {
-                    account: args.account,
+                    account,
                 },
                 &mut gas_counter,
                 reservoir,
@@ -304,7 +304,7 @@ mod tests {
     use arc_execution_config::hardforks::{ArcHardfork, ArcHardforkFlags};
 
     use super::*;
-    use alloy_primitives::{Bytes, B256};
+    use alloy_primitives::{address, Bytes, B256};
     use alloy_sol_types::SolEvent;
     use reth_ethereum::evm::revm::{
         context::{Context, ContextTr, JournalTr},

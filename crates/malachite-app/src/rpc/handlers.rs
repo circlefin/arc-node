@@ -20,6 +20,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use serde::Serialize;
 use serde_json::json;
 
 use malachitebft_app_channel::ConsensusRequest;
@@ -28,25 +29,35 @@ use malachitebft_app_channel::NetworkRequest;
 use arc_consensus_types::Height;
 
 use crate::metrics::AppMetrics;
-use crate::request::{AppRequest, AppRequestError, HeightRangeRequest, TxAppReq};
+use crate::request::{
+    AppRequest, AppRequestError, Health, HeightRangeRequest, InvalidPayloadsRequest, TxAppReq,
+};
 use crate::rpc::types::persistent_peer_error_to_response;
 use crate::rpc::types::request_error_to_response;
 use crate::rpc::types::RpcVersion;
 use crate::rpc::types::{range_error, RpcRangeReason};
 use crate::rpc::version::ApiVersion;
-use crate::store::RangeQueryResult;
+use crate::store::{HeightRangePage, RangeQueryResult};
 use crate::utils::sync_state::SyncState;
 
 use super::types::{
     AddOrRemovePersistentPeerBody, HeightRangeParams, RpcAppStatus, RpcCommitCertificate,
     RpcConsensusStateDump, RpcInvalidPayloads, RpcMisbehaviorEvidence, RpcNetworkStateDump,
-    RpcProposalMonitorData,
+    RpcProposalMonitorData, RpcRangePage,
 };
 use super::types::{TxConsensusReq, TxNetworkReq};
 
+fn record_app_request_full(metrics: &AppMetrics, err: &AppRequestError, request: &'static str) {
+    if matches!(err, AppRequestError::Full) {
+        metrics.inc_app_request_full_count(request);
+    }
+}
+
 /// Maximum number of heights one range query may request. Not configurable.
-/// Requests above it are rejected.
-const MAX_RANGE_COUNT: u64 = 1000;
+///
+/// A height with no row spends none of the response budget, so on the sparse
+/// tables this is the only bound on how many a request reads.
+const MAX_RANGE_COUNT: u64 = 10_000;
 
 /// Validated outcome of the `height`/`count` query parameters.
 #[derive(Debug, PartialEq)]
@@ -110,6 +121,23 @@ fn bad_request(message: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
 }
 
+/// Render a page as the shared range envelope, or as a structured range error.
+fn range_response<S, T>(from: u64, to: u64, page: HeightRangePage<S>) -> Response
+where
+    T: From<S> + Serialize,
+{
+    let (result, next) = page.into_parts();
+    match result {
+        RangeQueryResult::Complete(items) => {
+            Json(RpcRangePage::<T>::new(items, next)).into_response()
+        }
+        RangeQueryResult::Unavailable {
+            reason,
+            failed_heights,
+        } => range_error(from, to, reason.into(), failed_heights).into_response(),
+    }
+}
+
 /// Render a rejected range. Argument errors get a plain `{"error": ...}` body;
 /// only `over_limit` uses the structured body (it is a range-availability fact).
 fn render_bad_range(bad: BadRange) -> Response {
@@ -124,9 +152,11 @@ fn render_bad_range(bad: BadRange) -> Response {
 }
 
 pub(crate) async fn get_consensus_state(
+    metrics: State<AppMetrics>,
     tx_consensus_req: State<TxConsensusReq>,
     Extension(version): Extension<ApiVersion>,
 ) -> impl IntoResponse {
+    let _guard = metrics.start_rpc_request_timer("/consensus-state");
     tracing::debug!(?version, "get_consensus_state called");
 
     match ConsensusRequest::dump_state(&tx_consensus_req).await {
@@ -140,9 +170,11 @@ pub(crate) async fn get_consensus_state(
 }
 
 pub(crate) async fn get_network_state(
+    metrics: State<AppMetrics>,
     tx_network_req: State<TxNetworkReq>,
     Extension(version): Extension<ApiVersion>,
 ) -> impl IntoResponse {
+    let _guard = metrics.start_rpc_request_timer("/network-state");
     tracing::debug!(?version, "get_network_state called");
 
     match NetworkRequest::dump_state(&tx_network_req).await {
@@ -168,8 +200,8 @@ pub(crate) async fn get_commit(
         Err(bad) => render_bad_range(bad),
         Ok(ResolvedQuery::Single(height)) => {
             let result = AppRequest::get_certificate(height, &tx_app_req).await;
-            if matches!(result, Err(AppRequestError::Full)) {
-                metrics.inc_app_request_full_count("GetCertificate");
+            if let Err(e) = &result {
+                record_app_request_full(&metrics, e, AppRequest::LABEL_GET_CERTIFICATE);
             }
             match result {
                 Err(e) => request_error_to_response(e).into_response(),
@@ -184,8 +216,8 @@ pub(crate) async fn get_commit(
         Ok(ResolvedQuery::Range { range, to }) => {
             let from = range.from.as_u64();
             let result = AppRequest::get_certificate_range(range, &tx_app_req).await;
-            if matches!(result, Err(AppRequestError::Full)) {
-                metrics.inc_app_request_full_count("GetCertificate");
+            if let Err(e) = &result {
+                record_app_request_full(&metrics, e, AppRequest::LABEL_GET_CERTIFICATE_RANGE);
             }
             match result {
                 Err(e) => request_error_to_response(e).into_response(),
@@ -194,34 +226,33 @@ pub(crate) async fn get_commit(
                     Json(json!({"error": "Certificate not found"})),
                 )
                     .into_response(),
-                Ok(Some(RangeQueryResult::Complete(items))) => Json(
-                    items
-                        .into_iter()
-                        .map(RpcCommitCertificate::from)
-                        .collect::<Vec<_>>(),
-                )
-                .into_response(),
-                Ok(Some(RangeQueryResult::Unavailable {
-                    reason,
-                    failed_heights,
-                })) => range_error(from, to, reason.into(), failed_heights).into_response(),
+                Ok(Some(page)) => range_response::<_, RpcCommitCertificate>(from, to, page),
             }
         }
     }
 }
 
 pub(crate) async fn get_misbehavior_evidence(
+    metrics: State<AppMetrics>,
     tx_app_req: State<TxAppReq>,
     query: Query<HeightRangeParams>,
     Extension(version): Extension<ApiVersion>,
 ) -> Response {
+    let _guard = metrics.start_rpc_request_timer("/misbehavior-evidence");
     tracing::debug!(?version, "get_misbehavior_evidence called");
 
     match resolve_query(query.height, query.count) {
         Err(bad) => render_bad_range(bad),
         Ok(ResolvedQuery::Single(height)) => {
             match AppRequest::get_misbehavior_evidence(height, &tx_app_req).await {
-                Err(e) => request_error_to_response(e).into_response(),
+                Err(e) => {
+                    record_app_request_full(
+                        &metrics,
+                        &e,
+                        AppRequest::LABEL_GET_MISBEHAVIOR_EVIDENCE,
+                    );
+                    request_error_to_response(e).into_response()
+                }
                 Ok(Some(evidence)) => Json(RpcMisbehaviorEvidence::from(evidence)).into_response(),
                 Ok(None) => (
                     StatusCode::NOT_FOUND,
@@ -233,40 +264,46 @@ pub(crate) async fn get_misbehavior_evidence(
         Ok(ResolvedQuery::Range { range, to }) => {
             let from = range.from.as_u64();
             match AppRequest::get_misbehavior_evidence_range(range, &tx_app_req).await {
-                Err(e) => request_error_to_response(e).into_response(),
+                Err(e) => {
+                    record_app_request_full(
+                        &metrics,
+                        &e,
+                        AppRequest::LABEL_GET_MISBEHAVIOR_EVIDENCE_RANGE,
+                    );
+                    request_error_to_response(e).into_response()
+                }
                 Ok(None) => (
                     StatusCode::NOT_FOUND,
                     Json(json!({"error": "Misbehavior evidence not found"})),
                 )
                     .into_response(),
-                Ok(Some(RangeQueryResult::Complete(items))) => Json(
-                    items
-                        .into_iter()
-                        .map(RpcMisbehaviorEvidence::from)
-                        .collect::<Vec<_>>(),
-                )
-                .into_response(),
-                Ok(Some(RangeQueryResult::Unavailable {
-                    reason,
-                    failed_heights,
-                })) => range_error(from, to, reason.into(), failed_heights).into_response(),
+                Ok(Some(page)) => range_response::<_, RpcMisbehaviorEvidence>(from, to, page),
             }
         }
     }
 }
 
 pub(crate) async fn get_proposal_monitor(
+    metrics: State<AppMetrics>,
     tx_app_req: State<TxAppReq>,
     query: Query<HeightRangeParams>,
     Extension(version): Extension<ApiVersion>,
 ) -> Response {
+    let _guard = metrics.start_rpc_request_timer("/proposal-monitor");
     tracing::debug!(?version, "get_proposal_monitor called");
 
     match resolve_query(query.height, query.count) {
         Err(bad) => render_bad_range(bad),
         Ok(ResolvedQuery::Single(height)) => {
             match AppRequest::get_proposal_monitor_data(height, &tx_app_req).await {
-                Err(e) => request_error_to_response(e).into_response(),
+                Err(e) => {
+                    record_app_request_full(
+                        &metrics,
+                        &e,
+                        AppRequest::LABEL_GET_PROPOSAL_MONITOR_DATA,
+                    );
+                    request_error_to_response(e).into_response()
+                }
                 Ok(Some(data)) => Json(RpcProposalMonitorData::from(data)).into_response(),
                 Ok(None) => (
                     StatusCode::NOT_FOUND,
@@ -278,40 +315,42 @@ pub(crate) async fn get_proposal_monitor(
         Ok(ResolvedQuery::Range { range, to }) => {
             let from = range.from.as_u64();
             match AppRequest::get_proposal_monitor_data_range(range, &tx_app_req).await {
-                Err(e) => request_error_to_response(e).into_response(),
+                Err(e) => {
+                    record_app_request_full(
+                        &metrics,
+                        &e,
+                        AppRequest::LABEL_GET_PROPOSAL_MONITOR_DATA_RANGE,
+                    );
+                    request_error_to_response(e).into_response()
+                }
                 Ok(None) => (
                     StatusCode::NOT_FOUND,
                     Json(json!({"error": "Proposal monitor data not found"})),
                 )
                     .into_response(),
-                Ok(Some(RangeQueryResult::Complete(items))) => Json(
-                    items
-                        .into_iter()
-                        .map(RpcProposalMonitorData::from)
-                        .collect::<Vec<_>>(),
-                )
-                .into_response(),
-                Ok(Some(RangeQueryResult::Unavailable {
-                    reason,
-                    failed_heights,
-                })) => range_error(from, to, reason.into(), failed_heights).into_response(),
+                Ok(Some(page)) => range_response::<_, RpcProposalMonitorData>(from, to, page),
             }
         }
     }
 }
 
 pub(crate) async fn get_invalid_payloads(
+    metrics: State<AppMetrics>,
     tx_app_req: State<TxAppReq>,
     query: Query<HeightRangeParams>,
     Extension(version): Extension<ApiVersion>,
 ) -> Response {
+    let _guard = metrics.start_rpc_request_timer("/invalid-payloads");
     tracing::debug!(?version, "get_invalid_payloads called");
 
     match resolve_query(query.height, query.count) {
         Err(bad) => render_bad_range(bad),
         Ok(ResolvedQuery::Single(height)) => {
             match AppRequest::get_invalid_payloads(height, &tx_app_req).await {
-                Err(e) => request_error_to_response(e).into_response(),
+                Err(e) => {
+                    record_app_request_full(&metrics, &e, AppRequest::LABEL_GET_INVALID_PAYLOADS);
+                    request_error_to_response(e).into_response()
+                }
                 Ok(Some(payloads)) => Json(RpcInvalidPayloads::from(payloads)).into_response(),
                 Ok(None) => (
                     StatusCode::NOT_FOUND,
@@ -322,57 +361,76 @@ pub(crate) async fn get_invalid_payloads(
         }
         Ok(ResolvedQuery::Range { range, to }) => {
             let from = range.from.as_u64();
-            match AppRequest::get_invalid_payloads_range(range, &tx_app_req).await {
-                Err(e) => request_error_to_response(e).into_response(),
+            let request = InvalidPayloadsRequest {
+                from: range.from,
+                count: range.count,
+            };
+            match AppRequest::get_invalid_payloads_range(request, &tx_app_req).await {
+                Err(e) => {
+                    record_app_request_full(
+                        &metrics,
+                        &e,
+                        AppRequest::LABEL_GET_INVALID_PAYLOADS_RANGE,
+                    );
+                    request_error_to_response(e).into_response()
+                }
                 Ok(None) => (
                     StatusCode::NOT_FOUND,
                     Json(json!({"error": "Invalid payloads not found"})),
                 )
                     .into_response(),
-                Ok(Some(RangeQueryResult::Complete(items))) => Json(
-                    items
-                        .into_iter()
-                        .map(RpcInvalidPayloads::from)
-                        .collect::<Vec<_>>(),
-                )
-                .into_response(),
-                Ok(Some(RangeQueryResult::Unavailable {
-                    reason,
-                    failed_heights,
-                })) => range_error(from, to, reason.into(), failed_heights).into_response(),
+                Ok(Some(page)) => range_response::<_, RpcInvalidPayloads>(from, to, page),
             }
         }
     }
 }
 
 pub(crate) async fn get_status(
+    metrics: State<AppMetrics>,
     tx_app_req: State<TxAppReq>,
     Extension(version): Extension<ApiVersion>,
 ) -> impl IntoResponse {
+    let _guard = metrics.start_rpc_request_timer("/status");
     tracing::debug!(?version, "get_status called");
 
-    AppRequest::get_status(&tx_app_req)
-        .await
+    let result = AppRequest::get_status(&tx_app_req).await;
+    if let Err(e) = &result {
+        record_app_request_full(&metrics, e, AppRequest::LABEL_GET_STATUS);
+    }
+    result
         .map(|cert| Json(RpcAppStatus::from(cert)))
         .map_err(request_error_to_response)
 }
 
 pub(crate) async fn get_health(
+    metrics: State<AppMetrics>,
     tx_app_req: State<TxAppReq>,
     Extension(version): Extension<ApiVersion>,
 ) -> impl IntoResponse {
+    let _guard = metrics.start_rpc_request_timer("/health");
     tracing::debug!(?version, "get_health called");
 
-    AppRequest::get_health(&tx_app_req)
-        .await
-        .map(|()| Json(json!({ "status": "ok" })))
-        .map_err(request_error_to_response)
+    let result = AppRequest::get_health(&tx_app_req).await;
+    if let Err(e) = &result {
+        record_app_request_full(&metrics, e, AppRequest::LABEL_GET_HEALTH);
+    }
+    match result {
+        Ok(Health::Ok) => (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response(),
+        Ok(Health::EventLoopStalled) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "event_loop_stalled" })),
+        )
+            .into_response(),
+        Err(e) => request_error_to_response(e).into_response(),
+    }
 }
 
 pub(crate) async fn get_ready(
+    metrics: State<AppMetrics>,
     tx_app_req: State<TxAppReq>,
     Extension(version): Extension<ApiVersion>,
 ) -> impl IntoResponse {
+    let _guard = metrics.start_rpc_request_timer("/ready");
     tracing::debug!(?version, "get_ready called");
 
     match AppRequest::get_sync_state(&tx_app_req).await {
@@ -383,11 +441,18 @@ pub(crate) async fn get_ready(
             };
             (status_code, Json(json!({ "sync_state": sync_state }))).into_response()
         }
-        Err(e) => request_error_to_response(e).into_response(),
+        Err(e) => {
+            record_app_request_full(&metrics, &e, AppRequest::LABEL_GET_SYNC_STATE);
+            request_error_to_response(e).into_response()
+        }
     }
 }
 
-pub(crate) async fn get_version(Extension(version): Extension<ApiVersion>) -> impl IntoResponse {
+pub(crate) async fn get_version(
+    metrics: State<AppMetrics>,
+    Extension(version): Extension<ApiVersion>,
+) -> impl IntoResponse {
+    let _guard = metrics.start_rpc_request_timer("/version");
     tracing::debug!(?version, "get_version called");
 
     Json(RpcVersion {
@@ -399,10 +464,12 @@ pub(crate) async fn get_version(Extension(version): Extension<ApiVersion>) -> im
 }
 
 pub(crate) async fn add_persistent_peer(
+    metrics: State<AppMetrics>,
     tx_network_req: State<TxNetworkReq>,
     Extension(version): Extension<ApiVersion>,
     Json(body): Json<AddOrRemovePersistentPeerBody>,
 ) -> impl IntoResponse {
+    let _guard = metrics.start_rpc_request_timer("/persistent-peers");
     let addr: malachitebft_app_channel::app::net::Multiaddr = match body.addr.parse() {
         Ok(a) => a,
         Err(_) => {
@@ -430,10 +497,12 @@ pub(crate) async fn add_persistent_peer(
 }
 
 pub(crate) async fn remove_persistent_peer(
+    metrics: State<AppMetrics>,
     tx_network_req: State<TxNetworkReq>,
     Extension(version): Extension<ApiVersion>,
     Json(body): Json<AddOrRemovePersistentPeerBody>,
 ) -> impl IntoResponse {
+    let _guard = metrics.start_rpc_request_timer("/persistent-peers");
     let addr: malachitebft_app_channel::app::net::Multiaddr = match body.addr.parse() {
         Ok(a) => a,
         Err(_) => {

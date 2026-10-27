@@ -98,7 +98,11 @@ pub struct Inner {
     /// Number of app requests rejected because the app request channel was full
     app_request_full_count: Family<AppRequestLabel, Counter>,
 
-    /// Time app requests spend waiting in the app request channel
+    /// Number of app requests skipped because the caller dropped the reply
+    /// before handling started.
+    app_request_skipped_count: Family<AppRequestLabel, Counter>,
+
+    /// Time an app request spends waiting before its handler starts
     app_request_queue_time: Family<AppRequestLabel, Histogram>,
 
     /// Time taken to process app requests
@@ -127,6 +131,12 @@ pub struct Inner {
     /// place in the chain, labelled by the path that found it. Any non-zero value
     /// is an alert, and the label says where to start reading.
     binding_halt_count: Family<BindingHaltLabel, Counter>,
+
+    /// Number of engine verdict flips observed when re-validating a block whose
+    /// verdict is already stored, labelled by direction. An `invalid_to_valid`
+    /// flip is accepted; a `valid_to_invalid` flip is a chain anomaly that halts
+    /// the node.
+    verdict_flip_count: Family<VerdictFlipLabel, Counter>,
 
     /// Number of pending proposal parts waiting to be processed at a future height or round
     pending_proposal_parts_count: Gauge,
@@ -172,6 +182,7 @@ impl Inner {
                 Histogram::new(exponential_buckets_range(0.001, 2.0, 16))
             }),
             app_request_full_count: Family::default(),
+            app_request_skipped_count: Family::default(),
             app_request_queue_time: Family::new_with_constructor(|| {
                 Histogram::new(exponential_buckets_range(0.001, 2.0, 16))
             }),
@@ -184,6 +195,7 @@ impl Inner {
             clock_skew_nil_vote_count: Family::default(),
             transient_validation_errors_count: Family::default(),
             binding_halt_count: Family::default(),
+            verdict_flip_count: Family::default(),
             pending_proposal_parts_count: Gauge::default(),
             consensus_params: Family::default(),
             handshake_replay_blocks: Gauge::default(),
@@ -306,8 +318,14 @@ impl AppMetrics {
             );
 
             registry.register(
+                "app_request_skipped_count",
+                "Number of app requests skipped because the caller dropped the reply before handling started",
+                metrics.app_request_skipped_count.clone(),
+            );
+
+            registry.register(
                 "app_request_queue_time",
-                "Time app requests spend waiting in the app request channel, in seconds",
+                "Time an app request spends waiting before its handler starts, in seconds",
                 metrics.app_request_queue_time.clone(),
             );
 
@@ -348,10 +366,16 @@ impl AppMetrics {
             );
 
             registry.register(
-                "transient_validation_errors_count",
-                "Number of transient (no-verdict) payload validation errors, labelled by source",
-                metrics.transient_validation_errors_count.clone(),
+                "verdict_flip_count",
+                "Number of engine verdict flips on re-validation, labelled by direction",
+                metrics.verdict_flip_count.clone(),
             );
+
+            registry.register(
+            "transient_validation_errors_count",
+            "Number of transient (no-verdict) payload validation errors, labelled by source",
+            metrics.transient_validation_errors_count.clone(),
+        );
 
             registry.register(
                 "pending_proposal_parts_count",
@@ -530,7 +554,23 @@ impl AppMetrics {
             .inc();
     }
 
-    /// Observe the time an app request spent waiting in the app request channel.
+    /// Number of full-channel rejections recorded for a request label.
+    #[cfg(test)]
+    pub fn get_app_request_full_count(&self, request: &'static str) -> u64 {
+        self.app_request_full_count
+            .get_or_create(&AppRequestLabel::new(request))
+            .get()
+    }
+
+    /// Increment the number of app requests skipped because the caller dropped
+    /// the reply before handling started.
+    pub fn inc_app_request_skipped_count(&self, request: &'static str) {
+        self.app_request_skipped_count
+            .get_or_create(&AppRequestLabel::new(request))
+            .inc();
+    }
+
+    /// Observe the time an app request spent waiting before its handler started.
     pub fn observe_app_request_queue_time(&self, request: &'static str, seconds: f64) {
         self.app_request_queue_time
             .get_or_create(&AppRequestLabel::new(request))
@@ -641,6 +681,21 @@ impl AppMetrics {
             .get()
     }
 
+    /// Increment the verdict-flip counter for the given direction.
+    pub fn inc_verdict_flip_count(&self, flip: VerdictFlip) {
+        self.verdict_flip_count
+            .get_or_create(&VerdictFlipLabel::new(flip))
+            .inc();
+    }
+
+    /// Number of verdict flips recorded for a specific direction.
+    #[cfg(test)]
+    pub fn get_verdict_flip_count(&self, flip: VerdictFlip) -> u64 {
+        self.verdict_flip_count
+            .get_or_create(&VerdictFlipLabel::new(flip))
+            .get()
+    }
+
     /// Observe the number of pending proposal parts
     pub fn observe_pending_proposal_parts_count(&self, count: usize) {
         self.pending_proposal_parts_count.set(count as i64);
@@ -669,6 +724,78 @@ impl AppMetrics {
     pub fn get_consensus_round_missed_count(&self, proposer: Address) -> u64 {
         self.consensus_round_missed
             .get_or_create(&RoundMissedLabel::new(proposer))
+            .get()
+    }
+
+    /// Renders just the RPC request-time histogram as Prometheus text.
+    ///
+    /// `Histogram` exposes no getter, so tests assert against the exported
+    /// representation — `_count` and the `endpoint` label.
+    #[cfg(test)]
+    pub fn encode_rpc_request_time(&self) -> String {
+        use prometheus_client::encoding::text::encode;
+        use prometheus_client::registry::Registry;
+
+        let mut registry = Registry::default();
+        registry.register(
+            "arc_malachite_app_rpc_request_time",
+            "Time taken to serve RPC requests, in seconds",
+            self.rpc_request_time.clone(),
+        );
+
+        let mut buf = String::new();
+        encode(&mut buf, &registry).expect("encoding into a String cannot fail");
+        buf
+    }
+
+    /// Renders the app-request queue and process histograms as Prometheus text.
+    #[cfg(test)]
+    pub fn encode_app_request_times(&self) -> String {
+        use prometheus_client::encoding::text::encode;
+        use prometheus_client::registry::Registry;
+
+        let mut registry = Registry::default();
+        registry.register(
+            "arc_malachite_app_app_request_queue_time",
+            "Time app requests spend waiting in the app request channel, in seconds",
+            self.app_request_queue_time.clone(),
+        );
+        registry.register(
+            "arc_malachite_app_app_request_process_time",
+            "Time taken to process app requests, in seconds",
+            self.app_request_process_time.clone(),
+        );
+
+        let mut buf = String::new();
+        encode(&mut buf, &registry).expect("encoding into a String cannot fail");
+        buf
+    }
+
+    /// Whether any app-request queue-time observation has been recorded for `request`.
+    ///
+    /// A `Family` only materialises a series once a label set is observed.
+    #[cfg(test)]
+    pub fn has_app_request_queue_time_observation(&self, request: &str) -> bool {
+        use prometheus_client::encoding::text::encode;
+        use prometheus_client::registry::Registry;
+
+        let mut registry = Registry::default();
+        registry.register(
+            "app_request_queue_time",
+            "Time an app request spends waiting before its handler starts, in seconds",
+            self.app_request_queue_time.clone(),
+        );
+
+        let mut buf = String::new();
+        encode(&mut buf, &registry).expect("encoding into a String cannot fail");
+        buf.contains(&format!("request=\"{request}\""))
+    }
+
+    /// How many times `request` was skipped before handling started.
+    #[cfg(test)]
+    pub fn app_request_skipped_count(&self, request: &'static str) -> u64 {
+        self.app_request_skipped_count
+            .get_or_create(&AppRequestLabel::new(request))
             .get()
     }
 }
@@ -888,6 +1015,38 @@ impl BindingHaltLabel {
     fn new(site: BindingHaltSite) -> Self {
         Self {
             site: site.as_str(),
+        }
+    }
+}
+
+/// Direction of an engine verdict flip observed on re-validation, used to label
+/// the counter.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum VerdictFlip {
+    /// Stored `Valid` re-validated to `Invalid` — a chain anomaly.
+    ValidToInvalid,
+    /// Stored `Invalid` re-validated to `Valid` — permitted.
+    InvalidToValid,
+}
+
+impl VerdictFlip {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::ValidToInvalid => "valid_to_invalid",
+            Self::InvalidToValid => "invalid_to_valid",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct VerdictFlipLabel {
+    direction: &'static str,
+}
+
+impl VerdictFlipLabel {
+    fn new(flip: VerdictFlip) -> Self {
+        Self {
+            direction: flip.as_str(),
         }
     }
 }

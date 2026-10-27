@@ -31,6 +31,7 @@ use arc_consensus_types::{
 };
 use malachitebft_app_channel::app::types::core::{Round, Validity};
 use malachitebft_proto::Protobuf;
+use tracing::debug;
 
 use crate::invalid_payloads::{InvalidPayload, StoredInvalidPayloads};
 use crate::versions::{
@@ -123,10 +124,18 @@ pub fn decode_block(bytes: &[u8]) -> Result<ConsensusBlock, DecodeError> {
         Ok(ConsensusBlockVersion::V1) => {
             let (height, round, valid_round, proposer, is_valid, execution_payload, signature) =
                 SszBlock::<ExecutionPayloadV3>::from_ssz_bytes(&bytes[1..])?;
+
+            if let Some(stored_valid_round) = valid_round {
+                debug!(
+                    height, round = ?round, valid_round = stored_valid_round,
+                    "Unexpected non-nil deprecated valid_round field on stored block",
+                );
+            }
+
             Ok(ConsensusBlock {
                 height: Height::new(height),
                 round: Round::from(round),
-                valid_round: Round::from(valid_round),
+                valid_round: Round::Nil,
                 proposer: Address::from(proposer),
                 validity: Validity::from_bool(is_valid),
                 execution_payload,
@@ -406,6 +415,31 @@ mod tests {
             validity: Validity::Valid,
             execution_payload: create_test_execution_payload(),
             signature: Some(signature),
+        }
+    }
+
+    /// A stored row holding a non-nil `valid_round` decodes to nil, leaving every
+    /// other field intact.
+    #[test]
+    fn test_decode_block_pins_stored_valid_round_to_nil() {
+        for valid_round in [Round::Nil, Round::new(0), Round::new(1)] {
+            let block = ConsensusBlock {
+                valid_round,
+                ..create_test_consensus_block()
+            };
+
+            let decoded = decode_block(&encoder::encode_block(&block)).expect("should decode");
+
+            assert_eq!(
+                decoded.valid_round,
+                Round::Nil,
+                "stored valid_round {valid_round} must decode as nil"
+            );
+            assert_eq!(decoded.height, block.height);
+            assert_eq!(decoded.round, block.round);
+            assert_eq!(decoded.proposer, block.proposer);
+            assert_eq!(decoded.execution_payload, block.execution_payload);
+            assert_eq!(decoded.signature, block.signature);
         }
     }
 

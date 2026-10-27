@@ -862,6 +862,39 @@ impl From<DoubleProposal> for RpcDoubleProposal {
     }
 }
 
+/// Where a range query stopped, so a caller can resume from it.
+#[derive(Serialize)]
+pub(crate) struct RpcRangeCursor {
+    height: u64,
+}
+
+/// The body every range query returns: the per-height records it covered, and
+/// where to resume.
+///
+/// `next` is absent once the range is exhausted; otherwise it names the first
+/// height the page did not cover. Only endpoints that bound their response by
+/// size can leave a range unexhausted.
+#[derive(Serialize)]
+pub(crate) struct RpcRangePage<T> {
+    items: Vec<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<RpcRangeCursor>,
+}
+
+impl<T> RpcRangePage<T> {
+    pub(crate) fn new<S>(items: impl IntoIterator<Item = S>, next: Option<Height>) -> Self
+    where
+        T: From<S>,
+    {
+        Self {
+            items: items.into_iter().map(T::from).collect(),
+            next: next.map(|height| RpcRangeCursor {
+                height: height.as_u64(),
+            }),
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub(crate) struct RpcInvalidPayloads {
     height: u64,

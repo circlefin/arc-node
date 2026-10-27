@@ -26,7 +26,8 @@ use malachitebft_core_types::{LinearTimeouts, VotingPower};
 use alloy_sol_macro::sol;
 use alloy_sol_types::SolCall;
 
-// ABI types for decoding the return value of the `getActiveValidatorSet` and `consensusParams` functions.
+// ABI types for encoding calls to and decoding returns from the
+// getActiveValidatorSet, consensusParams, and isBlocklisted functions.
 sol! {
     #[derive(PartialEq)]
     enum ContractValidatorStatus { Unknown, Registered, Active }
@@ -50,6 +51,7 @@ sol! {
     }
 
     function consensusParams() external view override returns (ContractConsensusParams memory);
+    function isBlocklisted(address account) external view returns (bool _isBlocklisted);
 }
 
 /// Decode validator set from ABI-encoded result.
@@ -157,6 +159,14 @@ pub fn abi_decode_consensus_params(result: Vec<u8>) -> eyre::Result<ConsensusPar
 
     debug!("ABI decoded consensus params: {consensus_params:?}");
     Ok(consensus_params)
+}
+
+/// Returns the boolean decoded from a NativeCoinControl `isBlocklisted` call.
+///
+/// A truncated or malformed return propagates as an error rather than defaulting to
+/// "not blocklisted".
+pub fn abi_decode_is_blocklisted(result: Vec<u8>) -> eyre::Result<bool> {
+    Ok(isBlocklistedCall::abi_decode_returns(&result)?)
 }
 
 #[cfg(test)]

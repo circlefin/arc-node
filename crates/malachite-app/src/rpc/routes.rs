@@ -52,40 +52,40 @@ routes![
         get,
         "/commit",
         crate::rpc::handlers::get_commit,
-        "Get the commit certificate for a specific height or range of heights",
+        "Get the commit certificate for a specific height, or a bounded page of them for a range of heights",
         params = {
             "height (optional)" => "The height of the commit certificate to retrieve. No height returns the latest certificate.",
-            "count (optional)" => "Total heights to return starting at height, inclusive (forward range). Defaults to 1 (single object). When greater than 1, height is required and the response is a JSON array; capped at 1000."
+            "count (optional)" => "Total heights to return starting at height, inclusive (forward range). Defaults to 1 (single object). A count greater than 1 requires an explicit height and returns an object with the per-height records under items, plus next when the 4 MiB budget of stored bytes stopped the page short; capped at 10000."
         }
     ),
     route!(
         get,
         "/misbehavior-evidence",
         crate::rpc::handlers::get_misbehavior_evidence,
-        "Get misbehavior evidence (double votes or proposals) for a specific height or range of heights",
+        "Get misbehavior evidence (double votes or proposals) for a specific height, or a bounded page of it for a range of heights",
         params = {
             "height (optional)" => "The height of the misbehavior evidence to retrieve. No height returns the latest.",
-            "count (optional)" => "Total heights to return starting at height, inclusive (forward range). Defaults to 1 (single object). When greater than 1, height is required and the response is a JSON array; capped at 1000."
+            "count (optional)" => "Total heights to return starting at height, inclusive (forward range). Defaults to 1 (single object). A count greater than 1 requires an explicit height and returns an object with the per-height records under items, plus next when the 4 MiB budget of stored bytes stopped the page short; capped at 10000."
         }
     ),
     route!(
         get,
         "/proposal-monitor",
         crate::rpc::handlers::get_proposal_monitor,
-        "Get round-0 proposal monitoring data (timing and success) for a specific height or range of heights",
+        "Get round-0 proposal monitoring data (timing and success) for a specific height, or a bounded page of it for a range of heights",
         params = {
             "height (optional)" => "The height to get monitoring data for. No height returns the latest.",
-            "count (optional)" => "Total heights to return starting at height, inclusive (forward range). Defaults to 1 (single object). When greater than 1, height is required and the response is a JSON array; capped at 1000."
+            "count (optional)" => "Total heights to return starting at height, inclusive (forward range). Defaults to 1 (single object). A count greater than 1 requires an explicit height and returns an object with the per-height records under items, plus next when the 4 MiB budget of stored bytes stopped the page short; capped at 10000."
         }
     ),
     route!(
         get,
         "/invalid-payloads",
         crate::rpc::handlers::get_invalid_payloads,
-        "Get invalid payloads for a specific height or range of heights",
+        "Get invalid payloads for a specific height, or a bounded page of them for a range of heights",
         params = {
             "height (optional)" => "The height of the invalid payloads to retrieve. No height returns the latest.",
-            "count (optional)" => "Total heights to return starting at height, inclusive (forward range). Defaults to 1 (single object). When greater than 1, height is required and the response is a JSON array; capped at 1000."
+            "count (optional)" => "Total heights to return starting at height, inclusive (forward range). Defaults to 1 (single object). A count greater than 1 requires an explicit height and returns an object with the per-height records under items, plus next when the 4 MiB budget of stored bytes stopped the page short; capped at 10000."
         }
     ),
     route!(
@@ -98,7 +98,7 @@ routes![
         get,
         "/health",
         crate::rpc::handlers::get_health,
-        "Returns empty value. Used to check the node's health"
+        "Returns 200 when the consensus event loop is progressing, 503 when it is wedged"
     ),
     route!(
         get,
@@ -232,7 +232,13 @@ pub(crate) fn build_router_with_metrics(
 
     router = {
         let docs = Arc::new(docs);
-        router.route("/", get(move || get_index(Arc::clone(&docs))))
+        router.route(
+            "/",
+            get(move |metrics: axum::extract::State<AppMetrics>| {
+                let docs = Arc::clone(&docs);
+                async move { get_index(metrics, docs).await }
+            }),
+        )
     };
 
     router
@@ -272,7 +278,11 @@ async fn inner(
     Ok(())
 }
 
-async fn get_index(endpoints: Arc<BTreeMap<String, EndpointInfo>>) -> impl IntoResponse {
+async fn get_index(
+    metrics: axum::extract::State<AppMetrics>,
+    endpoints: Arc<BTreeMap<String, EndpointInfo>>,
+) -> impl IntoResponse {
+    let _guard = metrics.start_rpc_request_timer("/");
     Json(json!({
         "endpoints": endpoints,
         "rpc_versioning": {
@@ -316,13 +326,17 @@ mod tests {
     use malachitebft_network::{LocalNodeInfo, PersistentPeerError, ValidatorInfo};
 
     use super::*;
-    use crate::request::{AppRequest, CommitCertificateInfo, HeightRangeRequest, Status};
+    use crate::request::{
+        AppRequest, CommitCertificateInfo, Health, HeightRangeRequest, InvalidPayloadsRequest,
+        Status,
+    };
     use crate::rpc::types::{
         RpcAppStatus, RpcCommitCertificate, RpcConsensusStateDump, RpcNetworkStateDump,
     };
     use crate::store::{RangeFailureReason, RangeQueryResult};
     use crate::utils::sync_state::SyncState;
     use arc_consensus_db::invalid_payloads::StoredInvalidPayloads;
+    use arc_consensus_db::HeightRangePage;
     use arc_consensus_types::evidence::StoredMisbehaviorEvidence;
     use arc_consensus_types::proposal_monitor::ProposalMonitor;
 
@@ -332,25 +346,26 @@ mod tests {
     }
 
     enum MockConfig {
-        AppGetHealth,
+        AppGetHealth(Health),
         AppGetStatus,
         AppGetSyncState(SyncState),
         AppGetCertificate(MockValue),
         AppGetCertificateRange(
             HeightRangeRequest,
-            Option<RangeQueryResult<CommitCertificateInfo>>,
+            Option<HeightRangePage<CommitCertificateInfo>>,
         ),
         AppGetMisbehaviorEvidenceRange(
             HeightRangeRequest,
-            Option<RangeQueryResult<StoredMisbehaviorEvidence>>,
+            Option<HeightRangePage<StoredMisbehaviorEvidence>>,
         ),
         AppGetProposalMonitorDataRange(
             HeightRangeRequest,
-            Option<RangeQueryResult<ProposalMonitor>>,
+            Option<HeightRangePage<ProposalMonitor>>,
         ),
+        AppGetInvalidPayloads(Option<Height>, Option<StoredInvalidPayloads>),
         AppGetInvalidPayloadsRange(
-            HeightRangeRequest,
-            Option<RangeQueryResult<StoredInvalidPayloads>>,
+            InvalidPayloadsRequest,
+            Option<HeightRangePage<StoredInvalidPayloads>>,
         ),
         ConsensusDumpState(MockValue),
         NetworkDumpState(MockValue),
@@ -429,20 +444,23 @@ mod tests {
 
         fn handle_app_msg(msg: Option<AppRequest>, config: MockConfig) {
             match config {
-                MockConfig::AppGetHealth => {
-                    let Some(AppRequest::GetHealth(reply)) = msg else {
+                MockConfig::AppGetHealth(health) => {
+                    let Some(AppRequest::GetHealth { reply, .. }) = msg else {
                         panic!("Unexpected msg");
                     };
-                    let _ = reply.send(());
+                    let _ = reply.send(health);
                 }
                 MockConfig::AppGetStatus => {
-                    let Some(AppRequest::GetStatus(reply_port)) = msg else {
+                    let Some(AppRequest::GetStatus {
+                        reply: reply_port, ..
+                    }) = msg
+                    else {
                         panic!("Unexpected msg");
                     };
                     let _ = reply_port.send(Self::a_status());
                 }
                 MockConfig::AppGetSyncState(state) => {
-                    let Some(AppRequest::GetSyncState(reply)) = msg else {
+                    let Some(AppRequest::GetSyncState { reply, .. }) = msg else {
                         panic!("Unexpected msg");
                     };
                     let _ = reply.send(state);
@@ -462,14 +480,23 @@ mod tests {
                     });
                 }
                 MockConfig::AppGetCertificateRange(expected, ret) => {
-                    let Some(AppRequest::GetCertificateRange(range, reply_port)) = msg else {
+                    let Some(AppRequest::GetCertificateRange {
+                        range,
+                        reply: reply_port,
+                        ..
+                    }) = msg
+                    else {
                         panic!("Unexpected msg");
                     };
                     assert_eq!(range, expected);
                     let _ = reply_port.send(ret);
                 }
                 MockConfig::AppGetMisbehaviorEvidenceRange(expected, ret) => {
-                    let Some(AppRequest::GetMisbehaviorEvidenceRange(range, reply_port)) = msg
+                    let Some(AppRequest::GetMisbehaviorEvidenceRange {
+                        range,
+                        reply: reply_port,
+                        ..
+                    }) = msg
                     else {
                         panic!("Unexpected msg");
                     };
@@ -477,18 +504,34 @@ mod tests {
                     let _ = reply_port.send(ret);
                 }
                 MockConfig::AppGetProposalMonitorDataRange(expected, ret) => {
-                    let Some(AppRequest::GetProposalMonitorDataRange(range, reply_port)) = msg
+                    let Some(AppRequest::GetProposalMonitorDataRange {
+                        range,
+                        reply: reply_port,
+                        ..
+                    }) = msg
                     else {
                         panic!("Unexpected msg");
                     };
                     assert_eq!(range, expected);
                     let _ = reply_port.send(ret);
                 }
-                MockConfig::AppGetInvalidPayloadsRange(expected, ret) => {
-                    let Some(AppRequest::GetInvalidPayloadsRange(range, reply_port)) = msg else {
+                MockConfig::AppGetInvalidPayloads(expected_height, ret) => {
+                    let Some(AppRequest::GetInvalidPayloads { height, reply, .. }) = msg else {
                         panic!("Unexpected msg");
                     };
-                    assert_eq!(range, expected);
+                    assert_eq!(height, expected_height);
+                    let _ = reply.send(ret);
+                }
+                MockConfig::AppGetInvalidPayloadsRange(expected, ret) => {
+                    let Some(AppRequest::GetInvalidPayloadsRange {
+                        request,
+                        reply: reply_port,
+                        ..
+                    }) = msg
+                    else {
+                        panic!("Unexpected msg");
+                    };
+                    assert_eq!(request, expected);
                     let _ = reply_port.send(ret);
                 }
                 _ => panic!("Unexpected config"),
@@ -549,6 +592,7 @@ mod tests {
 
             StateDump {
                 consensus,
+                replaying_wal: false,
                 address,
                 proposer,
                 params,
@@ -898,7 +942,9 @@ mod tests {
             },
         );
 
-        let resp = get_index(Arc::new(docs)).await.into_response();
+        let resp = get_index(axum::extract::State(AppMetrics::default()), Arc::new(docs))
+            .await
+            .into_response();
         let val = response_to_json(resp).await;
 
         assert!(val.get("endpoints").is_some());
@@ -918,7 +964,9 @@ mod tests {
             .into_iter()
             .map(|r| (format!("{} {}", r.method, r.path), r.doc))
             .collect::<BTreeMap<_, _>>();
-        let resp = get_index(Arc::new(docs)).await.into_response();
+        let resp = get_index(axum::extract::State(AppMetrics::default()), Arc::new(docs))
+            .await
+            .into_response();
         let val = response_to_json(resp).await;
         let endpoints = &val["endpoints"];
         assert!(
@@ -982,11 +1030,235 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_success() {
-        let (tx_cons_req, tx_app_req, tx_nw_req) = MockBackend::spawn_new(MockConfig::AppGetHealth);
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetHealth(Health::Ok));
         let (status, val) =
             build_router_and_request(tx_cons_req, tx_app_req, tx_nw_req, "/health").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(val, json!({"status": "ok"}));
+    }
+
+    #[tokio::test]
+    async fn test_rpc_request_time_records_health_and_version() {
+        let metrics = AppMetrics::default();
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetHealth(Health::Ok));
+        let app =
+            build_router_with_metrics(tx_cons_req, tx_app_req, tx_nw_req, false, metrics.clone());
+
+        for uri in ["/health", "/version"] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let _ = app.clone().oneshot(req).await.unwrap();
+        }
+
+        let encoded = metrics.encode_rpc_request_time();
+        assert!(
+            encoded.contains("endpoint=\"/health\""),
+            "health must be timed, got:\n{encoded}"
+        );
+        assert!(
+            encoded.contains("endpoint=\"/version\""),
+            "version must be timed, got:\n{encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_full_channel_labels_single_and_range_separately() {
+        use std::time::Instant;
+        use tokio::sync::oneshot;
+
+        let metrics = AppMetrics::default();
+        let (tx_cons, _rx_cons) = mpsc::channel(1);
+        let (tx_app, _rx_app) = mpsc::channel::<AppRequest>(1);
+        let (tx_nw, _rx_nw) = mpsc::channel(1);
+
+        // Fill the capacity-1 app channel so the next try_send is Full.
+        let (block_tx, _block_rx) = oneshot::channel();
+        tx_app
+            .try_send(AppRequest::GetHealth {
+                enqueued_at: Instant::now(),
+                reply: block_tx,
+            })
+            .expect("first enqueue fills the channel");
+
+        let app = build_router_with_metrics(tx_cons, tx_app, tx_nw, false, metrics.clone());
+
+        let single = Request::builder()
+            .method("GET")
+            .uri("/commit?height=1")
+            .body(Body::empty())
+            .unwrap();
+        let single_resp = app.clone().oneshot(single).await.unwrap();
+        assert_eq!(single_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            metrics.get_app_request_full_count(AppRequest::LABEL_GET_CERTIFICATE),
+            1,
+            "single-height full must label get_certificate"
+        );
+        assert_eq!(
+            metrics.get_app_request_full_count(AppRequest::LABEL_GET_CERTIFICATE_RANGE),
+            0,
+            "range label must stay untouched for the single-height path"
+        );
+
+        let range = Request::builder()
+            .method("GET")
+            .uri("/commit?height=1&count=2")
+            .body(Body::empty())
+            .unwrap();
+        let range_resp = app.oneshot(range).await.unwrap();
+        assert_eq!(range_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            metrics.get_app_request_full_count(AppRequest::LABEL_GET_CERTIFICATE),
+            1,
+            "range full must not increment get_certificate again"
+        );
+        assert_eq!(
+            metrics.get_app_request_full_count(AppRequest::LABEL_GET_CERTIFICATE_RANGE),
+            1,
+            "range full must label get_certificate_range"
+        );
+    }
+
+    #[tokio::test]
+    async fn remaining_full_channel_labels_each_endpoint() {
+        use std::time::Instant;
+        use tokio::sync::oneshot;
+
+        let metrics = AppMetrics::default();
+        let (tx_cons, _rx_cons) = mpsc::channel(1);
+        let (tx_app, _rx_app) = mpsc::channel::<AppRequest>(1);
+        let (tx_nw, _rx_nw) = mpsc::channel(1);
+
+        let (block_tx, _block_rx) = oneshot::channel();
+        tx_app
+            .try_send(AppRequest::GetHealth {
+                enqueued_at: Instant::now(),
+                reply: block_tx,
+            })
+            .expect("first enqueue fills the channel");
+
+        let app = build_router_with_metrics(tx_cons, tx_app, tx_nw, false, metrics.clone());
+
+        let cases = [
+            (
+                "/misbehavior-evidence?height=1",
+                AppRequest::LABEL_GET_MISBEHAVIOR_EVIDENCE,
+            ),
+            (
+                "/misbehavior-evidence?height=1&count=2",
+                AppRequest::LABEL_GET_MISBEHAVIOR_EVIDENCE_RANGE,
+            ),
+            (
+                "/proposal-monitor?height=1",
+                AppRequest::LABEL_GET_PROPOSAL_MONITOR_DATA,
+            ),
+            (
+                "/proposal-monitor?height=1&count=2",
+                AppRequest::LABEL_GET_PROPOSAL_MONITOR_DATA_RANGE,
+            ),
+            (
+                "/invalid-payloads?height=1",
+                AppRequest::LABEL_GET_INVALID_PAYLOADS,
+            ),
+            (
+                "/invalid-payloads?height=1&count=2",
+                AppRequest::LABEL_GET_INVALID_PAYLOADS_RANGE,
+            ),
+            ("/status", AppRequest::LABEL_GET_STATUS),
+            ("/health", AppRequest::LABEL_GET_HEALTH),
+            ("/ready", AppRequest::LABEL_GET_SYNC_STATE),
+        ];
+
+        for (uri, label) in cases {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "{uri} must map a full channel to 429"
+            );
+            assert_eq!(
+                metrics.get_app_request_full_count(label),
+                1,
+                "{uri} must increment {label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_app_channel_does_not_count_as_full() {
+        let metrics = AppMetrics::default();
+        let (tx_cons, _rx_cons) = mpsc::channel(1);
+        let (tx_app, rx_app) = mpsc::channel::<AppRequest>(1);
+        let (tx_nw, _rx_nw) = mpsc::channel(1);
+        drop(rx_app);
+
+        let app = build_router_with_metrics(tx_cons, tx_app, tx_nw, false, metrics.clone());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            metrics.get_app_request_full_count(AppRequest::LABEL_GET_HEALTH),
+            0,
+            "Closed must not increment app_request_full_count"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rpc_request_time_records_index() {
+        let metrics = AppMetrics::default();
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetHealth(Health::Ok));
+        let app =
+            build_router_with_metrics(tx_cons_req, tx_app_req, tx_nw_req, false, metrics.clone());
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+
+        let encoded = metrics.encode_rpc_request_time();
+        assert!(
+            encoded.contains("endpoint=\"/\""),
+            "index must be timed, got:\n{encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_event_loop_stalled() {
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetHealth(Health::EventLoopStalled));
+        let (status, val) =
+            build_router_and_request(tx_cons_req, tx_app_req, tx_nw_req, "/health").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(val, json!({"status": "event_loop_stalled"}));
+    }
+
+    #[tokio::test]
+    async fn test_health_when_app_channel_is_closed() {
+        let (tx_cons_req, _rx_cons) = mpsc::channel(1);
+        let (tx_app_req, rx_app) = mpsc::channel(1);
+        drop(rx_app);
+        let (tx_nw_req, _rx_nw) = mpsc::channel(1);
+        let (status, val) =
+            build_router_and_request(tx_cons_req, tx_app_req, tx_nw_req, "/health").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(val, json!({"error": "Request channel is closed"}));
     }
 
     #[tokio::test]
@@ -1048,13 +1320,39 @@ mod tests {
         assert!(!val.is_array(), "count=1 must return a single object");
     }
 
+    /// A page covering the whole range, as an unbounded read returns.
+    fn whole_page<T>(items: Vec<T>) -> HeightRangePage<T> {
+        HeightRangePage::new(RangeQueryResult::Complete(items), None)
+    }
+
+    /// Assert a body is the shared range envelope and return the heights it
+    /// covered. Every range endpoint is held to this shape.
+    fn page_heights(val: &serde_json::Value) -> Vec<u64> {
+        let keys: Vec<&str> = val
+            .as_object()
+            .expect("range body is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            keys.iter().all(|k| matches!(*k, "items" | "next")),
+            "range body carries only items and next, got {keys:?}"
+        );
+        val["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .map(|e| e["height"].as_u64().expect("item carries its height"))
+            .collect()
+    }
+
     #[tokio::test]
-    async fn test_commit_range_returns_ordered_array() {
+    async fn test_commit_range_returns_page() {
         let range = HeightRangeRequest {
             from: Height::new(7),
             count: 2,
         };
-        let reply = RangeQueryResult::Complete(vec![
+        let reply = whole_page(vec![
             MockBackend::a_commit_cert_info_at(7),
             MockBackend::a_commit_cert_info_at(8),
         ]);
@@ -1068,21 +1366,22 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(page_heights(&val), vec![7, 8]);
         let expected = serde_json::to_value(vec![
             RpcCommitCertificate::from(MockBackend::a_commit_cert_info_at(7)),
             RpcCommitCertificate::from(MockBackend::a_commit_cert_info_at(8)),
         ])
         .unwrap();
-        assert_eq!(val, expected);
+        assert_eq!(val["items"], expected);
     }
 
     #[tokio::test]
-    async fn test_misbehavior_evidence_range_returns_array() {
+    async fn test_misbehavior_evidence_range_returns_page() {
         let range = HeightRangeRequest {
             from: Height::new(1),
             count: 3,
         };
-        let reply = RangeQueryResult::Complete(vec![
+        let reply = whole_page(vec![
             StoredMisbehaviorEvidence::empty(Height::new(1)),
             StoredMisbehaviorEvidence::empty(Height::new(2)),
             StoredMisbehaviorEvidence::empty(Height::new(3)),
@@ -1098,23 +1397,17 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let heights: Vec<u64> = val
-            .as_array()
-            .expect("array body")
-            .iter()
-            .map(|e| e["height"].as_u64().unwrap())
-            .collect();
-        assert_eq!(heights, vec![1, 2, 3]);
+        assert_eq!(page_heights(&val), vec![1, 2, 3]);
     }
 
     #[tokio::test]
-    async fn test_proposal_monitor_range_returns_array() {
+    async fn test_proposal_monitor_range_returns_page() {
         let proposer = Address::new([0x22; 20]);
         let range = HeightRangeRequest {
             from: Height::new(4),
             count: 2,
         };
-        let reply = RangeQueryResult::Complete(vec![
+        let reply = whole_page(vec![
             ProposalMonitor::new(Height::new(4), proposer, SystemTime::UNIX_EPOCH),
             ProposalMonitor::new(Height::new(5), proposer, SystemTime::UNIX_EPOCH),
         ]);
@@ -1129,27 +1422,21 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let heights: Vec<u64> = val
-            .as_array()
-            .expect("array body")
-            .iter()
-            .map(|e| e["height"].as_u64().unwrap())
-            .collect();
-        assert_eq!(heights, vec![4, 5]);
+        assert_eq!(page_heights(&val), vec![4, 5]);
     }
 
     #[tokio::test]
-    async fn test_invalid_payloads_range_returns_array() {
-        let range = HeightRangeRequest {
+    async fn test_invalid_payloads_range_returns_page() {
+        let request = InvalidPayloadsRequest {
             from: Height::new(10),
             count: 2,
         };
-        let reply = RangeQueryResult::Complete(vec![
+        let reply = whole_page(vec![
             StoredInvalidPayloads::empty(Height::new(10)),
             StoredInvalidPayloads::empty(Height::new(11)),
         ]);
         let (tx_cons_req, tx_app_req, tx_nw_req) =
-            MockBackend::spawn_new(MockConfig::AppGetInvalidPayloadsRange(range, Some(reply)));
+            MockBackend::spawn_new(MockConfig::AppGetInvalidPayloadsRange(request, Some(reply)));
         let (status, val) = build_router_and_request(
             tx_cons_req,
             tx_app_req,
@@ -1158,13 +1445,56 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let heights: Vec<u64> = val
-            .as_array()
-            .expect("array body")
-            .iter()
-            .map(|e| e["height"].as_u64().unwrap())
-            .collect();
-        assert_eq!(heights, vec![10, 11]);
+        assert_eq!(page_heights(&val), vec![10, 11]);
+        assert!(
+            val.get("next").is_none(),
+            "exhausted page carries no cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_payloads_range_returns_cursor_when_truncated() {
+        let request = InvalidPayloadsRequest {
+            from: Height::new(10),
+            count: 5,
+        };
+        let reply = HeightRangePage::new(
+            RangeQueryResult::Complete(vec![StoredInvalidPayloads::empty(Height::new(10))]),
+            Some(Height::new(11)),
+        );
+        let (tx_cons_req, tx_app_req, tx_nw_req) =
+            MockBackend::spawn_new(MockConfig::AppGetInvalidPayloadsRange(request, Some(reply)));
+        let (status, val) = build_router_and_request(
+            tx_cons_req,
+            tx_app_req,
+            tx_nw_req,
+            "/invalid-payloads?height=10&count=5",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page_heights(&val), vec![10]);
+        assert_eq!(val["next"]["height"].as_u64(), Some(11));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_payloads_single_height_returns_object() {
+        let reply = StoredInvalidPayloads::empty(Height::new(10));
+        let (tx_cons_req, tx_app_req, tx_nw_req) = MockBackend::spawn_new(
+            MockConfig::AppGetInvalidPayloads(Some(Height::new(10)), Some(reply)),
+        );
+        let (status, val) = build_router_and_request(
+            tx_cons_req,
+            tx_app_req,
+            tx_nw_req,
+            "/invalid-payloads?height=10",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(val["height"].as_u64(), Some(10));
+        assert!(
+            val.get("next").is_none(),
+            "a single height is not paginated"
+        );
     }
 
     #[tokio::test]
@@ -1187,13 +1517,13 @@ mod tests {
     #[tokio::test]
     async fn test_count_over_limit_returns_structured_400() {
         let (status, val) =
-            build_no_backend_router_and_request("/commit?height=10&count=1001").await;
+            build_no_backend_router_and_request("/commit?height=10&count=10001").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             val,
             json!({
                 "error": "partial range unavailable",
-                "requested": {"from": 10, "to": 1010},
+                "requested": {"from": 10, "to": 10010},
                 "reason": "over_limit"
             })
         );
@@ -1238,10 +1568,13 @@ mod tests {
             from: Height::new(8),
             count: 5,
         };
-        let reply = RangeQueryResult::Unavailable {
-            reason: RangeFailureReason::AboveCurrentHead,
-            failed_heights: vec![Height::new(11), Height::new(12)],
-        };
+        let reply = HeightRangePage::new(
+            RangeQueryResult::Unavailable {
+                reason: RangeFailureReason::AboveCurrentHead,
+                failed_heights: vec![Height::new(11), Height::new(12)],
+            },
+            None,
+        );
         let (tx_cons_req, tx_app_req, tx_nw_req) =
             MockBackend::spawn_new(MockConfig::AppGetCertificateRange(range, Some(reply)));
         let (status, val) = build_router_and_request(

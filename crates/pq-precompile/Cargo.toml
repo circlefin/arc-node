@@ -12,6 +12,7 @@ repository.workspace = true
 [dependencies]
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
+arc-shared.workspace = true
 revm.workspace = true
 revm-interpreter.workspace = true
 slh-dsa.workspace = true

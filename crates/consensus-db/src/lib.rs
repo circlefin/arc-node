@@ -27,10 +27,11 @@ pub mod versions;
 
 mod store;
 pub use store::{
-    rollback_to_height, DbUpgrade, RangeFailureReason, RangeQueryResult, RollbackReport, Store,
-    StoreError, CERTIFICATES_TABLE, DECIDED_BLOCKS_TABLE, INVALID_PAYLOADS_TABLE,
-    MISBEHAVIOR_EVIDENCE_TABLE, PENDING_PROPOSAL_PARTS_TABLE, PROPOSAL_MONITOR_DATA_TABLE,
-    ROLLBACK_BATCH_SIZE, UNDECIDED_BLOCKS_TABLE,
+    rollback_to_height, DbUpgrade, HeightRangePage, PendingPartsRow, RangeFailureReason,
+    RangeQueryResult, RollbackReport, Store, StoreError, CERTIFICATES_TABLE, DECIDED_BLOCKS_TABLE,
+    INVALID_PAYLOADS_TABLE, MAX_RANGE_QUERY_BYTES, MISBEHAVIOR_EVIDENCE_TABLE,
+    PENDING_PROPOSAL_PARTS_TABLE, PROPOSAL_MONITOR_DATA_TABLE, ROLLBACK_BATCH_SIZE,
+    UNDECIDED_BLOCKS_TABLE,
 };
 
 mod metrics;

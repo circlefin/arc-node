@@ -18,10 +18,13 @@ pub mod app;
 pub mod db;
 pub mod process;
 pub mod validator_set;
+pub mod ws_subscription;
 
 pub use app::{
-    AppMetrics, BindingHaltSite, InvalidPayloadSource, SkewNilVoteSource, TransientValidationSource,
+    AppMetrics, BindingHaltSite, InvalidPayloadSource, SkewNilVoteSource,
+    TransientValidationSource, VerdictFlip,
 };
 pub use db::DbMetrics;
 pub use process::ProcessMetrics;
 pub use validator_set::ValidatorSetMetrics;
+pub use ws_subscription::WsSubscriptionMetrics;

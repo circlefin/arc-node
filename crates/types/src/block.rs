@@ -39,6 +39,7 @@ use crate::{signing::Signature, Address, ArcContext, BlockHash, Height, Value};
 pub struct ConsensusBlock {
     pub height: Height,
     pub round: Round,
+    /// Deprecated: always [`Round::Nil`]. Retained for wire and on-disk compatibility.
     pub valid_round: Round,
     pub proposer: Address,
     pub validity: Validity,

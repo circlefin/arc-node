@@ -16,7 +16,7 @@
 
 use alloy_evm::EvmInternals;
 use alloy_primitives::{Address, Bytes, StorageKey, U256};
-use alloy_sol_types::{SolCall, SolEvent, SolValue};
+use alloy_sol_types::{SolEvent, SolValue};
 use arc_execution_config::hardforks::{ArcHardfork, ArcHardforkFlags};
 use reth_ethereum::evm::revm::precompile::{PrecompileError, PrecompileHalt, PrecompileOutput};
 use reth_evm::precompiles::PrecompileInput;
@@ -220,14 +220,6 @@ pub(crate) fn new_reverted_with_early_penalty(
         PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
         msg,
     )
-}
-
-/// ABI-decodes raw precompile call arguments.
-///
-/// Uses validated decoding, which rejects non-canonical ABI padding for short
-/// static types such as `address`, `bool`, and `uint64`.
-pub(crate) fn abi_decode_raw_validated<C: SolCall>(input: &[u8]) -> alloy_sol_types::Result<C> {
-    C::abi_decode_raw_validate(input)
 }
 
 /// Reads a value from storage for stateful precompiles.
@@ -859,7 +851,6 @@ pub(crate) mod test_utils {
 mod tests {
     use super::*;
     use alloy_primitives::U256;
-    use alloy_sol_types::sol;
     use revm_primitives::B256;
 
     /// Demonstrates that revm's `JournalTr::load_account_mut_skip_cold_load`
@@ -918,33 +909,6 @@ mod tests {
             sstore_base_cost(U256::from(1), U256::from(2), U256::from(3)),
             100,
         );
-    }
-
-    sol! {
-        interface IAbiDecodeTest {
-            function takesAddress(address account) external;
-            function takesUint64(uint64 value) external;
-        }
-    }
-
-    #[test]
-    fn abi_decode_raw_validation_rejects_address_padding() {
-        let mut input = [0u8; 32];
-        input[..12].fill(0x11);
-        input[12] = 0xaa;
-
-        let result = abi_decode_raw_validated::<IAbiDecodeTest::takesAddressCall>(&input);
-        assert!(result.is_err(), "non-zero address padding must be rejected");
-    }
-
-    #[test]
-    fn abi_decode_raw_validation_rejects_uint64_padding() {
-        let mut input = [0u8; 32];
-        input[0] = 0x11;
-        input[31] = 42;
-
-        let result = abi_decode_raw_validated::<IAbiDecodeTest::takesUint64Call>(&input);
-        assert!(result.is_err(), "non-zero uint64 padding must be rejected");
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub mod finalized;
 pub mod get_decided_values;
 pub mod get_history_min_height;
 pub mod get_value;
+mod history_window;
 pub mod process_synced_value;
 pub mod received_proposal_part;
 pub mod restream_proposal;

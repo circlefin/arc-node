@@ -23,8 +23,8 @@ use arc_consensus_types::{
 };
 use arc_node_consensus_cli::config::ScoringStrategy;
 use malachitebft_app_channel::app::config::{
-    BootstrapProtocol, DiscoveryConfig, GossipSubConfig, P2pConfig, ProtocolNames, PubSubProtocol,
-    Selector, ValuePayload,
+    BootstrapProtocol, DiscoveryConfig, GossipSubConfig, P2pConfig, ProtocolNames,
+    PubSubMaxSizePerTopic, PubSubProtocol, Selector, ValuePayload,
 };
 use malachitebft_app_channel::app::net::Multiaddr;
 
@@ -47,14 +47,16 @@ pub mod consensus {
     /// Default: `500`
     pub const QUEUE_PER_HEIGHT_CAPACITY: usize = 500;
 
-    /// Duration to wait before replaying the WAL on recovery.
-    ///
-    /// Default: `5s`
-    pub const WAL_REPLAY_DELAY: Duration = Duration::from_secs(5);
-
     /// Chain-specific libp2p protocol names.
     pub mod p2p {
+        use bytesize::ByteSize;
+
         use super::*;
+
+        /// Maximum application payload on the proposal-parts GossipSub topic.
+        ///
+        /// This accommodates a 128 KiB proposal chunk and its versioned stream envelope.
+        pub const PROPOSAL_PARTS_MAX_SIZE: ByteSize = ByteSize::kib(130);
 
         pub(crate) fn protocol_names_malachite_defaults() -> ProtocolNames {
             ProtocolNames {
@@ -135,15 +137,15 @@ pub mod value_sync {
 
     /// Timeout duration for sync requests
     /// Default: `Duration::from_secs(10)`
-    pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+    pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// Maximum size of a request
     /// Default: `1 MiB`
     pub const MAX_REQUEST_SIZE: ByteSize = ByteSize::mib(1);
 
-    /// Maximum size of a response
-    /// Default: `10 MiB`
-    pub const MAX_RESPONSE_SIZE: ByteSize = ByteSize::mib(10);
+    /// Maximum size of a ValueSync response and P2P RPC transport message
+    /// Default: `16 MiB`
+    pub const MAX_RESPONSE_SIZE: ByteSize = ByteSize::mib(16);
 
     /// Maximum number of parallel requests to send
     /// Default: `5`
@@ -155,7 +157,22 @@ pub mod value_sync {
 
     /// Maximum number of decided values to request in a single batch
     /// Default: `5`
-    pub const BATCH_SIZE: usize = 10;
+    pub const BATCH_SIZE: usize = 5;
+
+    /// Rolling window for each peer's inbound request rate.
+    pub const INBOUND_REQUEST_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
+
+    /// Maximum inbound requests accepted from one peer during a rate-limit window.
+    pub const MAX_INBOUND_REQUESTS_PER_WINDOW: u32 = 1000;
+
+    /// Maximum inbound requests dispatched concurrently to the serialized host connector.
+    pub const MAX_CONCURRENT_INBOUND_REQUESTS: usize = 1;
+
+    /// Maximum inbound requests waiting for the host connector.
+    ///
+    /// Sized for one block's worth of requests from peers following the tip, which
+    /// all ask for a new height at the same time.
+    pub const MAX_PENDING_INBOUND_REQUESTS: usize = 128;
 }
 
 /// Gossipsub network load profile.
@@ -239,12 +256,16 @@ pub fn build_consensus_config(
         value_payload: consensus::VALUE_PAYLOAD,
         queue_capacity: consensus::QUEUE_CAPACITY,
         queue_per_height_capacity: consensus::QUEUE_PER_HEIGHT_CAPACITY,
-        wal_replay_delay: consensus::WAL_REPLAY_DELAY,
         p2p: P2pConfig {
             listen_addr,
             persistent_peers,
             persistent_peers_only,
+            rpc_max_size: value_sync::MAX_RESPONSE_SIZE,
             protocol: PubSubProtocol::GossipSub(generate_p2p_gossip_config(gossipsub_overrides)),
+            pubsub_max_size_per_topic: PubSubMaxSizePerTopic {
+                proposal_parts: Some(consensus::p2p::PROPOSAL_PARTS_MAX_SIZE),
+                ..Default::default()
+            },
             discovery: DiscoveryConfig {
                 enabled: discovery_enabled,
                 bootstrap_protocol: discovery::BOOTSTRAP_PROTOCOL,
@@ -285,6 +306,10 @@ pub fn build_value_sync_config(enabled: bool) -> ValueSyncConfig {
         scoring_strategy: ScoringStrategy::Ema,
         inactive_threshold: value_sync::INACTIVE_THRESHOLD,
         batch_size: value_sync::BATCH_SIZE,
+        inbound_request_rate_limit_window: value_sync::INBOUND_REQUEST_RATE_LIMIT_WINDOW,
+        max_inbound_requests_per_window: value_sync::MAX_INBOUND_REQUESTS_PER_WINDOW,
+        max_concurrent_inbound_requests: value_sync::MAX_CONCURRENT_INBOUND_REQUESTS,
+        max_pending_inbound_requests: value_sync::MAX_PENDING_INBOUND_REQUESTS,
     }
 }
 
@@ -345,9 +370,15 @@ mod tests {
             config.queue_per_height_capacity,
             consensus::QUEUE_PER_HEIGHT_CAPACITY
         );
-        assert_eq!(config.wal_replay_delay, consensus::WAL_REPLAY_DELAY);
         assert_eq!(config.p2p.listen_addr, listen_addr);
         assert_eq!(config.p2p.persistent_peers, persistent_peers);
+        assert_eq!(
+            config.p2p.pubsub_max_size_per_topic.proposal_parts,
+            Some(consensus::p2p::PROPOSAL_PARTS_MAX_SIZE)
+        );
+        assert_eq!(config.p2p.pubsub_max_size_per_topic.consensus, None);
+        assert_eq!(config.p2p.pubsub_max_size_per_topic.liveness, None);
+        assert_eq!(config.p2p.rpc_max_size, value_sync::MAX_RESPONSE_SIZE);
     }
 
     #[test]
@@ -500,6 +531,25 @@ mod tests {
         let config = build_value_sync_config(true);
 
         assert!(config.enabled);
+        assert_eq!(config.request_timeout, value_sync::REQUEST_TIMEOUT);
+        assert_eq!(config.max_response_size, value_sync::MAX_RESPONSE_SIZE);
+        assert_eq!(config.batch_size, value_sync::BATCH_SIZE);
+        assert_eq!(
+            config.inbound_request_rate_limit_window,
+            value_sync::INBOUND_REQUEST_RATE_LIMIT_WINDOW
+        );
+        assert_eq!(
+            config.max_inbound_requests_per_window,
+            value_sync::MAX_INBOUND_REQUESTS_PER_WINDOW
+        );
+        assert_eq!(
+            config.max_concurrent_inbound_requests,
+            value_sync::MAX_CONCURRENT_INBOUND_REQUESTS
+        );
+        assert_eq!(
+            config.max_pending_inbound_requests,
+            value_sync::MAX_PENDING_INBOUND_REQUESTS
+        );
     }
 
     #[test]
@@ -553,8 +603,6 @@ mod tests {
         assert_eq!(consensus::VALUE_PAYLOAD, ValuePayload::ProposalAndParts);
         assert_eq!(consensus::QUEUE_CAPACITY, 16);
         assert_eq!(consensus::QUEUE_PER_HEIGHT_CAPACITY, 500);
-        assert_eq!(consensus::WAL_REPLAY_DELAY, Duration::from_secs(5));
-
         // Verify discovery constants
         assert_eq!(discovery::BOOTSTRAP_PROTOCOL, BootstrapProtocol::Full);
         assert_eq!(discovery::SELECTOR, Selector::Random);

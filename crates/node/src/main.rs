@@ -29,8 +29,14 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[unsafe(export_name = "malloc_conf")]
 pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
 
+use arc_evm::evm::MAX_TRACE_BYTES_DEFAULT;
 use arc_evm_node::node::{ArcNode, ArcRpcConfig};
-use arc_evm_node::ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT;
+use std::num::NonZeroUsize;
+
+use arc_evm_node::{
+    CallManyLimits, ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT, ARC_RPC_MAX_CALL_MANY_CALLS_DEFAULT,
+    ARC_RPC_MAX_CALL_MANY_STATE_OVERRIDES_DEFAULT,
+};
 use arc_execution_config::addresses_denylist::{
     AddressesDenylistConfig, DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
 };
@@ -210,11 +216,58 @@ struct ArcExtraCli {
     #[arg(
         long = "arc.rpc.max-batch-entries",
         default_value_t = ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
-        value_parser = parse_max_batch_entries,
+        value_parser = parse_positive_count,
         value_name = "COUNT",
         help_heading = "Arc RPC limits"
     )]
-    arc_rpc_max_batch_entries: usize,
+    arc_rpc_max_batch_entries: NonZeroUsize,
+
+    /// Maximum number of `eth_callMany` calls permitted in one JSON-RPC request.
+    ///
+    /// The budget covers every bundle and, in a JSON-RPC batch, every entry, so
+    /// batching cannot multiply it. Every `eth_callMany` costs at least one, because
+    /// it opens a database read transaction even when it executes nothing. A request
+    /// above the budget is rejected before any call executes, and a batch is
+    /// rejected as a whole. Must be >= 1.
+    #[arg(
+        long = "arc.rpc.max-call-many-calls",
+        default_value_t = ARC_RPC_MAX_CALL_MANY_CALLS_DEFAULT,
+        value_parser = parse_positive_count,
+        value_name = "COUNT",
+        help_heading = "Arc RPC limits"
+    )]
+    arc_rpc_max_call_many_calls: NonZeroUsize,
+
+    /// Maximum number of accounts a single `eth_callMany` request may override.
+    ///
+    /// Applying an override reads each account from state — the same cold read that
+    /// makes the calls expensive on an archive node. Unlike the call budget this
+    /// applies to each `eth_callMany` separately, not to a batch total. A request
+    /// above the limit is rejected before any call executes. Must be >= 1.
+    #[arg(
+        long = "arc.rpc.max-call-many-state-overrides",
+        default_value_t = ARC_RPC_MAX_CALL_MANY_STATE_OVERRIDES_DEFAULT,
+        value_parser = parse_positive_count,
+        value_name = "COUNT",
+        help_heading = "Arc RPC limits"
+    )]
+    arc_rpc_max_call_many_state_overrides: NonZeroUsize,
+
+    /// Maximum calldata bytes an RPC tracer may record while tracing one transaction.
+    ///
+    /// Tracers copy the calldata of every call a transaction makes, including internal
+    /// calls, so this bounds their memory per transaction. Covers every RPC that executes
+    /// with an inspector (`debug_trace*`, `trace_*`, `ots_*`, `eth_createAccessList`).
+    /// A transaction past the limit fails with an error instead of returning a partial
+    /// trace. Block execution is unaffected. Must be >= 1.
+    #[arg(
+        long = "arc.rpc.max-trace-bytes",
+        default_value_t = MAX_TRACE_BYTES_DEFAULT,
+        value_parser = parse_positive_count,
+        value_name = "BYTES",
+        help_heading = "Arc RPC limits"
+    )]
+    arc_rpc_max_trace_bytes: NonZeroUsize,
 
     /// Maximum duration for the custom payload builder's transaction selection loop, in milliseconds.
     ///
@@ -253,7 +306,8 @@ struct ArcExtraCli {
     ///
     /// Off by default: the middleware blocks `eth_subscribe("newPendingTransactions")`,
     /// `eth_newPendingTransactionFilter`, and returns null for
-    /// `eth_getBlockByNumber("pending")` and `eth_getTransactionBySenderAndNonce`.
+    /// `eth_getBlockByNumber("pending")`. `eth_getTransactionBySenderAndNonce`
+    /// still answers mined transactions; pool-sourced results are removed.
     /// Set this flag on trusted / internal nodes where exposing pending-tx state
     /// is desired (e.g. debugging).
     #[arg(
@@ -449,13 +503,10 @@ fn compute_filter_pending_txs(ext: &ArcExtraCli) -> bool {
     ext.public_api || !ext.arc_expose_pending_txs
 }
 
-/// Parses `--arc.rpc.max-batch-entries`, rejecting `0` so the cap is never silently disabled.
-fn parse_max_batch_entries(s: &str) -> Result<usize, String> {
+/// Parses an RPC count limit, rejecting `0` so the cap is never silently disabled.
+fn parse_positive_count(s: &str) -> Result<NonZeroUsize, String> {
     let n: usize = s.parse().map_err(|_| format!("invalid number: {s}"))?;
-    if n == 0 {
-        return Err("must be >= 1".to_string());
-    }
-    Ok(n)
+    NonZeroUsize::new(n).ok_or_else(|| "must be >= 1".to_string())
 }
 
 /// Number of bodies, receipts, etc. to retain after pruning.
@@ -606,26 +657,36 @@ fn main() {
             let filter_pending_txs = compute_filter_pending_txs(&ext);
             let allow_unprotected_txs = ext.arc_rpc_allow_unprotected_txs;
             let max_response_body_size = builder.config().rpc.rpc_max_response_size_bytes();
+            let rpc_gas_cap = builder.config().rpc.rpc_gas_cap;
             let max_batch_entries = ext.arc_rpc_max_batch_entries;
+            let call_many_limits = CallManyLimits {
+                max_calls: ext.arc_rpc_max_call_many_calls,
+                max_state_overrides: ext.arc_rpc_max_call_many_state_overrides,
+            };
             let tx_relays = build_tx_relays(&ext)?;
             let tx_relay_timeout = ext.arc_tx_relays_timeout;
             let rebroadcast_interval =
                 std::time::Duration::from_secs(ext.txpool_rebroadcast_interval);
             let handle = builder
-                .node(ArcNode::new(
-                    arc_rpc_cfg,
-                    invalid_tx_list_cfg,
-                    addresses_denylist_config,
-                    payload_builder_deadline_ms,
-                    wait_for_payload,
-                    filter_pending_txs,
-                    allow_unprotected_txs,
-                    max_response_body_size,
-                    max_batch_entries,
-                    rebroadcast_interval,
-                    tx_relays,
-                    tx_relay_timeout,
-                ))
+                .node(
+                    ArcNode::new(
+                        arc_rpc_cfg,
+                        invalid_tx_list_cfg,
+                        addresses_denylist_config,
+                        payload_builder_deadline_ms,
+                        wait_for_payload,
+                        filter_pending_txs,
+                        allow_unprotected_txs,
+                        max_response_body_size,
+                        max_batch_entries,
+                        call_many_limits,
+                        rebroadcast_interval,
+                        tx_relays,
+                        tx_relay_timeout,
+                    )
+                    .with_max_trace_bytes(ext.arc_rpc_max_trace_bytes)
+                    .with_rpc_gas_cap(rpc_gas_cap),
+                )
                 .launch_with_debug_capabilities()
                 .await?;
 
@@ -750,6 +811,31 @@ mod tests {
     fn test_extradata_default_is_allowed() {
         let cli = parse_with_arc_defaults(["arc-node-execution", "node"]);
         assert!(cli.validate().is_ok());
+    }
+
+    #[test]
+    fn test_db_read_transaction_timeout_default_is_sixty() {
+        let cli = parse_with_arc_defaults(["arc-node-execution", "node"]);
+        let Commands::Node(node_cmd) = cli.inner.command else {
+            panic!("expected node command");
+        };
+
+        assert_eq!(node_cmd.db.read_transaction_timeout, Some(60));
+    }
+
+    #[test]
+    fn test_db_read_transaction_timeout_explicit_zero_wins() {
+        let cli = parse_with_arc_defaults([
+            "arc-node-execution",
+            "node",
+            "--db.read-transaction-timeout",
+            "0",
+        ]);
+        let Commands::Node(node_cmd) = cli.inner.command else {
+            panic!("expected node command");
+        };
+
+        assert_eq!(node_cmd.db.read_transaction_timeout, Some(0));
     }
 
     #[test]
@@ -911,7 +997,7 @@ mod tests {
         ])
         .unwrap();
         if let Commands::Node(node_cmd) = cli.inner.command {
-            assert_eq!(node_cmd.ext.arc_rpc_max_batch_entries, 250);
+            assert_eq!(node_cmd.ext.arc_rpc_max_batch_entries.get(), 250);
         } else {
             panic!("Expected Node command");
         }
@@ -923,6 +1009,132 @@ mod tests {
             "arc-node-execution",
             "node",
             "--arc.rpc.max-batch-entries",
+            "0",
+        ]);
+        assert!(
+            result.is_err_and(|err| err.to_string().contains("must be >= 1")),
+            "0 should be rejected with the must-be->=1 message"
+        );
+    }
+
+    #[test]
+    fn test_arc_rpc_max_call_many_calls_default() {
+        let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert_eq!(
+                node_cmd.ext.arc_rpc_max_call_many_calls,
+                ARC_RPC_MAX_CALL_MANY_CALLS_DEFAULT
+            );
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_arc_rpc_max_call_many_calls_custom() {
+        let cli = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.max-call-many-calls",
+            "25",
+        ])
+        .unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert_eq!(node_cmd.ext.arc_rpc_max_call_many_calls.get(), 25);
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_arc_rpc_max_call_many_calls_zero_rejected() {
+        let result = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.max-call-many-calls",
+            "0",
+        ]);
+        assert!(
+            result.is_err_and(|err| err.to_string().contains("must be >= 1")),
+            "0 should be rejected with the must-be->=1 message"
+        );
+    }
+
+    #[test]
+    fn test_arc_rpc_max_call_many_state_overrides_default() {
+        let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert_eq!(
+                node_cmd.ext.arc_rpc_max_call_many_state_overrides,
+                ARC_RPC_MAX_CALL_MANY_STATE_OVERRIDES_DEFAULT
+            );
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_arc_rpc_max_call_many_state_overrides_custom() {
+        let cli = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.max-call-many-state-overrides",
+            "7",
+        ])
+        .unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert_eq!(node_cmd.ext.arc_rpc_max_call_many_state_overrides.get(), 7);
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_arc_rpc_max_call_many_state_overrides_zero_rejected() {
+        let result = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.max-call-many-state-overrides",
+            "0",
+        ]);
+        assert!(
+            result.is_err_and(|err| err.to_string().contains("must be >= 1")),
+            "0 should be rejected with the must-be->=1 message"
+        );
+    }
+
+    #[test]
+    fn test_arc_rpc_max_trace_bytes_default() {
+        let cli = ArcCli::try_parse_from(["arc-node-execution", "node"]).unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert_eq!(node_cmd.ext.arc_rpc_max_trace_bytes.get(), 64 * 1024 * 1024);
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_arc_rpc_max_trace_bytes_custom() {
+        let cli = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.max-trace-bytes",
+            "268435456",
+        ])
+        .unwrap();
+        if let Commands::Node(node_cmd) = cli.inner.command {
+            assert_eq!(node_cmd.ext.arc_rpc_max_trace_bytes.get(), 268_435_456);
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_arc_rpc_max_trace_bytes_zero_rejected() {
+        let result = ArcCli::try_parse_from([
+            "arc-node-execution",
+            "node",
+            "--arc.rpc.max-trace-bytes",
             "0",
         ]);
         assert!(

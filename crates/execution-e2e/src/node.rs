@@ -34,6 +34,10 @@ use alloy_serde::JsonStorageKey;
 use alloy_signer_local::PrivateKeySigner;
 use arc_evm_node::node::ArcNode;
 use eyre::WrapErr;
+use jsonrpsee::core::client::ClientT;
+use jsonrpsee::core::traits::ToRpcParams;
+use jsonrpsee::core::ClientError;
+use jsonrpsee::rpc_params;
 use reth_e2e_test_utils::transaction::TransactionTestContext;
 use reth_e2e_test_utils::wallet::Wallet;
 use reth_e2e_test_utils::NodeHelperType;
@@ -67,12 +71,14 @@ pub struct ArcTestNode {
 trait ArcEthRpc:
     EthApiClient<TransactionRequest, Transaction, RpcBlock, TransactionReceipt, Header, Bytes>
     + DebugApiClient<TransactionRequest>
+    + ClientT
 {
 }
 
 impl<T> ArcEthRpc for T where
     T: EthApiClient<TransactionRequest, Transaction, RpcBlock, TransactionReceipt, Header, Bytes>
         + DebugApiClient<TransactionRequest>
+        + ClientT
 {
 }
 
@@ -281,6 +287,26 @@ impl ArcTestNode {
             .ok_or_else(|| eyre::eyre!("receipt for transaction {hash} not found"))
     }
 
+    /// Looks up a transaction by sender and nonce via `eth_getTransactionBySenderAndNonce`.
+    pub async fn transaction_by_sender_and_nonce(
+        &self,
+        sender: Address,
+        nonce: u64,
+    ) -> eyre::Result<Option<Transaction>> {
+        Ok(self
+            .rpc_client()?
+            .request(
+                "eth_getTransactionBySenderAndNonce",
+                rpc_params![sender, format!("0x{nonce:x}")],
+            )
+            .await?)
+    }
+
+    /// Looks up a transaction by hash via `eth_getTransactionByHash`.
+    pub async fn transaction_by_hash(&self, hash: TxHash) -> eyre::Result<Option<Transaction>> {
+        Ok(self.rpc_client()?.transaction_by_hash(hash).await?)
+    }
+
     /// Executes `eth_call` and returns raw output bytes.
     pub async fn call(&self, request: TransactionRequest) -> eyre::Result<Bytes> {
         Ok(self.rpc_client()?.call(request, None, None, None).await?)
@@ -316,10 +342,37 @@ impl ArcTestNode {
             .await?)
     }
 
+    /// Calls `method` with a verbatim JSON params frame.
+    ///
+    /// A typed client cannot emit shapes such as a padded positional array, which
+    /// middleware param guards must still police.
+    pub async fn raw_rpc_request(
+        &self,
+        method: &str,
+        params_json: &str,
+    ) -> eyre::Result<Result<serde_json::Value, ClientError>> {
+        let client = self
+            .node
+            .rpc_client()
+            .ok_or_else(|| eyre::eyre!("RPC client not available"))?;
+        Ok(client
+            .request(method, RawParams(params_json.to_string()))
+            .await)
+    }
+
     fn rpc_client(&self) -> eyre::Result<impl ArcEthRpc> {
         self.node
             .rpc_client()
             .ok_or_else(|| eyre::eyre!("RPC client not available"))
+    }
+}
+
+/// Params passed through to the wire exactly as written.
+struct RawParams(String);
+
+impl ToRpcParams for RawParams {
+    fn to_rpc_params(self) -> Result<Option<Box<serde_json::value::RawValue>>, serde_json::Error> {
+        serde_json::value::RawValue::from_string(self.0).map(Some)
     }
 }
 

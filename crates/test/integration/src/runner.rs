@@ -73,7 +73,7 @@ use tracing::{error, info};
 
 use arc_consensus_types::{ArcContext, Config as ConsensusConfig};
 use arc_evm_node::node::{ArcNode, ArcRpcConfig};
-use arc_evm_node::{ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT, DEFAULT_TX_RELAY_TIMEOUT};
+use arc_evm_node::{CallManyLimits, ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT, DEFAULT_TX_RELAY_TIMEOUT};
 use arc_execution_config::addresses_denylist::{
     AddressesDenylistConfig, DEFAULT_DENYLIST_ERC7201_BASE_SLOT, DENYLIST_ADDRESS_LOCALDEV,
 };
@@ -657,6 +657,7 @@ async fn spawn_consensus_layer(
         validator,
         rpc_sync_enabled: false,
         rpc_sync_endpoints: Vec::new(),
+        rpc_sync_stale_timeout: StartConfig::DEFAULT_RPC_SYNC_STALE_TIMEOUT,
         gossipsub_overrides: GossipSubOverrides::default(),
         execution_ws_endpoint: None,
     };
@@ -728,6 +729,7 @@ async fn spawn_execution_layer(
         false,
         160 * 1024 * 1024,
         ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
+        CallManyLimits::default(),
         std::time::Duration::from_secs(0),
         Vec::new(),
         DEFAULT_TX_RELAY_TIMEOUT,

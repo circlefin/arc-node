@@ -16,7 +16,7 @@
 
 //! Setup configuration for Arc e2e tests.
 
-use arc_evm_node::node::ArcNode;
+use arc_evm_node::node::{ArcNode, ArcRpcConfig};
 use arc_execution_config::addresses_denylist::{
     AddressesDenylistConfig, DEFAULT_DENYLIST_ERC7201_BASE_SLOT, DENYLIST_ADDRESS_LOCALDEV,
 };
@@ -30,7 +30,7 @@ use reth_node_core::args::{DiscoveryArgs, NetworkArgs, RpcServerArgs};
 use reth_provider::providers::BlockchainProvider;
 use reth_rpc_server_types::RpcModuleSelection;
 use reth_tasks::Runtime;
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 
 /// Setup configuration for Arc e2e tests.
 ///
@@ -41,6 +41,9 @@ pub struct ArcSetup {
     invalid_tx_list_config: Option<InvalidTxListConfig>,
     rpc_gas_cap: Option<u64>,
     share_sparse_trie: bool,
+    arc_rpc_config: Option<ArcRpcConfig>,
+    filter_pending_txs: bool,
+    max_trace_bytes: Option<NonZeroUsize>,
 }
 
 impl Default for ArcSetup {
@@ -60,6 +63,9 @@ impl ArcSetup {
             invalid_tx_list_config: None,
             rpc_gas_cap: None,
             share_sparse_trie: false,
+            arc_rpc_config: None,
+            filter_pending_txs: true,
+            max_trace_bytes: None,
         }
     }
 
@@ -109,6 +115,27 @@ impl ArcSetup {
         self
     }
 
+    /// Overrides the node's default-off `arc` namespace configuration.
+    pub fn with_arc_rpc_config(mut self, arc_rpc_config: ArcRpcConfig) -> Self {
+        self.arc_rpc_config = Some(arc_rpc_config);
+        self
+    }
+
+    /// Disables the pending-tx RPC filter (`--arc.expose-pending-txs`).
+    ///
+    /// Pool-only `eth_getTransactionBySenderAndNonce` answers, pending-block
+    /// queries, and pending-tx subscriptions/filters are forwarded to Reth.
+    pub fn with_expose_pending_txs(mut self) -> Self {
+        self.filter_pending_txs = false;
+        self
+    }
+
+    /// Overrides the per-transaction RPC tracer input cap (`--arc.rpc.max-trace-bytes`).
+    pub fn with_max_trace_bytes(mut self, max_trace_bytes: NonZeroUsize) -> Self {
+        self.max_trace_bytes = Some(max_trace_bytes);
+        self
+    }
+
     /// Launches the configured single-node test environment.
     pub async fn launch(
         self,
@@ -123,6 +150,16 @@ impl ArcSetup {
         let mut arc_node = ArcNode::with_denylist_config(denylist_config);
         if let Some(cfg) = self.invalid_tx_list_config {
             arc_node.invalid_tx_list_cfg = cfg;
+        }
+        if let Some(cfg) = self.arc_rpc_config {
+            arc_node.rpc_cfg = cfg;
+        }
+        arc_node.filter_pending_txs = self.filter_pending_txs;
+        if let Some(max_trace_bytes) = self.max_trace_bytes {
+            arc_node = arc_node.with_max_trace_bytes(max_trace_bytes);
+        }
+        if let Some(rpc_gas_cap) = self.rpc_gas_cap {
+            arc_node = arc_node.with_rpc_gas_cap(rpc_gas_cap);
         }
 
         Self::launch_node(

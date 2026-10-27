@@ -504,6 +504,15 @@ where
     }
 }
 
+fn record_failed_if_err<T>(
+    result: Result<BuildOutcome<T>, PayloadBuilderError>,
+) -> Result<BuildOutcome<T>, PayloadBuilderError> {
+    if result.is_err() {
+        PayloadBuildMetrics::record_outcome_failed();
+    }
+    result
+}
+
 /// Proposer revenue contributed by a single transaction on Arc.
 ///
 /// On Arc, Proposer revenue equals `effective_gas_price * gas_used`, not
@@ -660,6 +669,34 @@ fn try_precomputed_state_root(
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn arc_ethereum_payload<EvmConfig, Client, Pool, F>(
+    evm_config: EvmConfig,
+    client: Client,
+    pool: Pool,
+    builder_config: EthereumBuilderConfig,
+    loop_time_limit: Option<Duration>,
+    args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
+    best_txs: F,
+) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
+where
+    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
+    Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks>,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
+    F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
+{
+    record_failed_if_err(build_arc_ethereum_payload(
+        evm_config,
+        client,
+        pool,
+        builder_config,
+        loop_time_limit,
+        args,
+        best_txs,
+    ))
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn build_arc_ethereum_payload<EvmConfig, Client, Pool, F>(
     evm_config: EvmConfig,
     client: Client,
     pool: Pool,
@@ -937,9 +974,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{BUILD_OUTCOME, FAILED_OUTCOME, OUTCOME_LABEL};
     use alloy_primitives::TxHash;
+    use metrics::{
+        atomics::AtomicU64, with_local_recorder, Counter, Gauge, Histogram, Key, KeyName, Metadata,
+        Recorder, SharedString, Unit,
+    };
     use reth_transaction_pool::test_utils::testing_pool;
     use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::Ordering;
 
     #[derive(Clone, Debug)]
     struct MockPendingPool {
@@ -1076,6 +1119,63 @@ mod tests {
             extracted, None,
             "Should return None for non-EvmExecutionError"
         );
+    }
+
+    #[test]
+    fn record_failed_if_err_preserves_ok_and_err() {
+        struct FailedOutcomeRecorder {
+            failed: Arc<AtomicU64>,
+        }
+
+        impl Recorder for FailedOutcomeRecorder {
+            fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+            fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
+                let is_failed = key.name() == BUILD_OUTCOME
+                    && key.labels().any(|label| {
+                        label.key() == OUTCOME_LABEL && label.value() == FAILED_OUTCOME
+                    });
+                if is_failed {
+                    Counter::from_arc(Arc::clone(&self.failed))
+                } else {
+                    Counter::noop()
+                }
+            }
+
+            fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+                Gauge::noop()
+            }
+
+            fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+                Histogram::noop()
+            }
+        }
+
+        let recorder = FailedOutcomeRecorder {
+            failed: Arc::new(AtomicU64::new(0)),
+        };
+        with_local_recorder(&recorder, || {
+            assert!(matches!(
+                record_failed_if_err::<()>(Ok(BuildOutcome::Cancelled)),
+                Ok(BuildOutcome::Cancelled)
+            ));
+            assert_eq!(
+                recorder.failed.load(Ordering::Acquire),
+                0,
+                "success must not increment failed"
+            );
+
+            let err = record_failed_if_err::<()>(Err(PayloadBuilderError::MissingPayload))
+                .expect_err("error must propagate");
+            assert!(matches!(err, PayloadBuilderError::MissingPayload));
+            assert_eq!(
+                recorder.failed.load(Ordering::Acquire),
+                1,
+                "error must increment failed exactly once"
+            );
+        });
     }
 
     #[test]
