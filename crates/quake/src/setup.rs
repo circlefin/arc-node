@@ -16,9 +16,12 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-use alloy_primitives::{address, Address};
+use alloy_primitives::{address, keccak256, Address};
 use arc_node_consensus_cli::args::Args;
 use arc_node_consensus_cli::cmd::start::{StartCmd, RUNTIME_SINGLE_THREADED};
 use arc_node_consensus_cli::file::save_priv_validator_key;
@@ -102,43 +105,23 @@ pub(crate) struct GenesisParams<'a> {
     pub block_gas_limit: Option<u64>,
 }
 
-/// Generate genesis file
-pub(crate) fn generate_genesis_file(params: GenesisParams<'_>) -> Result<()> {
-    let GenesisParams {
-        repo_root_dir,
-        genesis_file,
-        num_extra_accounts,
-        public_keys_overrides,
-        validator_names,
-        validator_voting_powers,
-        force,
-        el_init_hardfork,
-        extra_account_balance_usdc,
-        block_gas_limit,
-    } = params;
-
-    if !force && genesis_file.exists() {
-        debug!("⏭️ Skipping generating and copying genesis file");
-        return Ok(());
-    }
-
-    if validator_names.is_empty() {
-        return Err(eyre!("validator_names must not be empty"));
-    }
-
-    let num_validators = validator_names.len();
-    let num_overrides = public_keys_overrides.len();
+/// Compute cache metadata string identifying the genesis file and associated configs.
+pub(crate) fn genesis_cache_metadata(params: &GenesisParams<'_>) -> String {
+    let num_validators = params.validator_names.len();
+    let num_overrides = params.public_keys_overrides.len();
 
     // Metadata to identify the genesis file for the given parameters
-    let mut metadata =
-        format!("val_{num_validators}-extra_{num_extra_accounts}-over_{num_overrides}");
-    if let Some(bal) = extra_account_balance_usdc {
+    let mut metadata = format!(
+        "val_{num_validators}-extra_{}-over_{num_overrides}",
+        params.num_extra_accounts
+    );
+    if let Some(bal) = params.extra_account_balance_usdc {
         metadata.push_str(&format!("-bal_{bal}"));
     }
-    if let Some(gl) = block_gas_limit {
+    if let Some(gl) = params.block_gas_limit {
         metadata.push_str(&format!("-gas_{gl}"));
     }
-    if let Some(el_init_hardfork) = el_init_hardfork {
+    if let Some(el_init_hardfork) = params.el_init_hardfork {
         metadata.push_str(&format!("-hardfork_{el_init_hardfork}"));
     };
 
@@ -160,16 +143,72 @@ pub(crate) fn generate_genesis_file(params: GenesisParams<'_>) -> Result<()> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
-    validator_names.hash(&mut hasher);
-    validator_voting_powers.hash(&mut hasher);
+    params.validator_names.hash(&mut hasher);
+    params.validator_voting_powers.hash(&mut hasher);
     let names_hash = hasher.finish();
     metadata.push_str(&format!("-vnames_{names_hash:x}"));
 
+    // Include public-key overrides in the cache metadata so that different
+    // override mappings (different validator indices or keys) do not reuse stale
+    // genesis and controller configuration files. We sort by validator index to
+    // ensure canonical ordering regardless of map insertion order.
+    if !params.public_keys_overrides.is_empty() {
+        let mut sorted_overrides: Vec<_> = params.public_keys_overrides.iter().collect();
+        sorted_overrides.sort_by_key(|&(idx, _)| idx);
+        let canonical_overrides = sorted_overrides
+            .iter()
+            .map(|(idx, pk)| format!("{idx}:{pk}"))
+            .join(",");
+        let pko_hash = keccak256(canonical_overrides.as_bytes());
+        metadata.push_str(&format!("-pko_{pko_hash:x}"));
+    }
+
+    metadata
+}
+
+/// Compute cached genesis file path for the given parameters.
+pub(crate) fn cached_genesis_file_path(params: &GenesisParams<'_>) -> PathBuf {
+    let metadata = genesis_cache_metadata(params);
+    let filename = format!("genesis-{metadata}.json");
+    params
+        .repo_root_dir
+        .join(QUAKE_DIR)
+        .join(".cache")
+        .join(filename)
+}
+
+/// Generate genesis file
+pub(crate) fn generate_genesis_file(params: GenesisParams<'_>) -> Result<()> {
+    if !params.force && params.genesis_file.exists() {
+        debug!("⏭️ Skipping generating and copying genesis file");
+        return Ok(());
+    }
+
+    if params.validator_names.is_empty() {
+        return Err(eyre!("validator_names must not be empty"));
+    }
+
+    let metadata = genesis_cache_metadata(&params);
+
+    let GenesisParams {
+        repo_root_dir,
+        genesis_file,
+        num_extra_accounts,
+        public_keys_overrides,
+        validator_names,
+        validator_voting_powers,
+        force,
+        el_init_hardfork,
+        extra_account_balance_usdc,
+        block_gas_limit,
+    } = params;
+
+    let num_validators = validator_names.len();
+
     // Generate genesis file if --force was given or if the genesis file doesn't
     // exist in the testnet directory
-    let filename = format!("genesis-{metadata}.json");
     let quake_cache_dir = repo_root_dir.join(QUAKE_DIR).join(".cache");
-    let cached_genesis_file = quake_cache_dir.join(&filename);
+    let cached_genesis_file = cached_genesis_file_path(&params);
 
     let public_keys_overrides = public_keys_overrides
         .iter()
@@ -2138,5 +2177,207 @@ mod tests {
         let mut flags = vec!["--rpc.forwarder=http://192.168.1.1:8545".to_string()];
         rewrite_rpc_forwarder_for_remote(&mut flags, "node-0", &nodes_metadata, &manifest.subnets);
         assert_eq!(flags[0], "--rpc.forwarder=http://192.168.1.1:8545");
+    }
+
+    fn dummy_genesis_params<'a>(
+        names: &'a [String],
+        powers: Option<&'a [u64]>,
+        overrides: &'a IndexMap<usize, String>,
+    ) -> GenesisParams<'a> {
+        GenesisParams {
+            repo_root_dir: Path::new(""),
+            genesis_file: Path::new(""),
+            num_extra_accounts: 0,
+            public_keys_overrides: overrides,
+            validator_names: names,
+            validator_voting_powers: powers,
+            force: false,
+            el_init_hardfork: None,
+            extra_account_balance_usdc: None,
+            block_gas_limit: None,
+        }
+    }
+
+    #[test]
+    fn test_genesis_cache_metadata_different_override_indices() {
+        let names = vec!["node-0".to_string(), "node-1".to_string()];
+        let key = "0x22faef225605e08abb380a5da398b609b6641cd7d1e4d718cc0fe6ecd8a2a094".to_string();
+
+        let mut overrides1 = IndexMap::new();
+        overrides1.insert(1, key.clone());
+
+        let mut overrides2 = IndexMap::new();
+        overrides2.insert(2, key);
+
+        let meta1 = genesis_cache_metadata(&dummy_genesis_params(&names, None, &overrides1));
+        let meta2 = genesis_cache_metadata(&dummy_genesis_params(&names, None, &overrides2));
+
+        assert_ne!(
+            meta1, meta2,
+            "Configurations with different override indices must produce distinct cache metadata"
+        );
+        assert!(meta1.contains("-pko_"));
+        let pko_part = meta1.split("-pko_").nth(1).unwrap();
+        assert_eq!(
+            pko_part.len(),
+            64,
+            "pko hash should be 64 hex characters (32-byte keccak256)"
+        );
+        assert!(pko_part.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_genesis_cache_metadata_different_override_values() {
+        let names = vec!["node-0".to_string(), "node-1".to_string()];
+        let key1 = "0x22faef225605e08abb380a5da398b609b6641cd7d1e4d718cc0fe6ecd8a2a094".to_string();
+        let key2 = "0x784ad3ae1bbac71ff39311bca0de2517cdfa727857c5a2a5cbf395d9af3af43a".to_string();
+
+        let mut overrides1 = IndexMap::new();
+        overrides1.insert(1, key1);
+
+        let mut overrides2 = IndexMap::new();
+        overrides2.insert(1, key2);
+
+        let meta1 = genesis_cache_metadata(&dummy_genesis_params(&names, None, &overrides1));
+        let meta2 = genesis_cache_metadata(&dummy_genesis_params(&names, None, &overrides2));
+
+        assert_ne!(
+            meta1, meta2,
+            "Configurations with different public key values must produce distinct cache metadata"
+        );
+    }
+
+    #[test]
+    fn test_genesis_cache_metadata_equivalent_mappings_different_order() {
+        let names = vec!["node-0".to_string(), "node-1".to_string()];
+        let key1 = "0x22faef225605e08abb380a5da398b609b6641cd7d1e4d718cc0fe6ecd8a2a094".to_string();
+        let key2 = "0x784ad3ae1bbac71ff39311bca0de2517cdfa727857c5a2a5cbf395d9af3af43a".to_string();
+
+        // Insertion order: 1 then 2
+        let mut overrides1 = IndexMap::new();
+        overrides1.insert(1, key1.clone());
+        overrides1.insert(2, key2.clone());
+
+        // Insertion order: 2 then 1
+        let mut overrides2 = IndexMap::new();
+        overrides2.insert(2, key2);
+        overrides2.insert(1, key1);
+
+        let meta1 = genesis_cache_metadata(&dummy_genesis_params(&names, None, &overrides1));
+        let meta2 = genesis_cache_metadata(&dummy_genesis_params(&names, None, &overrides2));
+
+        assert_eq!(
+            meta1, meta2,
+            "Equivalent override mappings must produce the exact same cache metadata regardless of insertion order"
+        );
+    }
+
+    #[test]
+    fn test_genesis_cache_metadata_preserves_validator_name_and_voting_power_differentiation() {
+        let names1 = vec!["node-0".to_string(), "node-1".to_string()];
+        let names2 = vec!["node-1".to_string(), "node-0".to_string()];
+        let overrides = IndexMap::new();
+
+        let meta_names1 = genesis_cache_metadata(&dummy_genesis_params(&names1, None, &overrides));
+        let meta_names2 = genesis_cache_metadata(&dummy_genesis_params(&names2, None, &overrides));
+        assert_ne!(
+            meta_names1, meta_names2,
+            "Different validator names/order must produce distinct cache metadata"
+        );
+
+        let powers1 = vec![10, 20];
+        let powers2 = vec![20, 10];
+        let meta_pow1 =
+            genesis_cache_metadata(&dummy_genesis_params(&names1, Some(&powers1), &overrides));
+        let meta_pow2 =
+            genesis_cache_metadata(&dummy_genesis_params(&names1, Some(&powers2), &overrides));
+        assert_ne!(
+            meta_pow1, meta_pow2,
+            "Different voting powers must produce distinct cache metadata"
+        );
+    }
+
+    #[test]
+    fn test_genesis_cache_metadata_empty_overrides_omits_pko_suffix() {
+        let names = vec!["node-0".to_string(), "node-1".to_string()];
+        let overrides = IndexMap::new();
+
+        let meta = genesis_cache_metadata(&dummy_genesis_params(&names, None, &overrides));
+        assert!(
+            !meta.contains("-pko_"),
+            "Metadata should omit -pko_ suffix when there are no public key overrides: {}",
+            meta
+        );
+        assert!(
+            meta.contains("-over_0-"),
+            "Metadata should still include -over_0-: {}",
+            meta
+        );
+    }
+
+    #[test]
+    fn test_cached_genesis_file_path_isolation_between_different_overrides() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let repo_root = temp_dir.path();
+        let cache_dir = repo_root.join(QUAKE_DIR).join(".cache");
+        fs::create_dir_all(&cache_dir).expect("failed to create cache dir");
+
+        let names = vec!["node-0".to_string(), "node-1".to_string()];
+        let key1 = "0x22faef225605e08abb380a5da398b609b6641cd7d1e4d718cc0fe6ecd8a2a094".to_string();
+        let key2 = "0x784ad3ae1bbac71ff39311bca0de2517cdfa727857c5a2a5cbf395d9af3af43a".to_string();
+
+        let mut overrides1 = IndexMap::new();
+        overrides1.insert(1, key1);
+
+        let mut overrides2 = IndexMap::new();
+        overrides2.insert(1, key2);
+
+        let mut params1 = dummy_genesis_params(&names, None, &overrides1);
+        params1.repo_root_dir = repo_root;
+
+        let mut params2 = dummy_genesis_params(&names, None, &overrides2);
+        params2.repo_root_dir = repo_root;
+
+        // Exercise the real production cache-path lookup for both configurations
+        let path1 = cached_genesis_file_path(&params1);
+        let path2 = cached_genesis_file_path(&params2);
+
+        assert_ne!(
+            path1, path2,
+            "Configurations with different public-key overrides must resolve to different cache paths"
+        );
+
+        // Simulate configuration 1 generating and saving its cached genesis artifact
+        fs::write(&path1, b"{\"genesis\": \"config1\"}")
+            .expect("failed to write cached genesis file");
+        assert!(
+            path1.exists(),
+            "Configuration 1 cached genesis artifact must exist"
+        );
+
+        // Verify that configuration 2 cannot reuse configuration 1's cached genesis artifact
+        assert!(
+            !path2.exists(),
+            "Configuration 2 must not find or reuse configuration 1's cached genesis artifact"
+        );
+
+        // Verify that different override indices also prevent cache artifact reuse
+        let mut overrides3 = IndexMap::new();
+        overrides3.insert(
+            2,
+            "0x22faef225605e08abb380a5da398b609b6641cd7d1e4d718cc0fe6ecd8a2a094".to_string(),
+        );
+        let mut params3 = dummy_genesis_params(&names, None, &overrides3);
+        params3.repo_root_dir = repo_root;
+        let path3 = cached_genesis_file_path(&params3);
+
+        assert_ne!(
+            path1, path3,
+            "Configurations with different override indices must resolve to different cache paths"
+        );
+        assert!(
+            !path3.exists(),
+            "Configuration 3 must not find or reuse configuration 1's cached genesis artifact"
+        );
     }
 }
