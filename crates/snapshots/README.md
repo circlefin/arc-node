@@ -38,6 +38,11 @@ The native `.tar.lz4` archives contain:
 | Execution (explicit `--execution-url` only) | `db/` and `static_files/` |
 | Consensus (`consensus.tar.lz4`) | `store.db` |
 
+The consensus restore holds its archive to that layout: a consensus archive is
+read in full and rejected unless it contains exactly one regular `store.db`,
+before any of it is written. The consensus target is a node home that survives
+the restore, so an archive naming anything else would write into it.
+
 ## `arc-snapshots` CLI
 
 Restore both layers, resolving the latest snapshot for the chain automatically:

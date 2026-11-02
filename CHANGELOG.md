@@ -2,6 +2,77 @@
 
 All notable changes to arc-node are documented in this file.
 
+## [v0.8.2]
+
+**Changes:** [v0.8.1...v0.8.2](https://github.com/circlefin/arc-node/compare/v0.8.1...v0.8.2) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.2)
+
+This release has no hardfork activation and no database migration, and v0.8.2 nodes run alongside v0.8.0 and v0.8.1 nodes on the same network. Node operators can upgrade the binary on their own schedule.
+
+### For Node Operators
+
+- **[Format] `arc-node-consensus` height-range RPC responses are now a paged object instead of a JSON array.** `/commit`, `/misbehavior-evidence`, `/proposal-monitor`, and `/invalid-payloads` with `count` greater than `1` return `{ "items": [...], "next": { "height": N } }`; a page stops early once its stored records reach a 4 MiB budget, and `next` gives the height to continue from. The `count` cap rises from `1000` to `10000`. Single-height responses are unchanged. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v082) for migration details.
+- **[CLI] `arc-node-execution` limits `eth_callMany` work per JSON-RPC request.** The new `--arc.rpc.max-call-many-calls` (default `10`) caps the calls across every `eth_callMany` in one request or batch, and `--arc.rpc.max-call-many-state-overrides` (default `100`) caps the accounts a single `eth_callMany` may override. Requests above either limit are rejected with JSON-RPC error `-32602` before any call runs. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v082) for migration details.
+- **[CLI] `arc-node-execution` limits the calldata an RPC tracer records per transaction.** The new `--arc.rpc.max-trace-bytes` (default `67108864`, 64 MiB) applies to `debug_trace*`, `trace_*`, `ots_*`, and `eth_createAccessList`. A transaction past the limit fails with `trace byte limit of <BYTES> exceeded` instead of returning a partial trace. Block execution is unaffected. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v082) for migration details.
+- **[Config] `arc-node-execution` aborts database read transactions after 60 seconds.** The `node` subcommand now defaults `--db.read-transaction-timeout` to `60` seconds instead of reth's `300`, and the request that held the transaction fails. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v082) for migration details.
+- **[Config] `arc-node-consensus` value-sync defaults changed.** `ARC_SYNC_BATCH_SIZE` drops from `10` to `5`, `ARC_SYNC_REQUEST_TIMEOUT` rises from `1s` to `10s`, and `ARC_SYNC_MAX_RESPONSE_SIZE` rises from `10 MiB` to `16 MiB`. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v082) for migration details.
+- **[Config] `arc-node-consensus` limits inbound sync requests from peers.** Four new environment variables set the limits: `ARC_SYNC_INBOUND_RATE_LIMIT_WINDOW` (default `10s`), `ARC_SYNC_MAX_INBOUND_REQUESTS_PER_WINDOW` (default `1000`), `ARC_SYNC_MAX_CONCURRENT_INBOUND_REQUESTS` (default `1`), and `ARC_SYNC_MAX_PENDING_INBOUND_REQUESTS` (default `128`). See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v082) for migration details.
+- **[Config] `ARC_CONSENSUS_WAL_REPLAY_DELAY` was removed.** `arc-node-consensus` no longer reads it, so a value that is still set is ignored. See [BREAKING_CHANGES.md](./BREAKING_CHANGES.md#v082) for migration details.
+- **[CLI] `arc-node-consensus` follow mode reconnects a silent `newHeads` subscription.** The new `--follow.stale-timeout` (default `30s`, only with `--follow`) sets how long the node waits for a block header on an endpoint's subscription before it treats the subscription as stale, reconnects, and increments `arc_rpc_sync_ws_stale_total`. No action is needed.
+- **[API] `arc-node-consensus` `/health` returns `503` when the consensus event loop stalls.** After startup completes, `/health` returns `503` with `{"status": "event_loop_stalled"}` when the event loop has not progressed for more than 60 seconds, and `200` with `{"status": "ok"}` otherwise. Startup work, including replay and checkpoint sync, still reports `200`. A liveness probe on `/health` now restarts a stalled node.
+- **[API] `arc-node-execution` rejects simulation requests that ask for more gas than `--rpc.gascap`.** `eth_call`, `eth_callMany`, `trace_call`, `debug_traceCall`, and `debug_traceCallMany` return JSON-RPC error `-32602` before any call runs when a block override sets `gasLimit` above `--rpc.gascap` (default `30000000`), and `eth_createAccessList` does the same when the request's `gas` exceeds it. Requests at or below the cap are unaffected. Rejections are counted in `arc_rpc_gas_cap_rejected_total`.
+
+### Features
+
+- [CL] Cancel the matching in-flight RPC fetch in follow mode when consensus cancels or times out a sync request, so the node does not send a late sync response
+- [CL] Serve value-sync blocks from the consensus store, and query the execution layer only for heights outside the retained window
+- [CL] Keep a block's stored validity verdict when re-validation fails transiently, store a repair from `Invalid` to `Valid`, and halt when a block stored as `Valid` is later reported `Invalid`
+
+### Fixes
+
+- [CL] Tighten an existing validator key file to `0600` permissions before writing the private key into it, for example on `init --overwrite`
+- [CL] Bound the invalid-payload records stored for each height
+- [CL] Apply the non-canonical block-hash check to proposals assembled from proposal parts that arrived before their round started, and drop the parts it rejects
+- [CL] Select the `Valid` block for a decided height when an `Invalid` copy of the same block is stored at a lower round
+- [CL] List every unavailable height in range-query `Unavailable` responses; `reason` stays the class of the lowest failed height
+- [CL] Treat the unsigned proof-of-lock round in proposal streams as nil, so a relaying peer cannot change it
+- [CL] Stop storing invalid-payload records for blocks received through sync, which carry no proposer signature
+- [CL] Drop the reply when the execution layer cannot return decided blocks for a sync request, so the requesting peer retries another node instead of receiving an empty result
+- [CL] Keep consensus running when a sync request hits a consensus-database read error; the node logs the error and replies with an empty result
+- [CL] Refuse to start a validator whose `--suggested-fee-recipient` is on the native-coin blocklist, and skip the proposer turn instead of crashing when the fee recipient becomes blocklisted while the node runs
+- [CL] Answer `/health` and `/ready` without waiting for in-flight range queries
+- [CL] Record request time for every consensus RPC endpoint, and label range queries rejected because the request queue is full
+- [CL] Add a random salt to each proposal-part stream message, so its gossip message ID cannot be predicted from the block contents
+- [CL] Let a node that receives a decided block through sync decide the height when it already stored the same block at another round
+- [CL] Exclude the test-only fault-injection engine and its `--byzantine` flag from release builds of `arc-node-consensus`
+- [EL] Apply the pre-EIP-155 replay-protection check to raw-transaction submissions that carry extra positional parameters
+- [EL] Respect the transaction pool's propagation setting when rebroadcasting pending transactions
+- [EL] Fail startup when the `arc` RPC namespace is enabled but cannot be built, instead of starting without `arc_getVersion` and `arc_getCertificate`
+- [EL] Return mined transactions from `eth_getTransactionBySenderAndNonce` again; pending transactions stay hidden unless `--arc.expose-pending-txs` is set
+- [EL] Fail over to the next transaction relay on upstream HTTP `401`, `403`, `404`, `405`, `407`, and `408` responses, in addition to `429` and `5xx`
+- [EL] Treat database errors while reading ProtocolConfig fee parameters as internal errors, so a valid header is not marked invalid
+- [EL] Fail block assembly when reading the gas values for the header `extra_data` hits a storage error
+- [EL] Refuse a consensus snapshot archive unless it holds exactly one regular `store.db`, so a restore cannot overwrite the validator key or the WAL
+- [EL] Verify PQ signatures directly from the call input without copying it
+- [EL] Count the full CallFrom call argument against the RPC trace byte limit
+- [EL] Report the final result of a CallFrom subcall to tracers, so `callTracer` and `trace_*` no longer show a rolled-back subcall as successful
+- [Shared] Update libp2p-gossipsub to 0.49.5, which bounds the topics a peer can register through GRAFT messages
+- [Shared] Remediate cargo audit advisories via dependency bumps, including rustls and quinn-proto
+
+### Docs
+
+Full documentation tree at this release: [`arc-node` v0.8.2 docs](https://github.com/circlefin/arc-node/tree/v0.8.2/docs). New or updated topics in this release:
+
+- Document follow-mode sync tuning: `ARC_SYNC_BATCH_SIZE`, `ARC_SYNC_REQUEST_TIMEOUT`, multiple `--follow.endpoint` values, and the `newHeads` stale timeout
+- Correct the documented return value of the EVM self-destruct account check
+
+## [v0.8.1]
+
+**Changes:** [v0.8.0...v0.8.1](https://github.com/circlefin/arc-node/compare/v0.8.0...v0.8.1) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.1)
+
+### Fixes
+
+- [EL] Charge the PQ signature-verification precompile's base gas and message gas before it copies its input, so a call without enough gas runs out of gas before the input is copied. Gas used, results, and the inputs that fail are unchanged, so no hardfork is needed
+
 ## [v0.8.0]
 
 **Changes:** [v0.7.3...v0.8.0](https://github.com/circlefin/arc-node/compare/v0.7.3...v0.8.0) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.0)

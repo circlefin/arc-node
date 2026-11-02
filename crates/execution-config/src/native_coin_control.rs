@@ -16,8 +16,14 @@
 
 //! Native coin control storage helpers.
 
-use alloy_primitives::{b256, keccak256, Address, B256};
+use alloy_primitives::{address, b256, keccak256, Address, B256};
 use revm_primitives::U256;
+
+/// NativeCoinControl stateful precompile address. Holds the native-coin (USDC)
+/// blocklist read by the block-beneficiary check. This is not the
+/// transaction-pool `Denylist.sol`.
+pub const NATIVE_COIN_CONTROL_ADDRESS: Address =
+    address!("0x1800000000000000000000000000000000000001");
 
 /// Solidity mapping slot index for NativeCoinControl `isBlocklisted`.
 pub const BLOCKLIST_MAPPING_SLOT: B256 =

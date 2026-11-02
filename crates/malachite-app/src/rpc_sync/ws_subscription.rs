@@ -41,19 +41,22 @@ pub struct PeerHeightUpdate {
     pub height: Height,
 }
 
-/// Spawn a WebSocket subscription task for a single endpoint
+/// Spawn a WebSocket subscription task for a single endpoint.
 ///
 /// This task:
 /// 1. Connects to the WebSocket endpoint
 /// 2. Subscribes to newHeads
 /// 3. Sends height updates through the channel
 /// 4. Reconnects on disconnection
-pub async fn spawn_ws_subscription(
+/// 5. If no header arrives within `stale_timeout`, the task errors and the outer
+///    backoff loop reconnects
+pub fn spawn_ws_subscription(
     http_url: Url,
     ws_url: Url,
     peer_id: PeerId,
     update_tx: mpsc::Sender<PeerHeightUpdate>,
     cancel_token: CancellationToken,
+    stale_timeout: Duration,
 ) {
     tokio::spawn(run_ws_subscription(
         http_url,
@@ -61,6 +64,7 @@ pub async fn spawn_ws_subscription(
         peer_id,
         update_tx,
         cancel_token,
+        stale_timeout,
     ));
 }
 
@@ -81,6 +85,7 @@ async fn run_ws_subscription(
     peer_id: PeerId,
     update_tx: mpsc::Sender<PeerHeightUpdate>,
     cancel_token: CancellationToken,
+    stale_timeout: Duration,
 ) {
     use backon::RetryableWithContext;
 
@@ -89,12 +94,19 @@ async fn run_ws_subscription(
         http_url: Url,
         peer_id: PeerId,
         update_tx: mpsc::Sender<PeerHeightUpdate>,
+        stale_timeout: Duration,
     }
 
     async fn task(ctx: Context) -> (Context, eyre::Result<()>) {
         info!(ws_url = %ctx.ws_url, "Connecting to WebSocket endpoint");
-        let result =
-            connect_and_subscribe(&ctx.ws_url, &ctx.http_url, ctx.peer_id, &ctx.update_tx).await;
+        let result = connect_and_subscribe(
+            &ctx.ws_url,
+            &ctx.http_url,
+            ctx.peer_id,
+            &ctx.update_tx,
+            ctx.stale_timeout,
+        )
+        .await;
         (ctx, result)
     }
 
@@ -107,6 +119,7 @@ async fn run_ws_subscription(
             http_url,
             peer_id,
             update_tx,
+            stale_timeout,
         })
         .notify(|error, delay| {
             // Unbounded retries, but at ~60s backoff, overflow takes ~10^10 years
@@ -138,12 +151,14 @@ async fn run_ws_subscription(
 }
 
 /// Connect to a WebSocket endpoint, subscribe to newHeads,
-/// and forward height updates until the connection is lost or the channel closes.
+/// and forward height updates until the connection is lost, the channel closes,
+/// or `stale_timeout` elapses without any header arriving.
 async fn connect_and_subscribe(
     ws_url: &Url,
     http_url: &Url,
     peer_id: PeerId,
     update_tx: &mpsc::Sender<PeerHeightUpdate>,
+    stale_timeout: Duration,
 ) -> eyre::Result<()> {
     // Connect to WebSocket
     let ws = WsConnect::new(ws_url.to_string());
@@ -173,12 +188,9 @@ async fn connect_and_subscribe(
         }
     }
 
-    // Stream incoming block headers until the subscription breaks
+    // Stream incoming block headers until the subscription breaks or stalls.
     loop {
-        let header = subscription
-            .recv()
-            .await
-            .map_err(|e| eyre::eyre!("WebSocket subscription error: {e}"))?;
+        let header = recv_next_header(ws_url, stale_timeout, subscription.recv()).await?;
 
         let height = Height::new(header.number);
 
@@ -191,34 +203,65 @@ async fn connect_and_subscribe(
     }
 }
 
+/// Await one header from a `subscription.recv()` future with a stale timeout.
+///
+/// On timeout, increments `arc_rpc_sync_ws_stale_total`, logs a warning, and returns an
+/// error so the caller can drop the connection and let backoff reconnect.
+async fn recv_next_header<R, E, F>(
+    ws_url: &Url,
+    stale_timeout: Duration,
+    recv: F,
+) -> eyre::Result<R>
+where
+    F: std::future::Future<Output = Result<R, E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(stale_timeout, recv).await {
+        Ok(Ok(header)) => Ok(header),
+        Ok(Err(e)) => Err(eyre::eyre!("WebSocket subscription error: {e}")),
+        Err(_) => {
+            warn!(
+                %ws_url,
+                ?stale_timeout,
+                "newHeads subscription stalled, reconnecting"
+            );
+            crate::metrics::ws_subscription::record_stale();
+            Err(eyre::eyre!(
+                "newHeads subscription stalled: no header within {stale_timeout:?}"
+            ))
+        }
+    }
+}
+
 /// Manager for all WebSocket subscriptions
 pub struct WsSubscriptionManager {
     /// Sender for spawning new subscriptions
     update_tx: mpsc::Sender<PeerHeightUpdate>,
     /// Cancellation token for all subscriptions
     cancel_token: CancellationToken,
+    /// Staleness bound applied to each `newHeads` subscription
+    stale_timeout: Duration,
 }
 
 impl WsSubscriptionManager {
     /// Create a new subscription manager
-    pub fn new() -> (Self, mpsc::Receiver<PeerHeightUpdate>) {
+    pub fn new(
+        stale_timeout: Duration,
+        cancel_token: CancellationToken,
+    ) -> (Self, mpsc::Receiver<PeerHeightUpdate>) {
         let (update_tx, update_rx) = mpsc::channel(256);
 
         let this = Self {
             update_tx,
-            cancel_token: CancellationToken::new(),
+            cancel_token,
+            stale_timeout,
         };
 
         (this, update_rx)
     }
 
-    /// Set a custom cancellation token
-    pub fn set_cancel_token(&mut self, token: CancellationToken) {
-        self.cancel_token = token;
-    }
-
     /// Start WebSocket subscriptions for all peers
-    pub async fn start_subscriptions(&self, peers: &crate::rpc_sync::peers::RpcPeers) {
+    pub fn start_subscriptions(&self, peers: &crate::rpc_sync::peers::RpcPeers) {
         for peer in peers.all() {
             if let Some(ws_url) = &peer.ws_url {
                 spawn_ws_subscription(
@@ -227,8 +270,8 @@ impl WsSubscriptionManager {
                     peer.peer_id,
                     self.update_tx.clone(),
                     self.cancel_token.clone(),
-                )
-                .await;
+                    self.stale_timeout,
+                );
             } else {
                 warn!(
                     http_url = %peer.http_url,
@@ -237,14 +280,69 @@ impl WsSubscriptionManager {
             }
         }
     }
+}
 
-    /// Stop all subscriptions
-    pub fn stop(&self) {
-        self.cancel_token.cancel();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future;
+
+    fn test_url() -> Url {
+        "wss://example.invalid/ws".parse().unwrap()
     }
 
-    /// Get the cancellation token
-    pub fn cancel_token(&self) -> CancellationToken {
-        self.cancel_token.clone()
+    /// A `subscription.recv()` future that never resolves must not block
+    /// `recv_next_header` indefinitely — the timeout must fire and return an error,
+    /// triggering the outer backoff loop to reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn recv_next_header_errors_when_recv_never_resolves() {
+        let url = test_url();
+        let timeout = Duration::from_secs(30);
+        let never: future::Pending<Result<u64, std::io::Error>> = future::pending();
+
+        let mut fut = std::pin::pin!(recv_next_header(&url, timeout, never));
+
+        // Advance time just before the timeout — the future must still be pending.
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(
+            futures::poll!(&mut fut).is_pending(),
+            "future must still be pending before the timeout elapses"
+        );
+
+        // Advance past the timeout — the future must now resolve with a stale error.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let err = fut
+            .await
+            .expect_err("stalled subscription must produce an error");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("stalled"), "expected stall error, got: {msg}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recv_next_header_forwards_recv_error() {
+        let url = test_url();
+        let err_fut = async { Err::<u64, _>(std::io::Error::other("boom")) };
+
+        let err = recv_next_header(&url, Duration::from_secs(30), err_fut)
+            .await
+            .expect_err("recv error must propagate");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("WebSocket subscription error") && msg.contains("boom"),
+            "expected wrapped recv error, got: {msg}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recv_next_header_returns_header_when_ready() {
+        let url = test_url();
+        let ok_fut = async { Ok::<u64, std::io::Error>(7) };
+
+        let value = recv_next_header(&url, Duration::from_secs(30), ok_fut)
+            .await
+            .expect("ready future must return Ok");
+        assert_eq!(value, 7);
     }
 }

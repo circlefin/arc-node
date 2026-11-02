@@ -60,7 +60,7 @@ RUN --mount=type=cache,id=malachite-cargo-registry,sharing=locked,target=/usr/lo
         git config --global url."https://${token}@github.com/".insteadOf "https://github.com/"; \
         trap 'git config --global --remove-section url."https://${token}@github.com/" || true' EXIT; \
     fi; \
-    cargo chef cook --bin arc-node-consensus --bin arc-snapshots --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path arc-node-consensus-recipe.json
+    cargo chef cook -p arc-node-consensus -p arc-snapshots --bin arc-node-consensus --bin arc-snapshots --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path arc-node-consensus-recipe.json
 
 # Per-commit git version args come after dep-cook — moving them here prevents the
 # new commit hash from busting the cook layer's S3 cache key on every push.
@@ -90,7 +90,9 @@ RUN --mount=type=cache,id=malachite-cargo-registry,sharing=locked,target=/usr/lo
         git config --global url."https://${token}@github.com/".insteadOf "https://github.com/"; \
         trap 'git config --global --remove-section url."https://${token}@github.com/" || true' EXIT; \
     fi; \
-    cargo build --bin arc-node-consensus --bin arc-snapshots --profile $BUILD_PROFILE --features "$FEATURES" --locked && \
+    # Package selection is explicit: `--bin` filters targets, not packages, so a bare
+    # workspace build unifies every default member's features into these binaries.
+    cargo build -p arc-node-consensus -p arc-snapshots --bin arc-node-consensus --bin arc-snapshots --profile $BUILD_PROFILE --features "$FEATURES" --locked && \
     # Copy built binaries to a temporary, non-cached location to make them accessible to the next stage.
     # Cargo outputs 'dev' profile to 'debug' directory, but other profiles use their own name
     if [ "$BUILD_PROFILE" = "dev" ]; then TARGET_DIR="debug"; else TARGET_DIR="$BUILD_PROFILE"; fi && \

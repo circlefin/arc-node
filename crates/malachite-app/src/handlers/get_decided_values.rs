@@ -16,11 +16,10 @@
 
 use std::ops::RangeInclusive;
 
-use alloy_rpc_types_engine::ExecutionPayloadV3;
 use alloy_rpc_types_eth::BlockNumberOrTag;
-use arc_eth_engine::engine::Engine;
+use arc_eth_engine::engine::{Engine, EthereumAPI};
 use bytesize::ByteSize;
-use eyre::{eyre, WrapErr};
+use eyre::eyre;
 use ssz::Encode;
 use tracing::{debug, error, info, warn};
 
@@ -35,9 +34,21 @@ use arc_consensus_types::sync::{Response, ValueResponse};
 use arc_consensus_types::{ArcContext, Height};
 
 use crate::block::DecidedBlock;
-use crate::metrics::AppMetrics;
+use crate::handlers::history_window::read_history_window;
+
 use crate::state::State;
-use crate::store::Store;
+use crate::store::repositories::{CertificatesRepository, DecidedBlocksRepository};
+
+/// Log a store-read failure, reply with an empty batch, and return `Ok` so the
+/// consensus loop stays up.
+fn reply_store_read_failure(
+    reply: Reply<Vec<RawDecidedValue<ArcContext>>>,
+    error: impl std::fmt::Display,
+) -> eyre::Result<()> {
+    error!("GetDecidedValues: Failed to read history window from the store: {error}");
+    let _ = reply.send(Vec::new());
+    Ok(())
+}
 
 pub async fn handle(
     state: &mut State,
@@ -53,19 +64,10 @@ pub async fn handle(
         return Ok(());
     }
 
-    let latest_height = state
-        .store()
-        .max_height()
-        .await
-        .wrap_err("GetDecidedValues: Failed to fetch the latest height from the state")?
-        .unwrap_or_default();
-
-    let earliest_height = state
-        .store()
-        .min_height()
-        .await
-        .wrap_err("GetDecidedValues: Failed to fetch the earliest height from the state")?
-        .unwrap_or_default();
+    let (latest_height, earliest_height) = match read_history_window(state.store()).await {
+        Ok(window) => window,
+        Err(e) => return reply_store_read_failure(reply, e),
+    };
 
     let store = state.store().clone();
     let metrics = state.metrics().clone();
@@ -73,27 +75,44 @@ pub async fn handle(
 
     // Spawn retrieval of decided values in a separate task to avoid blocking the main application loop.
     tokio::spawn(async move {
-        let values = get_decided_values(
-            range,
-            earliest_height..=latest_height,
-            config.batch_size,
-            config.max_response_size,
-            store,
-            engine,
-            metrics,
-        )
-        .await
-        .inspect_err(|e| {
-            error!("🔴 GetDecidedValues: Error while getting decided values: {e:?}");
-        })
-        .unwrap_or_default();
+        let result = {
+            let _guard = metrics.start_msg_process_timer("GetDecidedValues");
+            get_decided_values(
+                range,
+                earliest_height..=latest_height,
+                config.batch_size,
+                config.max_response_size,
+                &store,
+                &store,
+                engine.eth.as_ref(),
+            )
+            .await
+        };
 
-        if let Err(e) = reply.send(values) {
-            error!("🔴 GetDecidedValues: Failed to send reply: {e:?}");
+        // Only answer on success. An EL/store failure must not look like
+        // "this node has no certificates" or the peer will skip us.
+        if let Some(values) = sync_reply_values(result) {
+            if let Err(e) = reply.send(values) {
+                error!("🔴 GetDecidedValues: Failed to send reply: {e:?}");
+            }
         }
     });
 
     Ok(())
+}
+
+/// Values to send a syncing peer, or `None` to drop the reply.
+///
+/// A failed fetch must not be rewritten as an empty batch: the peer would treat
+/// that as "no certificates here" and move on, instead of retrying another host.
+fn sync_reply_values<T, E: std::fmt::Debug>(result: Result<Vec<T>, E>) -> Option<Vec<T>> {
+    match result {
+        Ok(values) => Some(values),
+        Err(e) => {
+            error!("🔴 GetDecidedValues: Error while getting decided values: {e:?}");
+            None
+        }
+    }
 }
 
 async fn get_decided_values(
@@ -101,12 +120,10 @@ async fn get_decided_values(
     available_range: RangeInclusive<Height>,
     batch_size: usize,
     max_response_size: ByteSize,
-    store: Store,
-    engine: Engine,
-    metrics: AppMetrics,
+    decided_blocks: impl DecidedBlocksRepository,
+    certificates: impl CertificatesRepository,
+    ethereum_api: impl EthereumAPI,
 ) -> Result<Vec<RawDecidedValue<ArcContext>>, eyre::Error> {
-    let _guard = metrics.start_msg_process_timer("GetDecidedValues");
-
     let earliest_height = *available_range.start();
     let latest_height = *available_range.end();
 
@@ -116,32 +133,25 @@ async fn get_decided_values(
         return Ok(Vec::new()); // Warn logged inside get_clamped_request_range
     };
 
-    // Batch fetch all execution payloads in one RPC call
     let heights = range.clone().iter_heights().collect::<Vec<_>>();
-    let block_numbers = heights
-        .iter()
-        .map(|height| BlockNumberOrTag::Number(height.as_u64()))
-        .collect::<Vec<_>>();
-
-    let execution_payloads = engine.eth.get_execution_payloads(&block_numbers).await?;
+    let decided_blocks =
+        get_decided_blocks(&heights, decided_blocks, certificates, ethereum_api).await?;
 
     let mut values = Vec::with_capacity(range.len());
     let mut total_bytes = ByteSize::b(0);
 
-    for (height, execution_payload) in heights.into_iter().zip(execution_payloads.into_iter()) {
-        let Some(execution_payload) = execution_payload else {
-            debug!(%height, "No execution payload found at this height from EL, skipping");
+    for (height, decided_block) in heights.into_iter().zip(decided_blocks) {
+        let Some(decided_block) = decided_block else {
             continue;
         };
 
-        let (raw_value, raw_bytes_len) =
-            match get_raw_decided_value(&store, execution_payload, height).await {
-                Ok(result) => result,
-                Err(e) => {
-                    warn!(%height, "Failed to get decided value at height: {e}");
-                    continue;
-                }
-            };
+        let (raw_value, raw_bytes_len) = match get_raw_decided_value(decided_block, height) {
+            Ok(result) => result,
+            Err(e) => {
+                warn!(%height, "Failed to get decided value at height: {e}");
+                continue;
+            }
+        };
 
         // NOTE: This size estimate slightly over-approximates the true wire size.
         // These estimates assume each value is sent in its own SyncResponse message,
@@ -190,17 +200,73 @@ async fn get_decided_values(
     Ok(values)
 }
 
-async fn get_raw_decided_value(
-    store: &Store,
-    execution_payload: ExecutionPayloadV3,
+async fn get_decided_blocks(
+    heights: &[Height],
+    decided_blocks: impl DecidedBlocksRepository,
+    certificates: impl CertificatesRepository,
+    ethereum_api: impl EthereumAPI,
+) -> eyre::Result<Vec<Option<DecidedBlock>>> {
+    let mut blocks = Vec::with_capacity(heights.len());
+    let mut missing = Vec::new();
+
+    for &height in heights {
+        let block = match decided_blocks.get(height).await {
+            Ok(block) => block,
+            Err(e) => {
+                warn!(
+                    %height,
+                    error = %e,
+                    "Failed to fetch decided block from CL store, falling back to EL"
+                );
+                None
+            }
+        };
+
+        if block.is_none() {
+            missing.push((blocks.len(), height));
+        }
+
+        blocks.push(block);
+    }
+
+    if missing.is_empty() {
+        return Ok(blocks);
+    }
+
+    let block_numbers = missing
+        .iter()
+        .map(|(_, height)| BlockNumberOrTag::Number(height.as_u64()))
+        .collect::<Vec<_>>();
+    let execution_payloads = ethereum_api.get_execution_payloads(&block_numbers).await?;
+
+    for ((index, height), execution_payload) in missing.into_iter().zip(execution_payloads) {
+        let Some(execution_payload) = execution_payload else {
+            debug!(%height, "No execution payload found at this height from EL, skipping");
+            continue;
+        };
+
+        let certificate = match certificates.get(height).await {
+            Ok(Some(stored)) => stored.certificate,
+            Ok(None) => {
+                warn!(%height, "No certificate found at height, skipping");
+                continue;
+            }
+            Err(e) => {
+                warn!(%height, "Failed to fetch certificate at height: {e}");
+                continue;
+            }
+        };
+
+        blocks[index] = Some(DecidedBlock::new(execution_payload, certificate));
+    }
+
+    Ok(blocks)
+}
+
+fn get_raw_decided_value(
+    decided_block: DecidedBlock,
     height: Height,
 ) -> eyre::Result<(RawDecidedValue<ArcContext>, ByteSize)> {
-    let stored = store
-        .get_certificate(Some(height))
-        .await?
-        .ok_or_else(|| eyre!("No certificate found at height {height}"))?;
-
-    let decided_block = DecidedBlock::new(execution_payload, stored.certificate);
     let certificate = ExtendedCommitCertificate::from_commit_certificate_and_extensions(
         decided_block.certificate,
         VoteExtensions::default(),
@@ -304,11 +370,369 @@ fn get_clamped_request_range(
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::{Address as AlloyAddress, Bloom, Bytes as AlloyBytes, U256};
+    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3};
+    use arc_consensus_types::{
+        BlockHash, CommitCertificate, CommitCertificateType, Round, StoredCommitCertificate,
+        ValueId, B256,
+    };
+    use arc_eth_engine::mocks::MockEthereumAPI;
+
+    use crate::store::repositories::mocks::{
+        MockCertificatesRepository, MockDecidedBlocksRepository,
+    };
+
     use super::*;
+
+    #[tokio::test]
+    async fn reply_store_read_failure_sends_empty_batch_and_returns_ok() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reply_store_read_failure(tx, "max_height: disk I/O failed")
+            .expect("store read failure must not fail the handler");
+        let values = rx.await.expect("reply");
+        assert!(values.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reply_store_read_failure_returns_ok_when_reply_is_dropped() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        reply_store_read_failure(tx, "min_height: disk I/O failed")
+            .expect("dropped reply is not a handler error");
+    }
 
     // Helper to easily create ranges
     fn h(start: u64, end: u64) -> RangeInclusive<Height> {
         Height::new(start)..=Height::new(end)
+    }
+
+    fn test_payload(height: u64) -> ExecutionPayloadV3 {
+        ExecutionPayloadV3 {
+            payload_inner: ExecutionPayloadV2 {
+                payload_inner: ExecutionPayloadV1 {
+                    parent_hash: height
+                        .checked_sub(1)
+                        .map_or(B256::ZERO, |parent| B256::repeat_byte(parent as u8)),
+                    fee_recipient: AlloyAddress::ZERO,
+                    state_root: B256::ZERO,
+                    receipts_root: B256::ZERO,
+                    logs_bloom: Bloom::default(),
+                    prev_randao: B256::ZERO,
+                    block_number: height,
+                    gas_limit: 30_000_000,
+                    gas_used: 0,
+                    timestamp: height,
+                    extra_data: AlloyBytes::default(),
+                    base_fee_per_gas: U256::from(1u64),
+                    block_hash: B256::repeat_byte(height as u8),
+                    transactions: vec![],
+                },
+                withdrawals: vec![],
+            },
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        }
+    }
+
+    fn test_certificate(height: u64) -> CommitCertificate<ArcContext> {
+        CommitCertificate::new(
+            Height::new(height),
+            Round::new(0),
+            ValueId::new(BlockHash::repeat_byte(height as u8)),
+            vec![],
+        )
+    }
+
+    fn test_stored_certificate(height: u64) -> StoredCommitCertificate {
+        StoredCommitCertificate {
+            certificate: test_certificate(height),
+            certificate_type: CommitCertificateType::Minimal,
+            proposer: None,
+        }
+    }
+
+    fn test_decided_block(height: u64) -> DecidedBlock {
+        DecidedBlock::new(test_payload(height), test_certificate(height))
+    }
+
+    fn value_heights(values: &[RawDecidedValue<ArcContext>]) -> Vec<u64> {
+        values
+            .iter()
+            .map(|value| value.certificate.height.as_u64())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn full_cache_hits_do_not_query_the_execution_layer() {
+        let mut decided_blocks = MockDecidedBlocksRepository::new();
+        decided_blocks
+            .expect_get()
+            .times(3)
+            .returning(|height| Ok(Some(test_decided_block(height.as_u64()))));
+
+        let mut certificates = MockCertificatesRepository::new();
+        certificates.expect_get().times(0);
+
+        let mut ethereum_api = MockEthereumAPI::new();
+        ethereum_api.expect_get_execution_payloads().times(0);
+
+        let values = get_decided_values(
+            h(10, 12),
+            h(10, 12),
+            3,
+            ByteSize::mib(16),
+            decided_blocks,
+            certificates,
+            ethereum_api,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value_heights(&values), vec![10, 11, 12]);
+    }
+
+    #[tokio::test]
+    async fn full_cache_misses_use_one_execution_layer_batch() {
+        let mut decided_blocks = MockDecidedBlocksRepository::new();
+        decided_blocks.expect_get().times(3).returning(|_| Ok(None));
+
+        let mut certificates = MockCertificatesRepository::new();
+        certificates
+            .expect_get()
+            .times(3)
+            .returning(|height| Ok(Some(test_stored_certificate(height.as_u64()))));
+
+        let mut ethereum_api = MockEthereumAPI::new();
+        ethereum_api
+            .expect_get_execution_payloads()
+            .times(1)
+            .return_once(|block_numbers| {
+                assert_eq!(
+                    block_numbers,
+                    [
+                        BlockNumberOrTag::Number(10),
+                        BlockNumberOrTag::Number(11),
+                        BlockNumberOrTag::Number(12),
+                    ]
+                );
+                Ok(vec![
+                    Some(test_payload(10)),
+                    Some(test_payload(11)),
+                    Some(test_payload(12)),
+                ])
+            });
+
+        let values = get_decided_values(
+            h(10, 12),
+            h(10, 12),
+            3,
+            ByteSize::mib(16),
+            decided_blocks,
+            certificates,
+            ethereum_api,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value_heights(&values), vec![10, 11, 12]);
+    }
+
+    #[tokio::test]
+    async fn mixed_cache_results_preserve_height_order() {
+        let mut decided_blocks = MockDecidedBlocksRepository::new();
+        decided_blocks
+            .expect_get()
+            .times(3)
+            .returning(|height| match height.as_u64() {
+                10 | 12 => Ok(Some(test_decided_block(height.as_u64()))),
+                11 => Ok(None),
+                _ => unreachable!(),
+            });
+
+        let mut certificates = MockCertificatesRepository::new();
+        certificates.expect_get().times(1).return_once(|height| {
+            assert_eq!(height, Height::new(11));
+            Ok(Some(test_stored_certificate(11)))
+        });
+
+        let mut ethereum_api = MockEthereumAPI::new();
+        ethereum_api
+            .expect_get_execution_payloads()
+            .times(1)
+            .return_once(|block_numbers| {
+                assert_eq!(block_numbers, [BlockNumberOrTag::Number(11)]);
+                Ok(vec![Some(test_payload(11))])
+            });
+
+        let values = get_decided_values(
+            h(10, 12),
+            h(10, 12),
+            3,
+            ByteSize::mib(16),
+            decided_blocks,
+            certificates,
+            ethereum_api,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value_heights(&values), vec![10, 11, 12]);
+    }
+
+    #[tokio::test]
+    async fn unavailable_fallback_payloads_are_skipped() {
+        let mut decided_blocks = MockDecidedBlocksRepository::new();
+        decided_blocks.expect_get().times(3).returning(|_| Ok(None));
+
+        let mut certificates = MockCertificatesRepository::new();
+        certificates
+            .expect_get()
+            .times(2)
+            .returning(|height| Ok(Some(test_stored_certificate(height.as_u64()))));
+
+        let mut ethereum_api = MockEthereumAPI::new();
+        ethereum_api
+            .expect_get_execution_payloads()
+            .times(1)
+            .return_once(|_| Ok(vec![Some(test_payload(10)), None, Some(test_payload(12))]));
+
+        let values = get_decided_values(
+            h(10, 12),
+            h(10, 12),
+            3,
+            ByteSize::mib(16),
+            decided_blocks,
+            certificates,
+            ethereum_api,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value_heights(&values), vec![10, 12]);
+    }
+
+    #[tokio::test]
+    async fn execution_layer_batch_errors_are_returned() {
+        let mut decided_blocks = MockDecidedBlocksRepository::new();
+        decided_blocks.expect_get().return_once(|_| Ok(None));
+
+        let mut certificates = MockCertificatesRepository::new();
+        certificates.expect_get().times(0);
+
+        let mut ethereum_api = MockEthereumAPI::new();
+        ethereum_api
+            .expect_get_execution_payloads()
+            .return_once(|_| Err(eyre!("fallback failed")));
+
+        let error = get_decided_values(
+            h(10, 10),
+            h(10, 10),
+            1,
+            ByteSize::mib(16),
+            decided_blocks,
+            certificates,
+            ethereum_api,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("fallback failed"));
+    }
+
+    #[tokio::test]
+    async fn cache_errors_fall_back_without_dropping_other_values() {
+        let mut decided_blocks = MockDecidedBlocksRepository::new();
+        decided_blocks
+            .expect_get()
+            .times(3)
+            .returning(|height| match height.as_u64() {
+                10 | 12 => Ok(Some(test_decided_block(height.as_u64()))),
+                11 => Err(std::io::Error::other("cache read failed")),
+                _ => unreachable!(),
+            });
+
+        let mut certificates = MockCertificatesRepository::new();
+        certificates.expect_get().times(1).return_once(|height| {
+            assert_eq!(height, Height::new(11));
+            Ok(Some(test_stored_certificate(11)))
+        });
+
+        let mut ethereum_api = MockEthereumAPI::new();
+        ethereum_api
+            .expect_get_execution_payloads()
+            .times(1)
+            .return_once(|block_numbers| {
+                assert_eq!(block_numbers, [BlockNumberOrTag::Number(11)]);
+                Ok(vec![Some(test_payload(11))])
+            });
+
+        let values = get_decided_values(
+            h(10, 12),
+            h(10, 12),
+            3,
+            ByteSize::mib(16),
+            decided_blocks,
+            certificates,
+            ethereum_api,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value_heights(&values), vec![10, 11, 12]);
+    }
+
+    #[tokio::test]
+    async fn response_limit_applies_across_cached_and_fallback_values() {
+        let (_, first_value_size) =
+            get_raw_decided_value(test_decided_block(10), Height::new(10)).unwrap();
+
+        let mut decided_blocks = MockDecidedBlocksRepository::new();
+        decided_blocks
+            .expect_get()
+            .times(2)
+            .returning(|height| match height.as_u64() {
+                10 => Ok(Some(test_decided_block(10))),
+                11 => Ok(None),
+                _ => unreachable!(),
+            });
+
+        let mut certificates = MockCertificatesRepository::new();
+        certificates
+            .expect_get()
+            .return_once(|_| Ok(Some(test_stored_certificate(11))));
+
+        let mut ethereum_api = MockEthereumAPI::new();
+        ethereum_api
+            .expect_get_execution_payloads()
+            .return_once(|_| Ok(vec![Some(test_payload(11))]));
+
+        let values = get_decided_values(
+            h(10, 11),
+            h(10, 11),
+            2,
+            first_value_size,
+            decided_blocks,
+            certificates,
+            ethereum_api,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value_heights(&values), vec![10]);
+    }
+
+    #[test]
+    fn sync_reply_values_sends_successful_batches_including_empty() {
+        assert_eq!(
+            sync_reply_values(Ok::<_, &str>(vec![1, 2])),
+            Some(vec![1, 2])
+        );
+        assert_eq!(sync_reply_values(Ok::<Vec<u8>, &str>(vec![])), Some(vec![]));
+    }
+
+    #[test]
+    fn sync_reply_values_drops_failed_fetches() {
+        assert_eq!(sync_reply_values(Err::<Vec<u8>, _>("el unavailable")), None);
     }
 
     #[test]

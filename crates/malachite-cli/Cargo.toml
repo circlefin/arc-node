@@ -24,6 +24,8 @@ color-eyre = { workspace = true }
 directories = { workspace = true }
 eyre = { workspace = true }
 hex = { workspace = true }
+humantime = { workspace = true }
+humantime-serde = { workspace = true }
 itertools = { workspace = true }
 
 # malachite

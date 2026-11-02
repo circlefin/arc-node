@@ -17,7 +17,7 @@
 //! Arc transaction validator implementation with blocklist and addresses denylist support
 
 use crate::error::ArcTransactionValidatorError;
-use alloy_primitives::{Address, TxHash};
+use alloy_primitives::{Address, TxHash, TxKind};
 use arc_execution_config::addresses_denylist::AddressesDenylistConfig;
 use arc_execution_validation::{is_denylisted, DenylistError};
 use arc_precompiles::{
@@ -360,7 +360,8 @@ where
     }
 
     /// Returns Ok(Some(address)) if any checked address is blocklisted, Ok(None) if all clear.
-    /// Checks the sender unconditionally and the recipient only for value-bearing transactions.
+    /// Checks the sender unconditionally and the value recipient only for value-bearing
+    /// transactions: the `to` address of a call, or the address a contract creation deploys to.
     fn check_for_blocklisted_addresses(
         &self,
         transaction: &Tx,
@@ -368,8 +369,12 @@ where
     ) -> ProviderResult<Option<Address>> {
         let has_value = !transaction.value().is_zero();
 
-        let addresses =
-            std::iter::once(transaction.sender()).chain(transaction.to().filter(|_| has_value));
+        let recipient = has_value.then(|| match transaction.kind() {
+            TxKind::Call(to) => to,
+            TxKind::Create => transaction.sender().create(transaction.nonce()),
+        });
+
+        let addresses = std::iter::once(transaction.sender()).chain(recipient);
 
         for address in addresses {
             if self.is_address_blocklisted(address, state_provider)? {
@@ -429,7 +434,7 @@ where
 mod tests {
     use super::*;
     use alloy_consensus::Transaction;
-    use alloy_primitives::{Address, B256, U256};
+    use alloy_primitives::{address, Address, TxKind, B256, U256};
     use arc_execution_config::addresses_denylist::compute_denylist_storage_slot;
     use arc_execution_config::addresses_denylist::{
         AddressesDenylistConfig, DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
@@ -577,6 +582,132 @@ mod tests {
                 )
             );
             assert!(matches_expectation, "Test '{}' failed", test_case.name);
+        }
+    }
+
+    fn blocklist_addresses(provider: &MockEthProvider, addresses: &[Address]) {
+        let storage = addresses
+            .iter()
+            .map(|address| {
+                (
+                    compute_is_blocklisted_storage_slot(*address),
+                    BLOCKLISTED_STATUS,
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        provider.add_account(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            ExtendedAccount::new(0, U256::ZERO).extend_storage(storage),
+        );
+    }
+
+    fn assert_blocklist_rejected(
+        outcome: &TransactionValidationOutcome<MockTransaction>,
+        context: &str,
+    ) {
+        let TransactionValidationOutcome::Invalid(_, err) = outcome else {
+            panic!("{context}: expected Invalid, got {outcome:?}");
+        };
+        let inner: &ArcTransactionValidatorError = err
+            .downcast_other_ref::<ArcTransactionValidatorError>()
+            .unwrap();
+        assert!(
+            matches!(inner, ArcTransactionValidatorError::BlocklistedError),
+            "{context}: expected BlocklistedError, got {inner:?}"
+        );
+    }
+
+    fn assert_outcome_valid(
+        outcome: &TransactionValidationOutcome<MockTransaction>,
+        context: &str,
+    ) {
+        assert!(
+            matches!(outcome, TransactionValidationOutcome::Valid { .. }),
+            "{context}: expected Valid, got {outcome:?}"
+        );
+    }
+
+    fn into_create(mut tx: MockTransaction) -> MockTransaction {
+        let MockTransaction::Legacy { to, .. } = &mut tx else {
+            panic!("expected a legacy mock transaction");
+        };
+        *to = TxKind::Create;
+        tx
+    }
+
+    /// A value-bearing CREATE is checked against the address it deploys to.
+    #[tokio::test]
+    async fn create_to_blocklisted_derived_address() {
+        // Derived addresses checked by hand with `cast compute-address <SENDER> --nonce <n>`.
+        const SENDER: Address = address!("6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0");
+        const CREATED_AT_NONCE_0: Address = address!("cd234a471b72ba2f1ccf0a70fcaba648a5eecd8d");
+        const CREATED_AT_NONCE_1: Address = address!("343c43a37d37dff08ae8c4a11544c718abb4fcf8");
+
+        struct Case {
+            name: &'static str,
+            value: U256,
+            tx_nonce: u64,
+            blocklisted: Address,
+            rejected: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "value_create_to_blocklisted_address",
+                value: U256::from(1000),
+                tx_nonce: 0,
+                blocklisted: CREATED_AT_NONCE_0,
+                rejected: true,
+            },
+            Case {
+                // Like a call recipient, the created address is checked only when value is sent.
+                name: "zero_value_create_to_blocklisted_address",
+                value: U256::ZERO,
+                tx_nonce: 0,
+                blocklisted: CREATED_AT_NONCE_0,
+                rejected: false,
+            },
+            Case {
+                // The account nonce stays 0, so the address must come from the transaction nonce.
+                name: "queued_create_to_blocklisted_address",
+                value: U256::from(1000),
+                tx_nonce: 1,
+                blocklisted: CREATED_AT_NONCE_1,
+                rejected: true,
+            },
+            Case {
+                name: "create_to_address_of_other_nonce",
+                value: U256::from(1000),
+                tx_nonce: 1,
+                blocklisted: CREATED_AT_NONCE_0,
+                rejected: false,
+            },
+        ];
+
+        for case in cases {
+            let tx = into_create(
+                MockTransaction::legacy()
+                    .with_sender(SENDER)
+                    .with_nonce(case.tx_nonce)
+                    .with_gas_limit(100_000)
+                    .with_gas_price(1_000_000_000)
+                    .with_value(case.value),
+            );
+
+            let provider = MockEthProvider::default();
+            provider.add_account(SENDER, ExtendedAccount::new(0, U256::MAX));
+            blocklist_addresses(&provider, &[case.blocklisted]);
+            let arc_validator = create_arc_validator_for_test(provider);
+
+            let outcome = arc_validator
+                .validate_one_with_state(TransactionOrigin::External, tx, &mut None)
+                .await;
+
+            if case.rejected {
+                assert_blocklist_rejected(&outcome, case.name);
+            } else {
+                assert_outcome_valid(&outcome, case.name);
+            }
         }
     }
 

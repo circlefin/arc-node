@@ -16,6 +16,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use arc_consensus_types::rpc_sync::SyncEndpointUrl;
 use clap::Parser;
@@ -479,11 +480,28 @@ pub struct StartCmd {
     #[serde(skip)]
     pub follow_endpoints: Vec<SyncEndpointUrl>,
 
-    /// Byzantine behavior configuration as a JSON blob. Testnet / Quake only.
+    /// Staleness bound for the `newHeads` WebSocket subscription used in follow mode.
+    ///
+    /// If no block header arrives on the subscription within this interval the stream is
+    /// declared stale, the connection is closed, and the outer backoff loop reconnects.
+    /// Only takes effect when `--follow` is set.
+    #[clap(
+        long = "follow.stale-timeout",
+        value_name = "DURATION",
+        default_value = "30s",
+        value_parser = parse_humantime_duration,
+        requires = "follow",
+    )]
+    #[serde(with = "humantime_serde")]
+    pub follow_stale_timeout: Duration,
+
+    /// Byzantine behavior configuration as a JSON blob. Localdev / Devnet only.
     ///
     /// Deserializes into `arc_consensus_types::ByzantineConfig` and enables
     /// configurable Byzantine faults: vote/proposal equivocation, message
     /// dropping, inbound-proposal drops, amnesia, force-precommit-nil.
+    ///
+    /// An active configuration is rejected at startup on any other chain.
     ///
     /// Example: --byzantine='{"equivocate_votes":{"mode":"always"},"seed":42}'
     #[cfg(feature = "byzantine")]
@@ -491,7 +509,7 @@ pub struct StartCmd {
         long,
         value_name = "JSON",
         value_parser = parse_byzantine_json,
-        help_heading = "Byzantine (testnet only)"
+        help_heading = "Byzantine (localdev / devnet only)"
     )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byzantine: Option<arc_consensus_types::ByzantineConfig>,
@@ -500,6 +518,10 @@ pub struct StartCmd {
 #[cfg(feature = "byzantine")]
 fn parse_byzantine_json(s: &str) -> Result<arc_consensus_types::ByzantineConfig, String> {
     serde_json::from_str(s).map_err(|e| format!("invalid --byzantine JSON: {e}"))
+}
+
+fn parse_humantime_duration(s: &str) -> Result<Duration, String> {
+    humantime::parse_duration(s).map_err(|e| e.to_string())
 }
 
 fn parse_non_zero_address(s: &str) -> Result<Address, String> {
@@ -560,6 +582,9 @@ impl Default for StartCmd {
             byzantine: None,
             follow: false,
             follow_endpoints: Vec::new(),
+            // Must match `StartConfig::DEFAULT_RPC_SYNC_STALE_TIMEOUT` and the
+            // clap `default_value = "30s"` above.
+            follow_stale_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -674,6 +699,13 @@ impl StartCmd {
         push_if_some!("signing.tls-cert-path", self.signing_tls_cert_path);
         push_if!("follow", self.follow);
         push_each!("follow.endpoint", &self.follow_endpoints);
+        // Gated on `follow` because the flag declares `requires = "follow"`
+        if self.follow && self.follow_stale_timeout != defaults.follow_stale_timeout {
+            flags.push(format!(
+                "--follow.stale-timeout={}",
+                humantime::format_duration(self.follow_stale_timeout)
+            ));
+        }
 
         #[cfg(feature = "byzantine")]
         if let Some(ref byz) = self.byzantine {
@@ -736,6 +768,13 @@ impl StartCmd {
             return Err(eyre::eyre!(
                 "--execution-persistence-backpressure-threshold must be greater than 0.\n\
                 A value of 0 would cause persistence backpressure to stall indefinitely once active."
+            ));
+        }
+
+        if self.follow && self.follow_stale_timeout.is_zero() {
+            return Err(eyre::eyre!(
+                "--follow.stale-timeout must be greater than 0 \
+                 when --follow is enabled."
             ));
         }
 
@@ -966,6 +1005,63 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("execution-persistence-backpressure-threshold"));
+    }
+
+    /// Drift guard: the clap `default_value` literal must agree with the
+    /// hand-written `StartCmd::default()`, which never goes through the parser.
+    /// `follow_stale_timeout_cli_default_matches_start_config_const` in
+    /// `arc-node-consensus` pins that impl to
+    /// `StartConfig::DEFAULT_RPC_SYNC_STALE_TIMEOUT`; the const cannot be named
+    /// here, because this crate must not depend on the app crate.
+    #[test]
+    fn follow_stale_timeout_clap_default_matches_cmd_default() {
+        let args = vec![
+            "arc-node-consensus",
+            "--moniker",
+            "test",
+            "--p2p.addr",
+            "/ip4/127.0.0.1/tcp/27000",
+        ];
+        let parsed = StartCmd::try_parse_from(args).unwrap();
+
+        assert_eq!(
+            parsed.follow_stale_timeout,
+            StartCmd::default().follow_stale_timeout,
+        );
+    }
+
+    #[test]
+    fn validate_err_with_zero_follow_stale_timeout_when_enabled() {
+        let mut cmd = new_start_cmd();
+        cmd.follow = true;
+        cmd.follow_stale_timeout = Duration::ZERO;
+
+        let result = cmd.validate();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("--follow.stale-timeout"));
+
+        cmd.follow = false;
+        assert!(cmd.validate().is_ok());
+    }
+
+    /// A global `[cl.config]` in a Quake manifest reaches validators as well as
+    /// followers. Emitting `--follow.stale-timeout` for a node without `--follow`
+    /// would fail the trial parse, because the flag requires it.
+    #[test]
+    fn to_cli_flags_omits_stale_timeout_without_follow() {
+        let mut cmd = new_start_cmd();
+        cmd.follow = false;
+        cmd.follow_stale_timeout = Duration::from_secs(45);
+
+        let flags = cmd.to_cli_flags();
+        assert!(
+            !flags.iter().any(|f| f.contains("follow.stale-timeout")),
+            "{flags:?}"
+        );
+
+        let args = std::iter::once("arc-node-consensus".to_string()).chain(flags);
+        StartCmd::try_parse_from(args).expect("flags for a non-follow node must parse");
     }
 
     #[test]
@@ -1730,6 +1826,7 @@ mod tests {
             ),
             follow: true,
             follow_endpoints: vec!["http://rpc-1:8545,ws=8546".parse().unwrap()],
+            follow_stale_timeout: Duration::from_secs(45),
         };
 
         let args = std::iter::once("arc-node-consensus".to_string())

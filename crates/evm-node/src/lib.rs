@@ -29,5 +29,7 @@ pub mod rpc_middleware;
 // Re-export commonly used types
 pub use engine::ArcEngineValidator;
 pub use rpc_middleware::{
-    ArcRpcLayer, ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT, DEFAULT_TX_RELAY_TIMEOUT,
+    ArcRpcLayer, CallManyLimits, ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT,
+    ARC_RPC_MAX_CALL_MANY_CALLS_DEFAULT, ARC_RPC_MAX_CALL_MANY_STATE_OVERRIDES_DEFAULT,
+    DEFAULT_TX_RELAY_TIMEOUT,
 };

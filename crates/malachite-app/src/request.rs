@@ -14,13 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::error;
 
 use arc_consensus_db::invalid_payloads::StoredInvalidPayloads;
-use arc_consensus_db::RangeQueryResult;
+use arc_consensus_db::HeightRangePage;
 use arc_consensus_types::evidence::StoredMisbehaviorEvidence;
 use arc_consensus_types::{
     signing::PublicKey, Address, ArcContext, BlockHash, CommitCertificateType, Height, Round,
@@ -96,6 +96,15 @@ pub struct HeightRangeRequest {
     pub count: u64,
 }
 
+/// A bounded invalid-payloads query over heights `from..=from+count-1`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InvalidPayloadsRequest {
+    /// First height of the range.
+    pub from: Height,
+    /// Total number of heights, including `from`.
+    pub count: u64,
+}
+
 #[allow(clippy::enum_variant_names)]
 pub enum AppRequest {
     /// Retrieves a commit certificate at the given height
@@ -108,65 +117,221 @@ pub enum AppRequest {
         reply: oneshot::Sender<Option<CommitCertificateInfo>>,
     },
     /// Retrieves misbehavior evidence at the given height
-    GetMisbehaviorEvidence(
-        /// The height to get the evidence for. If None, use the latest height.
-        Option<Height>,
-        /// The channel to send the evidence back on.
-        oneshot::Sender<Option<StoredMisbehaviorEvidence>>,
-    ),
+    GetMisbehaviorEvidence {
+        height: Option<Height>,
+        enqueued_at: Instant,
+        reply: oneshot::Sender<Option<StoredMisbehaviorEvidence>>,
+    },
     /// Retrieves proposal monitor data at the given height
-    GetProposalMonitorData(
-        /// The height to get the data for. If None, get the latest.
-        Option<Height>,
-        /// The channel to send the data back on.
-        oneshot::Sender<Option<ProposalMonitor>>,
-    ),
+    GetProposalMonitorData {
+        height: Option<Height>,
+        enqueued_at: Instant,
+        reply: oneshot::Sender<Option<ProposalMonitor>>,
+    },
     /// Retrieves invalid payloads at the given height
-    GetInvalidPayloads(
-        /// The height to get the payloads for. If None, get the latest.
-        Option<Height>,
-        /// The channel to send the payloads back on.
-        oneshot::Sender<Option<StoredInvalidPayloads>>,
-    ),
-    /// Retrieves commit certificates for a range of heights
-    GetCertificateRange(
+    GetInvalidPayloads {
+        height: Option<Height>,
+        enqueued_at: Instant,
+        reply: oneshot::Sender<Option<StoredInvalidPayloads>>,
+    },
+    /// Retrieves a bounded page of commit certificates for a range of heights
+    GetCertificateRange {
         /// The range of heights to read.
-        HeightRangeRequest,
+        range: HeightRangeRequest,
+        /// The time the request was enqueued.
+        enqueued_at: Instant,
         /// The channel to send the certificates back on.
-        oneshot::Sender<Option<RangeQueryResult<CommitCertificateInfo>>>,
-    ),
-    /// Retrieves misbehavior evidence for a range of heights
-    GetMisbehaviorEvidenceRange(
+        reply: oneshot::Sender<Option<HeightRangePage<CommitCertificateInfo>>>,
+    },
+    /// Retrieves a bounded page of misbehavior evidence for a range of heights
+    GetMisbehaviorEvidenceRange {
         /// The range of heights to read.
-        HeightRangeRequest,
+        range: HeightRangeRequest,
+        /// The time the request was enqueued.
+        enqueued_at: Instant,
         /// The channel to send the evidence back on.
-        oneshot::Sender<Option<RangeQueryResult<StoredMisbehaviorEvidence>>>,
-    ),
-    /// Retrieves proposal monitor data for a range of heights
-    GetProposalMonitorDataRange(
+        reply: oneshot::Sender<Option<HeightRangePage<StoredMisbehaviorEvidence>>>,
+    },
+    /// Retrieves a bounded page of proposal monitor data for a range of heights
+    GetProposalMonitorDataRange {
         /// The range of heights to read.
-        HeightRangeRequest,
+        range: HeightRangeRequest,
+        /// The time the request was enqueued.
+        enqueued_at: Instant,
         /// The channel to send the data back on.
-        oneshot::Sender<Option<RangeQueryResult<ProposalMonitor>>>,
-    ),
-    /// Retrieves invalid payloads for a range of heights
-    GetInvalidPayloadsRange(
-        /// The range of heights to read.
-        HeightRangeRequest,
+        reply: oneshot::Sender<Option<HeightRangePage<ProposalMonitor>>>,
+    },
+    /// Retrieves a bounded page of invalid payloads for a range of heights
+    GetInvalidPayloadsRange {
+        /// The query to serve.
+        request: InvalidPayloadsRequest,
+        /// The time the request was enqueued.
+        enqueued_at: Instant,
         /// The channel to send the payloads back on.
-        oneshot::Sender<Option<RangeQueryResult<StoredInvalidPayloads>>>,
-    ),
+        reply: oneshot::Sender<Option<HeightRangePage<StoredInvalidPayloads>>>,
+    },
     /// Get the application status
-    GetStatus(oneshot::Sender<Status>),
+    GetStatus {
+        enqueued_at: Instant,
+        reply: oneshot::Sender<Status>,
+    },
     /// Check if the application is healthy
-    GetHealth(oneshot::Sender<()>),
+    GetHealth {
+        enqueued_at: Instant,
+        reply: oneshot::Sender<Health>,
+    },
     /// Get the current sync state (lightweight, no DB queries)
-    GetSyncState(oneshot::Sender<SyncState>),
+    GetSyncState {
+        enqueued_at: Instant,
+        reply: oneshot::Sender<SyncState>,
+    },
+}
+
+impl AppRequest {
+    /// Whether this request is a liveness/readiness probe that must not wait
+    /// behind a store range query.
+    pub(crate) fn is_liveness_probe(&self) -> bool {
+        matches!(self, Self::GetHealth { .. } | Self::GetSyncState { .. })
+    }
+
+    /// Whether the RPC caller has already dropped the reply receiver.
+    ///
+    /// A dropped receiver means the HTTP handler timed out. Store and
+    /// execution-layer work for this request would be thrown away.
+    pub(crate) fn reply_is_closed(&self) -> bool {
+        match self {
+            Self::GetCertificate { reply, .. } => reply.is_closed(),
+            Self::GetMisbehaviorEvidence { reply, .. } => reply.is_closed(),
+            Self::GetProposalMonitorData { reply, .. } => reply.is_closed(),
+            Self::GetInvalidPayloads { reply, .. } => reply.is_closed(),
+            Self::GetCertificateRange { reply, .. } => reply.is_closed(),
+            Self::GetMisbehaviorEvidenceRange { reply, .. } => reply.is_closed(),
+            Self::GetProposalMonitorDataRange { reply, .. } => reply.is_closed(),
+            Self::GetInvalidPayloadsRange { reply, .. } => reply.is_closed(),
+            Self::GetStatus { reply, .. } => reply.is_closed(),
+            Self::GetHealth { reply, .. } => reply.is_closed(),
+            Self::GetSyncState { reply, .. } => reply.is_closed(),
+        }
+    }
+
+    /// Resolves when the RPC caller drops the reply receiver.
+    pub(crate) async fn reply_closed(&mut self) {
+        match self {
+            Self::GetCertificate { reply, .. } => reply.closed().await,
+            Self::GetMisbehaviorEvidence { reply, .. } => reply.closed().await,
+            Self::GetProposalMonitorData { reply, .. } => reply.closed().await,
+            Self::GetInvalidPayloads { reply, .. } => reply.closed().await,
+            Self::GetCertificateRange { reply, .. } => reply.closed().await,
+            Self::GetMisbehaviorEvidenceRange { reply, .. } => reply.closed().await,
+            Self::GetProposalMonitorDataRange { reply, .. } => reply.closed().await,
+            Self::GetInvalidPayloadsRange { reply, .. } => reply.closed().await,
+            Self::GetStatus { reply, .. } => reply.closed().await,
+            Self::GetHealth { reply, .. } => reply.closed().await,
+            Self::GetSyncState { reply, .. } => reply.closed().await,
+        }
+    }
+}
+
+/// Result of a `/health` probe.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Health {
+    /// The consensus event loop has progressed recently.
+    Ok,
+    /// The `go()` loop has not been able to poll for longer than
+    /// [`CONSENSUS_LOOP_LIVENESS`]. It is likely blocked inside
+    /// `handle_consensus`.
+    EventLoopStalled,
+}
+
+/// Age beyond which `/health` treats the consensus `go()` loop as wedged.
+///
+/// Longer than one Engine API call (8s) and a typical propose sequence so a
+/// live loop blocked on EL work stays healthy. Short enough that a deadlock
+/// in `handle_consensus` fails k8s liveness.
+pub const CONSENSUS_LOOP_LIVENESS: Duration = Duration::from_secs(60);
+
+/// Whether a heartbeat of this age still counts as a live consensus loop.
+pub fn consensus_loop_is_live(age: Duration) -> bool {
+    age <= CONSENSUS_LOOP_LIVENESS
+}
+
+/// Map the consensus `go()` heartbeat to the `/health` result.
+///
+/// `None` means `ConsensusReady` has not completed. Startup work runs inline on
+/// the `go()` loop and may exceed [`CONSENSUS_LOOP_LIVENESS`], so it reports OK.
+pub fn health_from_heartbeat(
+    heartbeat_rx: &watch::Receiver<Option<tokio::time::Instant>>,
+) -> Health {
+    match *heartbeat_rx.borrow() {
+        Some(heartbeat) if !consensus_loop_is_live(heartbeat.elapsed()) => Health::EventLoopStalled,
+        _ => Health::Ok,
+    }
 }
 
 pub type TxAppReq = mpsc::Sender<AppRequest>;
 
 impl AppRequest {
+    /// Prometheus `request` label for a single-height certificate query.
+    pub const LABEL_GET_CERTIFICATE: &'static str = "get_certificate";
+    /// Prometheus `request` label for a certificate range query.
+    pub const LABEL_GET_CERTIFICATE_RANGE: &'static str = "get_certificate_range";
+    /// Prometheus `request` label for a single-height misbehavior query.
+    pub const LABEL_GET_MISBEHAVIOR_EVIDENCE: &'static str = "get_misbehavior_evidence";
+    /// Prometheus `request` label for a misbehavior range query.
+    pub const LABEL_GET_MISBEHAVIOR_EVIDENCE_RANGE: &'static str = "get_misbehavior_evidence_range";
+    /// Prometheus `request` label for a single-height proposal-monitor query.
+    pub const LABEL_GET_PROPOSAL_MONITOR_DATA: &'static str = "get_proposal_monitor_data";
+    /// Prometheus `request` label for a proposal-monitor range query.
+    pub const LABEL_GET_PROPOSAL_MONITOR_DATA_RANGE: &'static str =
+        "get_proposal_monitor_data_range";
+    /// Prometheus `request` label for a single-height invalid-payloads query.
+    pub const LABEL_GET_INVALID_PAYLOADS: &'static str = "get_invalid_payloads";
+    /// Prometheus `request` label for an invalid-payloads range query.
+    pub const LABEL_GET_INVALID_PAYLOADS_RANGE: &'static str = "get_invalid_payloads_range";
+    /// Prometheus `request` label for status.
+    pub const LABEL_GET_STATUS: &'static str = "get_status";
+    /// Prometheus `request` label for health.
+    pub const LABEL_GET_HEALTH: &'static str = "get_health";
+    /// Prometheus `request` label for sync state.
+    pub const LABEL_GET_SYNC_STATE: &'static str = "get_sync_state";
+
+    /// Stable Prometheus `request` label for this variant.
+    ///
+    /// Values are snake_case so they match Prometheus label naming
+    /// (`operation="create|update|delete"`).
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            Self::GetCertificate { .. } => Self::LABEL_GET_CERTIFICATE,
+            Self::GetMisbehaviorEvidence { .. } => Self::LABEL_GET_MISBEHAVIOR_EVIDENCE,
+            Self::GetProposalMonitorData { .. } => Self::LABEL_GET_PROPOSAL_MONITOR_DATA,
+            Self::GetInvalidPayloads { .. } => Self::LABEL_GET_INVALID_PAYLOADS,
+            Self::GetCertificateRange { .. } => Self::LABEL_GET_CERTIFICATE_RANGE,
+            Self::GetMisbehaviorEvidenceRange { .. } => Self::LABEL_GET_MISBEHAVIOR_EVIDENCE_RANGE,
+            Self::GetProposalMonitorDataRange { .. } => Self::LABEL_GET_PROPOSAL_MONITOR_DATA_RANGE,
+            Self::GetInvalidPayloadsRange { .. } => Self::LABEL_GET_INVALID_PAYLOADS_RANGE,
+            Self::GetStatus { .. } => Self::LABEL_GET_STATUS,
+            Self::GetHealth { .. } => Self::LABEL_GET_HEALTH,
+            Self::GetSyncState { .. } => Self::LABEL_GET_SYNC_STATE,
+        }
+    }
+
+    /// When this request was placed on the app-request channel.
+    pub fn enqueued_at(&self) -> Instant {
+        match self {
+            Self::GetCertificate { enqueued_at, .. }
+            | Self::GetMisbehaviorEvidence { enqueued_at, .. }
+            | Self::GetProposalMonitorData { enqueued_at, .. }
+            | Self::GetInvalidPayloads { enqueued_at, .. }
+            | Self::GetCertificateRange { enqueued_at, .. }
+            | Self::GetMisbehaviorEvidenceRange { enqueued_at, .. }
+            | Self::GetProposalMonitorDataRange { enqueued_at, .. }
+            | Self::GetInvalidPayloadsRange { enqueued_at, .. }
+            | Self::GetStatus { enqueued_at, .. }
+            | Self::GetHealth { enqueued_at, .. }
+            | Self::GetSyncState { enqueued_at, .. } => *enqueued_at,
+        }
+    }
+
     /// Request the certificate for a height.
     ///
     /// If the request fails, return an error.
@@ -201,7 +366,11 @@ impl AppRequest {
     ) -> Result<Option<StoredMisbehaviorEvidence>, AppRequestError> {
         let (tx, rx) = oneshot::channel();
         tx_app_req
-            .try_send(Self::GetMisbehaviorEvidence(height, tx))
+            .try_send(Self::GetMisbehaviorEvidence {
+                height,
+                enqueued_at: Instant::now(),
+                reply: tx,
+            })
             .inspect_err(|e| {
                 error!("Failed to send GetMisbehaviorEvidence request to consensus: {e}")
             })?;
@@ -222,7 +391,11 @@ impl AppRequest {
     ) -> Result<Option<ProposalMonitor>, AppRequestError> {
         let (tx, rx) = oneshot::channel();
         tx_app_req
-            .try_send(Self::GetProposalMonitorData(height, tx))
+            .try_send(Self::GetProposalMonitorData {
+                height,
+                enqueued_at: Instant::now(),
+                reply: tx,
+            })
             .inspect_err(|e| {
                 error!("Failed to send GetProposalMonitorData request to consensus: {e}")
             })?;
@@ -245,7 +418,11 @@ impl AppRequest {
     ) -> Result<Option<StoredInvalidPayloads>, AppRequestError> {
         let (tx, rx) = oneshot::channel();
         tx_app_req
-            .try_send(Self::GetInvalidPayloads(height, tx))
+            .try_send(Self::GetInvalidPayloads {
+                height,
+                enqueued_at: Instant::now(),
+                reply: tx,
+            })
             .inspect_err(|e| {
                 error!("Failed to send GetInvalidPayloads request to consensus: {e}")
             })?;
@@ -263,10 +440,14 @@ impl AppRequest {
     pub async fn get_certificate_range(
         range: HeightRangeRequest,
         tx_app_req: &mpsc::Sender<AppRequest>,
-    ) -> Result<Option<RangeQueryResult<CommitCertificateInfo>>, AppRequestError> {
+    ) -> Result<Option<HeightRangePage<CommitCertificateInfo>>, AppRequestError> {
         let (tx, rx) = oneshot::channel();
         tx_app_req
-            .try_send(Self::GetCertificateRange(range, tx))
+            .try_send(Self::GetCertificateRange {
+                range,
+                enqueued_at: Instant::now(),
+                reply: tx,
+            })
             .inspect_err(|e| {
                 error!("Failed to send GetCertificateRange request to consensus: {e}")
             })?;
@@ -284,10 +465,14 @@ impl AppRequest {
     pub async fn get_misbehavior_evidence_range(
         range: HeightRangeRequest,
         tx_app_req: &mpsc::Sender<AppRequest>,
-    ) -> Result<Option<RangeQueryResult<StoredMisbehaviorEvidence>>, AppRequestError> {
+    ) -> Result<Option<HeightRangePage<StoredMisbehaviorEvidence>>, AppRequestError> {
         let (tx, rx) = oneshot::channel();
         tx_app_req
-            .try_send(Self::GetMisbehaviorEvidenceRange(range, tx))
+            .try_send(Self::GetMisbehaviorEvidenceRange {
+                range,
+                enqueued_at: Instant::now(),
+                reply: tx,
+            })
             .inspect_err(|e| {
                 error!("Failed to send GetMisbehaviorEvidenceRange request to consensus: {e}")
             })?;
@@ -305,10 +490,14 @@ impl AppRequest {
     pub async fn get_proposal_monitor_data_range(
         range: HeightRangeRequest,
         tx_app_req: &mpsc::Sender<AppRequest>,
-    ) -> Result<Option<RangeQueryResult<ProposalMonitor>>, AppRequestError> {
+    ) -> Result<Option<HeightRangePage<ProposalMonitor>>, AppRequestError> {
         let (tx, rx) = oneshot::channel();
         tx_app_req
-            .try_send(Self::GetProposalMonitorDataRange(range, tx))
+            .try_send(Self::GetProposalMonitorDataRange {
+                range,
+                enqueued_at: Instant::now(),
+                reply: tx,
+            })
             .inspect_err(|e| {
                 error!("Failed to send GetProposalMonitorDataRange request to consensus: {e}")
             })?;
@@ -320,16 +509,20 @@ impl AppRequest {
         Ok(data)
     }
 
-    /// Request invalid payloads for a range of heights.
+    /// Request a bounded page of invalid payloads for a range of heights.
     ///
     /// Returns `Ok(None)` when the store has no certificates at all.
     pub async fn get_invalid_payloads_range(
-        range: HeightRangeRequest,
+        request: InvalidPayloadsRequest,
         tx_app_req: &mpsc::Sender<AppRequest>,
-    ) -> Result<Option<RangeQueryResult<StoredInvalidPayloads>>, AppRequestError> {
+    ) -> Result<Option<HeightRangePage<StoredInvalidPayloads>>, AppRequestError> {
         let (tx, rx) = oneshot::channel();
         tx_app_req
-            .try_send(Self::GetInvalidPayloadsRange(range, tx))
+            .try_send(Self::GetInvalidPayloadsRange {
+                request,
+                enqueued_at: Instant::now(),
+                reply: tx,
+            })
             .inspect_err(|e| {
                 error!("Failed to send GetInvalidPayloadsRange request to consensus: {e}")
             })?;
@@ -350,7 +543,10 @@ impl AppRequest {
         let (tx, rx) = oneshot::channel();
 
         tx_app_req
-            .try_send(Self::GetStatus(tx))
+            .try_send(Self::GetStatus {
+                enqueued_at: Instant::now(),
+                reply: tx,
+            })
             .inspect_err(|e| error!("Failed to send GetStatus request to consensus: {e}"))?;
 
         let status = rx
@@ -367,7 +563,10 @@ impl AppRequest {
         let (tx, rx) = oneshot::channel();
 
         tx_app_req
-            .try_send(Self::GetSyncState(tx))
+            .try_send(Self::GetSyncState {
+                enqueued_at: Instant::now(),
+                reply: tx,
+            })
             .inspect_err(|e| error!("Failed to send GetSyncState request to consensus: {e}"))?;
 
         let sync_state = rx.await.inspect_err(|e| {
@@ -377,21 +576,247 @@ impl AppRequest {
         Ok(sync_state)
     }
 
-    /// Get node's health. Returns unit type. Used to check whether the node is responsive.
+    /// Get node's health, including whether the consensus event loop is progressing.
     ///
     /// If the request fails, return an error.
-    pub async fn get_health(tx_app_req: &mpsc::Sender<AppRequest>) -> Result<(), AppRequestError> {
+    pub async fn get_health(
+        tx_app_req: &mpsc::Sender<AppRequest>,
+    ) -> Result<Health, AppRequestError> {
         let (tx, rx) = oneshot::channel();
 
         tx_app_req
-            .try_send(Self::GetHealth(tx))
+            .try_send(Self::GetHealth {
+                enqueued_at: Instant::now(),
+                reply: tx,
+            })
             .inspect_err(|e| error!("Failed to send GetHealth request to consensus: {e}"))?;
 
-        #[allow(clippy::let_unit_value)]
         let status = rx
             .await
             .inspect_err(|e| error!("Failed to receive GetHealth response from consensus: {e}"))?;
 
         Ok(status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn all_variants(enqueued_at: Instant) -> Vec<AppRequest> {
+        let range = HeightRangeRequest {
+            from: Height::new(1),
+            count: 2,
+        };
+        let invalid = InvalidPayloadsRequest {
+            from: Height::new(1),
+            count: 2,
+        };
+        vec![
+            AppRequest::GetCertificate {
+                height: None,
+                enqueued_at,
+                reply: oneshot::channel().0,
+            },
+            AppRequest::GetMisbehaviorEvidence {
+                height: None,
+                enqueued_at,
+                reply: oneshot::channel().0,
+            },
+            AppRequest::GetProposalMonitorData {
+                height: None,
+                enqueued_at,
+                reply: oneshot::channel().0,
+            },
+            AppRequest::GetInvalidPayloads {
+                height: None,
+                enqueued_at,
+                reply: oneshot::channel().0,
+            },
+            AppRequest::GetCertificateRange {
+                range,
+                enqueued_at,
+                reply: oneshot::channel().0,
+            },
+            AppRequest::GetMisbehaviorEvidenceRange {
+                range: HeightRangeRequest {
+                    from: Height::new(1),
+                    count: 2,
+                },
+                enqueued_at,
+                reply: oneshot::channel().0,
+            },
+            AppRequest::GetProposalMonitorDataRange {
+                range: HeightRangeRequest {
+                    from: Height::new(1),
+                    count: 2,
+                },
+                enqueued_at,
+                reply: oneshot::channel().0,
+            },
+            AppRequest::GetInvalidPayloadsRange {
+                request: invalid,
+                enqueued_at,
+                reply: oneshot::channel().0,
+            },
+            AppRequest::GetStatus {
+                enqueued_at,
+                reply: oneshot::channel().0,
+            },
+            AppRequest::GetHealth {
+                enqueued_at,
+                reply: oneshot::channel().0,
+            },
+            AppRequest::GetSyncState {
+                enqueued_at,
+                reply: oneshot::channel().0,
+            },
+        ]
+    }
+
+    #[test]
+    fn app_request_metric_labels_are_snake_case() {
+        let labels = [
+            AppRequest::LABEL_GET_CERTIFICATE,
+            AppRequest::LABEL_GET_CERTIFICATE_RANGE,
+            AppRequest::LABEL_GET_MISBEHAVIOR_EVIDENCE,
+            AppRequest::LABEL_GET_MISBEHAVIOR_EVIDENCE_RANGE,
+            AppRequest::LABEL_GET_PROPOSAL_MONITOR_DATA,
+            AppRequest::LABEL_GET_PROPOSAL_MONITOR_DATA_RANGE,
+            AppRequest::LABEL_GET_INVALID_PAYLOADS,
+            AppRequest::LABEL_GET_INVALID_PAYLOADS_RANGE,
+            AppRequest::LABEL_GET_STATUS,
+            AppRequest::LABEL_GET_HEALTH,
+            AppRequest::LABEL_GET_SYNC_STATE,
+        ];
+        for label in labels {
+            assert!(
+                label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "Prometheus request labels must be snake_case, got {label}"
+            );
+            assert!(
+                !label.is_empty() && !label.starts_with('_') && !label.ends_with('_'),
+                "label must not be empty or underscored at the edges: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn metric_label_and_enqueued_at_cover_every_variant() {
+        let enqueued_at = Instant::now() - Duration::from_millis(7);
+        let expected = [
+            AppRequest::LABEL_GET_CERTIFICATE,
+            AppRequest::LABEL_GET_MISBEHAVIOR_EVIDENCE,
+            AppRequest::LABEL_GET_PROPOSAL_MONITOR_DATA,
+            AppRequest::LABEL_GET_INVALID_PAYLOADS,
+            AppRequest::LABEL_GET_CERTIFICATE_RANGE,
+            AppRequest::LABEL_GET_MISBEHAVIOR_EVIDENCE_RANGE,
+            AppRequest::LABEL_GET_PROPOSAL_MONITOR_DATA_RANGE,
+            AppRequest::LABEL_GET_INVALID_PAYLOADS_RANGE,
+            AppRequest::LABEL_GET_STATUS,
+            AppRequest::LABEL_GET_HEALTH,
+            AppRequest::LABEL_GET_SYNC_STATE,
+        ];
+        let variants = all_variants(enqueued_at);
+        assert_eq!(variants.len(), expected.len());
+        for (req, label) in variants.iter().zip(expected) {
+            assert_eq!(req.metric_label(), label);
+            assert_eq!(req.enqueued_at(), enqueued_at);
+        }
+    }
+    use super::*;
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn liveness_probes_are_health_and_sync_state() {
+        let (tx, _rx) = oneshot::channel();
+        assert!(AppRequest::GetHealth {
+            enqueued_at: Instant::now(),
+            reply: tx,
+        }
+        .is_liveness_probe());
+        let (tx, _rx) = oneshot::channel();
+        assert!(AppRequest::GetSyncState {
+            enqueued_at: Instant::now(),
+            reply: tx,
+        }
+        .is_liveness_probe());
+    }
+
+    #[test]
+    fn range_queries_are_not_liveness_probes() {
+        let (tx, _rx) = oneshot::channel();
+        let range = HeightRangeRequest {
+            from: Height::new(1),
+            count: 10,
+        };
+        assert!(!AppRequest::GetCertificateRange {
+            range,
+            enqueued_at: Instant::now(),
+            reply: tx,
+        }
+        .is_liveness_probe());
+    }
+
+    #[test]
+    fn status_is_not_a_liveness_probe() {
+        let (tx, _rx) = oneshot::channel();
+        assert!(!AppRequest::GetStatus {
+            enqueued_at: Instant::now(),
+            reply: tx,
+        }
+        .is_liveness_probe());
+    }
+
+    #[tokio::test]
+    async fn reply_closed_resolves_when_the_receiver_is_dropped() {
+        let (tx, rx) = oneshot::channel::<Health>();
+        let mut req = AppRequest::GetHealth {
+            enqueued_at: Instant::now(),
+            reply: tx,
+        };
+        assert!(!req.reply_is_closed());
+
+        drop(rx);
+        assert!(req.reply_is_closed());
+        tokio::time::timeout(std::time::Duration::from_secs(1), req.reply_closed())
+            .await
+            .expect("a dropped receiver should wake reply_closed");
+    }
+
+    #[test]
+    fn consensus_loop_is_live_within_budget() {
+        assert!(consensus_loop_is_live(Duration::from_secs(0)));
+        assert!(consensus_loop_is_live(Duration::from_secs(8)));
+        assert!(consensus_loop_is_live(CONSENSUS_LOOP_LIVENESS));
+    }
+
+    #[test]
+    fn consensus_loop_is_live_rejects_stale_heartbeat() {
+        assert!(!consensus_loop_is_live(
+            CONSENSUS_LOOP_LIVENESS + Duration::from_millis(1)
+        ));
+        assert!(!consensus_loop_is_live(Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn health_from_heartbeat_ok_when_fresh() {
+        let (_tx, rx) = watch::channel(Some(tokio::time::Instant::now()));
+        assert_eq!(health_from_heartbeat(&rx), Health::Ok);
+    }
+
+    #[test]
+    fn health_from_heartbeat_stalled_when_stale() {
+        let stale = tokio::time::Instant::now()
+            .checked_sub(CONSENSUS_LOOP_LIVENESS + Duration::from_millis(1))
+            .expect("monotonic clock has more than 60s of history");
+        let (_tx, rx) = watch::channel(Some(stale));
+        assert_eq!(health_from_heartbeat(&rx), Health::EventLoopStalled);
+    }
+
+    #[test]
+    fn health_from_heartbeat_ok_before_startup_completes() {
+        let (_tx, rx) = watch::channel(None);
+        assert_eq!(health_from_heartbeat(&rx), Health::Ok);
     }
 }

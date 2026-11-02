@@ -33,6 +33,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use alloy_rpc_types_eth::BlockId;
 use bytesize::ByteSize;
 use eyre::Context;
 use rand::rngs::OsRng;
@@ -63,7 +64,9 @@ use arc_signer::ArcSigningProvider;
 
 use crate::env_config::EnvConfig;
 use crate::hardcoded_config::{GossipLoad, GossipMeshParams};
-use crate::metrics::{AppMetrics, DbMetrics, ProcessMetrics, ValidatorSetMetrics};
+use crate::metrics::{
+    AppMetrics, DbMetrics, ProcessMetrics, ValidatorSetMetrics, WsSubscriptionMetrics,
+};
 use crate::request::AppRequest;
 use crate::state::State;
 use crate::store::Store;
@@ -93,6 +96,26 @@ const STARTUP_ENGINE_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 #[derive(Debug, thiserror::Error)]
 #[error("execution engine unreachable during startup")]
 struct ExecutionEngineUnreachable;
+
+/// Marker attached to a startup failure when the validator's configured fee
+/// recipient is on the NativeCoinControl native-coin blocklist. A blocklisted
+/// beneficiary makes every block build fail, and `--suggested-fee-recipient` is
+/// fixed for the process lifetime, so the node exits cleanly at startup rather
+/// than crash-looping on every proposer turn.
+#[derive(Debug, thiserror::Error)]
+#[error("fee recipient {address} is blocklisted")]
+struct FeeRecipientBlocklisted {
+    address: arc_consensus_types::Address,
+}
+
+/// Marker attached to a startup failure when the fee-recipient blocklist query
+/// could not be completed (the execution layer failed to serve the
+/// `isBlocklisted` call). A failed read is not evidence of blocklisting, so this
+/// is kept distinct from [`FeeRecipientBlocklisted`] and from
+/// [`ExecutionEngineUnreachable`].
+#[derive(Debug, thiserror::Error)]
+#[error("could not verify fee recipient blocklist status")]
+struct FeeRecipientBlocklistCheckFailed;
 
 /// Main application struct implementing the consensus node functionality
 pub struct App {
@@ -433,6 +456,10 @@ impl App {
         // emitted from `abi_decode_validator_set` lands on the consensus `/metrics` endpoint.
         ValidatorSetMetrics::register(&self.registry).install_global();
 
+        // Same for `arc_rpc_sync_ws_stale_total`, incremented when a follow-mode WebSocket
+        // subscription goes stale and the outer backoff loop reconnects.
+        WsSubscriptionMetrics::register(&self.registry).install_global();
+
         (app_metrics, db_metrics, process_metrics)
     }
 
@@ -491,19 +518,26 @@ impl App {
             };
         }
 
+        let value_sync_max_response_size = env_config.value_sync_max_response_size;
         let value_sync = &mut self.config.value_sync;
         apply!(env_config.status_update_interval => value_sync.status_update_interval, "ARC_SYNC_STATUS_UPDATE_INTERVAL", "{:?}");
         apply!(env_config.value_sync_request_timeout => value_sync.request_timeout, "ARC_SYNC_REQUEST_TIMEOUT", "{:?}");
         apply!(env_config.value_sync_max_request_size => value_sync.max_request_size, "ARC_SYNC_MAX_REQUEST_SIZE", "{}");
-        apply!(env_config.value_sync_max_response_size => value_sync.max_response_size, "ARC_SYNC_MAX_RESPONSE_SIZE", "{}");
+        apply!(value_sync_max_response_size => value_sync.max_response_size, "ARC_SYNC_MAX_RESPONSE_SIZE", "{}");
         apply!(env_config.value_sync_parallel_requests => value_sync.parallel_requests, "ARC_SYNC_PARALLEL_REQUESTS", "{}");
         apply!(env_config.value_sync_inactive_threshold => value_sync.inactive_threshold, "ARC_SYNC_INACTIVE_THRESHOLD", "{:?}");
         apply!(env_config.value_sync_batch_size => value_sync.batch_size, "ARC_SYNC_BATCH_SIZE", "{}");
+        apply!(env_config.value_sync_inbound_request_rate_limit_window => value_sync.inbound_request_rate_limit_window, "ARC_SYNC_INBOUND_RATE_LIMIT_WINDOW", "{:?}");
+        apply!(env_config.value_sync_max_inbound_requests_per_window => value_sync.max_inbound_requests_per_window, "ARC_SYNC_MAX_INBOUND_REQUESTS_PER_WINDOW", "{}");
+        apply!(env_config.value_sync_max_concurrent_inbound_requests => value_sync.max_concurrent_inbound_requests, "ARC_SYNC_MAX_CONCURRENT_INBOUND_REQUESTS", "{}");
+        apply!(env_config.value_sync_max_pending_inbound_requests => value_sync.max_pending_inbound_requests, "ARC_SYNC_MAX_PENDING_INBOUND_REQUESTS", "{}");
 
         check_pending_proposals_bound(value_sync.parallel_requests, value_sync.batch_size)?;
 
         let consensus = &mut self.config.consensus;
-        apply!(env_config.wal_replay_delay => consensus.wal_replay_delay, "ARC_CONSENSUS_WAL_REPLAY_DELAY", "{:?}");
+        if let Some(max_response_size) = value_sync_max_response_size {
+            consensus.p2p.rpc_max_size = max_response_size;
+        }
         apply!(env_config.queue_capacity => consensus.queue_capacity, "ARC_CONSENSUS_QUEUE_CAPACITY", "{}");
         apply!(env_config.queue_per_height_capacity => consensus.queue_per_height_capacity, "ARC_CONSENSUS_QUEUE_PER_HEIGHT_CAPACITY", "{}");
         apply!(env_config.ephemeral_connection_timeout => consensus.p2p.discovery.ephemeral_connection_timeout, "ARC_DISCOVERY_EPHEMERAL_CONNECTION_TIMEOUT", "{:?}");
@@ -533,16 +567,58 @@ impl App {
         self.config.consensus.p2p.protocol_names = protocol_names;
     }
 
+    /// Checks whether the validator configured fee recipient is on the
+    /// NativeCoinControl native-coin blocklist.
+    /// If it is, returns an error, because the node should not start.
+    async fn check_fee_recipient_not_blocklisted(&self, engine: &Engine) -> eyre::Result<()> {
+        if !self.start_config.validator {
+            return Ok(());
+        }
+
+        let fee_recipient = self
+            .start_config
+            .suggested_fee_recipient
+            .ok_or_else(|| eyre::eyre!("a validator must have --suggested-fee-recipient set"))?;
+
+        let is_blocklisted = engine
+            .eth
+            .is_address_blocklisted(fee_recipient, BlockId::latest())
+            .await
+            .map_err(|e| {
+                eyre::Report::new(FeeRecipientBlocklistCheckFailed).wrap_err(format!(
+                    "could not verify whether fee recipient \
+                     {fee_recipient} is blocklisted; the execution-layer query on \
+                     the NativeCoinControl native-coin (USDC) blocklist failed: {e:#}"
+                ))
+            })?;
+
+        if is_blocklisted {
+            return Err(eyre::Report::new(FeeRecipientBlocklisted {
+                address: fee_recipient,
+            })
+            .wrap_err(format!(
+                "fee recipient {fee_recipient} is blocklisted on the ARC \
+                 NativeCoinControl native-coin (USDC) blocklist. \
+                 A validator cannot propose blocks while its fee recipient is blocklisted. \
+                 Set --suggested-fee-recipient to a non-blocklisted address, then restart."
+            )));
+        }
+
+        Ok(())
+    }
+
     fn apply_state_overrides(&self, state: &mut State) {
         if let Some(suggested_fee_recipient) = self.start_config.suggested_fee_recipient {
             state.set_suggested_fee_recipient(suggested_fee_recipient);
         }
     }
 
+    #[cfg_attr(not(feature = "byzantine"), allow(unused_variables))]
     async fn start_consensus_engine(
         &self,
         ctx: ArcContext,
         identity: NodeIdentity,
+        chain_id: ChainId,
     ) -> eyre::Result<(Channels<ArcContext>, EngineHandle)> {
         let wal_path = self.home_dir.join("wal").join("consensus.wal");
 
@@ -560,7 +636,9 @@ impl App {
             };
 
             #[cfg(feature = "byzantine")]
-            if let Some(byz_cfg) = self.config.byzantine.clone().filter(|c| c.is_active()) {
+            if let Some(byz_cfg) =
+                permitted_byzantine_config(chain_id, self.config.byzantine.as_ref())?.cloned()
+            {
                 return self
                     .start_byzantine_engine(ctx, identity, network_identity, wal_path, byz_cfg)
                     .await;
@@ -700,9 +778,11 @@ impl App {
         info!("Starting consensus engine with RPC sync mode");
 
         // Spawn Network actor - manages WebSocket subscriptions and RPC fetching
-        let (network_ref, network_tx) =
-            crate::rpc_sync::spawn_rpc_network_actor(self.start_config.rpc_sync_endpoints.clone())
-                .await?;
+        let (network_ref, network_tx) = crate::rpc_sync::spawn_rpc_network_actor(
+            self.start_config.rpc_sync_endpoints.clone(),
+            self.start_config.rpc_sync_stale_timeout,
+        )
+        .await?;
 
         // Build engine with custom network actor and default sync actor
         // The network actor handles WebSocket subscriptions and sends `NetworkEvent::Status`
@@ -798,6 +878,7 @@ impl App {
         .wrap_err("Failed to resolve chain identity from execution engine")?;
 
         self.apply_chain_specific_config(chain_id);
+        self.check_fee_recipient_not_blocklisted(&engine).await?;
 
         let consensus_spec = ConsensusSpec::from(chain_id);
 
@@ -831,7 +912,7 @@ impl App {
         #[cfg(feature = "byzantine")]
         let ctx = {
             let ctx = ArcContext::new();
-            match self.config.byzantine.as_ref() {
+            match permitted_byzantine_config(chain_id, self.config.byzantine.as_ref())? {
                 Some(byz) => {
                     use arc_consensus_types::context::ByzantineState;
                     use std::sync::Arc;
@@ -849,11 +930,14 @@ impl App {
         #[cfg(not(feature = "byzantine"))]
         let ctx = ArcContext::new();
 
+        // ArcContext owns shared state when the `byzantine` feature is enabled.
+        #[cfg(feature = "byzantine")]
+        let state_ctx = ctx.clone();
+        #[cfg(not(feature = "byzantine"))]
+        let state_ctx = ctx;
+
         // Initialize the application state with the resolved spec and genesis block
-        // NOTE: ArcContext is not always Copy, depending on whether
-        // `byzantine` feature is enabled, so we clone it here to avoid a conditional compilation warning.
-        #[allow(clippy::redundant_clone)]
-        let mut state = State::builder(ctx.clone())
+        let mut state = State::builder(state_ctx)
             .identity(identity.consensus.clone())
             .store(store.clone())
             .config(self.config.clone())
@@ -870,7 +954,8 @@ impl App {
         self.spawn_metrics_server(process_metrics);
 
         // Start the consensus engine
-        let (channels, engine_handle) = self.start_consensus_engine(ctx, identity).await?;
+        let (channels, engine_handle) =
+            self.start_consensus_engine(ctx, identity, chain_id).await?;
 
         // Start the application RPC server
         let (tx_app_req, rx_app_req, rpc_handle) =
@@ -950,6 +1035,13 @@ impl App {
                     return Err(startup_error);
                 }
 
+                if is_fee_recipient_blocklisted(&startup_error)
+                    || is_fee_recipient_blocklist_check_failed(&startup_error)
+                {
+                    error!("Fee-recipient startup guard failed; exiting non-zero");
+                    return Err(startup_error);
+                }
+
                 error!("Manual intervention required! Waiting for termination signal (SIGTERM)...");
                 wait_for_termination().await;
                 return Err(startup_error);
@@ -979,16 +1071,17 @@ impl App {
         }
 
         if let Err(e) = &result {
-            // If the application halted due to reaching a configured height,
-            // we stop the consensus engine and wait indefinitely for a termination signal.
-            if e.downcast_ref::<HaltAndWait>().is_some() {
-                warn!("Node halted, stopping consensus...");
+            // The application halted deliberately (reached a configured height, or
+            // hit a chain anomaly such as a Valid->Invalid verdict flip): stop the
+            // consensus engine and wait indefinitely for a termination signal.
+            if let Some(halt) = e.downcast_ref::<HaltAndWait>() {
+                warn!(reason = %halt.reason, "Node halted, stopping consensus...");
 
                 // Stop the consensus engine
                 handles
                     .engine
                     .actor
-                    .stop_and_wait(Some("Node halted at configured height".to_string()), None)
+                    .stop_and_wait(Some(format!("Node halted: {}", halt.reason)), None)
                     .await?;
 
                 // Create a database savepoint ensuring no repair is needed on restart
@@ -1047,6 +1140,34 @@ async fn drain_before_exit(savepoint: impl FnOnce()) {
     info!("Waiting for all tasks to finish...");
     tokio::time::sleep(SHUTDOWN_DRAIN_DELAY).await;
     info!("Shutdown complete, exiting");
+}
+
+/// Returns the Byzantine configuration to apply, rejecting active fault injection on
+/// chains not designated for development.
+///
+/// `Ok(None)` covers both an absent flag and a configuration whose triggers are all
+/// inert. Both fault-injection entry points derive their configuration from this
+/// function — the `ByzantineState` attached to [`ArcContext`] and the Byzantine network
+/// proxy in `start_byzantine_engine` — so neither can be reached with an unchecked
+/// value, independently of the order in which they run.
+#[cfg(feature = "byzantine")]
+fn permitted_byzantine_config(
+    chain_id: ChainId,
+    byzantine: Option<&arc_consensus_types::ByzantineConfig>,
+) -> eyre::Result<Option<&arc_consensus_types::ByzantineConfig>> {
+    let Some(byzantine) = byzantine.filter(|byz| byz.is_active()) else {
+        return Ok(None);
+    };
+
+    match chain_id {
+        ChainId::Localdev | ChainId::Devnet => Ok(Some(byzantine)),
+        ChainId::Mainnet | ChainId::Testnet => eyre::bail!(
+            "Active Byzantine configuration is not permitted on chain {chain_id}; \
+             fault injection is restricted to chains {} and {}",
+            ChainId::Localdev,
+            ChainId::Devnet,
+        ),
+    }
 }
 
 /// Query the execution engine for the chain ID and genesis block.
@@ -1117,6 +1238,21 @@ where
 fn is_execution_engine_unreachable(err: &eyre::Report) -> bool {
     err.chain()
         .any(|cause| cause.is::<ExecutionEngineUnreachable>())
+}
+
+/// Whether a startup error was caused by the configured fee recipient being on
+/// the native-coin blocklist. Walks the error chain since the marker sits beneath
+/// the context layers added on the way up through `start`/`run`.
+fn is_fee_recipient_blocklisted(err: &eyre::Report) -> bool {
+    err.chain()
+        .any(|cause| cause.is::<FeeRecipientBlocklisted>())
+}
+
+/// Whether a startup error was caused by the fee-recipient blocklist query
+/// failing to complete, as opposed to confirming a blocklisted address.
+fn is_fee_recipient_blocklist_check_failed(err: &eyre::Report) -> bool {
+    err.chain()
+        .any(|cause| cause.is::<FeeRecipientBlocklistCheckFailed>())
 }
 
 /// Install a SIGTERM handler to gracefully shutdown the node
@@ -1215,10 +1351,250 @@ mod tests {
         }
     }
 
+    fn app_for_blocklist_check(start_config: StartConfig) -> App {
+        App::new(
+            Config {
+                moniker: "test-node".into(),
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/unused.key"),
+            start_config,
+        )
+    }
+
+    #[tokio::test]
+    async fn blocklisted_fee_recipient_is_rejected() {
+        let fee_recipient = Address::new([1_u8; 20]);
+        let mut eth = MockEthereumAPI::new();
+        eth.expect_is_address_blocklisted()
+            .withf(move |address, block| *address == fee_recipient && *block == BlockId::latest())
+            .returning(|_, _| Ok(true));
+        let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(eth));
+        let app = app_for_blocklist_check(StartConfig {
+            validator: true,
+            suggested_fee_recipient: Some(fee_recipient),
+            ..Default::default()
+        });
+
+        let err = app
+            .check_fee_recipient_not_blocklisted(&engine)
+            .await
+            .expect_err("blocklisted fee recipient must be rejected");
+
+        assert!(is_fee_recipient_blocklisted(&err));
+        assert!(!is_execution_engine_unreachable(&err));
+        let message = format!("{err:#}");
+        assert!(message.contains(&fee_recipient.to_string()));
+        assert!(message.contains("native-coin"));
+        assert!(message.contains("--suggested-fee-recipient"));
+    }
+
+    #[tokio::test]
+    async fn non_blocklisted_fee_recipient_is_accepted() {
+        let fee_recipient = Address::new([2_u8; 20]);
+        let mut eth = MockEthereumAPI::new();
+        eth.expect_is_address_blocklisted()
+            .withf(move |address, block| *address == fee_recipient && *block == BlockId::latest())
+            .returning(|_, _| Ok(false));
+        let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(eth));
+        let app = app_for_blocklist_check(StartConfig {
+            validator: true,
+            suggested_fee_recipient: Some(fee_recipient),
+            ..Default::default()
+        });
+
+        assert!(app
+            .check_fee_recipient_not_blocklisted(&engine)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn non_validator_skips_fee_recipient_blocklist_check() {
+        let mut eth = MockEthereumAPI::new();
+        eth.expect_is_address_blocklisted().times(0);
+        let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(eth));
+        let app = app_for_blocklist_check(StartConfig {
+            validator: false,
+            suggested_fee_recipient: Some(Address::new([3_u8; 20])),
+            ..Default::default()
+        });
+
+        assert!(app
+            .check_fee_recipient_not_blocklisted(&engine)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn fee_recipient_blocklist_query_failure_is_classified() {
+        let fee_recipient = Address::new([4_u8; 20]);
+        let mut eth = MockEthereumAPI::new();
+        eth.expect_is_address_blocklisted()
+            .withf(move |address, block| *address == fee_recipient && *block == BlockId::latest())
+            .returning(|_, _| Err(eyre::eyre!("eth_call failed")));
+        let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(eth));
+        let app = app_for_blocklist_check(StartConfig {
+            validator: true,
+            suggested_fee_recipient: Some(fee_recipient),
+            ..Default::default()
+        });
+
+        let err = app
+            .check_fee_recipient_not_blocklisted(&engine)
+            .await
+            .expect_err("query failure must fail startup");
+
+        assert!(is_fee_recipient_blocklist_check_failed(&err));
+        assert!(!is_fee_recipient_blocklisted(&err));
+        assert!(!is_execution_engine_unreachable(&err));
+        assert!(format!("{err:#}").contains("eth_call failed"));
+    }
+
+    #[test]
+    fn fee_recipient_startup_errors_are_classified_by_marker() {
+        let address = Address::new([1_u8; 20]);
+        let blocklisted =
+            eyre::Report::new(FeeRecipientBlocklisted { address }).wrap_err("Node failed to start");
+        assert!(is_fee_recipient_blocklisted(&blocklisted));
+        assert!(!is_fee_recipient_blocklist_check_failed(&blocklisted));
+        assert!(!is_execution_engine_unreachable(&blocklisted));
+
+        let check_failed =
+            eyre::Report::new(FeeRecipientBlocklistCheckFailed).wrap_err("Node failed to start");
+        assert!(is_fee_recipient_blocklist_check_failed(&check_failed));
+        assert!(!is_fee_recipient_blocklisted(&check_failed));
+        assert!(!is_execution_engine_unreachable(&check_failed));
+
+        let other = eyre::eyre!("some error").wrap_err("Node failed to start");
+        assert!(!is_fee_recipient_blocklisted(&other));
+        assert!(!is_fee_recipient_blocklist_check_failed(&other));
+    }
+
     #[test]
     fn check_pending_proposals_bound_accepts_normal_values() {
         assert!(check_pending_proposals_bound(5, 10).is_ok());
         assert!(check_pending_proposals_bound(1, 1).is_ok());
+    }
+
+    #[test]
+    fn value_sync_max_response_size_override_updates_transport_limit() {
+        let mut app = test_app(PathBuf::from("unused.key"), false);
+        let max_response_size = ByteSize::mib(20);
+        let env_config = EnvConfig {
+            value_sync_max_response_size: Some(max_response_size),
+            ..Default::default()
+        };
+
+        app.override_config_from_env(&env_config).unwrap();
+
+        assert_eq!(app.config.value_sync.max_response_size, max_response_size);
+        assert_eq!(app.config.consensus.p2p.rpc_max_size, max_response_size);
+    }
+
+    #[test]
+    fn value_sync_inbound_limit_overrides_update_value_sync_config() {
+        let mut app = test_app(PathBuf::from("unused.key"), false);
+        let env_config = EnvConfig {
+            value_sync_inbound_request_rate_limit_window: Some(Duration::from_secs(30)),
+            value_sync_max_inbound_requests_per_window: Some(500),
+            value_sync_max_concurrent_inbound_requests: Some(4),
+            value_sync_max_pending_inbound_requests: Some(256),
+            ..Default::default()
+        };
+
+        app.override_config_from_env(&env_config).unwrap();
+
+        let value_sync = &app.config.value_sync;
+        assert_eq!(
+            value_sync.inbound_request_rate_limit_window,
+            Duration::from_secs(30)
+        );
+        assert_eq!(value_sync.max_inbound_requests_per_window, 500);
+        assert_eq!(value_sync.max_concurrent_inbound_requests, 4);
+        assert_eq!(value_sync.max_pending_inbound_requests, 256);
+    }
+
+    #[cfg(feature = "byzantine")]
+    mod byzantine_chain_guard {
+        use super::*;
+        use arc_consensus_types::{ByzantineConfig, ByzantineTrigger};
+
+        fn active_config() -> ByzantineConfig {
+            ByzantineConfig::new(Some(42)).with_drop_votes(ByzantineTrigger::Always)
+        }
+
+        #[test]
+        fn active_config_is_rejected_on_production_chains() {
+            for chain_id in [ChainId::Mainnet, ChainId::Testnet] {
+                let err = permitted_byzantine_config(chain_id, Some(&active_config()))
+                    .expect_err("active fault injection must be rejected");
+                let msg = err.to_string();
+                assert!(msg.contains("not permitted"), "unexpected error: {msg}");
+                assert!(
+                    msg.contains(&chain_id.to_string()),
+                    "error must name the rejected chain: {msg}"
+                );
+            }
+        }
+
+        #[test]
+        fn active_config_is_applied_on_development_chains() {
+            let active = active_config();
+
+            for chain_id in [ChainId::Localdev, ChainId::Devnet] {
+                let permitted = permitted_byzantine_config(chain_id, Some(&active))
+                    .expect("development chains permit fault injection");
+                assert_eq!(permitted, Some(&active));
+            }
+        }
+
+        /// The engine builder receives the node's real signing provider, so the chain
+        /// check has to reject before `start_consensus_engine` reaches it.
+        #[tokio::test]
+        async fn start_consensus_engine_rejects_active_config_on_production_chains() {
+            let dir = tempdir().unwrap();
+            let (key_path, _) = write_key_file(dir.path());
+
+            let mut app = test_app(key_path, false);
+            app.config.byzantine = Some(active_config());
+            let identity = app.setup_node_identity().await.unwrap();
+
+            let Err(err) = app
+                .start_consensus_engine(ArcContext::new(), identity, ChainId::Mainnet)
+                .await
+            else {
+                panic!("active fault injection must be rejected before the engine starts");
+            };
+
+            assert!(
+                err.to_string().contains("not permitted"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn inert_config_is_not_applied_on_any_chain() {
+            let inert = ByzantineConfig::new(None);
+            assert!(!inert.is_active());
+
+            for chain_id in [
+                ChainId::Mainnet,
+                ChainId::Testnet,
+                ChainId::Devnet,
+                ChainId::Localdev,
+            ] {
+                assert_eq!(
+                    permitted_byzantine_config(chain_id, Some(&inert)).expect("inert is accepted"),
+                    None
+                );
+                assert_eq!(
+                    permitted_byzantine_config(chain_id, None).expect("absent is accepted"),
+                    None
+                );
+            }
+        }
     }
 
     #[tokio::test]

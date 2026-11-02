@@ -33,8 +33,8 @@ use crate::store::repositories::UndecidedBlocksRepository;
 ///
 /// This is called when the consensus engine requests to restream a proposal for a specific height and round.
 /// The block is looked up by height and block hash (ignoring round), so it will be found
-/// regardless of which round it was originally stored under. The stored block is not modified
-/// (round and valid_round are left as when the block was first stored).
+/// regardless of which round it was originally stored under. The stored block is not modified:
+/// its round is left as when the block was first stored, and its `valid_round` is always nil.
 ///
 /// ## Errors
 /// - If no block is found for the specified height and value id
@@ -79,7 +79,7 @@ pub async fn restream_proposal(
     }
 
     info!(
-        %height, %round, valid_round = %block.valid_round,
+        %height, %round,
         "Restreaming proposal, block size: {:?}, payload size: {:?}",
         block.size_bytes(), block.payload_size()
     );

@@ -15,14 +15,25 @@
 // limitations under the License.
 
 use alloy_rpc_types_eth::BlockNumberOrTag;
-use eyre::Context;
 use tracing::{debug, error, warn};
 
 use arc_consensus_types::Height;
 use arc_eth_engine::engine::Engine;
 use malachitebft_app_channel::Reply;
 
+use crate::handlers::history_window::read_history_window;
 use crate::state::State;
+
+/// Log a store-read failure, reply with height 0, and return `Ok` so the
+/// consensus loop stays up.
+fn reply_store_read_failure(
+    reply: Reply<Height>,
+    error: impl std::fmt::Display,
+) -> eyre::Result<()> {
+    error!("GetHistoryMinHeight: Failed to read history window from the store: {error}");
+    let _ = reply.send(Height::new(0));
+    Ok(())
+}
 
 /// Handles the `GetHistoryMinHeight` message from the consensus engine.
 ///
@@ -34,20 +45,14 @@ use crate::state::State;
 /// does not request history at heights where either the CL store or EL no longer has data,
 /// and does not go below the configured halt height which typically corresponds to a hard fork
 /// at the consensus level.
+///
+/// A CL store read error must not take down the consensus loop: the handler logs, replies with
+/// height 0 (same as an empty store), and returns `Ok`.
 pub async fn handle(state: &State, engine: &Engine, reply: Reply<Height>) -> eyre::Result<()> {
-    let cl_earliest_height = state
-        .store()
-        .min_height()
-        .await
-        .wrap_err("Failed to get earliest height from the store")?
-        .unwrap_or_default();
-
-    let cl_latest_height = state
-        .store()
-        .max_height()
-        .await
-        .wrap_err("Failed to get latest height from the store")?
-        .unwrap_or_default();
+    let (cl_latest_height, cl_earliest_height) = match read_history_window(state.store()).await {
+        Ok(window) => window,
+        Err(e) => return reply_store_read_failure(reply, e),
+    };
 
     let el_earliest_height = match engine
         .eth
@@ -112,6 +117,22 @@ mod tests {
 
     const fn h(n: u64) -> Height {
         Height::new(n)
+    }
+
+    #[tokio::test]
+    async fn reply_store_read_failure_sends_height_zero_and_returns_ok() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reply_store_read_failure(tx, "max_height: disk I/O failed")
+            .expect("store read failure must not fail the handler");
+        assert_eq!(rx.await.expect("reply"), Height::new(0));
+    }
+
+    #[tokio::test]
+    async fn reply_store_read_failure_returns_ok_when_reply_is_dropped() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        reply_store_read_failure(tx, "min_height: disk I/O failed")
+            .expect("dropped reply is not a handler error");
     }
 
     #[test]

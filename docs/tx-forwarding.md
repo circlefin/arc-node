@@ -105,12 +105,16 @@ Behavior:
   upstream, sticky to the last good one.
 - Advances to the next upstream, wrapping past the end of the list, on a
   transport failure (connection refused, DNS or TLS error, timeout) or an HTTP
-  5xx or 429 response. One full pass is attempted before giving up.
+  status that describes the upstream rather than the transaction: 401, 403, 404,
+  405, 407, 408, 429, or any 5xx. One full pass is attempted before giving up.
 - Returns a JSON-RPC error from a reachable upstream verbatim, without failover.
   A rejected transaction is a decision, not an outage.
+- Ends the pass with error `-32011` on any other HTTP status, since another
+  upstream would reach the same verdict. The sticky cursor stays on the last
+  upstream that delivered.
 - Retains each accepted transaction in the local pool so local RPC reads see it
   before it is mined.
-- Returns a relay error when every upstream fails a full pass, and does not add
+- Returns error `-32010` when every upstream fails a full pass, and does not add
   the transaction locally.
 
 Conflicts with `--rpc.forwarder`; set one or the other, not both.

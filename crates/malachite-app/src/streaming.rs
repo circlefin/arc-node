@@ -221,6 +221,8 @@ impl<T> MinHeap<T> {
 }
 
 struct StreamState {
+    /// Delivering peer charged for this stream's resource usage.
+    charged_to: PeerId,
     buffer: MinHeap<ProposalPart>,
     seen_sequences: HashSet<Sequence>,
     expected_messages: usize,
@@ -229,12 +231,6 @@ struct StreamState {
     fin_received: bool,
     is_complete: bool,
     created_at: Instant,
-}
-
-impl Default for StreamState {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 enum StreamInsertResult {
@@ -247,8 +243,9 @@ enum StreamInsertResult {
 }
 
 impl StreamState {
-    fn new() -> Self {
+    fn new(charged_to: PeerId) -> Self {
         Self {
+            charged_to,
             buffer: MinHeap::default(),
             seen_sequences: HashSet::default(),
             expected_messages: 0,
@@ -330,10 +327,10 @@ impl StreamState {
     }
 }
 
-/// Map to track active proposal part streams from peers.
+/// Map to track active proposal part streams from authenticated publishers.
 ///
 /// Enforces the following limits:
-/// - [`MAX_STREAMS_PER_PEER`] streams per peer
+/// - [`MAX_STREAMS_PER_PEER`] streams charged to each delivering peer
 /// - [`MAX_MESSAGES_PER_STREAM`] messages per stream
 /// - [`CHUNK_SIZE`] per data chunk
 /// - `max_total_streams` total concurrent streams (= `MAX_STREAMS_PER_PEER * num_validators`)
@@ -352,6 +349,7 @@ pub struct PartStreamsMap {
     /// `MAX_STREAMS_PER_PEER * num_validators`, floored at
     /// [`MAX_STREAMS_PER_PEER`] during the pre-validator-set startup window.
     max_total_streams: usize,
+    /// Active streams keyed by the authenticated publisher and stream ID.
     streams: BTreeMap<(PeerId, StreamId), StreamState>,
     /// Keys that are terminal — evicted streams, or completed streams whose
     /// proposal was stored, ignored, or rejected. Bounded by
@@ -408,10 +406,11 @@ impl PartStreamsMap {
         }
     }
 
-    /// Insert a new proposal part message into the map
+    /// Insert a new proposal part message into the map.
     ///
     /// ## Parameters
-    /// - `peer_id`: The ID of the peer sending the message
+    /// - `from`: The peer that delivered the message, used for resource accounting
+    /// - `published_by`: The authenticated publisher, used to group relayed parts
     /// - `msg`: The stream message containing the proposal part
     ///
     /// ## Returns
@@ -419,9 +418,15 @@ impl PartStreamsMap {
     /// - [`InsertResult::Pending`] if the message was accepted but the stream is not
     ///   yet complete, or was silently rejected (duplicate, evicted, limit exceeded)
     /// - [`InsertResult::Invalid`] if the message was rejected due to misbehaviour
-    pub fn insert(&mut self, peer_id: PeerId, msg: StreamMessage<ProposalPart>) -> InsertResult {
+    pub fn insert(
+        &mut self,
+        from: PeerId,
+        published_by: Option<PeerId>,
+        msg: StreamMessage<ProposalPart>,
+    ) -> InsertResult {
+        let publisher = published_by.unwrap_or(from);
         let stream_id = msg.stream_id.clone();
-        let key = (peer_id, stream_id.clone());
+        let key = (publisher, stream_id.clone());
         let actual = stream_id.to_bytes().len();
         if actual != STREAM_ID_LEN {
             self.streams.remove(&key);
@@ -447,7 +452,8 @@ impl PartStreamsMap {
 
         if stream_height < self.current_height {
             debug!(
-                %peer_id,
+                %from,
+                %publisher,
                 %stream_id,
                 %stream_height,
                 current_height = %self.current_height,
@@ -476,10 +482,11 @@ impl PartStreamsMap {
 
         // If it's a new stream, check if we've exceeded the per-peer limit
         if is_new_stream {
-            let stream_count = self.peer_streams_count(peer_id);
+            let stream_count = self.peer_streams_count(from);
             if stream_count >= MAX_STREAMS_PER_PEER {
                 warn!(
-                    %peer_id,
+                    %from,
+                    %publisher,
                     %stream_count,
                     max = MAX_STREAMS_PER_PEER,
                     "Peer exceeded maximum number of concurrent streams, rejecting new stream"
@@ -494,7 +501,10 @@ impl PartStreamsMap {
             }
         }
 
-        let state = self.streams.entry(key.clone()).or_default();
+        let state = self
+            .streams
+            .entry(key.clone())
+            .or_insert_with(|| StreamState::new(from));
 
         // Insert the message into the stream state.
         let result = state.insert(msg);
@@ -517,7 +527,8 @@ impl PartStreamsMap {
 
             StreamInsertResult::ExceededMaxMessages => {
                 warn!(
-                    %peer_id,
+                    %from,
+                    %publisher,
                     %stream_id,
                     message_count = state.message_count,
                     max = MAX_MESSAGES_PER_STREAM,
@@ -530,7 +541,8 @@ impl PartStreamsMap {
 
             StreamInsertResult::InvalidFinSequence(sequence) => {
                 warn!(
-                    %peer_id,
+                    %from,
+                    %publisher,
                     %stream_id,
                     sequence,
                     max = MAX_MESSAGES_PER_STREAM,
@@ -543,7 +555,8 @@ impl PartStreamsMap {
 
             StreamInsertResult::ExceededMaxChunkSize(actual) => {
                 warn!(
-                    %peer_id,
+                    %from,
+                    %publisher,
                     %stream_id,
                     actual,
                     max = CHUNK_SIZE,
@@ -603,16 +616,16 @@ impl PartStreamsMap {
     /// table was full), because a later copy could still become storable.
     ///
     /// Shares the bounded [`MAX_CLOSED_STREAMS`] LRU with evicted streams.
-    pub fn mark_closed(&mut self, peer_id: PeerId, stream_id: StreamId) {
-        self.closed_keys.insert((peer_id, stream_id), ());
+    pub fn mark_closed(&mut self, publisher: PeerId, stream_id: StreamId) {
+        self.closed_keys.insert((publisher, stream_id), ());
     }
 
     /// Test-only: whether a key has been recorded as closed (evicted or
     /// terminally completed). Lets sibling-module tests observe `mark_closed`.
     #[cfg(test)]
-    pub(crate) fn is_closed(&self, peer_id: PeerId, stream_id: &StreamId) -> bool {
+    pub(crate) fn is_closed(&self, publisher: PeerId, stream_id: &StreamId) -> bool {
         self.closed_keys
-            .peek(&(peer_id, stream_id.clone()))
+            .peek(&(publisher, stream_id.clone()))
             .is_some()
     }
 
@@ -638,8 +651,8 @@ impl PartStreamsMap {
             .collect();
 
         // Evict the identified streams
-        for key @ (peer_id, stream_id) in &keys_to_remove {
-            warn!(%peer_id, %stream_id, "Evicting stream due to age timeout");
+        for key @ (publisher, stream_id) in &keys_to_remove {
+            warn!(%publisher, %stream_id, "Evicting stream due to age timeout");
             self.evict(key);
         }
     }
@@ -649,15 +662,17 @@ impl PartStreamsMap {
     /// Targets the busiest peer so no single peer can push others out via the
     /// global cap.
     fn evict_oldest_stream(&mut self) {
-        let peer_id = self.busiest_peer();
-        let Some(peer_id) = peer_id else { return };
-
-        let key = self.oldest_stream_of(peer_id);
-        let Some(ref key @ (ref peer_id, ref stream_id)) = key else {
+        let charged_to = self.busiest_peer();
+        let Some(charged_to) = charged_to else {
             return;
         };
 
-        warn!(%peer_id, %stream_id, "Evicting oldest stream from peer with most streams");
+        let key = self.oldest_stream_of(charged_to);
+        let Some(ref key @ (ref publisher, ref stream_id)) = key else {
+            return;
+        };
+
+        warn!(%charged_to, %publisher, %stream_id, "Evicting oldest stream from peer with most streams");
         self.evict(key);
     }
 
@@ -667,10 +682,10 @@ impl PartStreamsMap {
     /// ordering rather than by hash-map iteration order.
     fn busiest_peer(&self) -> Option<PeerId> {
         let mut counts: BTreeMap<PeerId, usize> = BTreeMap::new();
-        for (pid, _) in self.streams.keys() {
+        for state in self.streams.values() {
             #[allow(clippy::arithmetic_side_effects)]
             {
-                *counts.entry(*pid).or_default() += 1;
+                *counts.entry(state.charged_to).or_default() += 1;
             }
         }
         counts
@@ -682,8 +697,8 @@ impl PartStreamsMap {
     /// Count active streams for a given peer
     fn peer_streams_count(&self, peer_id: PeerId) -> usize {
         self.streams
-            .keys()
-            .filter(|(pid, _)| *pid == peer_id)
+            .values()
+            .filter(|state| state.charged_to == peer_id)
             .count()
     }
 
@@ -691,7 +706,7 @@ impl PartStreamsMap {
     fn oldest_stream_of(&self, peer_id: PeerId) -> Option<(PeerId, StreamId)> {
         self.streams
             .iter()
-            .filter(|((pid, _), _)| *pid == peer_id)
+            .filter(|(_, state)| state.charged_to == peer_id)
             .min_by_key(|(_, state)| state.created_at)
             .map(|(key, _)| key.clone())
     }
@@ -699,12 +714,14 @@ impl PartStreamsMap {
 
 #[cfg(test)]
 mod tests {
+    use arc_consensus_types::codec::{network::NetCodec, Codec};
     use arc_consensus_types::signing::Signature;
     use arc_consensus_types::{Address, Height, ProposalData, ProposalFin, ProposalInit, Round};
     use malachitebft_app_channel::app::streaming::StreamContent;
     use proptest::prelude::*;
 
     use super::*;
+    use crate::hardcoded_config::consensus::p2p::PROPOSAL_PARTS_MAX_SIZE;
 
     /// Default validator count for tests. Large enough that the global cap
     /// (`MAX_STREAMS_PER_PEER * NUM_VALIDATORS`) does not interfere with
@@ -724,7 +741,21 @@ mod tests {
             peer_id: PeerId,
             msg: StreamMessage<ProposalPart>,
         ) -> Option<ProposalParts> {
-            match self.insert(peer_id, msg) {
+            match self.insert(peer_id, None, msg) {
+                InsertResult::Complete(parts) => Some(parts),
+                InsertResult::Pending | InsertResult::Stale => None,
+                InsertResult::Invalid(e) => panic!("unexpected InsertError: {e}"),
+            }
+        }
+
+        /// Test-only wrapper for a message relayed by a peer other than its publisher.
+        fn must_insert_relayed(
+            &mut self,
+            from: PeerId,
+            publisher: PeerId,
+            msg: StreamMessage<ProposalPart>,
+        ) -> Option<ProposalParts> {
+            match self.insert(from, Some(publisher), msg) {
                 InsertResult::Complete(parts) => Some(parts),
                 InsertResult::Pending | InsertResult::Stale => None,
                 InsertResult::Invalid(e) => panic!("unexpected InsertError: {e}"),
@@ -757,7 +788,7 @@ mod tests {
         ProposalPart::Init(ProposalInit {
             height: Height::new(1),
             round: Round::new(0),
-            pol_round: Round::new(0),
+            pol_round: Round::Nil,
             proposer: Address::new([0xa; 20]),
         })
     }
@@ -814,6 +845,20 @@ mod tests {
     }
 
     #[test]
+    fn test_max_chunk_encoding_fits_proposal_parts_topic_limit() {
+        let stream = make_stream_id(101);
+        let message = make_message(&stream, 0, make_data_part_with_size(CHUNK_SIZE));
+        let encoded = NetCodec.encode(&message).expect("message should encode");
+        let encoded_len = u64::try_from(encoded.len()).expect("encoded length should fit in u64");
+
+        assert!(
+            encoded_len <= PROPOSAL_PARTS_MAX_SIZE.as_u64(),
+            "encoded proposal part is {encoded_len} bytes, above the {}-byte topic limit",
+            PROPOSAL_PARTS_MAX_SIZE.as_u64(),
+        );
+    }
+
+    #[test]
     fn test_insert_in_order_completes_and_removes_stream() {
         let peer_1 = PeerId::random();
         let stream_1 = make_stream_id(101);
@@ -843,6 +888,88 @@ mod tests {
             map.streams.is_empty(),
             "Map should be empty after stream is complete"
         );
+    }
+
+    #[test]
+    fn test_relayed_parts_from_one_publisher_complete_one_stream() {
+        let publisher = PeerId::random();
+        let relays = [PeerId::random(), PeerId::random(), PeerId::random()];
+        let stream = make_stream_id(101);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        assert!(map
+            .must_insert_relayed(
+                relays[0],
+                publisher,
+                make_message(&stream, 0, make_init_part()),
+            )
+            .is_none());
+        assert!(map
+            .must_insert_relayed(
+                relays[1],
+                publisher,
+                make_message(&stream, 1, make_fin_part()),
+            )
+            .is_none());
+        assert!(map
+            .must_insert_relayed(relays[2], publisher, make_fin_message(&stream, 2))
+            .is_some());
+        assert!(map.streams.is_empty());
+    }
+
+    #[test]
+    fn test_same_stream_id_from_different_publishers_stays_separate() {
+        let relay = PeerId::random();
+        let publisher_1 = PeerId::random();
+        let publisher_2 = PeerId::random();
+        let stream = make_stream_id(101);
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        assert!(map
+            .must_insert_relayed(
+                relay,
+                publisher_1,
+                make_message(&stream, 0, make_init_part()),
+            )
+            .is_none());
+        assert!(map
+            .must_insert_relayed(
+                relay,
+                publisher_2,
+                make_message(&stream, 0, make_init_part()),
+            )
+            .is_none());
+
+        assert_eq!(map.streams.len(), 2);
+        assert!(map.streams.contains_key(&(publisher_1, stream.clone())));
+        assert!(map.streams.contains_key(&(publisher_2, stream)));
+    }
+
+    #[test]
+    fn test_relayed_streams_are_limited_by_delivering_peer() {
+        let relay = PeerId::random();
+        let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
+
+        for i in 0..MAX_STREAMS_PER_PEER {
+            assert!(map
+                .must_insert_relayed(
+                    relay,
+                    PeerId::random(),
+                    make_message(&make_stream_id(i as u8), 0, make_init_part()),
+                )
+                .is_none());
+        }
+        assert_eq!(map.peer_streams_count(relay), MAX_STREAMS_PER_PEER);
+
+        assert!(map
+            .must_insert_relayed(
+                relay,
+                PeerId::random(),
+                make_message(&make_stream_id(255), 0, make_init_part()),
+            )
+            .is_none());
+        assert_eq!(map.streams.len(), MAX_STREAMS_PER_PEER);
+        assert_eq!(map.peer_streams_count(relay), MAX_STREAMS_PER_PEER);
     }
 
     #[test]
@@ -906,7 +1033,7 @@ mod tests {
             .is_none());
 
         // Complete the stream
-        let result = map.insert(peer, make_fin_message(&stream, 2));
+        let result = map.insert(peer, None, make_fin_message(&stream, 2));
 
         // Insert fails with DuplicatePart("Init")
         assert!(matches!(
@@ -944,7 +1071,7 @@ mod tests {
             .is_none());
 
         // Complete the stream
-        let result = map.insert(peer, make_fin_message(&stream, 3));
+        let result = map.insert(peer, None, make_fin_message(&stream, 3));
 
         // Insert fails with DuplicatePart("Fin")
         assert!(matches!(
@@ -1237,7 +1364,7 @@ mod tests {
             .is_none());
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            map.insert(peer, make_fin_message(&stream, u64::MAX))
+            map.insert(peer, None, make_fin_message(&stream, u64::MAX))
         }));
 
         let result = result.expect("Out-of-range Fin should not panic");
@@ -1709,7 +1836,7 @@ mod tests {
             init.height = Height::new(3);
         }
         let init_msg = make_message(&stream_1, 0, init_part);
-        let result = map.insert(peer_1, init_msg);
+        let result = map.insert(peer_1, None, init_msg);
 
         assert!(matches!(
             result,
@@ -1740,7 +1867,10 @@ mod tests {
         for nonce in 0..MAX_STREAMS_PER_PEER as u32 {
             let stream_id = new_stream_id(Height::new(90 + nonce as u64), Round::new(0), nonce);
             let data_msg = make_message(&stream_id, 1, make_data_part(nonce as u8));
-            assert!(matches!(map.insert(peer, data_msg), InsertResult::Stale));
+            assert!(matches!(
+                map.insert(peer, None, data_msg),
+                InsertResult::Stale
+            ));
         }
 
         assert_eq!(
@@ -1825,11 +1955,11 @@ mod tests {
 
         // Fin parts arrive first; height stays unknown so the stream is kept.
         assert!(matches!(
-            map.insert(peer, make_message(&stream, 1, make_fin_part())),
+            map.insert(peer, None, make_message(&stream, 1, make_fin_part())),
             InsertResult::Pending
         ));
         assert!(matches!(
-            map.insert(peer, make_fin_message(&stream, 2)),
+            map.insert(peer, None, make_fin_message(&stream, 2)),
             InsertResult::Pending
         ));
 
@@ -1838,7 +1968,7 @@ mod tests {
         if let ProposalPart::Init(ref mut init) = init_part {
             init.height = Height::new(3);
         }
-        let result = map.insert(peer, make_message(&stream, 0, init_part));
+        let result = map.insert(peer, None, make_message(&stream, 0, init_part));
         assert!(matches!(
             result,
             InsertResult::Invalid(InsertError::StreamIdHeightMismatch {
@@ -1888,12 +2018,12 @@ mod tests {
         let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         let init_msg = make_message(&stream, 0, make_init_part());
-        map.insert(peer, init_msg);
+        map.insert(peer, None, init_msg);
 
         // Send a data chunk exceeding CHUNK_SIZE
         let oversized = make_data_part_with_size(CHUNK_SIZE + 1);
         let msg = make_message(&stream, 1, oversized);
-        let result = map.insert(peer, msg);
+        let result = map.insert(peer, None, msg);
 
         assert!(
             matches!(result, InsertResult::Pending),
@@ -1916,18 +2046,18 @@ mod tests {
         let mut map = PartStreamsMap::new(Height::new(1), NUM_VALIDATORS);
 
         let init_msg = make_message(&stream, 0, make_init_part());
-        map.insert(peer, init_msg);
+        map.insert(peer, None, init_msg);
 
         // CHUNK_SIZE - 1 should be accepted
         let under_limit = make_data_part_with_size(CHUNK_SIZE - 1);
         let msg = make_message(&stream, 1, under_limit);
-        map.insert(peer, msg);
+        map.insert(peer, None, msg);
         assert_eq!(map.streams.len(), 1, "Under-limit chunk should be accepted");
 
         // Data chunk exactly at CHUNK_SIZE should be accepted
         let at_limit = make_data_part_with_size(CHUNK_SIZE);
         let msg = make_message(&stream, 2, at_limit);
-        let result = map.insert(peer, msg);
+        let result = map.insert(peer, None, msg);
 
         assert!(
             matches!(result, InsertResult::Pending),
@@ -1944,15 +2074,15 @@ mod tests {
 
         // Init and Fin are not Data variants, so they bypass the byte limit
         let init_msg = make_message(&stream, 0, make_init_part());
-        map.insert(peer, init_msg);
+        map.insert(peer, None, init_msg);
         assert_eq!(map.streams.len(), 1, "Init should be accepted");
 
         let fin_part_msg = make_message(&stream, 1, make_fin_part());
-        map.insert(peer, fin_part_msg);
+        map.insert(peer, None, fin_part_msg);
         assert_eq!(map.streams.len(), 1, "Fin part should be accepted");
 
         let fin_msg = make_fin_message(&stream, 2);
-        let result = map.insert(peer, fin_msg);
+        let result = map.insert(peer, None, fin_msg);
 
         assert!(
             matches!(result, InsertResult::Complete(_)),
@@ -1969,7 +2099,7 @@ mod tests {
         let short = StreamId::new(vec![0x01; 8].into());
         let msg = make_message(&short, 0, make_init_part());
         assert!(matches!(
-            map.insert(peer, msg),
+            map.insert(peer, None, msg),
             InsertResult::Invalid(InsertError::InvalidStreamIdLength {
                 actual: 8,
                 expected: 16
@@ -1981,7 +2111,7 @@ mod tests {
         let long = StreamId::new(vec![0x01; 1024].into());
         let msg = make_message(&long, 0, make_init_part());
         assert!(matches!(
-            map.insert(peer, msg),
+            map.insert(peer, None, msg),
             InsertResult::Invalid(InsertError::InvalidStreamIdLength {
                 actual: 1024,
                 expected: 16
@@ -1993,7 +2123,7 @@ mod tests {
         let empty = StreamId::new(vec![].into());
         let msg = make_message(&empty, 0, make_init_part());
         assert!(matches!(
-            map.insert(peer, msg),
+            map.insert(peer, None, msg),
             InsertResult::Invalid(InsertError::InvalidStreamIdLength {
                 actual: 0,
                 expected: 16
@@ -2026,7 +2156,7 @@ mod tests {
             let stream = new_stream_id(Height::new(100), Round::new(0), i as u32);
             let msg = make_message(&stream, 0, init);
             assert!(matches!(
-                map.insert(peer, msg),
+                map.insert(peer, None, msg),
                 InsertResult::Invalid(InsertError::StreamIdHeightMismatch { .. })
             ));
 

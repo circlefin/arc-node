@@ -155,6 +155,8 @@ http://validator1:26658,ws=8546
 https://example.com,wss=ws.example.com:1212
 ```
 
+See [Running an Arc Node: Sync tuning](../../docs/running-an-arc-node.md#sync-tuning) for endpoint selection and sync tuning.
+
 #### Optional Flags
 
 - `--moniker` - Human-readable name for this node (if not provided, a random moniker like "brave-validator-742" will be generated)
@@ -286,6 +288,13 @@ arc-node-consensus db compact --home=~/.arc/consensus
 The following environment variables can be used to modify behavior:
 
 - `ARC_HALT_AT_BLOCK_HEIGHT` - If set to a non-zero value, the node will gracefully shut down after reaching this block height. Used for automated testing.
+- `ARC_SYNC_BATCH_SIZE` (default `5`) - Heights requested per sync request. Lower it to shrink the per-request response; raising it is not unilateral, since a server answers a request longer than its own batch size with an empty response. See [Sync tuning](../../docs/running-an-arc-node.md#sync-tuning).
+- `ARC_SYNC_REQUEST_TIMEOUT` (default `10s`) - How long the node waits for a sync request before abandoning it and re-requesting the range. Raise it further when requests still miss the deadline over a very high-latency link.
+- `ARC_SYNC_PARALLEL_REQUESTS` (default `5`) - Sync requests in flight at once. Together with the batch size this bounds how many heights the node is fetching at any moment.
+- `ARC_SYNC_MAX_CONCURRENT_INBOUND_REQUESTS` (default `1`) - Sync requests from peers that the node serves at once. Requests are served one at a time by the application, so a higher value does not add throughput.
+- `ARC_SYNC_MAX_PENDING_INBOUND_REQUESTS` (default `128`) - Sync requests from peers that wait for a free slot. The node answers requests beyond this limit with an empty response. `0` disables the queue.
+- `ARC_SYNC_INBOUND_RATE_LIMIT_WINDOW` (default `10s`) - Window over which the node counts sync requests from each peer.
+- `ARC_SYNC_MAX_INBOUND_REQUESTS_PER_WINDOW` (default `1000`) - Sync requests the node accepts from one peer in each window. The node answers further requests with an empty response.
 
 ## REST API
 
@@ -344,7 +353,7 @@ All endpoints support versioning:
 
 - `GET /` - API documentation and versioning info
 - `GET /status` - Application status
-- `GET /health` - Health check
+- `GET /health` - Health check (200 when the consensus event loop is progressing or startup is still in progress, 503 when it is wedged)
 - `GET /ready` - Readiness probe (200 in sync, 503 catching up)
 - `GET /version` - Version information (git, cargo)
 - `GET /consensus-state` - Current consensus state
@@ -356,7 +365,8 @@ All endpoints support versioning:
 
 The four observability endpoints (`/commit`, `/misbehavior-evidence`,
 `/proposal-monitor`, `/invalid-payloads`) accept an optional `count` for range
-queries — see [Height Ranges](#height-ranges).
+queries, all answering with the same page object, bounded by the same response
+size — see [Height Ranges](#height-ranges).
 
 #### Example API Usage
 
@@ -390,17 +400,51 @@ parameter to fetch a contiguous forward range of heights in one request:
 - `count` is the total number of heights **including** `height`. It defaults to
   `1`. `count=1` (or omitting `count`) is identical to the single-height
   behavior and returns a single JSON object.
-- `count > 1` returns an ordered JSON **array** of the per-height object, for
-  heights `height, height+1, …, height+count-1`. An explicit `height` is
-  required; `count > 1` without `height` is a `400 Bad Request`.
-- `count` is capped at **1000**. Requests above the cap are rejected with a
-  `400 Bad Request` (see below). The limit is fixed, not configurable.
+- `count > 1` returns a page object, identical in shape on all four endpoints,
+  covering heights `height, height+1, …, height+count-1`. An explicit `height`
+  is required; `count > 1` without `height` is a `400 Bad Request`.
+- `count` is capped at **10000**. Requests above the cap are rejected with a
+  `400 Bad Request` (see below). The limit is fixed, not configurable. It
+  bounds the work a range costs rather than its size: a height with no record
+  costs a lookup without spending any of the response budget below, so on the
+  sparse tables `count` is what decides how much a request scans.
+
+```json
+{
+  "items": [ { "height": 100, ... }, { "height": 101, ... } ],
+  "next": { "height": 102 }
+}
+```
+
+- `items` — the per-height objects that endpoint returns for a single height, in
+  ascending height order.
+- `next` — the first height the page did not cover. **Absent once the range is
+  exhausted**; its presence is the only signal that more data exists. Pass it
+  back as `height` to continue, with `count` covering the heights still wanted.
+
+#### Response Size
+
+`count` alone does not bound a response: a commit certificate carries one
+signature per validator, misbehavior evidence carries one entry per
+equivocation, and an invalid-payload record carries a full execution payload.
+So every range is also bounded by size, on all four endpoints alike.
+
+A page stops before the row that would take it past **4 MiB**, measured on the
+stored rows before they are decoded, and reports that height as `next`. The
+limit is fixed, not configurable.
+
+A page always carries **at least one height**. A single row larger than the
+whole budget is therefore still served — alone, in a page that exceeds the
+limit — so iterating on `next` always advances and always terminates.
+
+The budget counts stored bytes, not the JSON that comes back; base64 signatures
+and hex addresses make the serialized response larger.
 
 ```bash
-# A single height (unchanged):
+# A single height:
 curl "http://localhost:26658/commit?height=100" | jq
 
-# 50 contiguous heights (100..=149) as a JSON array:
+# 50 contiguous heights (100..=149) under items:
 curl "http://localhost:26658/commit?height=100&count=50" | jq
 ```
 
@@ -428,7 +472,7 @@ endpoints, e.g., for a request that exceeds the current head:
   - `not_recorded` — within range but never recorded (proposal monitor only; a
     permanent gap, not retryable).
   - `internal` — a record is missing or could not be decoded.
-  - `over_limit` — `count` exceeds the 1000 cap. `failed_heights` is omitted
+  - `over_limit` — `count` exceeds the 10000 cap. `failed_heights` is omitted
     (the range is never evaluated); `requested` still carries the bounds.
 
 Plain argument errors (`count=0`, `count > 1` without `height`, or a range that
@@ -438,6 +482,33 @@ When the store holds no decided heights yet (an empty table — e.g. a freshly
 started node), a range request returns `404 Not Found` with a per-endpoint body
 (e.g., `{"error": "Certificate not found"}` on `/commit`, and the analogous message on
 the other three) rather than the structured `400` above.
+
+A mixed-class range still reports a single `reason`: the class of the lowest
+height that failed. `failed_heights` lists every height that could not be
+served, including later heights that failed for a different class.
+
+A page that stops early hides failures beyond where it stopped, because those
+heights are never reached. Asking for `100..=1099` when the head is at 150
+returns `above_current_head` if the page spans the whole range, but a `200` with
+`next` set if the budget stopped it at, say, 140. Continuing from `next` then
+surfaces the error. So a successful page does not mean the rest of the
+requested range is available.
+
+#### Invalid Payloads
+
+An invalid-payload record carries a full execution payload, so
+`/invalid-payloads` is the endpoint most likely to page. Walking the cursor:
+
+```bash
+curl "http://localhost:26658/invalid-payloads?height=100&count=50" | jq
+# next: { "height": 118 } — resume there for the heights still wanted
+curl "http://localhost:26658/invalid-payloads?height=118&count=32" | jq
+```
+
+A height retains at most **64** invalid-payload records; beyond that further
+records at that height are dropped and the earliest are kept. That is a count
+cap, not a byte cap, so one height can still exceed the page budget and come
+back on its own.
 
 ### Response Compression
 

@@ -35,6 +35,7 @@ use crate::block::ConsensusBlock;
 use crate::metrics::{AppMetrics, InvalidPayloadSource, SkewNilVoteSource};
 use crate::payload::{
     establish_block_validity, persist_invalid_payload_best_effort, EnginePayloadValidator,
+    PayloadOrigin,
 };
 use crate::proposal_parts::{
     assemble_block_from_parts, resolve_expected_proposer, validate_proposal_parts,
@@ -57,6 +58,7 @@ pub async fn handle(
     state: &mut State,
     engine: &Engine,
     from: PeerId,
+    published_by: Option<PeerId>,
     part: StreamMessage<ProposalPart>,
     reply: Reply<Option<ProposedValue<ArcContext>>>,
 ) {
@@ -81,7 +83,7 @@ pub async fn handle(
         previous_block,
     };
 
-    let outcome = on_received_proposal_part(context, from, part)
+    let outcome = on_received_proposal_part(context, from, published_by, part)
         .await
         .inspect_err(|e| {
             error!(%from, "🔴 Error processing proposal part: {e:#}");
@@ -211,15 +213,17 @@ struct HandlerContext<'a, 'b> {
 async fn on_received_proposal_part(
     context: HandlerContext<'_, '_>,
     from: PeerId,
+    published_by: Option<PeerId>,
     part: StreamMessage<ProposalPart>,
 ) -> eyre::Result<ReceivedPart> {
+    let publisher = published_by.unwrap_or(from);
     let (part_type, part_size) = match &part.content {
         StreamContent::Data(part) => (part.get_type(), part.size_bytes()),
         StreamContent::Fin => ("end of stream", 0),
     };
 
     info!(
-        %from, %part.sequence, part.type = %part_type, part.size = %part_size, stream_id = %part.stream_id,
+        %from, %publisher, %part.sequence, part.type = %part_type, part.size = %part_size, stream_id = %part.stream_id,
         "Received proposal part"
     );
 
@@ -228,14 +232,14 @@ async fn on_received_proposal_part(
     let stream_id = part.stream_id.clone();
 
     // Check if we have a full proposal
-    let parts = match context.streams_map.insert(from, part) {
+    let parts = match context.streams_map.insert(from, published_by, part) {
         InsertResult::Complete(parts) => parts,
         InsertResult::Pending => return Ok(ReceivedPart::None),
         // Benign: an old proposal part re-circulating on the network. Dropped
         // without warning — not peer misbehaviour.
         InsertResult::Stale => return Ok(ReceivedPart::None),
         InsertResult::Invalid(e) => {
-            warn!(%from, error = %e, "Rejecting stream message");
+            warn!(%from, %publisher, error = %e, "Rejecting stream message");
             return Ok(ReceivedPart::None);
         }
     };
@@ -249,7 +253,7 @@ async fn on_received_proposal_part(
     let disposition = handle_complete_parts(&context, parts, from).await;
 
     if !matches!(disposition, Ok(Disposition::Deferred)) {
-        context.streams_map.mark_closed(from, stream_id);
+        context.streams_map.mark_closed(publisher, stream_id);
     }
 
     match disposition? {
@@ -380,16 +384,23 @@ async fn validate_block(
     from: PeerId,
 ) -> eyre::Result<()> {
     let validator = EnginePayloadValidator::new(engine, metrics);
-    let validity = establish_block_validity(&validator, block, previous_block, store, metrics)
-        .await
-        .map(|verdict| verdict.validity())
-        .wrap_err_with(|| {
-            format!(
-                "Payload validation failed on block built after \
+    let validity = establish_block_validity(
+        &validator,
+        block,
+        previous_block,
+        store,
+        metrics,
+        PayloadOrigin::Signed,
+    )
+    .await
+    .map(|verdict| verdict.validity())
+    .wrap_err_with(|| {
+        format!(
+            "Payload validation failed on block built after \
                  receiving proposal part at height={}, round={} from {}",
-                block.height, block.round, from,
-            )
-        })?;
+            block.height, block.round, from,
+        )
+    })?;
 
     match validity {
         Validity::Invalid => {
@@ -1058,7 +1069,7 @@ mod tests {
                 max_pending,
                 previous_block,
             );
-            last = on_received_proposal_part(ctx, from, msg.clone()).await?;
+            last = on_received_proposal_part(ctx, from, None, msg.clone()).await?;
         }
         Ok(last)
     }
@@ -1244,7 +1255,7 @@ mod tests {
         // does not reopen a slot.
         let straggler = messages[1].clone();
         let ctx = make_ctx(&f, &engine, &selector, &mut streams_map, height, 10, None);
-        assert!(on_received_proposal_part(ctx, from, straggler)
+        assert!(on_received_proposal_part(ctx, from, None, straggler)
             .await
             .unwrap()
             .is_none());
@@ -1458,7 +1469,7 @@ mod tests {
         // reopen a slot.
         let straggler = messages[1].clone();
         let ctx = make_ctx(&f, &engine, &selector, &mut streams_map, height, 10, None);
-        assert!(on_received_proposal_part(ctx, from, straggler)
+        assert!(on_received_proposal_part(ctx, from, None, straggler)
             .await
             .unwrap()
             .is_none());

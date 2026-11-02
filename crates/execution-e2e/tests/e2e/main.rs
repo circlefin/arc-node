@@ -16,10 +16,12 @@
 
 #![allow(clippy::arithmetic_side_effects)]
 
+mod arc_rpc_namespace;
 mod base_fee;
 mod beneficiary_blocklist;
 mod block_hash_history;
 mod block_production;
+mod call_from_trace;
 mod denylist;
 mod eip161_empty_account_clearing;
 mod eip7708_denylist;
@@ -37,9 +39,13 @@ mod helpers;
 mod invalid_tx_list;
 mod native_transfer_balance;
 mod p256_precompile;
+mod pending_rpc;
 mod pq_precompile;
+mod raw_tx_params_shapes;
+mod rpc_gas_cap_guard;
 mod selfdestruct_beneficiary;
 mod sparse_trie_payload_state_root;
 mod static_rpc_gas_cap;
+mod trace_byte_limit;
 mod transaction;
 mod withdrawals_payload_validation;

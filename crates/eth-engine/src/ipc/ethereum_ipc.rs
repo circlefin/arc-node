@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use alloy_consensus::TxEnvelope;
-use alloy_rpc_types::{Block, BlockNumberOrTag, TransactionRequest};
+use alloy_rpc_types::{Block, BlockId, BlockNumberOrTag, TransactionRequest};
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use alloy_rpc_types_txpool::{TxpoolInspect, TxpoolStatus};
 use alloy_sol_types::SolCall;
@@ -29,11 +29,12 @@ use jsonrpsee::rpc_params;
 use serde::de::DeserializeOwned;
 use tracing::{debug, trace};
 
-use arc_consensus_types::{ConsensusParams, ValidatorSet};
+use arc_consensus_types::{Address, ConsensusParams, ValidatorSet};
+use arc_execution_config::native_coin_control::NATIVE_COIN_CONTROL_ADDRESS;
 
 use crate::abi_utils::{
-    abi_decode_consensus_params, abi_decode_validator_set, consensusParamsCall,
-    getActiveValidatorSetCall,
+    abi_decode_consensus_params, abi_decode_is_blocklisted, abi_decode_validator_set,
+    consensusParamsCall, getActiveValidatorSetCall, isBlocklistedCall,
 };
 use crate::constants::{
     ETH_BATCH_REQUEST_TIMEOUT, ETH_CALL_RETRY, ETH_DEFAULT_TIMEOUT, IPC_CLIENT_TIMEOUT,
@@ -195,6 +196,45 @@ impl EthereumIPC {
         abi_decode_consensus_params(result)
     }
 
+    /// Returns whether `address` is on the NativeCoinControl blocklist at `block`.
+    ///
+    /// Calls the precompile's `isBlocklisted(address)` view function through
+    /// `eth_call`.
+    /// The call leaves `from` unset, so the caller defaults to the zero address.
+    /// Arc aborts an `eth_call` from a blocklisted caller, so a blocklisted zero
+    /// address would make this return an error instead of the true status. That is
+    /// an accepted low risk: the validator-set query already depends on the zero
+    /// address staying unblocked.
+    #[tracing::instrument(skip(self))]
+    pub async fn is_address_blocklisted(
+        &self,
+        address: Address,
+        block: BlockId,
+    ) -> eyre::Result<bool> {
+        let calldata = isBlocklistedCall {
+            account: address.to_alloy_address(),
+        }
+        .abi_encode();
+
+        let tx_request = TransactionRequest {
+            to: Some(alloy_primitives::TxKind::Call(NATIVE_COIN_CONTROL_ADDRESS)),
+            input: alloy_primitives::Bytes::from(calldata).into(),
+            ..Default::default()
+        };
+
+        let result: String = self
+            .ipc
+            .build_rpc_request("eth_call", rpc_params!(tx_request, block))
+            .timeout(ETH_DEFAULT_TIMEOUT)
+            .retry(ETH_CALL_RETRY.build())
+            .send()
+            .await?;
+
+        debug!("eth_call isBlocklisted result: {result}");
+        let result = hex::decode(result.trim_start_matches("0x"))?;
+        abi_decode_is_blocklisted(result)
+    }
+
     /// Get a block by its number or tag.
     pub async fn get_block_by_number(
         &self,
@@ -300,6 +340,14 @@ impl EthereumAPI for EthereumIPC {
     /// Get the consensus parameters at a specific block height.
     async fn get_consensus_params(&self, block_height: u64) -> eyre::Result<ConsensusParams> {
         self.get_consensus_params(block_height).await
+    }
+
+    async fn is_address_blocklisted(&self, address: Address, block: BlockId) -> eyre::Result<bool> {
+        self.is_address_blocklisted(address, block)
+            .await
+            .wrap_err_with(|| {
+                format!("EthereumIPC is_address_blocklisted call failed for address={address}")
+            })
     }
 
     /// Get a block by its number or tag.

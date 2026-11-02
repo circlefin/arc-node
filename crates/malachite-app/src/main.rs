@@ -293,6 +293,7 @@ fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<
         validator: cmd.validator,
         rpc_sync_enabled: cmd.follow,
         rpc_sync_endpoints: cmd.follow_endpoints.clone(),
+        rpc_sync_stale_timeout: cmd.follow_stale_timeout,
     };
 
     // Setup the application
@@ -839,5 +840,14 @@ mod tests {
         assert!(result.is_err());
         let error_message = format!("{}", result.unwrap_err());
         assert!(error_message.contains("Invalid runtime flavor"));
+    }
+
+    #[test]
+    fn follow_stale_timeout_cli_default_matches_start_config_const() {
+        assert_eq!(
+            StartCmd::default().follow_stale_timeout,
+            StartConfig::DEFAULT_RPC_SYNC_STALE_TIMEOUT,
+            "StartCmd default and StartConfig constant must agree"
+        );
     }
 }

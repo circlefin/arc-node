@@ -27,7 +27,7 @@ use tokio::sync::watch;
 use async_trait::async_trait;
 use tracing::debug;
 
-use alloy_rpc_types::BlockNumberOrTag;
+use alloy_rpc_types::{BlockId, BlockNumberOrTag};
 use alloy_rpc_types_engine::{
     ExecutionPayloadV3, ForkchoiceUpdated, PayloadAttributes, PayloadId as AlloyPayloadId,
     PayloadStatus, PayloadStatusEnum,
@@ -118,6 +118,11 @@ pub trait EthereumAPI: Send + Sync {
     async fn txpool_status(&self) -> eyre::Result<TxpoolStatus>;
     /// Get the contents of the transaction pool.
     async fn txpool_inspect(&self) -> eyre::Result<TxpoolInspect>;
+
+    /// Whether `address` is on the NativeCoinControl native-coin blocklist at
+    /// `block`. `true` means a block whose beneficiary is this address would be
+    /// rejected by the execution layer's beneficiary check.
+    async fn is_address_blocklisted(&self, address: Address, block: BlockId) -> eyre::Result<bool>;
 }
 
 /// Function that checks whether Osaka is active at a given timestamp.
@@ -648,6 +653,10 @@ where
     async fn txpool_inspect(&self) -> eyre::Result<TxpoolInspect> {
         (**self).txpool_inspect().await
     }
+
+    async fn is_address_blocklisted(&self, address: Address, block: BlockId) -> eyre::Result<bool> {
+        (**self).is_address_blocklisted(address, block).await
+    }
 }
 
 #[async_trait]
@@ -688,6 +697,10 @@ impl EthereumAPI for Box<dyn EthereumAPI> {
 
     async fn txpool_inspect(&self) -> eyre::Result<TxpoolInspect> {
         (**self).txpool_inspect().await
+    }
+
+    async fn is_address_blocklisted(&self, address: Address, block: BlockId) -> eyre::Result<bool> {
+        (**self).is_address_blocklisted(address, block).await
     }
 }
 

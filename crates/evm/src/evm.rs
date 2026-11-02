@@ -38,6 +38,7 @@ use arc_precompiles::helpers::{
 };
 use arc_precompiles::NATIVE_COIN_CONTROL_ADDRESS;
 use core::fmt::Debug;
+use core::num::NonZeroUsize;
 use reth_ethereum::evm::revm::context::block::BlockEnv;
 use reth_ethereum::evm::revm::primitives::U256;
 use reth_ethereum::{
@@ -82,7 +83,7 @@ use revm::{
     InspectEvm,
 };
 use revm_context_interface::journaled_state::{JournalCheckpoint, JournalLoadError};
-use revm_context_interface::{FrameStack, Transaction};
+use revm_context_interface::{ContextError, FrameStack, Transaction};
 use revm_handler::SystemCallTx;
 use revm_interpreter::interpreter_action::FrameInit;
 use revm_interpreter::{CallScheme, CreateScheme, FrameInput, Instruction};
@@ -105,6 +106,10 @@ use revm::interpreter::interpreter_action::CallInputs;
 /// value attached, sender spoofing, init_subcall errors). Charged by `init_subcall_revert`
 /// calls. Prevents zero-cost probing of subcall precompile addresses.
 const SUBCALL_DISPATCH_COST: u64 = 100;
+
+/// Default per-transaction cap on call input bytes passed to an inspector.
+pub const MAX_TRACE_BYTES_DEFAULT: NonZeroUsize =
+    NonZeroUsize::new(64 * 1024 * 1024).expect("literal is non-zero");
 
 fn insert_arc_selfdestruct_instruction<DB: Database>(
     instruction: &mut EthInstructions<EthInterpreter, EthEvmContext<DB>>,
@@ -211,6 +216,10 @@ pub struct ArcEvm<CTX, INSP, I, P, F = EthFrame<EthInterpreter>> {
     subcall_registry: Arc<SubcallRegistry>,
     /// Active subcall continuations, keyed by the precompile call's depth.
     subcall_continuations: HashMap<usize, SubcallContinuation>,
+    /// Per-transaction cap on the call input bytes a tracer can retain.
+    max_trace_bytes: NonZeroUsize,
+    /// Upper bound on the call input bytes a tracer can retain in the current transaction.
+    trace_input_bytes: usize,
 }
 
 /// ArcEvm implementation, wrapping an inner revm EVM instance to apply handler
@@ -241,7 +250,15 @@ impl<CTX: ContextTr, INSP, P> ArcEvm<CTX, INSP, EthInstructions<EthInterpreter, 
             hardfork_flags,
             subcall_registry,
             subcall_continuations: HashMap::new(),
+            max_trace_bytes: MAX_TRACE_BYTES_DEFAULT,
+            trace_input_bytes: 0,
         }
+    }
+
+    /// Sets the per-transaction cap on the call input bytes a tracer can retain.
+    pub fn with_max_trace_bytes(mut self, max_trace_bytes: NonZeroUsize) -> Self {
+        self.max_trace_bytes = max_trace_bytes;
+        self
     }
 }
 
@@ -706,6 +723,8 @@ where
     /// Overrides the default revm behavior to intercept subcall continuations:
     /// when a child frame completes and a continuation exists at `depth - 1`,
     /// we finalize the subcall via `complete_subcall` instead of returning the raw child result.
+    /// Under inspection, `inspect_frame_run` has already finalized it and consumed the
+    /// continuation, so the result propagates as-is.
     #[inline]
     fn frame_return_result(
         &mut self,
@@ -735,24 +754,18 @@ where
         // depth — not the child's. Looking up `finished_depth - 1` would match the grandparent's
         // continuation, corrupting state.
         if frame_was_finished {
-            let continuation_key = finished_depth.checked_sub(1);
-            if let Some(key) = continuation_key {
-                if let Some(continuation) = self.subcall_continuations.remove(&key) {
-                    let final_result = self.complete_subcall(result, continuation)?;
-                    if stack_empty {
-                        // Direct EOA -> precompile: no parent frame to propagate to.
-                        return Ok(Some(final_result));
-                    }
-                    // Propagate to the parent frame
-                    self.inner
-                        .frame_stack
-                        .get()
-                        .return_result::<_, ContextDbError<CTX>>(
-                            &mut self.inner.ctx,
-                            final_result,
-                        )?;
-                    return Ok(None);
+            if let Some(continuation) = self.take_subcall_continuation(finished_depth) {
+                let final_result = self.complete_subcall(&result, continuation)?;
+                if stack_empty {
+                    // Direct EOA -> precompile: no parent frame to propagate to.
+                    return Ok(Some(final_result));
                 }
+                // Propagate to the parent frame
+                self.inner
+                    .frame_stack
+                    .get()
+                    .return_result::<_, ContextDbError<CTX>>(&mut self.inner.ctx, final_result)?;
+                return Ok(None);
             }
         }
 
@@ -1089,10 +1102,18 @@ where
                     continuation_data: init_result.continuation_data,
                     checkpoint,
                 };
-                let final_result = self.complete_subcall(child_result, continuation)?;
+                let final_result = self.complete_subcall(&child_result, continuation)?;
                 Ok(ItemOrResult::Result(final_result))
             }
         }
+    }
+
+    /// Removes the continuation of the subcall whose child frame ran at `child_depth`.
+    ///
+    /// `init_subcall` stores it at the precompile call's depth, one below the child.
+    fn take_subcall_continuation(&mut self, child_depth: usize) -> Option<SubcallContinuation> {
+        let key = child_depth.checked_sub(1)?;
+        self.subcall_continuations.remove(&key)
     }
 
     /// The child frame has completed. Finalize the precompile result via
@@ -1105,7 +1126,7 @@ where
     /// state is reverted using the checkpoint stored in the continuation.
     fn complete_subcall(
         &mut self,
-        child_result: FrameResult,
+        child_result: &FrameResult,
         continuation: SubcallContinuation,
     ) -> Result<FrameResult, ContextDbError<CTX>> {
         let child_gas = child_result.gas();
@@ -1121,7 +1142,7 @@ where
         //   including the retained 1/64th (revm's `is_ok_or_revert()` check gates
         //   `erase_cost`). We mirror that here: when the child halted, the full gas_limit
         //   is reported as spent.
-        let (child_succeeded, child_halted) = match &child_result {
+        let (child_succeeded, child_halted) = match child_result {
             FrameResult::Call(outcome) => {
                 let r = outcome.result.result;
                 (r.is_ok(), !r.is_ok_or_revert())
@@ -1131,7 +1152,7 @@ where
 
         let completion_result = continuation
             .precompile
-            .complete_subcall(continuation.continuation_data, &child_result);
+            .complete_subcall(continuation.continuation_data, child_result);
 
         // Extract completion gas before consuming the result in the match below.
         let completion_gas = match &completion_result {
@@ -1237,6 +1258,27 @@ where
     }
 }
 
+/// Makes the result traced for a subcall child match the subcall's final outcome.
+///
+/// The trace node covers the whole subcall, so it reports the subcall's final gas: what the
+/// parent was charged out of the gas it forwarded. A halt, from the child or from completion,
+/// spends all of it, as for any halted frame.
+///
+/// When completion fails a child that returned successfully (completion OOG, an error, or a
+/// rejection), `complete_subcall` rolls back the child's state, so its status and output are
+/// replaced by the final failure. Otherwise the child keeps its own status and output: a real
+/// revert reason or halt, or its raw returndata rather than the precompile's encoding.
+fn mirror_subcall_result(traced_child: &mut FrameResult, final_result: &FrameResult) {
+    let (FrameResult::Call(child), FrameResult::Call(fin)) = (traced_child, final_result) else {
+        return;
+    };
+    child.result.gas = fin.result.gas;
+    if child.result.result.is_ok() && !fin.result.result.is_ok() {
+        child.result.result = fin.result.result;
+        child.result.output = fin.result.output.clone();
+    }
+}
+
 // Implement InspectorEvmTr for ArcEvm
 // ref: op-revm v12.0.1 implementation https://github.com/bluealloy/revm/blob/v97/crates/op-revm/src/evm.rs#L59
 impl<CTX, INSP, I, P> InspectorEvmTr for ArcEvm<CTX, INSP, I, P>
@@ -1287,6 +1329,8 @@ where
         &mut self,
         mut frame_init: <Self::Frame as FrameTr>::FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
+        self.charge_trace_input(&frame_init.frame_input)?;
+
         // Check if this targets a subcall precompile.
         let is_subcall = matches!(
             &frame_init.frame_input,
@@ -1310,14 +1354,80 @@ where
 
         // Fall back to the original input if trace_child_call returns None
         // (e.g. malformed calldata that will fail during actual execution).
+        // The trace node stands for the whole subcall, so it gets the gas forwarded to the
+        // precompile and `inspect_frame_run` reports the subcall's final gas.
         let trace_frame_input = self
             .subcall_registry
             .get(&call_inputs.target_address)
             .and_then(|(precompile, _)| precompile.trace_child_call(call_inputs))
-            .map(|inputs| FrameInput::Call(Box::new(inputs)))
+            .map(|mut inputs| {
+                inputs.gas_limit = call_inputs.gas_limit;
+                FrameInput::Call(Box::new(inputs))
+            })
             .unwrap_or_else(|| frame_init.frame_input.clone());
 
+        // The entry charge counts only the argument, so `trace_child_call` must return the
+        // argument or a window into it; a longer traced input would escape the budget.
+        debug_assert!(
+            !matches!(&trace_frame_input, FrameInput::Call(c) if c.input.len() > call_inputs.input.len()),
+            "traced subcall input must not exceed the charged argument"
+        );
+
         self.inspect_frame_init_impl(frame_init, Some(trace_frame_input))
+    }
+
+    /// Override `inspect_frame_run` to finalize a subcall before its child's `frame_end`.
+    ///
+    /// Upstream ends the child frame before `frame_return_result` runs `complete_subcall`, so
+    /// a successful child that completion then fails would stay successful in the trace. Here
+    /// the inspector gets the child's result with the subcall's final gas and failure
+    /// mirrored in, see [`mirror_subcall_result`].
+    ///
+    /// The parent of a subcall child receives the result of `complete_subcall`, so `call_end`
+    /// mutations of the child's outcome do not reach execution. Other frames pass their
+    /// result through, so `call_end` mutations reach execution as upstream.
+    fn inspect_frame_run(
+        &mut self,
+    ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
+        use crate::inspect::inspect_instructions;
+        use revm::inspector::handler::frame_end;
+        use revm::inspector::InspectorFrame;
+
+        // --- Upstream (revm-inspector v19.0.0 `InspectorEvmTr::inspect_frame_run`) ---
+        // Except `inspect_instructions`, which is Arc's fork, see `crate::inspect`.
+        let (ctx, inspector, frame, instructions) = self.ctx_inspector_frame_instructions();
+        let Some(frame) = frame.eth_frame() else {
+            return self.frame_run();
+        };
+        let next_action = inspect_instructions(
+            ctx,
+            &mut frame.interpreter,
+            inspector,
+            instructions.instruction_table(),
+        );
+        let result = frame.process_next_action(ctx, next_action);
+        let Ok(ItemOrResult::Result(mut child_result)) = result else {
+            return result;
+        };
+        // --- End upstream ---
+
+        // --- Arc: finalize a subcall child before the inspector sees its end ---
+        let depth = self.inner.frame_stack.get().depth;
+        let final_result = self
+            .take_subcall_continuation(depth)
+            .map(|continuation| self.complete_subcall(&child_result, continuation))
+            .transpose()?;
+        if let Some(final_result) = &final_result {
+            mirror_subcall_result(&mut child_result, final_result);
+        }
+
+        // --- Upstream: end the frame ---
+        let (ctx, inspector, frame) = self.ctx_inspector_frame();
+        if let Some(frame) = frame.eth_frame() {
+            frame_end(ctx, inspector, &frame.input, &mut child_result);
+            frame.set_finished(true);
+        }
+        Ok(ItemOrResult::Result(final_result.unwrap_or(child_result)))
     }
 }
 
@@ -1379,6 +1489,25 @@ where
                 Ok(frame_init.frame_input.clone())
             }
         }
+    }
+
+    /// Charges the full call argument because a traced subcall window can retain its allocation.
+    ///
+    /// Errors once the budget is exceeded, before the inspector copies the input.
+    fn charge_trace_input(&mut self, input: &FrameInput) -> Result<(), ContextDbError<CTX>> {
+        let len = match input {
+            FrameInput::Call(inputs) => inputs.input.len(),
+            // Init code is already an owned buffer the inspector clones by refcount.
+            FrameInput::Create(_) | FrameInput::Empty => return Ok(()),
+        };
+        self.trace_input_bytes = self.trace_input_bytes.saturating_add(len);
+        if self.trace_input_bytes > self.max_trace_bytes.get() {
+            return Err(ContextError::Custom(format!(
+                "trace byte limit of {} exceeded",
+                self.max_trace_bytes
+            )));
+        }
+        Ok(())
     }
 
     fn inspect_frame_init_impl(
@@ -1499,9 +1628,10 @@ where
 
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.inner.ctx.set_tx(tx);
+        self.trace_input_bytes = 0;
         let result = ArcEvmHandler::<_, _>::new(self.hardfork_flags).inspect_run(self);
         debug_assert!(
-            self.subcall_continuations.is_empty(),
+            result.is_err() || self.subcall_continuations.is_empty(),
             "stale subcall continuations after inspect"
         );
         self.subcall_continuations.clear();
@@ -1636,11 +1766,21 @@ where
 #[non_exhaustive]
 pub struct ArcEvmFactory {
     chain_spec: Arc<ArcChainSpec>,
+    max_trace_bytes: NonZeroUsize,
 }
 
 impl ArcEvmFactory {
     pub fn new(chain_spec: Arc<ArcChainSpec>) -> Self {
-        Self { chain_spec }
+        Self {
+            chain_spec,
+            max_trace_bytes: MAX_TRACE_BYTES_DEFAULT,
+        }
+    }
+
+    /// Sets the per-transaction cap on the call input bytes a tracer can retain.
+    pub fn with_max_trace_bytes(mut self, max_trace_bytes: NonZeroUsize) -> Self {
+        self.max_trace_bytes = max_trace_bytes;
+        self
     }
 
     fn get_hardfork_flags(&self, block_env: &BlockEnv) -> ArcHardforkFlags {
@@ -1723,6 +1863,7 @@ impl EvmFactory for ArcEvmFactory {
             hardfork_flags,
             subcall_registry,
         )
+        .with_max_trace_bytes(self.max_trace_bytes)
     }
 
     fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>, EthInterpreter>>(
@@ -1754,6 +1895,28 @@ impl EvmFactory for ArcEvmFactory {
             hardfork_flags,
             subcall_registry,
         )
+        .with_max_trace_bytes(self.max_trace_bytes)
+    }
+}
+
+/// [`ConfigureEvm::Error`] for [`ArcEvmConfig`].
+///
+/// Reth's [`EthEvmConfig`] uses [`core::convert::Infallible`]. Arc needs a
+/// fallible type so a ProtocolConfig database fault can abort payload building
+/// instead of applying chainspec defaults.
+#[derive(Debug, thiserror::Error)]
+#[error("ProtocolConfig fee params database error: {0}")]
+pub struct ArcEvmConfigError(Box<dyn core::error::Error + Send + Sync + 'static>);
+
+impl ArcEvmConfigError {
+    fn protocol_config_database(error: impl core::error::Error + Send + Sync + 'static) -> Self {
+        Self(Box::new(error))
+    }
+}
+
+impl From<core::convert::Infallible> for ArcEvmConfigError {
+    fn from(value: core::convert::Infallible) -> Self {
+        match value {}
     }
 }
 
@@ -1818,7 +1981,7 @@ impl BlockExecutorFactory for ArcEvmConfig {
 
 impl ConfigureEvm for ArcEvmConfig {
     type Primitives = <EthEvmConfig as ConfigureEvm>::Primitives;
-    type Error = <EthEvmConfig as ConfigureEvm>::Error;
+    type Error = ArcEvmConfigError;
     type NextBlockEnvCtx = <EthEvmConfig as ConfigureEvm>::NextBlockEnvCtx;
     type BlockExecutorFactory = Self;
     type BlockAssembler = ArcBlockAssembler<ArcChainSpec>;
@@ -1832,7 +1995,7 @@ impl ConfigureEvm for ArcEvmConfig {
     }
 
     fn evm_env(&self, header: &Header) -> Result<EvmEnv<SpecId>, Self::Error> {
-        self.inner.evm_env(header)
+        Ok(self.inner.evm_env(header)?)
     }
 
     fn builder_for_next_block<'a, DB: Database + 'a>(
@@ -1861,9 +2024,8 @@ impl ConfigureEvm for ArcEvmConfig {
         // ADR-0003: use chainspec bounds; fall back to chainspec default when ProtocolConfig
         // is unavailable or returns an out-of-bounds value.
         let chain_spec = self.inner.chain_spec().as_ref();
-        let fee_params = retrieve_fee_params(&mut system_evm).inspect_err(|err| {
-                tracing::warn!(error = ?err, "Failed to get fee params from ProtocolConfig, using default gas limit");
-            }).ok();
+        let fee_params = retrieve_fee_params(&mut system_evm)
+            .map_err(ArcEvmConfigError::protocol_config_database)?;
         let next_block_height = parent.number.checked_add(1).expect("block number overflow");
 
         let gas_limit_config = chain_spec.block_gas_limit_config(next_block_height);
@@ -1881,14 +2043,14 @@ impl ConfigureEvm for ArcEvmConfig {
         parent: &Header,
         attributes: &NextBlockEnvAttributes,
     ) -> Result<EvmEnv, Self::Error> {
-        self.inner.next_evm_env(parent, attributes)
+        Ok(self.inner.next_evm_env(parent, attributes)?)
     }
 
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<reth_ethereum::Block>,
     ) -> Result<EthBlockExecutionCtx<'a>, Self::Error> {
-        self.inner.context_for_block(block)
+        Ok(self.inner.context_for_block(block)?)
     }
 
     fn context_for_next_block(
@@ -1905,21 +2067,21 @@ impl ConfigureEvm for ArcEvmConfig {
 
 impl ConfigureEngineEvm<ExecutionData> for ArcEvmConfig {
     fn evm_env_for_payload(&self, payload: &ExecutionData) -> Result<EvmEnvFor<Self>, Self::Error> {
-        self.inner.evm_env_for_payload(payload)
+        Ok(self.inner.evm_env_for_payload(payload)?)
     }
 
     fn context_for_payload<'a>(
         &self,
         payload: &'a ExecutionData,
     ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
-        self.inner.context_for_payload(payload)
+        Ok(self.inner.context_for_payload(payload)?)
     }
 
     fn tx_iterator_for_payload(
         &self,
         payload: &ExecutionData,
     ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
-        self.inner.tx_iterator_for_payload(payload)
+        Ok(self.inner.tx_iterator_for_payload(payload)?)
     }
 }
 
@@ -2052,6 +2214,29 @@ mod tests {
             evm.inner.instruction.instruction_table[opcode::DELEGATECALL as usize].static_gas(),
             700
         );
+    }
+
+    #[test]
+    fn factory_applies_trace_input_limit() {
+        assert_eq!(MAX_TRACE_BYTES_DEFAULT.get(), 64 * 1024 * 1024);
+        let factory = ArcEvmFactory::new(LOCAL_DEV.clone());
+        let evm = factory.create_evm_with_inspector(
+            InMemoryDB::default(),
+            evm_env_with_spec(SpecId::PRAGUE),
+            NoOpInspector {},
+        );
+        assert_eq!(evm.max_trace_bytes, MAX_TRACE_BYTES_DEFAULT);
+
+        let limit = NonZeroUsize::new(4096).unwrap();
+        let factory = factory.with_max_trace_bytes(limit);
+        let evm = factory.create_evm(InMemoryDB::default(), evm_env_with_spec(SpecId::PRAGUE));
+        assert_eq!(evm.max_trace_bytes, limit);
+        let evm = factory.create_evm_with_inspector(
+            InMemoryDB::default(),
+            evm_env_with_spec(SpecId::PRAGUE),
+            NoOpInspector {},
+        );
+        assert_eq!(evm.max_trace_bytes, limit);
     }
 
     fn create_db(accounts: &[(Address, u64)]) -> InMemoryDB {
@@ -2300,6 +2485,102 @@ mod tests {
         assert!(
             result.is_ok(),
             "builder_for_next_block should succeed when ProtocolConfig is absent"
+        );
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("forced ProtocolConfig database read failure")]
+    struct ForcedProtocolConfigReadError;
+    impl revm::database_interface::DBErrorMarker for ForcedProtocolConfigReadError {}
+
+    #[derive(Debug)]
+    struct ProtocolConfigReadFailingDb {
+        inner: InMemoryDB,
+    }
+
+    impl revm::Database for ProtocolConfigReadFailingDb {
+        type Error = ForcedProtocolConfigReadError;
+
+        fn basic(
+            &mut self,
+            address: Address,
+        ) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+            if address == arc_execution_config::protocol_config::PROTOCOL_CONFIG_ADDRESS {
+                return Err(ForcedProtocolConfigReadError);
+            }
+            <InMemoryDB as revm::Database>::basic(&mut self.inner, address)
+                .map_err(|infallible: core::convert::Infallible| match infallible {})
+        }
+
+        fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+            <InMemoryDB as revm::Database>::code_by_hash(&mut self.inner, code_hash)
+                .map_err(|infallible: core::convert::Infallible| match infallible {})
+        }
+
+        fn storage(
+            &mut self,
+            address: Address,
+            index: revm::primitives::StorageKey,
+        ) -> Result<revm::primitives::StorageValue, Self::Error> {
+            if address == arc_execution_config::protocol_config::PROTOCOL_CONFIG_ADDRESS {
+                return Err(ForcedProtocolConfigReadError);
+            }
+            <InMemoryDB as revm::Database>::storage(&mut self.inner, address, index)
+                .map_err(|infallible: core::convert::Infallible| match infallible {})
+        }
+
+        fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+            <InMemoryDB as revm::Database>::block_hash(&mut self.inner, number)
+                .map_err(|infallible: core::convert::Infallible| match infallible {})
+        }
+    }
+
+    #[test]
+    fn test_builder_for_next_block_database_error_aborts() {
+        let chain_spec = LOCAL_DEV.clone();
+        let inner_config = EthEvmConfig::new_with_evm_factory(
+            chain_spec.clone(),
+            ArcEvmFactory::new(chain_spec.clone()),
+        );
+        let evm_config = ArcEvmConfig::new(inner_config);
+        let mut db = State::builder()
+            .with_database(ProtocolConfigReadFailingDb {
+                inner: InMemoryDB::default(),
+            })
+            .build();
+        let parent_header = Header {
+            number: 1,
+            gas_limit: 30_000_000,
+            gas_used: 21_000,
+            base_fee_per_gas: Some(1_000_000_000),
+            timestamp: 1000,
+            ..Default::default()
+        };
+        let sealed_parent = SealedHeader::new(parent_header, B256::ZERO);
+
+        let attributes = NextBlockEnvAttributes {
+            timestamp: 1001,
+            prev_randao: B256::ZERO,
+            suggested_fee_recipient: Address::repeat_byte(0x42),
+            gas_limit: 30_000_000,
+            parent_beacon_block_root: None,
+            withdrawals: None,
+            extra_data: Default::default(),
+            slot_number: None,
+        };
+
+        let err = evm_config
+            .builder_for_next_block(&mut db, &sealed_parent, attributes)
+            .err()
+            .expect("builder_for_next_block must abort on ProtocolConfig database faults");
+        let message = err.to_string();
+        assert!(
+            message.contains("ProtocolConfig fee params database error"),
+            "expected ConfigureEvm error wrapper, got: {message}"
+        );
+        assert!(
+            message.contains("forced ProtocolConfig database read failure"),
+            "expected underlying DB error to be preserved, got: {message}"
         );
     }
 
@@ -5663,6 +5944,628 @@ mod tests {
             );
         }
 
+        /// Returns bytecode that emits an empty LOG0, expands memory to `size` bytes, burns
+        /// gas down to a small floor, then returns `size` bytes. Expanding memory before the
+        /// burn keeps the final RETURN cheap, so the child succeeds with little gas left.
+        fn log_drain_gas_then_return_bytecode(size: u16) -> Bytes {
+            let [size_hi, size_lo] = size.to_be_bytes();
+            let [word_hi, word_lo] = size
+                .checked_sub(32)
+                .expect("size must cover at least one word")
+                .to_be_bytes();
+            #[rustfmt::skip]
+            let code = vec![
+                PUSH1, 0x00,
+                PUSH1, 0x00,
+                LOG0,              // LOG0(0, 0)
+                PUSH1, 0x00,
+                PUSH2, word_hi, word_lo,
+                MSTORE,            // memory[size-32..size] = 0
+                JUMPDEST,          // offset 11
+                GAS,
+                PUSH2, 0x00, 0x40, // stop once gasleft <= 64
+                LT,                // 64 < gasleft
+                PUSH1, 0x0b,
+                JUMPI,
+                PUSH2, size_hi, size_lo,
+                PUSH1, 0x00,
+                RETURN,            // RETURN(0, size)
+            ];
+            Bytes::from(code)
+        }
+
+        /// Returns bytecode that returns `len` zero bytes.
+        fn return_zeros_bytecode(len: usize) -> Bytes {
+            let [len_hi, len_lo] = u16::try_from(len)
+                .expect("len must fit in PUSH2")
+                .to_be_bytes();
+            Bytes::from(vec![PUSH2, len_hi, len_lo, PUSH1, 0x00, RETURN])
+        }
+
+        /// The trace must report the subcall's final outcome, not only the child's.
+        ///
+        /// The child succeeds and CallFrom then ABI-encodes its output from the gas it
+        /// retained. A large output cannot be paid for: the subcall fails with OOG and the
+        /// child's state and log are reverted, so the transparent child node must be marked
+        /// failed and its log dropped. A small output keeps the child's own success, raw
+        /// output, and log. Either way the node reports the subcall's gas as the wrapper sees it.
+        #[rstest]
+        #[case::completion_fits(32, None)]
+        #[case::completion_oog(32_768, Some("out of gas"))]
+        fn test_call_from_trace_reports_final_subcall_result(
+            #[case] return_size: u16,
+            #[case] expected_error: Option<&str>,
+        ) {
+            use alloy_rpc_types_trace::geth::call::CallConfig;
+            use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+
+            const TARGET: Address = address!("c000000000000000000000000000000000000031");
+            const REFERENCE: Address = address!("c000000000000000000000000000000000000032");
+            const TX_GAS_LIMIT: u64 = 100_000;
+
+            let call_config = CallConfig {
+                with_log: Some(true),
+                only_top_call: Some(false),
+            };
+            let accounts = [(EOA, U256::from(1_000_000))];
+            let contracts = [
+                (WRAPPER, wrapper_call_bytecode(CALL_FROM_ADDRESS)),
+                (TARGET, log_drain_gas_then_return_bytecode(return_size)),
+            ];
+            // Both callees are warm, so the wrapper pays the same for calling either.
+            let access_list: alloy_eips::eip2930::AccessList = [CALL_FROM_ADDRESS, REFERENCE]
+                .map(|address| alloy_eips::eip2930::AccessListItem {
+                    address,
+                    storage_keys: vec![],
+                })
+                .to_vec()
+                .into();
+            let tx = TxEnv {
+                tx_type: 1, // EIP-2930
+                caller: EOA,
+                kind: TxKind::Call(WRAPPER),
+                gas_limit: TX_GAS_LIMIT,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: encode_call_from_input(EOA, TARGET, &[]),
+                access_list,
+                ..Default::default()
+            };
+
+            let untraced = setup_test_evm(&accounts, &contracts, &[WRAPPER])
+                .transact_one(tx.clone())
+                .expect("transact_one should succeed");
+
+            let inspector =
+                TracingInspector::new(TracingInspectorConfig::from_geth_call_config(&call_config));
+            let mut evm =
+                setup_test_evm_with_inspector(&accounts, &contracts, &[WRAPPER], inspector);
+            let result = evm
+                .inspect_one_tx(tx.clone())
+                .expect("inspect_one_tx should succeed");
+            assert_eq!(
+                result, untraced,
+                "tracing must not change the execution result"
+            );
+            let ExecutionResult::Success {
+                gas, logs, output, ..
+            } = &result
+            else {
+                panic!("wrapper should succeed either way, got {result:?}");
+            };
+            let completion_oog = expected_error.is_some();
+            let expected_output = if completion_oog {
+                Bytes::new()
+            } else {
+                use alloy_sol_types::SolCall;
+                use arc_precompiles::call_from::ICallFrom;
+                ICallFrom::callFromCall::abi_encode_returns(&ICallFrom::callFromReturn {
+                    success: true,
+                    returnData: vec![0u8; usize::from(return_size)].into(),
+                })
+                .into()
+            };
+            assert_eq!(
+                output.data(),
+                &expected_output,
+                "wrapper should receive CallFrom's encoding only when completion fits"
+            );
+            assert_eq!(
+                logs.len(),
+                usize::from(!completion_oog),
+                "child's log should persist only when completion fits"
+            );
+
+            // The subcall node must account gas like a plain call from the wrapper: same gas
+            // forwarded, and the wrapper's own cost unchanged. The reference callee returns as
+            // many bytes as CallFrom, so the wrapper's returndata copy costs the same. Raw
+            // nodes are read because the geth builder reports `gas_used = gas` for failures.
+            let mut reference = setup_test_evm_with_inspector(
+                &accounts,
+                &[
+                    (WRAPPER, wrapper_call_bytecode(REFERENCE)),
+                    (REFERENCE, return_zeros_bytecode(expected_output.len())),
+                ],
+                &[WRAPPER],
+                TracingInspector::new(TracingInspectorConfig::from_geth_call_config(&call_config)),
+            );
+            reference
+                .inspect_one_tx(tx)
+                .expect("reference tx should succeed");
+            let gas_of = |nodes: &[revm_inspectors::tracing::types::CallTraceNode]| {
+                let (wrapper, call) = (&nodes[0].trace, &nodes[1].trace);
+                let wrapper_own_gas = wrapper
+                    .gas_used
+                    .checked_sub(call.gas_used)
+                    .expect("wrapper gas includes its call");
+                (call.gas_limit, call.gas_used, wrapper_own_gas)
+            };
+            let (gas_limit, gas_used, wrapper_own_gas) =
+                gas_of(evm.inner.inspector.traces().nodes());
+            let (reference_gas_limit, _, reference_wrapper_own_gas) =
+                gas_of(reference.inner.inspector.traces().nodes());
+            assert_eq!(
+                gas_limit, reference_gas_limit,
+                "subcall node should report the gas forwarded to the precompile"
+            );
+            assert_eq!(
+                wrapper_own_gas, reference_wrapper_own_gas,
+                "subcall node should report the gas the wrapper was charged"
+            );
+            if completion_oog {
+                assert_eq!(gas_used, gas_limit, "a halted subcall spends all its gas");
+            } else {
+                assert!(gas_used < gas_limit, "a successful subcall returns gas");
+            }
+
+            let frame = evm
+                .inner
+                .inspector
+                .with_transaction_gas_limit(TX_GAS_LIMIT)
+                .into_geth_builder()
+                .geth_call_traces(call_config, gas.total_gas_spent());
+            assert_eq!(
+                frame.calls.len(),
+                1,
+                "wrapper should have exactly 1 child call"
+            );
+            let child = &frame.calls[0];
+            assert_eq!(child.from, EOA, "trace should keep the spoofed sender");
+            assert_eq!(child.to, Some(TARGET), "trace should keep the child target");
+            assert_eq!(child.error.as_deref(), expected_error);
+            if completion_oog {
+                assert_eq!(child.output, None, "failed subcall returns no data");
+                assert!(
+                    child.logs.is_empty(),
+                    "reverted child log must not appear in the trace"
+                );
+            } else {
+                assert_eq!(
+                    child.output,
+                    Some(Bytes::from(vec![0u8; usize::from(return_size)])),
+                    "trace should show the child's raw output, not CallFrom's encoding"
+                );
+                assert_eq!(child.logs.len(), 1, "child log should appear in the trace");
+            }
+        }
+
+        /// Every `complete_subcall` path that fails a successful child must reach the
+        /// inspector, and inspected execution must still revert the child's state.
+        #[rstest]
+        #[case::completion_oog(
+            crate::subcall_test::EXCESSIVE_COMPLETE_SUBCALL_ADDRESS,
+            Arc::new(crate::subcall_test::ExcessiveCompleteSubcallPrecompile),
+            "out of gas"
+        )]
+        #[case::completion_error(
+            crate::subcall_test::FAILING_COMPLETE_SUBCALL_ADDRESS,
+            Arc::new(crate::subcall_test::FailingCompleteSubcallPrecompile),
+            "execution reverted"
+        )]
+        #[case::completion_rejects(
+            crate::subcall_test::REJECTING_COMPLETE_SUBCALL_ADDRESS,
+            Arc::new(crate::subcall_test::RejectingCompleteSubcallPrecompile),
+            "execution reverted"
+        )]
+        fn test_trace_reports_completion_failure_of_successful_child(
+            #[case] precompile_address: Address,
+            #[case] precompile: Arc<dyn SubcallPrecompile>,
+            #[case] expected_error: &str,
+        ) {
+            use crate::subcall::AllowedCallers;
+            use alloy_rpc_types_trace::geth::call::CallConfig;
+            use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+
+            const STORAGE_CONTRACT: Address = address!("c000000000000000000000000000000000000032");
+
+            let call_config = CallConfig {
+                with_log: Some(true),
+                only_top_call: Some(false),
+            };
+            let inspector =
+                TracingInspector::new(TracingInspectorConfig::from_geth_call_config(&call_config));
+            let mut evm = setup_test_evm_with_inspector(
+                &[(EOA, U256::from(1_000_000))],
+                &[
+                    (WRAPPER, wrapper_call_bytecode(precompile_address)),
+                    (STORAGE_CONTRACT, sstore_42_then_drain_gas_bytecode()),
+                ],
+                &[],
+                inspector,
+            );
+            let mut registry = SubcallRegistry::new();
+            registry.register(precompile_address, precompile, AllowedCallers::Unrestricted);
+            evm.subcall_registry = Arc::new(registry);
+
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(WRAPPER),
+                gas_limit: 100_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: encode_subcall_test_input(STORAGE_CONTRACT, &[]),
+                ..Default::default()
+            };
+
+            let result_and_state = evm.inspect_tx(tx).expect("inspect_tx should succeed");
+            let ExecutionResult::Success { gas, .. } = &result_and_state.result else {
+                panic!(
+                    "wrapper should catch the failed subcall, got {:?}",
+                    result_and_state.result
+                );
+            };
+            let slot_value = result_and_state
+                .state
+                .get(&STORAGE_CONTRACT)
+                .and_then(|account| account.storage.get(&U256::ZERO))
+                .map(|slot| slot.present_value)
+                .unwrap_or(U256::ZERO);
+            assert_eq!(
+                slot_value,
+                U256::ZERO,
+                "child's SSTORE(0, 42) should be reverted under inspection"
+            );
+
+            let frame = evm
+                .inner
+                .inspector
+                .into_geth_builder()
+                .geth_call_traces(call_config, gas.total_gas_spent());
+            assert_eq!(
+                frame.calls.len(),
+                1,
+                "wrapper should have exactly 1 child call"
+            );
+            let child = &frame.calls[0];
+            assert_eq!(child.to, Some(precompile_address));
+            assert_eq!(child.error.as_deref(), Some(expected_error));
+        }
+
+        // ----- Trace input budget tests -----
+
+        const TRACE_INPUT_CONTRACT: Address = address!("c0000000000000000000000000000000000000aa");
+        const TRACE_INPUT_TARGET: Address = address!("d0000000000000000000000000000000000000aa");
+        const TRACE_INPUT_ARGS_LEN: u16 = 1024;
+        /// Fits two calls of `TRACE_INPUT_ARGS_LEN` bytes, not three.
+        const TRACE_INPUT_LIMIT: usize = 3000;
+
+        /// Returns bytecode making `calls` zero-gas CALLs to `target`, each passing
+        /// memory[0..args_len] as input.
+        fn repeated_call_bytecode(target: Address, calls: usize, args_len: u16) -> Bytes {
+            let [len_hi, len_lo] = args_len.to_be_bytes();
+            let mut code = Vec::new();
+            for _ in 0..calls {
+                #[rustfmt::skip]
+                code.extend_from_slice(&[
+                    PUSH1, 0x00,              // retLen=0
+                    PUSH1, 0x00,              // retOffset=0
+                    PUSH2, len_hi, len_lo,    // argsLen
+                    PUSH1, 0x00,              // argsOffset=0
+                    PUSH1, 0x00,              // value=0
+                    PUSH20,                   // target address follows
+                ]);
+                code.extend_from_slice(target.as_slice());
+                code.extend_from_slice(&[PUSH1, 0x00, CALL, POP]); // gas=0
+            }
+            code.push(STOP);
+            Bytes::from(code)
+        }
+
+        /// Returns a call tracer for the trace input budget tests.
+        fn call_tracer() -> revm_inspectors::tracing::TracingInspector {
+            use alloy_rpc_types_trace::geth::call::CallConfig;
+            use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+
+            TracingInspector::new(TracingInspectorConfig::from_geth_call_config(
+                &CallConfig::default(),
+            ))
+        }
+
+        type CallTracedEvm = ArcEvm<
+            EthEvmContext<InMemoryDB>,
+            revm_inspectors::tracing::TracingInspector,
+            EthInstructions<EthInterpreter, EthEvmContext<InMemoryDB>>,
+            PrecompilesMap,
+        >;
+
+        /// Returns a call-traced EVM capped at `TRACE_INPUT_LIMIT`, and a tx whose
+        /// contract makes `calls` calls of `TRACE_INPUT_ARGS_LEN` input bytes each.
+        fn trace_input_limited_evm(calls: usize) -> (CallTracedEvm, TxEnv) {
+            let code = repeated_call_bytecode(TRACE_INPUT_TARGET, calls, TRACE_INPUT_ARGS_LEN);
+            let evm = setup_test_evm_with_inspector(
+                &[(EOA, U256::from(1_000_000))],
+                &[(TRACE_INPUT_CONTRACT, code)],
+                &[],
+                call_tracer(),
+            )
+            .with_max_trace_bytes(NonZeroUsize::new(TRACE_INPUT_LIMIT).unwrap());
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(TRACE_INPUT_CONTRACT),
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                ..Default::default()
+            };
+            (evm, tx)
+        }
+
+        #[test]
+        fn trace_input_over_limit_fails_inspected_tx() {
+            let (mut evm, tx) = trace_input_limited_evm(3);
+
+            match evm.inspect_one_tx(tx) {
+                Err(EVMError::Custom(msg)) => {
+                    assert_eq!(msg, "trace byte limit of 3000 exceeded");
+                }
+                other => panic!("expected trace input limit error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn trace_input_budget_resets_per_tx() {
+            // Each tx fits the limit; together they exceed it.
+            let (mut evm, tx) = trace_input_limited_evm(2);
+
+            for _ in 0..2 {
+                let result = evm
+                    .inspect_tx(tx.clone())
+                    .expect("under-limit trace should succeed");
+                assert!(result.result.is_success(), "got {:?}", result.result);
+            }
+        }
+
+        #[test]
+        fn trace_input_limit_ignores_uninspected_tx() {
+            let (mut evm, tx) = trace_input_limited_evm(3);
+            evm.inspect = false;
+
+            let result = AlloyEvmTrait::transact_raw(&mut evm, tx)
+                .expect("uninspected execution should succeed");
+            assert!(result.result.is_success(), "got {:?}", result.result);
+        }
+
+        #[test]
+        fn trace_input_counts_subcall_frames() {
+            let child_data = vec![0u8; usize::from(TRACE_INPUT_ARGS_LEN)];
+            let tx_data = encode_call_from_input(EOA, TRACE_INPUT_TARGET, &child_data);
+            // The tx input alone fits; the CallFrom frame pushes it past the limit.
+            let limit = tx_data.len() + child_data.len() / 2;
+
+            let mut evm = setup_test_evm_with_inspector(
+                &[(EOA, U256::from(1_000_000))],
+                &[(WRAPPER, wrapper_call_bytecode(CALL_FROM_ADDRESS))],
+                &[WRAPPER],
+                call_tracer(),
+            )
+            .with_max_trace_bytes(NonZeroUsize::new(limit).unwrap());
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(WRAPPER),
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: tx_data,
+                ..Default::default()
+            };
+
+            match evm.inspect_one_tx(tx) {
+                Err(EVMError::Custom(msg)) => {
+                    assert_eq!(msg, format!("trace byte limit of {limit} exceeded"));
+                }
+                other => panic!("expected trace input limit error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn trace_input_over_limit_in_subcall_child_fails_inspected_tx() {
+            let child_code = repeated_call_bytecode(TRACE_INPUT_TARGET, 3, TRACE_INPUT_ARGS_LEN);
+            let mut evm = setup_test_evm_with_inspector(
+                &[(EOA, U256::from(1_000_000))],
+                &[
+                    (WRAPPER, wrapper_call_bytecode(CALL_FROM_ADDRESS)),
+                    (TRACE_INPUT_CONTRACT, child_code),
+                ],
+                &[WRAPPER],
+                call_tracer(),
+            )
+            .with_max_trace_bytes(NonZeroUsize::new(TRACE_INPUT_LIMIT).unwrap());
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(WRAPPER),
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: encode_call_from_input(EOA, TRACE_INPUT_CONTRACT, &[]),
+                ..Default::default()
+            };
+
+            match evm.inspect_one_tx(tx) {
+                Err(EVMError::Custom(msg)) => {
+                    assert_eq!(msg, "trace byte limit of 3000 exceeded");
+                }
+                other => panic!("expected trace input limit error, got {other:?}"),
+            }
+        }
+
+        /// CallFrom argument length. The ABI `data` inside it is one byte, or empty.
+        const PADDED_CALL_FROM_ARGS: u16 = 32 * 1024;
+        /// Holds the outer calldata and a 1-byte `data` window, not one padded argument.
+        const PADDED_CALL_FROM_BUDGET: usize = 4_000;
+        const _: () = assert!(PADDED_CALL_FROM_ARGS as usize > PADDED_CALL_FROM_BUDGET);
+        /// Charging the argument trips the budget on the first call. Repeated calls are the
+        /// shape that stays under the budget when only the `data` window is charged.
+        const PADDED_CALL_FROM_CALLS: usize = 4;
+
+        /// Copies tx calldata to memory, then calls CallFrom `calls` times with
+        /// `PADDED_CALL_FROM_ARGS` bytes. The tail past the calldata is zero.
+        fn padded_call_from_bytecode(calls: usize, forward_gas: bool) -> Bytes {
+            let [len_hi, len_lo] = PADDED_CALL_FROM_ARGS.to_be_bytes();
+            #[rustfmt::skip]
+            let mut code = vec![
+                CALLDATASIZE,
+                PUSH1, 0x00,
+                PUSH1, 0x00,
+                CALLDATACOPY,
+            ];
+            for _ in 0..calls {
+                #[rustfmt::skip]
+                code.extend_from_slice(&[
+                    PUSH1, 0x00,           // retLen=0
+                    PUSH1, 0x00,           // retOffset=0
+                    PUSH2, len_hi, len_lo, // argsLen
+                    PUSH1, 0x00,           // argsOffset=0
+                    PUSH1, 0x00,           // value=0
+                    PUSH20,
+                ]);
+                code.extend_from_slice(CALL_FROM_ADDRESS.as_slice());
+                if forward_gas {
+                    code.push(GAS);
+                } else {
+                    code.extend_from_slice(&[PUSH1, 0x00]);
+                }
+                code.extend_from_slice(&[CALL, POP]);
+            }
+            code.push(STOP);
+            Bytes::from(code)
+        }
+
+        type TraceInputResult = Result<
+            ExecutionResult<HaltReason>,
+            EVMError<core::convert::Infallible, InvalidTransaction>,
+        >;
+
+        /// An allowlisted caller makes `calls` padded CallFrom calls. With gas forwarded,
+        /// decoding succeeds and the trace shows a `data` window into the argument; with
+        /// zero gas, decoding fails and the trace shows the argument itself.
+        fn inspect_padded_call_from(
+            data: &[u8],
+            forward_gas: bool,
+            calls: usize,
+            budget: usize,
+        ) -> (TraceInputResult, CallTracedEvm) {
+            let mut evm = setup_test_evm_with_inspector(
+                &[(EOA, U256::from(1_000_000))],
+                &[(
+                    TRACE_INPUT_CONTRACT,
+                    padded_call_from_bytecode(calls, forward_gas),
+                )],
+                &[TRACE_INPUT_CONTRACT],
+                call_tracer(),
+            )
+            .with_max_trace_bytes(NonZeroUsize::new(budget).expect("budget is non-zero"));
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(TRACE_INPUT_CONTRACT),
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: encode_call_from_input(EOA, TRACE_INPUT_TARGET, data),
+                ..Default::default()
+            };
+            let result = evm.inspect_one_tx(tx);
+            (result, evm)
+        }
+
+        fn assert_trace_byte_limit(result: TraceInputResult, budget: usize) {
+            match result {
+                Err(EVMError::Custom(msg)) => {
+                    assert_eq!(msg, format!("trace byte limit of {budget} exceeded"));
+                }
+                other => panic!("expected trace input limit error, got {other:?}"),
+            }
+        }
+
+        /// The budget boundary proves the argument is charged once; the trace distinguishes the
+        /// decoded child call from the same-cost undecoded precompile call.
+        fn assert_charges_argument_once(data: &[u8], forward_gas: bool) {
+            use alloy_rpc_types_trace::geth::call::CallConfig;
+
+            let charge = encode_call_from_input(EOA, TRACE_INPUT_TARGET, data)
+                .len()
+                .checked_add(usize::from(PADDED_CALL_FROM_ARGS))
+                .expect("charge fits in usize");
+            let (result, evm) = inspect_padded_call_from(data, forward_gas, 1, charge);
+            let result = result.expect("budget equal to the charge must succeed");
+            let gas_used = match &result {
+                ExecutionResult::Success { gas, .. } => gas.total_gas_spent(),
+                other => panic!("expected Success, got {other:?}"),
+            };
+
+            let frame = evm
+                .inner
+                .inspector
+                .into_geth_builder()
+                .geth_call_traces(CallConfig::default(), gas_used);
+            assert_eq!(frame.calls.len(), 1, "caller should make one traced call");
+            let call = &frame.calls[0];
+            if forward_gas {
+                assert_eq!(call.from, EOA);
+                assert_eq!(call.to, Some(TRACE_INPUT_TARGET));
+                assert_eq!(call.input.as_ref(), data);
+            } else {
+                assert_eq!(call.from, TRACE_INPUT_CONTRACT);
+                assert_eq!(call.to, Some(CALL_FROM_ADDRESS));
+                assert_eq!(call.input.len(), usize::from(PADDED_CALL_FROM_ARGS));
+            }
+
+            assert_trace_byte_limit(
+                inspect_padded_call_from(data, forward_gas, 1, charge - 1).0,
+                charge - 1,
+            );
+        }
+
+        /// A 1-byte `data` window keeps the whole copied argument alive, so the budget
+        /// must count the argument, not the window.
+        #[rstest]
+        #[case::gas_forwarded(true)]
+        #[case::zero_gas(false)]
+        fn trace_input_call_from_padded_data_hits_budget(#[case] forward_gas: bool) {
+            assert_trace_byte_limit(
+                inspect_padded_call_from(
+                    &[0xab],
+                    forward_gas,
+                    PADDED_CALL_FROM_CALLS,
+                    PADDED_CALL_FROM_BUDGET,
+                )
+                .0,
+                PADDED_CALL_FROM_BUDGET,
+            );
+        }
+
+        #[rstest]
+        #[case::gas_forwarded(true)]
+        #[case::zero_gas(false)]
+        fn trace_input_call_from_padded_data_charges_argument_once(#[case] forward_gas: bool) {
+            assert_charges_argument_once(&[0xab], forward_gas);
+        }
+
+        /// An empty `data` window keeps nothing, but the argument is still charged.
+        #[test]
+        fn trace_input_call_from_empty_data_charges_argument() {
+            assert_charges_argument_once(&[], true);
+        }
+
         // ----- Gas accounting tests -----
 
         /// Verifies CallFromPrecompile::init_subcall applies EIP-150 63/64ths gas forwarding.
@@ -6678,7 +7581,7 @@ mod tests {
                 });
 
                 evm.complete_subcall(
-                    child_result,
+                    &child_result,
                     SubcallContinuation {
                         precompile: Arc::new(FixedCompleteSubcallPrecompile {
                             completion_gas: 5,
@@ -7951,6 +8854,148 @@ mod tests {
                 continuation.init_subcall_gas_overhead, exact_gas,
                 "overhead should equal the full gas budget"
             );
+        }
+
+        // ----- SELFDESTRUCT tracing -----
+
+        const SELFDESTRUCT_CALLER: Address = address!("c0000000000000000000000000000000000000e1");
+        const SELFDESTRUCT_TO_SELF: Address = address!("c0000000000000000000000000000000000000e2");
+        const SELFDESTRUCT_PAYEE: Address = address!("e0000000000000000000000000000000000000e3");
+        /// `EOA.create(0)`: the contract a CREATE transaction from `EOA` deploys.
+        const SELFDESTRUCT_CREATED: Address = address!("6d6f9cc3d9731bd5a2299cc86798b509e5a6f2d0");
+
+        /// Appends `CALL(gas, target, value, 0, 0, 0, 0); POP`, with value CALLVALUE or 0.
+        fn push_call(code: &mut Vec<u8>, target: Address, forward_call_value: bool) {
+            code.extend_from_slice(&[PUSH1, 0x00, PUSH1, 0x00, PUSH1, 0x00, PUSH1, 0x00]);
+            if forward_call_value {
+                code.push(CALLVALUE);
+            } else {
+                code.extend_from_slice(&[PUSH1, 0x00]);
+            }
+            code.push(PUSH20);
+            code.extend_from_slice(target.as_slice());
+            code.extend_from_slice(&[GAS, CALL, POP]);
+        }
+
+        fn selfdestruct_to(target: Address) -> Bytes {
+            let mut code = vec![PUSH20];
+            code.extend_from_slice(target.as_slice());
+            code.push(SELFDESTRUCT);
+            Bytes::from(code)
+        }
+
+        /// Forwards the call value to the payee, then self-destructs to itself.
+        fn forward_value_then_selfdestruct_to_self() -> Bytes {
+            let mut code = Vec::new();
+            push_call(&mut code, SELFDESTRUCT_PAYEE, true);
+            code.extend_from_slice(&[ADDRESS, SELFDESTRUCT]);
+            Bytes::from(code)
+        }
+
+        /// Calls `SELFDESTRUCT_TO_SELF` once, forwards the call value to the payee, then calls
+        /// it twice more. The first call warms and touches it, so the later calls write no
+        /// journal entry before their SELFDESTRUCT.
+        fn value_call_between_selfdestruct_calls() -> Bytes {
+            let mut code = Vec::new();
+            push_call(&mut code, SELFDESTRUCT_TO_SELF, false);
+            push_call(&mut code, SELFDESTRUCT_PAYEE, true);
+            push_call(&mut code, SELFDESTRUCT_TO_SELF, false);
+            push_call(&mut code, SELFDESTRUCT_TO_SELF, false);
+            code.push(STOP);
+            Bytes::from(code)
+        }
+
+        /// The trace reports a SELFDESTRUCT from the journal entry the instruction wrote.
+        /// `Some((from, to))` is the frame for that entry, value 0 here. `None` is the empty
+        /// frame left when it writes none (EIP-6780 selfdestruct to self of an existing
+        /// contract), as on revm-inspector 43.0.3. It must not repeat an earlier transfer.
+        #[rstest]
+        #[case::to_other(
+            selfdestruct_to(SELFDESTRUCT_PAYEE), false, 0,
+            &[Some((SELFDESTRUCT_CALLER, SELFDESTRUCT_PAYEE))],
+        )]
+        #[case::to_self_created_in_tx(
+            Bytes::from_static(&[ADDRESS, SELFDESTRUCT]), true, 0,
+            &[Some((SELFDESTRUCT_CREATED, SELFDESTRUCT_CREATED))],
+        )]
+        #[case::to_self(Bytes::from_static(&[ADDRESS, SELFDESTRUCT]), false, 0, &[None])]
+        #[case::to_self_after_value_call(
+            forward_value_then_selfdestruct_to_self(), false, 1_000, &[None],
+        )]
+        #[case::to_self_in_frames_after_value_call(
+            value_call_between_selfdestruct_calls(), false, 1_000, &[None, None, None],
+        )]
+        fn test_selfdestruct_trace_reports_own_journal_entry(
+            #[case] code: Bytes,
+            #[case] create: bool,
+            #[case] value: u64,
+            #[case] expected: &[Option<(Address, Address)>],
+        ) {
+            use alloy_rpc_types_trace::geth::{call::CallConfig, CallFrame};
+
+            fn collect_selfdestructs(
+                frame: &CallFrame,
+                out: &mut Vec<(Address, Option<Address>, Option<U256>)>,
+            ) {
+                for call in &frame.calls {
+                    if call.typ == "SELFDESTRUCT" {
+                        out.push((call.from, call.to, call.value));
+                    }
+                    collect_selfdestructs(call, out);
+                }
+            }
+
+            let contracts = [
+                (SELFDESTRUCT_CALLER, code.clone()),
+                (
+                    SELFDESTRUCT_TO_SELF,
+                    Bytes::from_static(&[ADDRESS, SELFDESTRUCT]),
+                ),
+            ];
+            let mut evm = setup_test_evm_with_inspector(
+                &[
+                    (EOA, U256::from(1_000_000)),
+                    (SELFDESTRUCT_PAYEE, U256::from(1)),
+                ],
+                &contracts,
+                &[],
+                call_tracer(),
+            );
+            let (kind, data) = if create {
+                (TxKind::Create, code)
+            } else {
+                (TxKind::Call(SELFDESTRUCT_CALLER), Bytes::new())
+            };
+            let result = evm
+                .inspect_one_tx(TxEnv {
+                    caller: EOA,
+                    kind,
+                    data,
+                    value: U256::from(value),
+                    gas_limit: 1_000_000,
+                    gas_price: 0,
+                    chain_id: Some(LOCAL_DEV.chain_id()),
+                    ..Default::default()
+                })
+                .expect("inspect_one_tx should succeed");
+            assert!(result.is_success(), "tx should succeed, got {result:?}");
+
+            let trace = evm
+                .inner
+                .inspector
+                .clone()
+                .into_geth_builder()
+                .geth_call_traces(CallConfig::default(), result.tx_gas_used());
+            let mut selfdestructs = Vec::new();
+            collect_selfdestructs(&trace, &mut selfdestructs);
+            let expected: Vec<_> = expected
+                .iter()
+                .map(|frame| match frame {
+                    Some((from, to)) => (*from, Some(*to), Some(U256::ZERO)),
+                    None => (Address::ZERO, None, None),
+                })
+                .collect();
+            assert_eq!(selfdestructs, expected);
         }
     }
     fn create_test_evm_with_spec(

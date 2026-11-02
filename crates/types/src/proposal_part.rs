@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use malachitebft_core_types::Round;
 use malachitebft_proto::{self as proto, Error as ProtoError, Protobuf};
 use malachitebft_signing_ed25519::Signature;
+use tracing::debug;
 
 use crate::codec::proto::{decode_signature, encode_signature};
 use crate::{Address, ArcContext, Height};
@@ -95,6 +96,12 @@ impl ProposalPart {
 pub struct ProposalInit {
     pub height: Height,
     pub round: Round,
+    /// Deprecated: always [`Round::Nil`]. Retained for wire and on-disk compatibility.
+    ///
+    /// Not covered by [`ProposalParts::hash`], so a relayed value is peer-controlled;
+    /// [`Protobuf::from_proto`] pins it to [`Round::Nil`] on decode.
+    ///
+    /// [`ProposalParts::hash`]: crate::ProposalParts::hash
     pub pol_round: Round,
     pub proposer: Address,
 }
@@ -145,14 +152,27 @@ impl malachitebft_core_types::ProposalPart<ArcContext> for ProposalPart {
     }
 }
 
+// The codec is the one layer that still reads and writes the deprecated `pol_round`
+// wire field; the deprecation targets its consumers.
+#[allow(deprecated)]
 impl Protobuf for ProposalInit {
     type Proto = crate::proto::ProposalInit;
 
     fn from_proto(proto: Self::Proto) -> Result<Self, ProtoError> {
+        let height = Height::new(proto.height);
+        let round = Round::new(proto.round);
+
+        if let Some(pol_round) = proto.pol_round {
+            debug!(
+                %height, %round, pol_round,
+                "Unexpected non-nil deprecated pol_round field on proposal init",
+            );
+        }
+
         Ok(Self {
-            height: Height::new(proto.height),
-            round: Round::new(proto.round),
-            pol_round: Round::from(proto.pol_round),
+            height,
+            round,
+            pol_round: Round::Nil,
             proposer: proto
                 .proposer
                 .ok_or_else(|| ProtoError::missing_field::<Self::Proto>("proposer"))
@@ -236,6 +256,66 @@ impl Protobuf for ProposalPart {
             Self::Fin(fin) => Ok(Self::Proto {
                 part: Some(Part::Fin(fin.to_proto()?)),
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(deprecated)] // exercises the deprecated pol_round wire field on purpose
+mod tests {
+    use super::*;
+
+    fn init_proto(pol_round: Option<u32>) -> crate::proto::ProposalInit {
+        crate::proto::ProposalInit {
+            height: 7,
+            round: 3,
+            pol_round,
+            proposer: Some(Address::new([1u8; 20]).to_proto().unwrap()),
+        }
+    }
+
+    #[test]
+    fn proposal_init_from_proto_pins_absent_pol_round_to_nil() {
+        let init = ProposalInit::from_proto(init_proto(None)).unwrap();
+
+        assert_eq!(init.pol_round, Round::Nil);
+        assert_eq!(init.round, Round::new(3));
+    }
+
+    #[test]
+    fn proposal_init_from_proto_pins_present_pol_round_to_nil() {
+        for pol_round in [0, 1, u32::MAX] {
+            let init = ProposalInit::from_proto(init_proto(Some(pol_round))).unwrap();
+
+            assert_eq!(
+                init.pol_round,
+                Round::Nil,
+                "pol_round {pol_round} must decode as nil"
+            );
+            assert_eq!(init.round, Round::new(3));
+        }
+    }
+
+    #[test]
+    fn proposal_init_to_proto_omits_pol_round() {
+        let init = ProposalInit::new(
+            Height::new(7),
+            Round::new(3),
+            Round::Nil,
+            Address::new([1u8; 20]),
+        );
+
+        assert_eq!(init.to_proto().unwrap().pol_round, None);
+    }
+
+    #[test]
+    fn proposal_part_init_from_proto_pins_pol_round_to_nil() {
+        let part = ProposalPart::Init(ProposalInit::from_proto(init_proto(Some(2))).unwrap());
+        let decoded = ProposalPart::from_proto(part.to_proto().unwrap()).unwrap();
+
+        match decoded {
+            ProposalPart::Init(init) => assert_eq!(init.pol_round, Round::Nil),
+            other => panic!("expected an init part, got {other:?}"),
         }
     }
 }

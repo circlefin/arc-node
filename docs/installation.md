@@ -170,6 +170,15 @@ arc-node-execution --version
 arc-node-consensus --version
 ```
 
+> **Build one package at a time.** The commands above are package-scoped
+> (`--path crates/...`) deliberately. Cargo unifies features across every package it
+> selects in a single invocation, and `--bin` filters targets rather than packages — so
+> a workspace-wide build enables the test-only `byzantine` fault-injection option in
+> `arc-node-consensus`. Use `cargo install --path crates/malachite-app` or
+> `cargo build --release -p arc-node-consensus` rather than building the workspace.
+> Released binaries and the published container images are built this way and do not
+> expose `--byzantine`.
+
 ## Docker
 
 Running an Arc node requires two Docker images — one for each layer:

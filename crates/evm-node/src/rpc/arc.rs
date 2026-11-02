@@ -65,3 +65,23 @@ pub fn build_arc_rpc_module(
     let certificate_source = HttpCertificateSource::new(base)?;
     Ok(ArcApiImpl::new(certificate_source).into_rpc())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_arc_rpc_module_registers_both_methods() {
+        let module = build_arc_rpc_module(Some("http://127.0.0.1:1".into()))
+            .expect("HTTP client builder should succeed in tests");
+        let names: Vec<_> = module.method_names().collect();
+        assert!(
+            names.contains(&"arc_getVersion"),
+            "missing arc_getVersion in {names:?}"
+        );
+        assert!(
+            names.contains(&"arc_getCertificate"),
+            "missing arc_getCertificate in {names:?}"
+        );
+    }
+}

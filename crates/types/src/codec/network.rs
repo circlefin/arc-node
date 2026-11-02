@@ -113,6 +113,10 @@ mod tests {
 
     use alloy_primitives::Address as AlloyAddress;
     use malachitebft_sync::PeerId;
+    use prost::Message;
+
+    use crate::codec::proto::STREAM_MESSAGE_SALT_LEN;
+    use crate::proto;
 
     // Helper function to create a test SignedConsensusMsg (Vote variant)
     fn create_test_vote() -> SignedConsensusMsg<ArcContext> {
@@ -395,6 +399,111 @@ mod tests {
         assert_eq!(msg.stream_id, decoded.stream_id);
         assert_eq!(msg.sequence, decoded.sequence);
         assert!(matches!(decoded.content, StreamContent::Fin));
+    }
+
+    /// `StreamMessage` wire format without the `salt` field.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct UnsaltedStreamMessage {
+        #[prost(bytes = "bytes", tag = "1")]
+        stream_id: Bytes,
+        #[prost(uint64, tag = "2")]
+        sequence: u64,
+        #[prost(oneof = "UnsaltedContent", tags = "3, 4")]
+        content: Option<UnsaltedContent>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    enum UnsaltedContent {
+        #[prost(bytes = "bytes", tag = "3")]
+        Data(Bytes),
+        #[prost(bool, tag = "4")]
+        Fin(bool),
+    }
+
+    /// One stream message per content variant.
+    fn stream_messages(data_len: usize, sequence: u64) -> Vec<StreamMessage<ProposalPart>> {
+        [
+            StreamContent::Data(ProposalPart::Init(ProposalInit::new(
+                Height::new(42),
+                Round::new(2),
+                Round::Nil,
+                Address::new([3; 20]),
+            ))),
+            StreamContent::Data(ProposalPart::Data(ProposalData::new(Bytes::from(vec![
+                5;
+                data_len
+            ])))),
+            StreamContent::Data(ProposalPart::Fin(ProposalFin::new(Signature::from_bytes(
+                [6; 64],
+            )))),
+            StreamContent::Fin,
+        ]
+        .into_iter()
+        .map(|content| {
+            StreamMessage::new(
+                StreamId::new(Bytes::from_static(&[7; 16])),
+                sequence,
+                content,
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn stream_message_salt_is_wire_compatible() {
+        for data_len in [0, 1, 7, 8, 9, 131_071, 131_072] {
+            for sequence in [0, 127, 128] {
+                for msg in stream_messages(data_len, sequence) {
+                    let bytes = NetCodec.encode(&msg).unwrap();
+                    assert_eq!(bytes[0], StreamMessageVersion::V1 as u8);
+
+                    // A decoder that predates the salt skips it.
+                    let unsalted = UnsaltedStreamMessage::decode(&bytes[1..]).unwrap();
+                    assert_eq!(unsalted.stream_id, msg.stream_id.to_bytes());
+                    assert_eq!(unsalted.sequence, msg.sequence);
+                    let content = match unsalted.content.clone().unwrap() {
+                        UnsaltedContent::Data(data) => {
+                            let part: ProposalPart = ProtobufCodec.decode(data).unwrap();
+                            StreamContent::Data(part)
+                        }
+                        UnsaltedContent::Fin(fin) => {
+                            assert!(fin);
+                            StreamContent::Fin
+                        }
+                    };
+                    assert_eq!(content, msg.content);
+
+                    // Bytes without a salt decode to the same message.
+                    let mut unsalted_bytes = vec![StreamMessageVersion::V1 as u8];
+                    unsalted.encode(&mut unsalted_bytes).unwrap();
+                    let decoded: StreamMessage<ProposalPart> =
+                        NetCodec.decode(Bytes::from(unsalted_bytes)).unwrap();
+                    assert_eq!(decoded, msg);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stream_message_encodings_differ_only_in_salt() {
+        for msg in stream_messages(131_072, 128) {
+            let first_bytes = NetCodec.encode(&msg).unwrap();
+            let second_bytes = NetCodec.encode(&msg).unwrap();
+            let mut first = proto::StreamMessage::decode(&first_bytes[1..]).unwrap();
+            let mut second = proto::StreamMessage::decode(&second_bytes[1..]).unwrap();
+
+            assert_eq!(first.salt.len(), STREAM_MESSAGE_SALT_LEN);
+            assert_eq!(second.salt.len(), STREAM_MESSAGE_SALT_LEN);
+            assert_ne!(first.salt, second.salt);
+            first.salt = Bytes::new();
+            second.salt = Bytes::new();
+            assert_eq!(first, second);
+
+            for bytes in [first_bytes, second_bytes] {
+                let decoded: StreamMessage<ProposalPart> = NetCodec.decode(bytes).unwrap();
+                assert_eq!(decoded, msg);
+            }
+        }
     }
 
     #[test]

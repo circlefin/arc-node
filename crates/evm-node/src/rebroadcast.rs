@@ -97,11 +97,17 @@ where
 ///
 /// When the pool exceeds `MAX_REBROADCAST`, only the first `MAX_REBROADCAST` transactions
 /// by internal pool ordering (sender-id, then nonce) are broadcast.
+///
+/// Only transactions whose `propagate` flag is set are collected. This mirrors the gossip
+/// gate reth applies on its own propagation path, so a transaction the pool marks as
+/// non-propagatable (a `Private`-origin transaction, or a local transaction when
+/// `--txpool.no-local-transactions-propagation` is set) is never re-announced by this task.
 pub(crate) fn collect_pending_txs<Pool: TransactionPool>(
     pool: &Pool,
 ) -> Vec<<Pool::Transaction as PoolTransaction>::Consensus> {
     pool.pending_transactions_max(MAX_REBROADCAST)
         .into_iter()
+        .filter(|tx| tx.propagate)
         .map(|tx| tx.transaction.clone_into_consensus().into_inner())
         .collect()
 }
@@ -114,13 +120,11 @@ mod tests {
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_transaction_pool::{
         blobstore::InMemoryBlobStore, test_utils::MockTransaction,
-        validate::EthTransactionValidatorBuilder, CoinbaseTipOrdering, Pool, PoolTransaction,
-        TransactionPool,
+        validate::EthTransactionValidatorBuilder, CoinbaseTipOrdering, LocalTransactionConfig,
+        Pool, PoolConfig, PoolTransaction, TransactionOrigin, TransactionPool,
     };
 
-    fn create_test_pool(
-        provider: &MockEthProvider,
-    ) -> Pool<
+    type TestPool = Pool<
         reth_transaction_pool::validate::EthTransactionValidator<
             MockEthProvider,
             MockTransaction,
@@ -128,17 +132,33 @@ mod tests {
         >,
         CoinbaseTipOrdering<MockTransaction>,
         InMemoryBlobStore,
-    > {
+    >;
+
+    fn create_test_pool(provider: &MockEthProvider) -> TestPool {
+        create_test_pool_with_local_config(provider, LocalTransactionConfig::default())
+    }
+
+    // The `propagate` flag is decided by the validator, which holds its own local config, so the
+    // config must be applied to the validator builder — not just to the pool's `PoolConfig`.
+    fn create_test_pool_with_local_config(
+        provider: &MockEthProvider,
+        local_config: LocalTransactionConfig,
+    ) -> TestPool {
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let blob_store = InMemoryBlobStore::default();
         let validator =
             EthTransactionValidatorBuilder::new(provider.clone(), EthEvmConfig::mainnet())
+                .with_local_transactions_config(local_config.clone())
                 .build(blob_store.clone());
+        let config = PoolConfig {
+            local_transactions_config: local_config,
+            ..Default::default()
+        };
         Pool::new(
             validator,
             CoinbaseTipOrdering::default(),
             blob_store,
-            Default::default(),
+            config,
         )
     }
 
@@ -207,5 +227,81 @@ mod tests {
 
         let collected = collect_pending_txs(&pool);
         assert_eq!(collected.len(), MAX_REBROADCAST);
+    }
+
+    // A `Private`-origin transaction has `propagate == false` regardless of config and must
+    // never be re-announced by the rebroadcast task, even though that origin is reportedly not
+    // reachable on this node today.
+    #[tokio::test]
+    async fn collect_pending_txs_excludes_private() {
+        let provider = MockEthProvider::default();
+        let pool = create_test_pool(&provider);
+
+        let external = funded_tx(&provider, 0);
+        let external_hash = *external.hash();
+        let private = funded_tx(&provider, 0);
+        assert_ne!(external.sender(), private.sender(), "independent nonces");
+
+        pool.add_transaction(TransactionOrigin::External, external)
+            .await
+            .unwrap();
+        pool.add_transaction(TransactionOrigin::Private, private)
+            .await
+            .unwrap();
+
+        let txs = collect_pending_txs(&pool);
+        assert_eq!(txs.len(), 1, "private transaction must be filtered out");
+        assert_eq!(*txs[0].tx_hash(), external_hash);
+    }
+
+    // With `--txpool.no-local-transactions-propagation` (modelled by
+    // `propagate_local_transactions = false`), a local transaction carries `propagate == false`
+    // and must not be rebroadcast, while external traffic in the same pool is unaffected.
+    #[tokio::test]
+    async fn collect_pending_txs_excludes_local_when_propagation_disabled() {
+        let provider = MockEthProvider::default();
+        let local_config = LocalTransactionConfig {
+            propagate_local_transactions: false,
+            ..Default::default()
+        };
+        let pool = create_test_pool_with_local_config(&provider, local_config);
+
+        let local = funded_tx(&provider, 0);
+        let external = funded_tx(&provider, 0);
+        let external_hash = *external.hash();
+        assert_ne!(local.sender(), external.sender(), "independent nonces");
+
+        pool.add_transaction(TransactionOrigin::Local, local)
+            .await
+            .unwrap();
+        pool.add_transaction(TransactionOrigin::External, external)
+            .await
+            .unwrap();
+
+        let txs = collect_pending_txs(&pool);
+        assert_eq!(
+            txs.len(),
+            1,
+            "non-propagatable local transaction must be filtered out"
+        );
+        assert_eq!(*txs[0].tx_hash(), external_hash);
+    }
+
+    // Regression guard: with propagation at its default (on), a local transaction is still
+    // propagatable and must be rebroadcast.
+    #[tokio::test]
+    async fn collect_pending_txs_includes_local_by_default() {
+        let provider = MockEthProvider::default();
+        let pool = create_test_pool(&provider);
+
+        let local = funded_tx(&provider, 0);
+        let local_hash = *local.hash();
+        pool.add_transaction(TransactionOrigin::Local, local)
+            .await
+            .unwrap();
+
+        let txs = collect_pending_txs(&pool);
+        assert_eq!(txs.len(), 1);
+        assert_eq!(*txs[0].tx_hash(), local_hash);
     }
 }

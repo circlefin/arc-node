@@ -23,15 +23,6 @@ use arc_consensus_types::block::ConsensusBlock;
 pub trait UndecidedBlocksRepository {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Gets the undecided block with the given height, round, and block hash.
-    /// Returns `None` if no such block exists.
-    async fn get_by_round_and_hash(
-        &self,
-        height: Height,
-        round: Round,
-        block_hash: BlockHash,
-    ) -> Result<Option<ConsensusBlock>, Self::Error>;
-
     /// Gets all undecided blocks for the given height and round.
     async fn get_by_round(
         &self,
@@ -48,6 +39,14 @@ pub trait UndecidedBlocksRepository {
         block_hash: BlockHash,
     ) -> Result<Option<ConsensusBlock>, Self::Error>;
 
+    /// Gets a valid undecided block with the given height and block hash.
+    /// Scans across all rounds and returns `None` if no valid match exists.
+    async fn get_valid_by_hash(
+        &self,
+        height: Height,
+        block_hash: BlockHash,
+    ) -> Result<Option<ConsensusBlock>, Self::Error>;
+
     /// Stores the undecided block.
     async fn store_undecided_block(&self, block: ConsensusBlock) -> Result<(), Self::Error>;
 }
@@ -57,17 +56,6 @@ where
     T: UndecidedBlocksRepository,
 {
     type Error = T::Error;
-
-    async fn get_by_round_and_hash(
-        &self,
-        height: Height,
-        round: Round,
-        block_hash: BlockHash,
-    ) -> Result<Option<ConsensusBlock>, Self::Error> {
-        (*self)
-            .get_by_round_and_hash(height, round, block_hash)
-            .await
-    }
 
     async fn get_by_round(
         &self,
@@ -85,6 +73,14 @@ where
         (*self).get_by_hash(height, block_hash).await
     }
 
+    async fn get_valid_by_hash(
+        &self,
+        height: Height,
+        block_hash: BlockHash,
+    ) -> Result<Option<ConsensusBlock>, Self::Error> {
+        (*self).get_valid_by_hash(height, block_hash).await
+    }
+
     async fn store_undecided_block(&self, block: ConsensusBlock) -> Result<(), Self::Error> {
         (*self).store_undecided_block(block).await
     }
@@ -92,15 +88,6 @@ where
 
 impl UndecidedBlocksRepository for Store {
     type Error = StoreError;
-
-    async fn get_by_round_and_hash(
-        &self,
-        height: Height,
-        round: Round,
-        block_hash: BlockHash,
-    ) -> Result<Option<ConsensusBlock>, Self::Error> {
-        self.get_undecided_block(height, round, block_hash).await
-    }
 
     async fn get_by_round(
         &self,
@@ -116,6 +103,15 @@ impl UndecidedBlocksRepository for Store {
         block_hash: BlockHash,
     ) -> Result<Option<ConsensusBlock>, Self::Error> {
         self.get_undecided_block_by_height_and_block_hash(height, block_hash)
+            .await
+    }
+
+    async fn get_valid_by_hash(
+        &self,
+        height: Height,
+        block_hash: BlockHash,
+    ) -> Result<Option<ConsensusBlock>, Self::Error> {
+        self.get_valid_undecided_block_by_height_and_block_hash(height, block_hash)
             .await
     }
 

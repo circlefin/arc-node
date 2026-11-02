@@ -57,6 +57,7 @@ tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 
 [dev-dependencies]
+alloy-signer.workspace = true
 arc-precompiles = { path = "../precompiles", features = ["integration", "test-utils"] }
 reth-tracing.workspace = true
 revm-bytecode.workspace = true

@@ -15,7 +15,8 @@
 // limitations under the License.
 
 use alloy_primitives::{address, Address, Bytes};
-use alloy_sol_types::{abi, sol, SolCall, SolType, SolValue};
+use alloy_sol_types::{sol, SolCall, SolValue};
+use arc_shared::precompile::abi_decode_raw_borrowed;
 use revm::precompile::{PrecompileError, PrecompileHalt, PrecompileOutput};
 use revm_interpreter::gas::KECCAK256WORD;
 use revm_interpreter::Gas;
@@ -80,12 +81,6 @@ fn early_revert(
     ))
 }
 
-/// The `(bytes, bytes, bytes)` parameter tuple of [`IPQ::verifySlhDsaSha2128sCall`].
-type CallParams<'a> = <IPQ::verifySlhDsaSha2128sCall as SolCall>::Parameters<'a>;
-
-/// Token form of [`CallParams`]: three `PackedSeqToken`s that borrow from the input.
-type CallTokens<'a> = <IPQ::verifySlhDsaSha2128sCall as SolCall>::Token<'a>;
-
 /// Gas for hashing `msg_len` message bytes, one KECCAK256-rate charge per 32-byte word.
 ///
 /// `GAS_PER_MSG_WORD` (6) < 32, so `div_ceil(32) * GAS_PER_MSG_WORD` cannot exceed `u64::MAX`.
@@ -99,11 +94,15 @@ fn msg_word_gas(msg_len: usize) -> u64 {
 /// Early-path failures (short input, wrong selector, ABI decode error) charge a 200-gas
 /// penalty and return OOG if the caller has insufficient gas — preventing free probing.
 ///
-/// Base and message gas are reserved before the byte arguments are copied out of the
-/// input, so the work a call performs is bounded by the gas it pays. Decoding is split to
-/// allow this: `abi_decode_raw_validate` is tokenize, then `type_check`, then `detokenize`,
-/// and only `detokenize` copies. The first two steps run before the charges; the copy runs
-/// after them.
+/// The byte arguments are never copied out of the input. [`abi_decode_raw_borrowed`]
+/// returns slices that borrow from `data`, and the length checks, key and signature
+/// parsing, and verification all read those slices directly. Base and message gas are
+/// reserved before anything beyond the O(1) decode happens, so the work a call performs is
+/// bounded by the gas it pays.
+///
+/// This is observably identical to the original `abi_decode_raw_validate` path: the
+/// borrowed decode accepts the same inputs, and only skips the copy into owned `Bytes`, so
+/// every downstream consumer sees the same bytes either way.
 pub fn run_pq_precompile(
     gas: u64,
     data: &[u8],
@@ -120,34 +119,30 @@ pub fn run_pq_precompile(
         return early_revert(&mut gas_counter, reservoir, "Invalid selector");
     }
 
-    // Tokenize and type-check without copying: reads the offset and length words, bounds-checks
-    // them against the body, and yields borrowed slices. O(1) regardless of input size.
-    let tokens = match abi::decode_sequence::<CallTokens<'_>>(&data[4..])
-        .and_then(|tokens| CallParams::<'_>::type_check(&tokens).map(|()| tokens))
-    {
-        Ok(tokens) => tokens,
-        Err(_) => return early_revert(&mut gas_counter, reservoir, "Execution reverted"),
-    };
+    // Reads the offset and length words and bounds-checks them against the body. O(1)
+    // regardless of input size. These slices are the only form the arguments ever take.
+    let (vk, message, sig) =
+        match abi_decode_raw_borrowed::<IPQ::verifySlhDsaSha2128sCall>(&data[4..]) {
+            Ok(args) => args,
+            Err(_) => return early_revert(&mut gas_counter, reservoir, "Execution reverted"),
+        };
 
     if !gas_counter.record_regular_cost(VERIFY_BASE_GAS) {
         return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir));
     }
 
-    if !gas_counter.record_regular_cost(msg_word_gas(tokens.1.as_slice().len())) {
+    if !gas_counter.record_regular_cost(msg_word_gas(message.len())) {
         return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir));
     }
 
-    // Paid for: copy the byte arguments out of the input.
-    let args = IPQ::verifySlhDsaSha2128sCall::new(CallParams::<'_>::detokenize(tokens));
-
-    if args.vk.len() != VK_LEN {
+    if vk.len() != VK_LEN {
         return Ok(PrecompileOutput::revert(
             gas_counter.used(),
             revert_message_to_bytes("Invalid verifying key length"),
             reservoir,
         ));
     }
-    if args.sig.len() != SIG_LEN {
+    if sig.len() != SIG_LEN {
         return Ok(PrecompileOutput::revert(
             gas_counter.used(),
             revert_message_to_bytes("Invalid signature length"),
@@ -155,7 +150,7 @@ pub fn run_pq_precompile(
         ));
     }
 
-    let verifying_key = match SlhDsaVerifyingKey::<Sha2_128s>::try_from(args.vk.as_ref()) {
+    let verifying_key = match SlhDsaVerifyingKey::<Sha2_128s>::try_from(vk) {
         Ok(vk) => vk,
         Err(_) => {
             return Ok(PrecompileOutput::revert(
@@ -165,7 +160,7 @@ pub fn run_pq_precompile(
             ));
         }
     };
-    let signature = match Signature::<Sha2_128s>::try_from(args.sig.as_ref()) {
+    let signature = match Signature::<Sha2_128s>::try_from(sig) {
         Ok(sig) => sig,
         Err(_) => {
             return Ok(PrecompileOutput::revert(
@@ -176,9 +171,7 @@ pub fn run_pq_precompile(
         }
     };
 
-    let is_valid = verifying_key
-        .verify(args.message.as_ref(), &signature)
-        .is_ok();
+    let is_valid = verifying_key.verify(message, &signature).is_ok();
     Ok(PrecompileOutput::new(
         gas_counter.used(),
         is_valid.abi_encode().into(),
@@ -279,6 +272,16 @@ mod tests {
     }
 
     #[test]
+    fn pq_selector_only_input_charges_abi_decode_penalty() {
+        // Exactly the 4-byte selector — passes the length and selector gates but
+        // ABI-decoding the empty body fails, charging the penalty.
+        let calldata = IPQ::verifySlhDsaSha2128sCall::SELECTOR.to_vec();
+        let output = run_pq_precompile(u64::MAX, &calldata, 0).expect("should be Ok(revert)");
+        assert!(output.is_revert());
+        assert_eq!(output.gas_used, EARLY_REVERT_GAS);
+    }
+
+    #[test]
     fn oog_on_base_gas_returns_halt() {
         // Valid calldata structure but gas just below VERIFY_BASE_GAS — fails at base gas charge.
         let calldata = encode_call(&[0u8; VK_LEN], &[], &[0u8; SIG_LEN]);
@@ -320,11 +323,11 @@ mod tests {
         assert_eq!(output.gas_used, expected);
     }
 
-    // --- Gas is reserved before the byte arguments are copied ---
+    // --- The byte arguments are never copied: allocation is bounded independent of input size ---
 
-    /// Calldata whose three dynamic offsets alias one `shared_len`-byte array. The ABI decoder
-    /// accepts it; `vk` and `sig` then fail their length checks, but only after base and
-    /// message gas have been charged.
+    /// Calldata whose three dynamic offsets all point at the same `shared_len`-byte array, so the
+    /// three arguments together span three times the body. The ABI decoder accepts it; `vk` and
+    /// `sig` then fail their length checks, but only after base and message gas have been charged.
     fn aliased_calldata(shared_len: usize) -> Vec<u8> {
         let mut calldata = IPQ::verifySlhDsaSha2128sCall::SELECTOR.to_vec();
         for _ in 0..3 {
@@ -353,30 +356,57 @@ mod tests {
         assert_eq!(output.halt_reason(), Some(&PrecompileHalt::OutOfGas));
     }
 
-    /// An underfunded call must not copy the byte arguments. 64 zero-gas calls with a 1 MiB
-    /// aliased body would copy 3 MiB each (192 MiB total) if the arguments were copied before
-    /// gas is reserved; reserving first allocates nothing for the arguments. Other tests run
-    /// concurrently, so the bound is loose (16 MiB) but still an order of magnitude below the
-    /// copying figure.
+    /// Number of calls made by the allocation tests. With a 1 MiB aliased body, copying the
+    /// three byte arguments would cost 3 MiB per call, 192 MiB in total.
+    const ALLOC_ITERATIONS: usize = 64;
+    /// Allocation ceiling for [`ALLOC_ITERATIONS`] calls. Other tests run concurrently, so the
+    /// bound is loose (16 MiB) but still an order of magnitude below the copying figure.
+    const MAX_ALLOCATED_BYTES: usize = 16 << 20;
+
+    /// Bytes allocated by [`ALLOC_ITERATIONS`] calls of `calldata` at `gas`.
+    fn bytes_allocated_by_calls(gas: u64, calldata: &[u8]) -> usize {
+        let before = alloc_counter::ALLOCATED_BYTES.load(Ordering::Relaxed);
+        for _ in 0..ALLOC_ITERATIONS {
+            run_pq_precompile(gas, calldata, 0).expect("pq precompile never returns Err");
+        }
+        alloc_counter::ALLOCATED_BYTES
+            .load(Ordering::Relaxed)
+            .saturating_sub(before)
+    }
+
+    /// An underfunded call must not copy the byte arguments: it halts at the base-gas charge
+    /// having done nothing but the O(1) tokenize.
     #[test]
     fn underfunded_aliased_input_is_not_copied() {
-        const ITERATIONS: usize = 64;
-        const BODY_LEN: usize = 1 << 20;
-        const MAX_ALLOCATED_BYTES: usize = 16 << 20;
+        let calldata = aliased_calldata(1 << 20);
+        assert!(run_pq_precompile(0, &calldata, 0)
+            .expect("Ok(halt)")
+            .is_halt());
 
-        let calldata = aliased_calldata(BODY_LEN);
-        let before = alloc_counter::ALLOCATED_BYTES.load(Ordering::Relaxed);
-        for _ in 0..ITERATIONS {
-            let output = run_pq_precompile(0, &calldata, 0).expect("Ok(halt)");
-            assert!(output.is_halt());
-        }
-        let allocated = alloc_counter::ALLOCATED_BYTES
-            .load(Ordering::Relaxed)
-            .saturating_sub(before);
+        let allocated = bytes_allocated_by_calls(0, &calldata);
         assert!(
             allocated < MAX_ALLOCATED_BYTES,
             "underfunded calls allocated {allocated} bytes; the byte arguments are being copied \
              before gas is reserved"
+        );
+    }
+
+    /// A funded call must not copy the byte arguments either: the length checks, parsing,
+    /// and verification read the borrowed slices directly. The aliased body fails the `vk`
+    /// length check, which under a copying implementation happens only after 3 MiB has been
+    /// materialized per call.
+    #[test]
+    fn funded_aliased_input_is_not_copied() {
+        let calldata = aliased_calldata(1 << 20);
+        assert!(run_pq_precompile(u64::MAX, &calldata, 0)
+            .expect("Ok(revert)")
+            .is_revert());
+
+        let allocated = bytes_allocated_by_calls(u64::MAX, &calldata);
+        assert!(
+            allocated < MAX_ALLOCATED_BYTES,
+            "funded calls allocated {allocated} bytes; the byte arguments are being copied out \
+             of the input"
         );
     }
 
@@ -415,9 +445,9 @@ mod tests {
         static GLOBAL: CountingAllocator = CountingAllocator;
     }
 
-    /// Reference implementation that decodes the full input before charging gas. The
-    /// differential test checks that `run_pq_precompile` returns the same output for every
-    /// `(gas, input, reservoir)`, so reserving gas first changes no observable result.
+    /// The original ordering (decode, then charge), kept verbatim as the reference for the
+    /// differential test. This is the consensus-safety proof for shipping the reordering
+    /// without a hardfork: for every `(gas, input, reservoir)` the two must be equal.
     #[allow(clippy::arithmetic_side_effects)]
     fn legacy_run_pq_precompile(
         gas: u64,

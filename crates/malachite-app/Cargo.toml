@@ -62,6 +62,7 @@ malachitebft-peer.workspace = true
 malachitebft-sync.workspace = true
 multihash.workspace = true
 oneline-eyre.workspace = true
+parking_lot.workspace = true
 pprof_hyper_server = { version = "0.2", features = ["pprof"], optional = true }
 ractor.workspace = true
 rand.workspace = true

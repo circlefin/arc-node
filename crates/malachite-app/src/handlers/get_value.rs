@@ -16,6 +16,7 @@
 
 use std::time::{Duration, Instant};
 
+use alloy_rpc_types_eth::BlockId;
 use eyre::{eyre, Context};
 use itertools::Itertools;
 use tokio::sync::mpsc;
@@ -31,13 +32,14 @@ use arc_consensus_types::{Address, ArcContext, Height};
 use arc_eth_engine::deadline::EngineDeadline;
 use arc_eth_engine::engine::Engine;
 use arc_eth_engine::json_structures::ExecutionBlock;
+use arc_eth_engine::rpc::EngineApiRpcError;
 use arc_signer::ArcSigningProvider;
 
 use crate::block::ConsensusBlock;
 use crate::metrics::{AppMetrics, BindingHaltSite};
 use crate::payload::{
     check_payload_binding, generate_payload_with_retry, validate_consensus_block,
-    EnginePayloadGenerator, EnginePayloadValidator,
+    EnginePayloadGenerator, EnginePayloadValidator, PayloadOrigin,
 };
 use crate::proposal_parts::{prepare_stream, stream_proposal};
 use crate::state::State;
@@ -189,9 +191,30 @@ async fn on_get_value(
                 }
             };
 
-            result.wrap_err_with(|| {
-                format!("Proposer failed to build new block at height={height} and round={round}")
-            })?
+            match result {
+                Ok(block) => block,
+                Err(build_error) => {
+                    if should_not_propose_with_blocklisted_recipient(
+                        engine,
+                        &build_error,
+                        fee_recipient,
+                        previous_block,
+                        deadline,
+                        height,
+                        round,
+                    )
+                    .await
+                    {
+                        return Ok(None);
+                    }
+
+                    return Err(build_error).wrap_err_with(|| {
+                        format!(
+                            "Proposer failed to build new block at height={height} and round={round}"
+                        )
+                    });
+                }
+            }
         }
     };
 
@@ -281,14 +304,15 @@ async fn build_and_validate_block(
     )?;
 
     let validator = EnginePayloadValidator::new_with_deadline(engine, metrics, deadline);
-    let validity = validate_consensus_block(&validator, &block, store, metrics)
-        .await
-        .wrap_err_with(|| {
-            format!(
-                "Payload validation failed on self-built block at height={height}, round={round}: {}",
-                block.self_reported_block_hash()
-            )
-        })?;
+    let validity =
+        validate_consensus_block(&validator, &block, store, metrics, PayloadOrigin::SelfBuilt)
+            .await
+            .wrap_err_with(|| {
+                format!(
+            "Payload validation failed on self-built block at height={height}, round={round}: {}",
+            block.self_reported_block_hash()
+        )
+            })?;
 
     if !validity.is_valid() {
         return Err(eyre!(
@@ -341,6 +365,69 @@ pub async fn build_block(
         execution_payload,
         signature: None,
     })
+}
+
+/// Returns true if the given `build_error` is an UnknownPayload error and the build
+/// failure was caused by a blocklisted fee recipient.
+/// UnknownPayload covers a broad class of errors that reth returns when something
+/// goes wrong during the building of a payload.
+/// If true, the node will not propose a value for this round.
+/// The function uses previous_block to query the blocklist because if the block
+/// build failed, we don't have the block for that height, only the error it
+/// returned.
+async fn should_not_propose_with_blocklisted_recipient(
+    engine: &Engine,
+    build_error: &eyre::Report,
+    fee_recipient: Address,
+    previous_block: &ExecutionBlock,
+    deadline: EngineDeadline,
+    height: Height,
+    round: Round,
+) -> bool {
+    // Not an UnknownPayload error, so the build failed for another reason.
+    if !EngineApiRpcError::try_from(build_error).is_ok_and(|e| e.is_unknown_payload()) {
+        return false;
+    }
+
+    let query = engine
+        .eth
+        .is_address_blocklisted(fee_recipient, BlockId::from(previous_block.block_hash));
+
+    match tokio::time::timeout_at(deadline.timeout_at(), query).await {
+        Ok(Ok(true)) => {
+            warn!(
+                %height, %round,
+                "⚠️ Fee recipient {fee_recipient} is currently blocklisted on the \
+                 ARC native-coin blocklist. Skipping this proposer turn; restart \
+                 with a different --suggested-fee-recipient to recover."
+            );
+            true
+        }
+        // The fee recipient is not blocklisted, so the UnknownPayload error is
+        // due to something else.
+        Ok(Ok(false)) => false,
+        // If the query fails, return false so that the node keeps the original
+        // error
+        Ok(Err(query_error)) => {
+            warn!(
+                %height, %round,
+                "Could not query the Blocklist after an \
+                 UnknownPayload build error: \
+                 {query_error:#}"
+            );
+            false
+        }
+        // If the timeout is reached, return false so that the node can act on the
+        // original error.
+        Err(_elapsed) => {
+            warn!(
+                %height, %round,
+                "Skipping Blocklist query after an UnknownPayload build error: \
+                 round timeout reached"
+            );
+            false
+        }
+    }
 }
 
 /// Makes sure that the node's own previous block sits one height below the height
@@ -453,6 +540,7 @@ mod tests {
 
     use crate::store::repositories::mocks::MockUndecidedBlocksRepository;
     use crate::utils::HaltAndWait;
+    use arc_eth_engine::mocks::{MockEngineAPI, MockEthereumAPI};
 
     fn test_execution_payload(block_hash_byte: u8) -> ExecutionPayloadV3 {
         ExecutionPayloadV3 {
@@ -745,5 +833,152 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("db connection lost"));
+    }
+
+    #[tokio::test]
+    async fn unknown_payload_with_blocklisted_recipient_returns_true() {
+        let parent_hash = B256::repeat_byte(0xAB);
+        let previous_block = ExecutionBlock {
+            block_hash: parent_hash,
+            block_number: 9,
+            parent_hash: B256::ZERO,
+            timestamp: 0,
+        };
+        let height = Height::new(10);
+        let round = Round::new(0);
+        let fee_recipient = Address::new([7u8; 20]);
+        let mut eth = MockEthereumAPI::new();
+        eth.expect_is_address_blocklisted()
+            .withf(move |addr, block| {
+                *addr == fee_recipient && *block == BlockId::from(parent_hash)
+            })
+            .times(1)
+            .returning(|_, _| Ok(true));
+        let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(eth));
+        let build_error =
+            eyre::Report::new(EngineApiRpcError::new(-38001, "Unknown payload", None));
+        let deadline = EngineDeadline::within(Duration::from_secs(30));
+
+        assert!(
+            should_not_propose_with_blocklisted_recipient(
+                &engine,
+                &build_error,
+                fee_recipient,
+                &previous_block,
+                deadline,
+                height,
+                round,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_payload_without_blocklisted_recipient_returns_false() {
+        let parent_hash = B256::repeat_byte(0xAB);
+        let previous_block = ExecutionBlock {
+            block_hash: parent_hash,
+            block_number: 9,
+            parent_hash: B256::ZERO,
+            timestamp: 0,
+        };
+        let height = Height::new(10);
+        let round = Round::new(0);
+        let fee_recipient = Address::new([7u8; 20]);
+        let mut eth = MockEthereumAPI::new();
+        eth.expect_is_address_blocklisted()
+            .withf(move |addr, block| {
+                *addr == fee_recipient && *block == BlockId::from(parent_hash)
+            })
+            .times(1)
+            .returning(|_, _| Ok(false));
+        let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(eth));
+        let build_error =
+            eyre::Report::new(EngineApiRpcError::new(-38001, "Unknown payload", None));
+        let deadline = EngineDeadline::within(Duration::from_secs(30));
+
+        assert!(
+            !should_not_propose_with_blocklisted_recipient(
+                &engine,
+                &build_error,
+                fee_recipient,
+                &previous_block,
+                deadline,
+                height,
+                round,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_payload_with_failed_blocklist_query_returns_false() {
+        let parent_hash = B256::repeat_byte(0xAB);
+        let previous_block = ExecutionBlock {
+            block_hash: parent_hash,
+            block_number: 9,
+            parent_hash: B256::ZERO,
+            timestamp: 0,
+        };
+        let height = Height::new(10);
+        let round = Round::new(0);
+        let fee_recipient = Address::new([7u8; 20]);
+        let mut eth = MockEthereumAPI::new();
+        eth.expect_is_address_blocklisted()
+            .withf(move |addr, block| {
+                *addr == fee_recipient && *block == BlockId::from(parent_hash)
+            })
+            .times(1)
+            .returning(|_, _| Err(eyre::eyre!("eth_call failed")));
+        let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(eth));
+        let build_error =
+            eyre::Report::new(EngineApiRpcError::new(-38001, "Unknown payload", None));
+        let deadline = EngineDeadline::within(Duration::from_secs(30));
+
+        assert!(
+            !should_not_propose_with_blocklisted_recipient(
+                &engine,
+                &build_error,
+                fee_recipient,
+                &previous_block,
+                deadline,
+                height,
+                round,
+            )
+            .await
+        );
+    }
+
+    /// Pins non-UnknownPayload failures as fatal without a diagnostic call.
+    #[tokio::test]
+    async fn non_unknown_payload_error_never_runs_diagnostic() {
+        let parent_hash = B256::repeat_byte(0xAB);
+        let previous_block = ExecutionBlock {
+            block_hash: parent_hash,
+            block_number: 9,
+            parent_hash: B256::ZERO,
+            timestamp: 0,
+        };
+        let height = Height::new(10);
+        let round = Round::new(0);
+        let fee_recipient = Address::new([7u8; 20]);
+        let mut eth = MockEthereumAPI::new();
+        eth.expect_is_address_blocklisted().times(0);
+        let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(eth));
+        let build_error = eyre::Report::new(EngineApiRpcError::new(-32603, "Internal error", None));
+        let deadline = EngineDeadline::within(Duration::from_secs(30));
+
+        assert!(
+            !should_not_propose_with_blocklisted_recipient(
+                &engine,
+                &build_error,
+                fee_recipient,
+                &previous_block,
+                deadline,
+                height,
+                round,
+            )
+            .await
+        );
     }
 }

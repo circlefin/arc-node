@@ -22,6 +22,10 @@ use malachitebft_app_channel::app::types::core::Round;
 /// Key for pending proposal parts.
 pub type PendingPartsKey = (HeightKey, RoundKey, BlockHashKey);
 
+/// The value a [`PendingPartsKey`] resolves to: the height, round and digest a
+/// pending row is stored under.
+pub type PendingPartsRowKey = (Height, Round, BlockHash);
+
 /// Key for undecided blocks.
 pub type UndecidedBlockKey = (HeightKey, RoundKey, BlockHashKey);
 

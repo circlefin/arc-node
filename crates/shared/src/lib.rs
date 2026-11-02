@@ -18,3 +18,4 @@
 
 pub mod chain_ids;
 pub mod metrics;
+pub mod precompile;

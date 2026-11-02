@@ -174,6 +174,8 @@ message StreamMessage {
     // Marker for end of stream
     bool fin = 4;
   }
+  // Random bytes, new for every encoding
+  bytes salt = 5;
 }
 ```
 
@@ -181,6 +183,7 @@ message StreamMessage {
 > In `StreamMessage`:
 > - `data` is the encoded `ProposalPart` (ie. `ProposalInit`, `ProposalData` or `ProposalFin`).
 > - `fin` is a marker for end-of-stream. It is redundant with the `ProposalFin` message but inherited from the original spec from Starkware.
+> - `salt` holds 16 random bytes, new for every encoding. The gossip message ID is a hash of the encoded message, so the salt makes each message ID unpredictable. Receivers ignore it.
 
 ## Consequences
 

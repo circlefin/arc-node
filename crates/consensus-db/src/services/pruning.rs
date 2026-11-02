@@ -160,7 +160,7 @@ mod tests {
         let block = ConsensusBlock {
             height,
             round,
-            valid_round: round,
+            valid_round: Round::Nil,
             proposer: Address::new([0u8; 20]),
             validity: Validity::Valid,
             execution_payload: payload,

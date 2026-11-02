@@ -663,9 +663,11 @@ pub fn execution_snapshot_exists(dir: &Path) -> bool {
 }
 
 pub fn consensus_snapshot_exists(dir: &Path) -> bool {
-    dir.join("store.db").exists()
+    dir.join(CONSENSUS_STORE_ENTRY).exists()
 }
 
+/// The consensus store, and the only entry a consensus archive may hold.
+const CONSENSUS_STORE_ENTRY: &str = "store.db";
 const SNAPSHOT_VERSION_FILE: &str = ".snapshot-url";
 const EXECUTION_STAGING_DIR: &str = "execution";
 const CONSENSUS_STAGING_DIR: &str = "consensus";
@@ -833,13 +835,97 @@ fn replace_from_archive(url: &str, execution_dir: &Path, staging_dir: &Path) -> 
     result
 }
 
+/// Checks a staged consensus archive against the layout a restore may write.
+///
+/// Extraction writes each entry an archive names into a directory that survives
+/// the restore, next to `config/priv_validator_key.json` and
+/// `wal/consensus.wal`. Confining entries to the target directory, as
+/// [`extract_archive`] does, is not enough here: the layout itself is the
+/// contract, and only a single regular `store.db` satisfies it. Requiring that
+/// entry to be present also separates a real snapshot from an empty archive,
+/// which would otherwise be recorded as a complete restore that replaced
+/// nothing.
+///
+/// The whole archive is read before the caller writes anything, so a rejected
+/// archive leaves the consensus home and its marker as they were. The cost is
+/// decompressing the archive twice.
+///
+/// Accepting only `store.db` subsumes [`extract_archive`]'s traversal and link
+/// checks — an absolute path, a `..` component, a symlink or a hard link is
+/// either not that name or not a regular file.
+fn validate_consensus_archive(archive_path: &Path) -> Result<()> {
+    let file = std::fs::File::open(archive_path)?;
+    let decoder = Decoder::new(file)?;
+    let mut archive = Archive::new(decoder);
+
+    let mut seen_store = false;
+
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let entry_type = entry.header().entry_type();
+
+        // Archive-wide metadata: surfaced as an entry, unpacks to nothing. Per-entry
+        // extended headers and GNU long names are folded into the entry they
+        // describe, so only the global one reaches here.
+        if entry_type == tar::EntryType::XGlobalHeader {
+            continue;
+        }
+
+        // Entry paths are recorded verbatim, so a producer that archived the
+        // directory rather than the file names entries `./store.db` and the walk
+        // root `./`. Dropping the prefix leaves the root as the empty path.
+        let entry_path: PathBuf = entry
+            .path()?
+            .components()
+            .filter(|c| *c != std::path::Component::CurDir)
+            .collect();
+
+        if entry_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        // `EntryType` cannot be matched exhaustively, and an entry type this does
+        // not name is refused below. A sparse file is a regular file the producer
+        // recorded without its holes.
+        let is_regular_file = matches!(
+            entry_type,
+            tar::EntryType::Regular | tar::EntryType::Continuous | tar::EntryType::GNUSparse
+        );
+
+        if !is_regular_file || entry_path != Path::new(CONSENSUS_STORE_ENTRY) {
+            return Err(eyre::eyre!(
+                "Unexpected entry in consensus archive, which holds only a regular {CONSENSUS_STORE_ENTRY}: {} ({entry_type:?})",
+                entry_path.display()
+            ));
+        }
+
+        if seen_store {
+            return Err(eyre::eyre!(
+                "Duplicate {CONSENSUS_STORE_ENTRY} entry in consensus archive"
+            ));
+        }
+        seen_store = true;
+    }
+
+    if !seen_store {
+        return Err(eyre::eyre!(
+            "Consensus archive holds no {CONSENSUS_STORE_ENTRY} entry"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Unpacks a staged consensus archive over the store in `consensus_dir`.
 ///
-/// The one place the consensus store is written, so the marker rule is stated
-/// once. The directory is not removed — [`restore_consensus`] carries why — so its
-/// marker is withdrawn before extraction starts. Left in place, a failure partway
-/// through `store.db` would leave a marker claiming the store is intact.
+/// The one place the consensus store is written, so the layout check and the
+/// marker rule are stated once. The directory is not removed —
+/// [`restore_consensus`] carries why — so the archive is checked before anything
+/// is written, and the marker is withdrawn before extraction starts. Left in
+/// place, a failure partway through `store.db` would leave a marker claiming the
+/// store is intact.
 fn extract_consensus_store(archive_path: &Path, consensus_dir: &Path, url: &str) -> Result<()> {
+    validate_consensus_archive(archive_path)?;
     invalidate_snapshot_version(consensus_dir)?;
     extract_downloaded_archive(archive_path, consensus_dir)?;
     write_snapshot_version(consensus_dir, url)
@@ -920,11 +1006,11 @@ pub fn download_and_extract_both(
 /// The target directory is never deleted, not even under `--force`. It is the
 /// malachite home, and it holds two files no snapshot puts back:
 /// `config/priv_validator_key.json` and `wal/consensus.wal`. Deleting it would
-/// buy nothing anyway — the archive contains only `store.db`, and extraction
+/// buy nothing anyway — the archive holds only `store.db`, and extraction
 /// truncates that file, so the store is fully replaced either way. What the
-/// surviving directory does require is that the marker be deleted before
-/// extraction rather than overwritten after it. A consensus archive that grows
-/// beyond `store.db` would need this revisited.
+/// surviving directory does require is that the archive be held to that layout,
+/// which [`validate_consensus_archive`] checks before extraction, and that the
+/// marker be deleted before extraction rather than overwritten after it.
 ///
 /// Keeping the WAL is a safety decision. Every time malachite starts a height it
 /// compares the height recorded in that file against the one it is about to run.
@@ -1024,32 +1110,29 @@ mod tests {
         Ok(buf)
     }
 
-    /// Builds an archive that unpacks `path` and then fails.
+    /// Build a `.tar.lz4` archive writing entry names and types verbatim.
     ///
-    /// The trailing symlink entry is rejected mid-stream, so extraction leaves
-    /// the first file on disk — the shape a restore killed partway has, and the
-    /// only one where the target ends up holding part of a snapshot.
-    fn build_tar_lz4_failing_after(path: &str, content: &[u8]) -> Result<Vec<u8>> {
+    /// `Header::set_path` strips `.` components, so an entry named `./store.db` —
+    /// what a producer that archived the directory rather than the file emits — is
+    /// reachable only by writing the name into the header directly.
+    fn build_tar_lz4_raw(entries: &[(&str, tar::EntryType, &[u8])]) -> Result<Vec<u8>> {
         let buf = Vec::new();
         let encoder = lz4::EncoderBuilder::new().build(buf)?;
         let mut builder = tar::Builder::new(encoder);
-
-        let mut good = tar::Header::new_gnu();
-        good.set_size(content.len() as u64);
-        good.set_mode(0o644);
-        good.set_cksum();
-        builder.append_data(&mut good, path, content)?;
-
-        let mut link = tar::Header::new_gnu();
-        link.set_entry_type(tar::EntryType::Symlink);
-        link.set_size(0);
-        link.set_mode(0o777);
-        let gnu = link.as_gnu_mut().expect("gnu header");
-        gnu.linkname[..b"/etc\0".len()].copy_from_slice(b"/etc\0");
-        gnu.name[..b"link\0".len()].copy_from_slice(b"link\0");
-        link.set_cksum();
-        builder.append(&link, b"".as_ref())?;
-
+        for (name, entry_type, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(*entry_type);
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            let gnu = header.as_gnu_mut().expect("gnu header");
+            gnu.name[..name.len()].copy_from_slice(name.as_bytes());
+            if *entry_type == tar::EntryType::GNUSparse {
+                // Read back and reconciled against the sparse map, which is empty.
+                gnu.set_real_size(0);
+            }
+            header.set_cksum();
+            builder.append(&header, *content)?;
+        }
         let (buf, result) = builder.into_inner()?.finish();
         result?;
         Ok(buf)
@@ -1799,6 +1882,121 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // validate_consensus_archive
+    // ---------------------------------------------------------------------------
+
+    /// Stage `entries` as an archive and return what the layout check made of it.
+    fn validate_archive(dir: &std::path::Path, body: &[u8]) -> Result<()> {
+        validate_consensus_archive(&write_file(dir, "cl.tar.lz4", body))
+    }
+
+    #[test]
+    fn validate_consensus_archive_accepts_a_lone_store() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        validate_archive(dir.path(), &build_tar_lz4(&[("store.db", b"data")])?)
+    }
+
+    #[test]
+    fn validate_consensus_archive_accepts_a_producer_that_archived_the_directory() -> Result<()> {
+        // `tar -C home -cf - .` records the walk root and prefixes every member.
+        let dir = tempfile::tempdir()?;
+        let body = build_tar_lz4_raw(&[
+            ("./", tar::EntryType::Directory, b""),
+            ("./store.db", tar::EntryType::Regular, b"data"),
+        ])?;
+        validate_archive(dir.path(), &body)
+    }
+
+    #[test]
+    fn validate_consensus_archive_accepts_a_pax_global_header() -> Result<()> {
+        // GNU tar emits it as an entry, and it unpacks to nothing.
+        let dir = tempfile::tempdir()?;
+        let body = build_tar_lz4_raw(&[
+            ("pax_global_header", tar::EntryType::XGlobalHeader, b""),
+            ("store.db", tar::EntryType::Regular, b"data"),
+        ])?;
+        validate_archive(dir.path(), &body)
+    }
+
+    #[test]
+    fn validate_consensus_archive_accepts_a_sparse_store() -> Result<()> {
+        // A store recorded without its holes is still a regular file.
+        let dir = tempfile::tempdir()?;
+        let body = build_tar_lz4_raw(&[("store.db", tar::EntryType::GNUSparse, b"")])?;
+        validate_archive(dir.path(), &body)
+    }
+
+    #[test]
+    fn validate_consensus_archive_refuses_an_unexpected_path() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for entry in [
+            "config/priv_validator_key.json",
+            "wal/consensus.wal",
+            SNAPSHOT_VERSION_FILE,
+            "nested/store.db",
+            "store.db.bak",
+        ] {
+            let body = build_tar_lz4(&[("store.db", b"data"), (entry, b"extra")])?;
+            let err = validate_archive(dir.path(), &body)
+                .expect_err("an entry beyond the store must be refused");
+            assert!(
+                err.to_string()
+                    .contains("Unexpected entry in consensus archive"),
+                "{entry}: unexpected: {err}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validate_consensus_archive_refuses_a_store_that_is_not_a_regular_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for entry_type in [
+            tar::EntryType::Directory,
+            tar::EntryType::Symlink,
+            tar::EntryType::Link,
+            tar::EntryType::Fifo,
+        ] {
+            let body = build_tar_lz4_raw(&[("store.db", entry_type, b"")])?;
+            let err = validate_archive(dir.path(), &body)
+                .expect_err("the store must arrive as a regular file");
+            assert!(
+                err.to_string()
+                    .contains("Unexpected entry in consensus archive"),
+                "{entry_type:?}: unexpected: {err}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validate_consensus_archive_refuses_a_duplicate_store() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let body = build_tar_lz4(&[("store.db", b"first"), ("store.db", b"second")])?;
+        let err =
+            validate_archive(dir.path(), &body).expect_err("a second store entry must be refused");
+        assert!(
+            err.to_string().contains("Duplicate store.db entry"),
+            "unexpected: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_consensus_archive_refuses_an_archive_without_a_store() -> Result<()> {
+        // Extraction would succeed and the marker would then record a complete
+        // restore of a store the archive never carried.
+        let dir = tempfile::tempdir()?;
+        let err = validate_archive(dir.path(), &build_tar_lz4(&[])?)
+            .expect_err("an archive with no store must be refused");
+        assert!(
+            err.to_string().contains("holds no store.db entry"),
+            "unexpected: {err}"
+        );
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------
     // replace_consensus_store via local HTTP server (wiremock)
     // ---------------------------------------------------------------------------
 
@@ -1838,22 +2036,31 @@ mod tests {
     // restore_consensus
     // ---------------------------------------------------------------------------
 
-    /// Serves one `.tar.lz4` archive containing `store.db` and returns its URL.
-    async fn serve_consensus_archive(server: &wiremock::MockServer) -> Result<String> {
+    /// Serves `body` at `route` and returns its URL.
+    async fn serve_archive_bytes(
+        server: &wiremock::MockServer,
+        route: &str,
+        body: Vec<u8>,
+    ) -> String {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
-        let data = build_tar_lz4(&[("store.db", b"fresh-consensus-data")])?;
         Mock::given(method("GET"))
-            .and(path("/cl.tar.lz4"))
+            .and(path(route))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_bytes(data.clone())
-                    .append_header("Content-Length", data.len().to_string().as_str()),
+                    .set_body_bytes(body.clone())
+                    .append_header("Content-Length", body.len().to_string().as_str()),
             )
             .mount(server)
             .await;
-        Ok(format!("{}/cl.tar.lz4", server.uri()))
+        format!("{}{route}", server.uri())
+    }
+
+    /// Serves one `.tar.lz4` archive containing `store.db` and returns its URL.
+    async fn serve_consensus_archive(server: &wiremock::MockServer) -> Result<String> {
+        let data = build_tar_lz4(&[("store.db", b"fresh-consensus-data")])?;
+        Ok(serve_archive_bytes(server, "/cl.tar.lz4", data).await)
     }
 
     #[tokio::test]
@@ -1923,6 +2130,122 @@ mod tests {
             std::fs::read(consensus.join("wal/consensus.wal"))?,
             b"wal-entries"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_consensus_refuses_an_archive_naming_a_home_file() -> Result<()> {
+        // The consensus home survives the restore, so any entry beyond `store.db`
+        // is written into it. Each of these names a file the restore must leave
+        // alone: the node's identity, the WAL it replays, and the marker that
+        // records which snapshot the store holds.
+        for (entry, route) in [
+            ("config/priv_validator_key.json", "/key.tar.lz4"),
+            ("wal/consensus.wal", "/wal.tar.lz4"),
+            (SNAPSHOT_VERSION_FILE, "/marker.tar.lz4"),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            let data = build_tar_lz4(&[
+                ("store.db", b"fresh-consensus-data"),
+                (entry, b"replacement"),
+            ])?;
+            let url = serve_archive_bytes(&server, route, data).await;
+
+            let dir = tempfile::tempdir()?;
+            let consensus = dir.path().join("consensus");
+            std::fs::create_dir_all(consensus.join("config"))?;
+            std::fs::create_dir_all(consensus.join("wal"))?;
+            std::fs::write(consensus.join("store.db"), b"stale")?;
+            std::fs::write(
+                consensus.join("config/priv_validator_key.json"),
+                b"validator-key",
+            )?;
+            std::fs::write(consensus.join("wal/consensus.wal"), b"wal-entries")?;
+            write_snapshot_version(&consensus, "http://previous.invalid/cl.tar.lz4")?;
+
+            let (consensus_arg, tmp) = (consensus.clone(), dir.path().join("tmp"));
+            let err = tokio::task::spawn_blocking(move || {
+                restore_consensus(&url, &consensus_arg, &tmp, true)
+            })
+            .await?
+            .expect_err("an archive naming a consensus home file must be refused");
+            assert!(
+                err.to_string()
+                    .contains("Unexpected entry in consensus archive"),
+                "{entry}: unexpected: {err}"
+            );
+
+            // Refused before extraction, so the home is untouched: the store
+            // still holds what it did, and the marker still names the snapshot
+            // that is actually there.
+            assert_eq!(
+                std::fs::read(consensus.join("config/priv_validator_key.json"))?,
+                b"validator-key",
+                "{entry}: the validator key was replaced"
+            );
+            assert_eq!(
+                std::fs::read(consensus.join("wal/consensus.wal"))?,
+                b"wal-entries",
+                "{entry}: the WAL was replaced"
+            );
+            assert_eq!(
+                std::fs::read(consensus.join("store.db"))?,
+                b"stale",
+                "{entry}: the store was replaced"
+            );
+            assert_eq!(
+                std::fs::read_to_string(consensus.join(SNAPSHOT_VERSION_FILE))?,
+                "http://previous.invalid/cl.tar.lz4",
+                "{entry}: the marker was rewritten"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_and_extract_both_refuses_a_consensus_archive_naming_a_home_file() -> Result<()>
+    {
+        // The pair restore reaches the consensus store through the same check.
+        // The execution layer is extracted first, so it is already replaced when
+        // the consensus archive is refused; what the refusal protects is the
+        // consensus home.
+        let server = wiremock::MockServer::start().await;
+        let el_data = build_tar_lz4(&[("db/mdbx.dat", b"new-el")])?;
+        let cl_data = build_tar_lz4(&[
+            ("store.db", b"new-cl"),
+            ("config/priv_validator_key.json", b"replacement"),
+        ])?;
+        let el_url = serve_archive_bytes(&server, "/el.tar.lz4", el_data).await;
+        let cl_url = serve_archive_bytes(&server, "/cl.tar.lz4", cl_data).await;
+
+        let dir = tempfile::tempdir()?;
+        let el_dest = dir.path().join("el");
+        let cl_dest = dir.path().join("cl");
+        std::fs::create_dir_all(cl_dest.join("config"))?;
+        std::fs::write(
+            cl_dest.join("config/priv_validator_key.json"),
+            b"validator-key",
+        )?;
+
+        let (el_arg, cl_arg, tmp) = (el_dest.clone(), cl_dest.clone(), dir.path().join("tmp"));
+        let err = tokio::task::spawn_blocking(move || {
+            download_and_extract_both(&el_url, &cl_url, &el_arg, &cl_arg, &tmp, true)
+        })
+        .await?
+        .expect_err("a consensus archive naming the validator key must be refused");
+        assert!(
+            err.to_string()
+                .contains("Unexpected entry in consensus archive"),
+            "unexpected: {err}"
+        );
+
+        assert_eq!(
+            std::fs::read(cl_dest.join("config/priv_validator_key.json"))?,
+            b"validator-key"
+        );
+        assert!(!cl_dest.join("store.db").exists());
+        // No marker either: nothing recorded a consensus restore that did not happen.
+        assert!(!cl_dest.join(SNAPSHOT_VERSION_FILE).exists());
         Ok(())
     }
 
@@ -2542,30 +2865,18 @@ mod tests {
     #[tokio::test]
     async fn restore_consensus_withdraws_the_marker_before_extracting() -> Result<()> {
         // The consensus directory is never removed, so its marker outlives a
-        // failed restore unless the restore withdraws it. Extraction truncates
-        // `store.db` as it writes, and here the snapshot being restored is the one
-        // the marker already names — a --force retry. Keep the marker and the next
-        // run reads a truncated store as up to date.
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let partial = build_tar_lz4_failing_after("store.db", b"half-written")?;
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/cl.tar.lz4"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(partial.clone())
-                    .append_header("Content-Length", partial.len().to_string().as_str()),
-            )
-            .mount(&server)
-            .await;
+        // failed restore unless the restore withdraws it. Here the snapshot being
+        // restored is the one the marker already names — a --force retry — and
+        // extraction fails partway. Keep the marker and the next run reads a store
+        // the restore never replaced as up to date.
+        let server = wiremock::MockServer::start().await;
+        let url = serve_consensus_archive(&server).await?;
 
         let dir = tempfile::tempdir()?;
         let consensus = dir.path().join("consensus");
-        std::fs::create_dir_all(&consensus)?;
-        std::fs::write(consensus.join("store.db"), b"stale")?;
-        let url = format!("{}/cl.tar.lz4", server.uri());
+        // A non-empty directory under the store's name passes the layout check,
+        // which reads only the archive, and then cannot be unpacked over.
+        std::fs::create_dir_all(consensus.join("store.db").join("occupied"))?;
         write_snapshot_version(&consensus, &url)?;
 
         let (consensus_arg, url_arg) = (consensus.clone(), url.clone());
@@ -2574,11 +2885,11 @@ mod tests {
             restore_consensus(&url_arg, &consensus_arg, &tmp, true)
         })
         .await?
-        .expect_err("a partial archive must not report success");
+        .expect_err("a failed extraction must not report success");
 
         assert!(!consensus.join(SNAPSHOT_VERSION_FILE).exists(), "{err}");
         let rerun = should_download("Consensus layer", &consensus, &url, true, false)
-            .expect_err("a truncated store must not read as up to date");
+            .expect_err("a store no restore replaced must not read as up to date");
         assert!(rerun.to_string().contains("--force"), "unexpected: {rerun}");
         Ok(())
     }

@@ -86,7 +86,8 @@ pub async fn generate_payload_with_retry(
                 attempt = attempt_num,
                 attempts_left,
                 delay_ms = dur.as_millis(),
-                "reth forgot its payload id; retrying (forking off the same previous block)"
+                "getPayload returned UnknownPayload (payload job dropped, or its build \
+                 failed); retrying off the same previous block"
             );
         })
         .when(|e| {
@@ -305,24 +306,53 @@ async fn validate_payload(
     }
 }
 
-/// Validates a consensus block's payload and stores it in the database
-/// if the engine rejects it.
+/// Where the bytes under validation came from.
+///
+/// This is not stored. It only decides whether a rejection is written as an
+/// [`InvalidPayload`]. [`Self::UnverifiedSync`] never is: those bytes are
+/// unsigned, and the forensic row would name the certificate proposer as their
+/// author.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadOrigin {
+    /// A proposal signature covers the block, or the stored row still has one.
+    Signed,
+    /// This node built the block. Validation runs before that block is signed.
+    SelfBuilt,
+    /// Value-sync bytes. The proposer is the certificate's, not a signer of these bytes.
+    UnverifiedSync,
+}
+
+impl PayloadOrigin {
+    /// Whether the named proposer is the author of these bytes.
+    ///
+    /// [`Self::SelfBuilt`] counts: this node produced the block, before it is
+    /// signed. [`Self::UnverifiedSync`] does not: the certificate proposer did
+    /// not sign the bytes.
+    pub(crate) const fn is_attributable(self) -> bool {
+        !matches!(self, Self::UnverifiedSync)
+    }
+}
+
+/// Validates a consensus block's payload and, when `payload_origin` allows it, stores
+/// a forensic record if the engine rejects it.
 ///
 /// This is the higher-level entry point for callers that have a
 /// [`ConsensusBlock`] and an [`InvalidPayloadsRepository`]. It delegates
 /// to [`PayloadValidator::validate_payload`] for the actual engine call
-/// and then persists an [`InvalidPayload`] record when the verdict is
-/// `Invalid`.
+/// and then, for [`PayloadOrigin::Signed`] and
+/// [`PayloadOrigin::SelfBuilt`], persists an [`InvalidPayload`] record
+/// if the verdict is `Invalid`. [`PayloadOrigin::UnverifiedSync`] never
+/// writes that record.
 ///
 /// # Return contract
 ///
 /// - `Ok(Validity::Valid)`: the engine accepted the payload.
-/// - `Ok(Validity::Invalid)`: the engine rejected the payload. Persisting
-///   the forensic [`InvalidPayload`] record is **best-effort**: a failure
-///   to append is logged at `error` but does not change the verdict
-///   returned to the caller. The engine's verdict is authoritative and
-///   must reach the consensus layer so the corresponding undecided block
-///   is marked `Invalid` rather than left with a placeholder `Valid`.
+/// - `Ok(Validity::Invalid)`: the engine rejected the payload. When the proposer
+///   is attributable, persisting the [`InvalidPayload`] is **best-effort**: a
+///   failure to append is logged at `error` but does not change the verdict
+///   returned to the caller. The engine's verdict is authoritative and must
+///   reach the consensus layer so the corresponding undecided block is marked
+///   `Invalid` rather than left with a placeholder `Valid`.
 /// - `Err(_)`: no verdict was obtained (engine transport error,
 ///   `SYNCING`/`ACCEPTED` status, etc.).
 pub async fn validate_consensus_block(
@@ -330,6 +360,7 @@ pub async fn validate_consensus_block(
     block: &ConsensusBlock,
     store: &impl InvalidPayloadsRepository,
     metrics: &AppMetrics,
+    payload_origin: PayloadOrigin,
 ) -> eyre::Result<Validity> {
     let result = payload_validator
         .validate_payload(&block.execution_payload)
@@ -344,21 +375,74 @@ pub async fn validate_consensus_block(
                 block_hash = %block.self_reported_block_hash(),
                 proposer = %block.proposer,
                 reason = %reason,
-                "Engine rejected payload, storing for forensics",
+                ?payload_origin,
+                "Engine rejected payload",
             );
             metrics.inc_invalid_payloads_count(InvalidPayloadSource::EngineReject);
-            let invalid = InvalidPayload::new_from_block(block, &reason);
-            if let Err(e) = store.append(invalid).await {
-                error!(
-                    height = %block.height,
-                    round = %block.round,
-                    block_hash = %block.self_reported_block_hash(),
-                    proposer = %block.proposer,
-                    "Failed to persist invalid-payload forensic record: {e}",
-                );
+            if payload_origin.is_attributable() {
+                let invalid = InvalidPayload::new_from_block(block, &reason);
+                if let Err(e) = store.append(invalid).await {
+                    error!(
+                        height = %block.height,
+                        round = %block.round,
+                        block_hash = %block.self_reported_block_hash(),
+                        proposer = %block.proposer,
+                        "Failed to persist invalid-payload forensic record: {e}",
+                    );
+                }
             }
             Ok(Validity::Invalid)
         }
+    }
+}
+
+/// Outcome of (re-)validating a block whose verdict is already stored.
+///
+/// Derived from a [`validate_consensus_block`] result: an `Ok` is a definitive
+/// (deterministic) engine verdict computed against a known parent state; an
+/// `Err` is a transient outcome (`SYNCING`/`ACCEPTED`/transport/internal JSON-RPC
+/// error) that carries no verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictOutcome {
+    /// The engine returned a definitive verdict.
+    Deterministic(Validity),
+    /// The engine could not produce a verdict (transient failure).
+    Transient,
+}
+
+/// How to reconcile a freshly-computed verdict with one already stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlipResolution {
+    /// Verdicts agree, or the fresh outcome is Transient: keep the stored verdict.
+    KeepStored,
+    /// Deterministic `Invalid -> Valid`: accept and persist the fresh `Valid` verdict.
+    AcceptFresh,
+    /// Deterministic `Valid -> Invalid`: a replay-divergence chain anomaly. The
+    /// node must fail-stop rather than silently overwrite the verdict.
+    HaltAnomaly,
+}
+
+/// Reconciles a stored verdict with a freshly-computed one for the same block.
+///
+/// The policy:
+/// - A transient outcome never flips a verdict (the stored verdict is kept).
+/// - A deterministic `Invalid -> Valid` flip is permitted — Malachite accepts it,
+///   and it can revive a stuck chain.
+/// - A deterministic `Valid -> Invalid` flip is a chain anomaly (binary,
+///   chainspec/hardfork, or EL-state divergence). It must not be silently
+///   overwritten; the node fail-stops and recovers via operator tooling.
+pub fn resolve_verdict_flip(stored: Validity, fresh: VerdictOutcome) -> FlipResolution {
+    let fresh = match fresh {
+        VerdictOutcome::Transient => return FlipResolution::KeepStored,
+        VerdictOutcome::Deterministic(fresh) => fresh,
+    };
+
+    match (stored, fresh) {
+        (Validity::Valid, Validity::Valid) | (Validity::Invalid, Validity::Invalid) => {
+            FlipResolution::KeepStored
+        }
+        (Validity::Invalid, Validity::Valid) => FlipResolution::AcceptFresh,
+        (Validity::Valid, Validity::Invalid) => FlipResolution::HaltAnomaly,
     }
 }
 
@@ -455,17 +539,24 @@ impl BlockVerdict {
     }
 }
 
-/// Establishes the validity of a block that arrived from the network.
+/// Decides whether a block from the network is valid.
 ///
-/// The binding rules run first. The engine never sees a payload that breaks
-/// them, so such a payload never enters the block tree of the execution client.
-/// A payload that keeps the rules gets its verdict from [`validate_consensus_block`].
+/// Checks the payload's block number and parent hash before calling the
+/// execution client. A mismatch is invalid on its own: the engine is not asked,
+/// because it would accept a real block that belongs at another height and
+/// insert that block into its block tree. A payload that passes both checks
+/// gets its verdict from [`validate_consensus_block`].
+///
+/// `payload_origin` is forwarded to that path and also gates the forensic write when
+/// the block-number or parent-hash check fails. [`PayloadOrigin::UnverifiedSync`]
+/// never writes that record.
 pub async fn establish_block_validity(
     payload_validator: &impl PayloadValidator,
     block: &ConsensusBlock,
     previous_block: Option<&ExecutionBlock>,
     store: &impl InvalidPayloadsRepository,
     metrics: &AppMetrics,
+    payload_origin: PayloadOrigin,
 ) -> eyre::Result<BlockVerdict> {
     if let Err(error) =
         check_payload_binding(&block.execution_payload, block.height, previous_block)
@@ -476,24 +567,27 @@ pub async fn establish_block_validity(
             block_hash = %block.self_reported_block_hash(),
             proposer = %block.proposer,
             reason = %error,
-            "Payload is not bound to its place in the chain, storing for forensics",
+            ?payload_origin,
+            "Payload block number or parent hash does not match this height",
         );
 
         metrics.inc_invalid_payloads_count(error.invalid_payload_source());
 
-        persist_invalid_payload_best_effort(
-            store,
-            InvalidPayload::new_from_block(block, &error.to_string()),
-            block.height,
-            block.round,
-            block.proposer,
-        )
-        .await;
+        if payload_origin.is_attributable() {
+            persist_invalid_payload_best_effort(
+                store,
+                InvalidPayload::new_from_block(block, &error.to_string()),
+                block.height,
+                block.round,
+                block.proposer,
+            )
+            .await;
+        }
 
         return Ok(BlockVerdict::Unbound(error));
     }
 
-    validate_consensus_block(payload_validator, block, store, metrics)
+    validate_consensus_block(payload_validator, block, store, metrics, payload_origin)
         .await
         .map(BlockVerdict::Engine)
 }
@@ -885,9 +979,16 @@ mod tests {
         let metrics = AppMetrics::default();
         let block = block_at(11, bound_payload(5, B256::ZERO));
 
-        let verdict = establish_block_validity(&validator, &block, None, &store, &metrics)
-            .await
-            .expect("a binding error is a verdict, not a failure");
+        let verdict = establish_block_validity(
+            &validator,
+            &block,
+            None,
+            &store,
+            &metrics,
+            PayloadOrigin::Signed,
+        )
+        .await
+        .expect("a binding error is a verdict, not a failure");
 
         assert_eq!(
             verdict,
@@ -897,6 +998,32 @@ mod tests {
             }),
             "the caller must be able to tell which rule rejected the payload",
         );
+        assert_eq!(verdict.validity(), Validity::Invalid);
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn establish_block_validity_skips_persist_for_unverified_sync() {
+        let mut validator = MockPayloadValidator::new();
+        validator.expect_validate_payload().times(0);
+
+        let mut store = MockInvalidPayloadsRepository::new();
+        store.expect_append().times(0);
+
+        let metrics = AppMetrics::default();
+        let block = block_at(11, bound_payload(5, B256::ZERO));
+
+        let verdict = establish_block_validity(
+            &validator,
+            &block,
+            None,
+            &store,
+            &metrics,
+            PayloadOrigin::UnverifiedSync,
+        )
+        .await
+        .expect("a binding error is a verdict, not a failure");
+
         assert_eq!(verdict.validity(), Validity::Invalid);
         assert_eq!(metrics.get_invalid_payloads_count(), 1);
     }
@@ -924,6 +1051,7 @@ mod tests {
             Some(&prev_block(10, expected)),
             &store,
             &metrics,
+            PayloadOrigin::Signed,
         )
         .await
         .expect("a binding error is a verdict, not a failure");
@@ -960,6 +1088,7 @@ mod tests {
             Some(&prev_block(10, parent)),
             &store,
             &metrics,
+            PayloadOrigin::Signed,
         )
         .await
         .expect("should succeed");
@@ -980,9 +1109,10 @@ mod tests {
 
         let metrics = AppMetrics::default();
         let block = test_block();
-        let result = validate_consensus_block(&validator, &block, &store, &metrics)
-            .await
-            .expect("should succeed");
+        let result =
+            validate_consensus_block(&validator, &block, &store, &metrics, PayloadOrigin::Signed)
+                .await
+                .expect("should succeed");
 
         assert_eq!(result, Validity::Valid);
         assert_eq!(metrics.get_invalid_payloads_count(), 0);
@@ -1012,9 +1142,43 @@ mod tests {
 
         let metrics = AppMetrics::default();
         let block = test_block();
-        let result = validate_consensus_block(&validator, &block, &store, &metrics)
-            .await
-            .expect("should succeed");
+        let result = validate_consensus_block(
+            &validator,
+            &block,
+            &store,
+            &metrics,
+            PayloadOrigin::SelfBuilt,
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(result, Validity::Invalid);
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn validate_consensus_block_skips_persist_for_unverified_sync() {
+        let mut validator = MockPayloadValidator::new();
+        validator.expect_validate_payload().returning(|_| {
+            Ok(PayloadValidationResult::Invalid {
+                reason: "bad block".into(),
+            })
+        });
+
+        let mut store = MockInvalidPayloadsRepository::new();
+        store.expect_append().times(0);
+
+        let metrics = AppMetrics::default();
+        let block = test_block();
+        let result = validate_consensus_block(
+            &validator,
+            &block,
+            &store,
+            &metrics,
+            PayloadOrigin::UnverifiedSync,
+        )
+        .await
+        .expect("should succeed");
 
         assert_eq!(result, Validity::Invalid);
         assert_eq!(metrics.get_invalid_payloads_count(), 1);
@@ -1032,9 +1196,10 @@ mod tests {
 
         let metrics = AppMetrics::default();
         let block = test_block();
-        let err = validate_consensus_block(&validator, &block, &store, &metrics)
-            .await
-            .expect_err("should propagate error");
+        let err =
+            validate_consensus_block(&validator, &block, &store, &metrics, PayloadOrigin::Signed)
+                .await
+                .expect_err("should propagate error");
 
         assert!(
             err.to_string().contains("engine down"),
@@ -1067,9 +1232,10 @@ mod tests {
 
         let metrics = AppMetrics::default();
         let block = test_block();
-        let validity = validate_consensus_block(&validator, &block, &store, &metrics)
-            .await
-            .expect("verdict should be returned even when forensics persist fails");
+        let validity =
+            validate_consensus_block(&validator, &block, &store, &metrics, PayloadOrigin::Signed)
+                .await
+                .expect("verdict should be returned even when forensics persist fails");
 
         assert_eq!(validity, Validity::Invalid);
         assert_eq!(metrics.get_invalid_payloads_count(), 1);
@@ -1240,6 +1406,58 @@ mod tests {
             generator.attempts.load(Ordering::SeqCst),
             1,
             "should only attempt once"
+        );
+    }
+
+    #[test]
+    fn resolve_verdict_flip_keeps_stored_when_verdicts_match() {
+        assert_eq!(
+            resolve_verdict_flip(
+                Validity::Valid,
+                VerdictOutcome::Deterministic(Validity::Valid)
+            ),
+            FlipResolution::KeepStored,
+        );
+        assert_eq!(
+            resolve_verdict_flip(
+                Validity::Invalid,
+                VerdictOutcome::Deterministic(Validity::Invalid),
+            ),
+            FlipResolution::KeepStored,
+        );
+    }
+
+    #[test]
+    fn resolve_verdict_flip_keeps_stored_on_transient() {
+        assert_eq!(
+            resolve_verdict_flip(Validity::Valid, VerdictOutcome::Transient),
+            FlipResolution::KeepStored,
+        );
+        assert_eq!(
+            resolve_verdict_flip(Validity::Invalid, VerdictOutcome::Transient),
+            FlipResolution::KeepStored,
+        );
+    }
+
+    #[test]
+    fn resolve_verdict_flip_accepts_fresh_on_invalid_to_valid() {
+        assert_eq!(
+            resolve_verdict_flip(
+                Validity::Invalid,
+                VerdictOutcome::Deterministic(Validity::Valid),
+            ),
+            FlipResolution::AcceptFresh,
+        );
+    }
+
+    #[test]
+    fn resolve_verdict_flip_halts_on_valid_to_invalid() {
+        assert_eq!(
+            resolve_verdict_flip(
+                Validity::Valid,
+                VerdictOutcome::Deterministic(Validity::Invalid),
+            ),
+            FlipResolution::HaltAnomaly,
         );
     }
 }

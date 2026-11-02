@@ -176,7 +176,7 @@ mod tests {
     use ssz::Encode;
 
     /// Mirrors `value_sync::MAX_RESPONSE_SIZE` in `crates/malachite-app/src/hardcoded_config.rs`.
-    const VALUE_SYNC_MAX_RESPONSE_SIZE: ByteSize = ByteSize::mib(10);
+    const VALUE_SYNC_MAX_RESPONSE_SIZE: ByteSize = ByteSize::mib(16);
 
     fn create_validator() -> ArcEngineValidator {
         let chain_spec = Arc::new(ChainSpecBuilder::mainnet().build());
@@ -375,13 +375,23 @@ mod tests {
 
     #[test]
     fn ensure_well_formed_payload_rejects_withdrawals_payload_over_value_sync_limit() {
-        const WITHDRAWALS_COUNT: usize = 238_500;
+        const TRANSACTIONS_COUNT: usize = 920_000;
+        const WITHDRAWALS_COUNT: usize = 298_000;
 
         let validator = create_validator();
         let mut new_payload = create_test_payload_v3(0);
+        // Empty transactions add SSZ offsets but consume only one encoded RLP byte each,
+        // allowing both size-boundary assertions to hold.
+        new_payload.payload_inner.payload_inner.transactions =
+            vec![Bytes::new(); TRANSACTIONS_COUNT];
         new_payload.payload_inner.withdrawals = vec![Default::default(); WITHDRAWALS_COUNT];
 
-        let rlp_len = new_payload.clone().into_block_raw().unwrap().length();
+        // The transaction root has a fixed RLP length, so avoid hashing the large synthetic list.
+        let rlp_len = new_payload
+            .clone()
+            .into_block_raw_with_transactions_root(B256::ZERO)
+            .unwrap()
+            .length();
         let ssz_len = new_payload.ssz_bytes_len();
 
         assert!(rlp_len <= MAX_RLP_BLOCK_SIZE);

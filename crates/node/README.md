@@ -108,11 +108,14 @@ In addition to standard Reth flags, `arc-node-execution` provides the following 
 | `--invalid-tx-list-enable[=<bool>]` | `true` | - | Enable the invalid transaction list feature. Opt out with `--invalid-tx-list-enable=false`. |
 | `--invalid-tx-list-cap <CAPACITY>` | `100000` | - | Maximum capacity of the invalid tx list LRU cache. Only read if `--invalid-tx-list-enable` is `true`. |
 | `--arc.rpc.max-batch-entries <N>` | `100` | - | Maximum number of entries permitted in a JSON-RPC batch request. Oversized batches are rejected with JSON-RPC error `-32600` before any per-entry handler runs. Must be `>= 1`. |
+| `--arc.rpc.max-call-many-calls <N>` | `10` | - | Maximum number of `eth_callMany` calls permitted in one JSON-RPC request. The budget covers every bundle and, in a JSON-RPC batch, every entry, so batching cannot multiply it. Every `eth_callMany` costs at least one, because it opens a database read transaction even when it executes nothing, so at the default a single batch admits at most 10 `eth_callMany` entries. A request above the budget is rejected with JSON-RPC error `-32602` before any call executes; a batch is rejected as a whole, so the verdict does not depend on entry order. Must be `>= 1`. |
+| `--arc.rpc.max-call-many-state-overrides <N>` | `100` | - | Maximum number of accounts a single `eth_callMany` request may override. Unlike the call budget this applies to each `eth_callMany` separately, not to a batch total. Applying an override reads each account from state, adding the same cold reads that make the calls expensive on an archive node. Requests above it are rejected with JSON-RPC error `-32602` before any call executes. Must be `>= 1`. |
+| `--arc.rpc.max-trace-bytes <BYTES>` | `67108864` (64 MiB) | - | Maximum calldata bytes an RPC tracer may record while tracing one transaction. Tracers copy the calldata of every call a transaction makes, including internal calls, so this bounds their memory per transaction. Applies to every RPC that executes with an inspector (`debug_trace*`, `trace_*`, `ots_*`, `eth_createAccessList`). A transaction past the limit fails with `trace byte limit of <BYTES> exceeded` instead of returning a partial trace. Block execution is unaffected. Must be `>= 1`. |
 | `--arc.builder.deadline <MS>` | Reth `builder.deadline` | `ARC_BUILDER_DEADLINE_MS` | Maximum transaction-selection duration in milliseconds. Overrides the equivalent Reth builder setting. |
 | `--arc.builder.wait-for-payload <BOOL>` | `true` | `ARC_BUILDER_WAIT_FOR_PAYLOAD` | Wait for in-flight payload building when `engine_getPayload` arrives early instead of racing an empty block. |
 | `--full` | - | - | Full-node pruning preset. Fully prunes sender recovery; keeps the last 237,600 blocks for all other segments. Also sets `--prune.block-interval=128`. Mutually exclusive with `--minimal`. |
 | `--minimal` | - | - | Minimal-storage pruning preset. Fully prunes sender recovery; keeps transaction lookup for 64 blocks, receipts for 64 blocks, account/storage history for 10,064 blocks, and block bodies for 237,600 blocks. Also sets `--prune.block-interval=128`. Mutually exclusive with `--full`. |
-| `--arc.expose-pending-txs` | `false` | - | Expose pending-tx RPCs. By default pending-tx subscriptions, filters, and pending-block queries are blocked — set this on trusted / internal nodes where exposing pending state is intentional. |
+| `--arc.expose-pending-txs` | `false` | - | Expose pending-tx RPCs. By default pending-tx subscriptions, filters, pending-block queries, and pool-only `eth_getTransactionBySenderAndNonce` results are hidden — set this on trusted / internal nodes where exposing pending state is intentional. |
 | `--public-api` | `false` | - | Convenience flag for externally-exposed RPC nodes. Forces pending-tx hiding and warns if `--http.api` / `--ws.api` expose namespaces outside `{eth, net, web3, rpc}`. Conflicts with `--arc.expose-pending-txs`. |
 | `--arc.rpc.allow-unprotected-txs` | `false` | - | Accept pre-EIP-155 transactions through raw transaction submission RPC methods. |
 | `--arc.tx.relays <URLS>` | - | `ARC_TX_RELAYS` | Ordered comma-separated relay URLs for transaction failover. Conflicts with `--rpc.forwarder`. |
@@ -157,6 +160,18 @@ arc-node-execution node \
   --arc.rpc.max-batch-entries 25 \
   --chain genesis.json
 ```
+
+Tighten the `eth_callMany` call cap:
+
+```bash
+arc-node-execution node \
+  --arc.rpc.max-call-many-calls 5 \
+  --chain genesis.json
+```
+
+Reth runs the calls of one `eth_callMany` request sequentially, in a single blocking task that holds one database read transaction and one blocking-IO permit. That permit is the same permit `eth_call` takes, and one permit covers every call in the request. This cap governs how long one request can hold the permit and the read transaction; raising it lengthens that window, so raise it only on a node serving trusted tooling.
+
+The cap bounds the number of calls per request, not the cost of each one and not how many requests arrive at once. A caller sending many small `eth_callMany` requests still reaches the concurrency allowed by `--rpc.max-connections` and never trips this limit. `--rpc.gascap` does not bound each call either: a call that omits `gas` and sets a non-zero `gasPrice` gets as much gas as its balance pays for, up to the block gas limit, and a balance override together with `blockOverride.gasLimit` lifts both bounds. Use `arc_rpc_call_many_rejected_total`, labelled by reason, to tune either limit.
 
 ### Init
 
@@ -220,10 +235,11 @@ RPC surface.
 | `eth_subscribe("newPendingTransactions")` | Error -32001 |
 | `eth_newPendingTransactionFilter` | Error -32001 |
 | `eth_getBlockByNumber("pending")` | Returns `null` (success) |
+| `eth_getTransactionBySenderAndNonce` | Mined txs returned; pool-only answers return `null` (success) |
 
 **When the filter is disabled (`--arc.expose-pending-txs`):**
 
-All three methods bypass the middleware. Pending-block queries additionally depend on `--rpc.pending-block` (Arc default: `none`); to actually receive pending-block data, set `--rpc.pending-block=full` alongside `--arc.expose-pending-txs`.
+These methods bypass the middleware. Pending-block queries additionally depend on `--rpc.pending-block` (Arc default: `none`); to actually receive pending-block data, set `--rpc.pending-block=full` alongside `--arc.expose-pending-txs`.
 
 ## Architecture
 
@@ -252,7 +268,7 @@ Arc-specific execution metrics:
 | `reth_arc_node_version_info` | Gauge | Node version information, labeled by `version` and `git_commit`. |
 | `reth_arc_payload_stage_duration_seconds` | Histogram | Payload build stage duration, labeled by `stage`. |
 | `reth_arc_payload_total_duration_seconds` | Histogram | Total payload build duration. |
-| `reth_arc_payload_build_outcome_total` | Counter | Payload build outcome count, labeled by `outcome`. |
+| `reth_arc_payload_build_outcome_total` | Counter | Payload build outcome count, labeled by `outcome` (`better`, `aborted`, `cancelled`, `failed`). |
 | `reth_arc_tx_denylist_rejection_total` | Counter | Transactions rejected during mempool validation because a transaction address is denylisted. |
 | `reth_arc_invalid_tx_list_size` | Gauge | Current number of transaction hashes in the invalid transaction list. |
 | `reth_arc_invalid_tx_list_hits_total` | Counter | Transactions rejected because their hash is in the invalid transaction list. |

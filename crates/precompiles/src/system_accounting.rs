@@ -15,15 +15,17 @@
 // limitations under the License.
 
 use crate::helpers::{
-    abi_decode_raw_validated, check_delegatecall, check_staticcall,
-    new_reverted_with_early_penalty, read, write, PrecompileErrorOrRevert, ERR_EXECUTION_REVERTED,
-    ERR_INVALID_CALLER, PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+    check_delegatecall, check_staticcall, new_reverted_with_early_penalty, read, write,
+    PrecompileErrorOrRevert, ERR_EXECUTION_REVERTED, ERR_INVALID_CALLER,
+    PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
 };
 use crate::precompile;
 use alloy_evm::Evm;
 use alloy_primitives::B256;
 use alloy_primitives::{address, keccak256, Address, Bytes, StorageKey};
 use alloy_sol_types::{sol, SolCall, SolValue};
+use arc_shared::impl_sol_borrow_by_value;
+use arc_shared::precompile::abi_decode_raw_borrowed;
 use reth_ethereum::evm::revm::precompile::PrecompileOutput;
 use revm::handler::SYSTEM_ADDRESS;
 use revm::state::EvmState;
@@ -96,6 +98,8 @@ sol! {
     }
 }
 
+impl_sol_borrow_by_value!(GasValues);
+
 /// Computes the storage slot for a mapping key of type address
 ///
 /// A mapping, while slightly less efficient than a fixed size contiguous array,
@@ -146,7 +150,7 @@ precompile!(run_system_accounting, precompile_input, hardfork_flags; {
             )?;
 
             // Decode arguments passed to blocklist function
-            let args = abi_decode_raw_validated::<ISystemAccounting::storeGasValuesCall>(input)
+            let (block_number, gas_values) = abi_decode_raw_borrowed::<ISystemAccounting::storeGasValuesCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
                         gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
@@ -167,8 +171,8 @@ precompile!(run_system_accounting, precompile_input, hardfork_flags; {
             )?;
 
             // Update storage
-            let storage_slot = compute_gas_values_storage_slot(args.blockNumber);
-            let updated_value_bytes = pack_gas_values_for_storage(args.gasValues);
+            let storage_slot = compute_gas_values_storage_slot(block_number);
+            let updated_value_bytes = pack_gas_values_for_storage(gas_values);
             write(
                 &mut precompile_input.internals,
                 SYSTEM_ACCOUNTING_ADDRESS,
@@ -189,7 +193,7 @@ precompile!(run_system_accounting, precompile_input, hardfork_flags; {
             let mut precompile_input = precompile_input;
 
             // Decode arguments passed to blocklist function
-            let args = abi_decode_raw_validated::<ISystemAccounting::getGasValuesCall>(input)
+            let (block_number,) = abi_decode_raw_borrowed::<ISystemAccounting::getGasValuesCall>(input)
                 .map_err(|_|
                     PrecompileErrorOrRevert::new_reverted_with_penalty(
                         gas_counter, reservoir, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, ERR_EXECUTION_REVERTED,
@@ -197,7 +201,7 @@ precompile!(run_system_accounting, precompile_input, hardfork_flags; {
                 )?;
 
             // Read stored value
-            let storage_slot = compute_gas_values_storage_slot(args.blockNumber);
+            let storage_slot = compute_gas_values_storage_slot(block_number);
             let slot_value = read(
                 &mut precompile_input.internals,
                 SYSTEM_ACCOUNTING_ADDRESS,

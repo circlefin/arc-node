@@ -132,12 +132,17 @@ impl ProposalParts {
 
     /// Storage key for the pending proposal-parts table.
     ///
-    /// Hashes [`Self::hash`] together with the fields it omits:
-    /// `proposer`, `pol_round`, and the `Fin` signature. Streams with the same
-    /// signed hash but different unsigned fields therefore occupy distinct rows.
+    /// Hashes [`Self::hash`] together with the fields it omits: `proposer`,
+    /// `pol_round`, and the `Fin` signature. Streams with the same signed hash but a
+    /// different `proposer` or signature therefore occupy distinct rows. The
+    /// `pol_round` term is constant, since decoding pins it to [`Round::Nil`].
     ///
     /// ## Important
     /// ⚠️ Not a signing hash. It must never be used to produce or verify a signature.
+    ///
+    /// ⚠️ Not a way to address a stored row. A row keyed on a non-nil `pol_round` by a
+    /// build that stored one is not reachable from its decoded parts; remove such a row
+    /// under the key it was read with.
     pub fn pending_key(&self) -> (Height, Round, B256) {
         use sha3::{Digest, Keccak256};
 

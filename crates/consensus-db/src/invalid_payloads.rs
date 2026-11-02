@@ -23,6 +23,14 @@ use arc_consensus_types::{Address, Height, ProposalParts, Round};
 
 use arc_consensus_types::block::ConsensusBlock;
 
+/// Maximum number of invalid-payload records retained per height.
+///
+/// Each append rewrites the whole per-height value, so an uncapped vector lets
+/// repeated invalid payloads at one height grow storage without bound and make
+/// appends increasingly expensive. Retaining the earliest records at a height
+/// bounds a single stored value while preserving the onset of any anomaly.
+pub const MAX_INVALID_PAYLOADS_PER_HEIGHT: usize = 64;
+
 /// Invalid payloads collected during a height.
 /// Stored in the database.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,9 +48,19 @@ impl StoredInvalidPayloads {
         }
     }
 
-    /// Appends an invalid payload to this collection.
-    pub fn add_invalid_payload(&mut self, payload: InvalidPayload) {
+    /// Appends an invalid payload to this collection, enforcing the per-height
+    /// cap.
+    ///
+    /// Returns `true` if the payload was stored, or `false` if the collection
+    /// was already at [`MAX_INVALID_PAYLOADS_PER_HEIGHT`] and the payload was
+    /// dropped. The earliest records at a height are kept.
+    #[must_use]
+    pub fn add_invalid_payload(&mut self, payload: InvalidPayload) -> bool {
+        if self.payloads.len() >= MAX_INVALID_PAYLOADS_PER_HEIGHT {
+            return false;
+        }
         self.payloads.push(payload);
+        true
     }
 }
 
@@ -124,5 +142,59 @@ impl fmt::Display for InvalidPayload {
             "{{ height: {}, round: {}, proposer_address: {}, block_hash: {}, reason: {} }}",
             self.height, self.round, self.proposer_address, block_hash, self.reason,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InvalidPayload, StoredInvalidPayloads, MAX_INVALID_PAYLOADS_PER_HEIGHT};
+    use arc_consensus_types::{Address, Height, Round};
+
+    fn payload_with_reason(height: Height, reason: &str) -> InvalidPayload {
+        InvalidPayload::new_without_payload(height, Round::new(0), Address::new([0u8; 20]), reason)
+    }
+
+    #[test]
+    fn add_invalid_payload_accepts_up_to_the_cap() {
+        let height = Height::new(1);
+        let mut stored = StoredInvalidPayloads::empty(height);
+
+        for i in 0..MAX_INVALID_PAYLOADS_PER_HEIGHT {
+            assert!(
+                stored.add_invalid_payload(payload_with_reason(height, &i.to_string())),
+                "append below the cap must be accepted",
+            );
+        }
+
+        assert_eq!(stored.payloads.len(), MAX_INVALID_PAYLOADS_PER_HEIGHT);
+    }
+
+    #[test]
+    fn add_invalid_payload_drops_beyond_the_cap_and_keeps_the_earliest() {
+        let height = Height::new(1);
+        let mut stored = StoredInvalidPayloads::empty(height);
+
+        for i in 0..MAX_INVALID_PAYLOADS_PER_HEIGHT {
+            let _ = stored.add_invalid_payload(payload_with_reason(height, &i.to_string()));
+        }
+
+        // Further appends at a full height are rejected and do not grow the vector.
+        for i in 0..5 {
+            assert!(
+                !stored.add_invalid_payload(payload_with_reason(height, &format!("overflow-{i}"))),
+                "append at a full height must be rejected",
+            );
+        }
+
+        assert_eq!(stored.payloads.len(), MAX_INVALID_PAYLOADS_PER_HEIGHT);
+        // The earliest records are the ones retained.
+        assert_eq!(stored.payloads.first().unwrap().reason, "0");
+        assert!(
+            stored
+                .payloads
+                .iter()
+                .all(|p| !p.reason.starts_with("overflow")),
+            "no dropped record should have been stored",
+        );
     }
 }

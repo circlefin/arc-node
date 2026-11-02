@@ -29,6 +29,7 @@ pub mod evm;
 pub mod executor;
 pub mod frame_result;
 pub mod handler;
+mod inspect;
 mod log;
 pub mod opcode;
 pub mod subcall;
@@ -36,4 +37,4 @@ pub mod subcall;
 mod subcall_test;
 
 // Re-export commonly used types
-pub use evm::{ArcEvm, ArcEvmConfig, ArcEvmFactory};
+pub use evm::{ArcEvm, ArcEvmConfig, ArcEvmConfigError, ArcEvmFactory};
