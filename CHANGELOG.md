@@ -2,6 +2,16 @@
 
 All notable changes to arc-node are documented in this file.
 
+## [v0.8.3]
+
+**Changes:** [v0.8.2...v0.8.3](https://github.com/circlefin/arc-node/compare/v0.8.2...v0.8.3) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.3)
+
+This release has no hardfork activation and no database migration, and v0.8.3 nodes run alongside v0.8.0, v0.8.1, and v0.8.2 nodes on the same network. Node operators can upgrade the binary on their own schedule.
+
+### Fixes
+
+- [Shared] Remediate cargo audit advisories via dependency bumps, including rustls-webpki, webpki-roots, and zstd
+
 ## [v0.8.2]
 
 **Changes:** [v0.8.1...v0.8.2](https://github.com/circlefin/arc-node/compare/v0.8.1...v0.8.2) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.2)

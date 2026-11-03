@@ -53,4 +53,10 @@ ignore = [
     # Transitive dependency via vergen-git2 9.1.0 → reth-node-core (reth v1.11.3).
     # Cannot update without bumping reth.
     "RUSTSEC-2026-0184",
+
+    # crypto-bigint 0.5.5 - timing variability in operations meant to be constant-time; fixed
+    # in >=0.7.6. No fixed 0.5.x exists. Transitive dependency via elliptic-curve 0.13.8 →
+    # k256, p256, ecdsa, alloy-signer 2.0.4. The elliptic-curve 0.13 line requires
+    # crypto-bigint ^0.5, so it cannot update without moving off elliptic-curve 0.13.
+    "RUSTSEC-2026-0387",
 ]
