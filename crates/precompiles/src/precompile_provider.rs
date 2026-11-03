@@ -22,7 +22,7 @@ use crate::pq::{run_pq, PQ_ADDRESS};
 use crate::system_accounting::{run_system_accounting, SYSTEM_ACCOUNTING_ADDRESS};
 use alloy_evm::precompiles::PrecompilesMap;
 use alloy_primitives::Address;
-use arc_execution_config::hardforks::ArcHardforkFlags;
+use arc_execution_config::hardforks::{ArcHardfork, ArcHardforkFlags};
 use reth_ethereum::evm::revm::precompile::PrecompileSpecId;
 use reth_ethereum::evm::revm::precompile::Precompiles;
 use reth_evm::precompiles::DynPrecompile;
@@ -60,10 +60,11 @@ impl ArcPrecompileProvider {
                 PrecompileId::Custom("SYSTEM_ACCOUNTING".into()),
                 move |input| run_system_accounting(input, hardfork_flags),
             )),
-            PQ_ADDRESS => Some(DynPrecompile::new_stateful(
-                PrecompileId::Custom("PQ".into()),
-                move |input| run_pq(input, hardfork_flags),
-            )),
+            PQ_ADDRESS if hardfork_flags.is_active(ArcHardfork::Zero6) => Some(
+                DynPrecompile::new_stateful(PrecompileId::Custom("PQ".into()), move |input| {
+                    run_pq(input, hardfork_flags)
+                }),
+            ),
             _ => handle_unknown_precompile(address),
         });
         precompile_map
@@ -117,15 +118,28 @@ mod tests {
     }
 
     #[test]
-    fn test_pq_precompile_available() {
+    fn test_pq_precompile_not_available_before_zero6() {
         let precompiles = ArcPrecompileProvider::create_precompiles_map(
             SpecId::PRAGUE,
             ArcHardforkFlags::default(),
         );
 
         assert!(
+            precompiles.get(&PQ_ADDRESS).is_none(),
+            "PQ precompile should not be available before Zero6"
+        );
+    }
+
+    #[test]
+    fn test_pq_precompile_available_with_zero6() {
+        let precompiles = ArcPrecompileProvider::create_precompiles_map(
+            SpecId::PRAGUE,
+            ArcHardforkFlags::with(&[ArcHardfork::Zero6]),
+        );
+
+        assert!(
             precompiles.get(&PQ_ADDRESS).is_some(),
-            "PQ precompile should be available"
+            "PQ precompile should be available with Zero6"
         );
     }
 
