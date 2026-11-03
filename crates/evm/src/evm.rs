@@ -2054,6 +2054,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn factory_registers_pq_precompile_from_block_derived_zero6() {
+        use arc_precompiles::pq::PQ_ADDRESS;
+
+        let spec = localdev_with_hardforks(&[
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(0)),
+            (ArcHardfork::Zero5, ForkCondition::Block(0)),
+            (ArcHardfork::Zero6, ForkCondition::Block(10)),
+        ]);
+        let factory = ArcEvmFactory::new(spec);
+        let env_at = |number: u64| {
+            let mut env = evm_env_with_spec(SpecId::PRAGUE);
+            env.block_env.number = U256::from(number);
+            env
+        };
+
+        let pre = factory.create_evm(InMemoryDB::default(), env_at(9));
+        assert!(
+            pre.inner.precompiles.get(&PQ_ADDRESS).is_none(),
+            "block 9: Zero6 not yet active"
+        );
+        let pre =
+            factory.create_evm_with_inspector(InMemoryDB::default(), env_at(9), NoOpInspector {});
+        assert!(
+            pre.inner.precompiles.get(&PQ_ADDRESS).is_none(),
+            "block 9: Zero6 not yet active (inspector)"
+        );
+
+        let post = factory.create_evm(InMemoryDB::default(), env_at(10));
+        assert!(
+            post.inner.precompiles.get(&PQ_ADDRESS).is_some(),
+            "block 10: Zero6 active"
+        );
+        let post =
+            factory.create_evm_with_inspector(InMemoryDB::default(), env_at(10), NoOpInspector {});
+        assert!(
+            post.inner.precompiles.get(&PQ_ADDRESS).is_some(),
+            "block 10: Zero6 active (inspector)"
+        );
+    }
+
     fn create_db(accounts: &[(Address, u64)]) -> InMemoryDB {
         let mut db = InMemoryDB::default();
         for (address, balance) in accounts {
