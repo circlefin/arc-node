@@ -12,6 +12,12 @@ Entries are split by audience. A change appears under `### For Validators` when 
 
 Compare and release-notes links resolve once the corresponding tag is published at [`circlefin/arc-node`](https://github.com/circlefin/arc-node).
 
+## [v0.8.4]
+
+**Changes:** [v0.8.3...v0.8.4](https://github.com/circlefin/arc-node/compare/v0.8.3...v0.8.4) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.4)
+
+No breaking changes in this release.
+
 ## [v0.8.3]
 
 **Changes:** [v0.8.2...v0.8.3](https://github.com/circlefin/arc-node/compare/v0.8.2...v0.8.3) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.3)

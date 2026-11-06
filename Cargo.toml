@@ -171,55 +171,55 @@ rand = { version = "0.8.5", features = ["std_rng", "small_rng"] }
 # rand 8 for secp256k1
 redb               = "2.6.0"
 reqwest = { version = "0.13", default-features = false }
-reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-basic-payload-builder = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-chainspec = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-cli = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-cli-commands = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
 reth-codecs = { version = "0.3.1" }
-reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-consensus-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-db-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-e2e-test-utils = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-execution-cache = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-fs-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-ipc = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-network = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-node-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-node-core = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-node-metrics = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-consensus = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-consensus-common = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-db = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-db-api = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-e2e-test-utils = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-engine-primitives = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-errors = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-ethereum = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-ethereum-engine-primitives = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-ethereum-forks = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-ethereum-payload-builder = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-ethereum-primitives = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-evm = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-evm-ethereum = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-execution-cache = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-fs-util = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-ipc = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-network = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-network-peers = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-node-api = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-node-builder = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-node-core = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-node-ethereum = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-node-metrics = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-payload-builder = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-payload-primitives = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
 reth-primitives-traits = { version = "0.3.1", default-features = false }
-reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-prune-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-rpc-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-rpc-server-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-stages-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-static-file = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-static-file-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
-reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-trie-parallel = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-provider = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-prune-types = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-revm = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-rpc = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-rpc-api = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-rpc-builder = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-rpc-eth-api = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-rpc-eth-types = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-rpc-server-types = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-stages-types = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-static-file = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-static-file-types = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-storage-api = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1", default-features = false }
+reth-tasks = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-tracing = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-transaction-pool = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
+reth-trie-parallel = { git = "https://github.com/circlefin/arc-reth", tag = "v2.2.0-arc.1" }
 
 # revm
 revm = { version = "38.0.0", default-features = false }
