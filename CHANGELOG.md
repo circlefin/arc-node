@@ -2,6 +2,16 @@
 
 All notable changes to arc-node are documented in this file.
 
+## [v0.8.4]
+
+**Changes:** [v0.8.3...v0.8.4](https://github.com/circlefin/arc-node/compare/v0.8.3...v0.8.4) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.4)
+
+This release has no hardfork activation and no database migration. Because it corrects state-root computation, operators should upgrade promptly rather than running mixed versions for an extended period.
+
+### Fixes
+
+- [EL] Fix incremental state-root computation omitting a newly inserted hashed entry located before a deeper stored trie branch. The execution layer now builds on `circlefin/arc-reth` v2.2.0-arc.1, which is reth v2.2.0 plus the upstream trie seek-boundary fix ([paradigmxyz/reth PR 28264](https://github.com/paradigmxyz/reth/pull/28264))
+
 ## [v0.8.3]
 
 **Changes:** [v0.8.2...v0.8.3](https://github.com/circlefin/arc-node/compare/v0.8.2...v0.8.3) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.3)
