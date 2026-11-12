@@ -33,6 +33,7 @@ mod eip7708_payload_validation;
 mod eip7708_precompile;
 mod eip7708_zero_address;
 mod evict_unincludable_txs;
+mod execution_cache_recreated_account;
 mod gas_limit_validation;
 mod hardfork_transition;
 mod helpers;

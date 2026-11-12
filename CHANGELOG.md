@@ -2,6 +2,16 @@
 
 All notable changes to arc-node are documented in this file.
 
+## [v0.8.5]
+
+**Changes:** [v0.8.4...v0.8.5](https://github.com/circlefin/arc-node/compare/v0.8.4...v0.8.5) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.5)
+
+This release has no hardfork activation and no database migration. Because it corrects cached execution state, operators should upgrade promptly rather than running mixed versions for an extended period.
+
+### Fixes
+
+- [EL] Fix the execution cache discarding an account that a block deletes under EIP-161 and then recreates within the same block, which left the account's pre-deletion storage and account info cached and allowed a later read to serve a stale value. The execution layer now builds on `circlefin/arc-reth` v2.2.0-arc.2, which is v2.2.0-arc.1 plus the upstream execution-cache fix ([paradigmxyz/reth PR 28148](https://github.com/paradigmxyz/reth/pull/28148))
+
 ## [v0.8.4]
 
 **Changes:** [v0.8.3...v0.8.4](https://github.com/circlefin/arc-node/compare/v0.8.3...v0.8.4) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.4)
