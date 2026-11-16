@@ -1,7 +1,7 @@
 ###############
 # cargo chef
 ###############
-FROM public.ecr.aws/docker/library/rust:1.93.0-bookworm AS chef
+FROM public.ecr.aws/docker/library/rust:1.93.0-trixie AS chef
 
 # Install any custom CA certificates from the certs named context.
 RUN --mount=type=bind,from=certs,target=/usr/local/share/ca-certificates/ \
@@ -46,7 +46,7 @@ WORKDIR /app
 COPY --from=planner /src/arc-engine-bench-recipe.json arc-engine-bench-recipe.json
 RUN --mount=type=cache,id=bench-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=bench-cargo-git,sharing=locked,target=/usr/local/cargo/git \
-    --mount=type=cache,id=bench-cargo-target,sharing=locked,target=/app/target \
+    --mount=type=cache,id=bench-cargo-target-trixie,sharing=locked,target=/app/target \
     --mount=type=secret,id=github_token,required=false \
     # Cook the recipe produced by the planner, namely compile dependencies
     set -eu; \
@@ -72,7 +72,7 @@ COPY . .
 
 RUN --mount=type=cache,id=bench-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=bench-cargo-git,sharing=locked,target=/usr/local/cargo/git \
-    --mount=type=cache,id=bench-cargo-target,sharing=locked,target=/app/target \
+    --mount=type=cache,id=bench-cargo-target-trixie,sharing=locked,target=/app/target \
     --mount=type=secret,id=github_token,required=false \
     set -eu; \
     if [ -s /run/secrets/github_token ]; then \
@@ -87,7 +87,7 @@ RUN --mount=type=cache,id=bench-cargo-registry,sharing=locked,target=/usr/local/
 #######################
 # dev runtime image
 #######################
-FROM gcr.io/distroless/cc-debian12:nonroot AS dev-runtime
+FROM gcr.io/distroless/cc-debian13:nonroot AS dev-runtime
 
 COPY --from=chef /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 

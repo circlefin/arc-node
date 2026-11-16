@@ -59,4 +59,33 @@ ignore = [
     # k256, p256, ecdsa, alloy-signer 2.0.4. The elliptic-curve 0.13 line requires
     # crypto-bigint ^0.5, so it cannot update without moving off elliptic-curve 0.13.
     "RUSTSEC-2026-0387",
+
+    # hickory-proto / hickory-resolver 0.25.2 via libp2p-dns 0.44.0 → libp2p 0.56.0 →
+    # arc-malachitebft-*. Fixed by moving malachite to libp2p 0.57 (hickory 0.26).
+    # DNSSEC validation is not compiled in (no dnssec-* feature enabled):
+    "RUSTSEC-2026-0504",
+    "RUSTSEC-2026-0505",
+    "RUSTSEC-2026-0511",
+    "RUSTSEC-2026-0512",
+    "RUSTSEC-2026-0514",
+    "RUSTSEC-2026-0530",
+    "RUSTSEC-2026-0531",
+    "RUSTSEC-2026-0532",
+    # Zone-file and SVCB/HTTPS text parsing; the resolver only parses wire format:
+    "RUSTSEC-2026-0487",
+    "RUSTSEC-2026-0489",
+    "RUSTSEC-2026-0490",
+    # Memory amplification from header record counts; reachable only through DNS
+    # responses to operator-configured `/dns` peer addresses:
+    "RUSTSEC-2026-0491",
+
+    # rmcp 1.4.0 - unbounded response buffering in Streamable HTTP clients; fixed in >=3.9.0.
+    # Used only by quake (dev tooling) with the server and stdio transports; the
+    # Streamable HTTP client is not compiled in.
+    "RUSTSEC-2026-0462",
+
+    # libp2p-gossipsub 0.49.5 - unbounded backoff state from PRUNE messages for unknown
+    # topics; fixed in >=0.50.1, which requires libp2p 0.57. Transitive dependency via
+    # arc-malachitebft-network (malachite v0.8.2); cannot update without bumping malachite.
+    "RUSTSEC-2026-0534",
 ]

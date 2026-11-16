@@ -2,6 +2,20 @@
 
 All notable changes to arc-node are documented in this file.
 
+## [v0.8.6]
+
+**Changes:** [v0.8.5...v0.8.6](https://github.com/circlefin/arc-node/compare/v0.8.5...v0.8.6) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.6)
+
+This release has no hardfork activation and no database migration, and v0.8.6 nodes run alongside v0.8.5 nodes on the same network. Node operators can upgrade the binary on their own schedule.
+
+### Features
+
+- [Shared] Build the Docker images on Debian 13 (trixie); the release runtime image is now based on `distroless/cc-debian13`
+
+### Fixes
+
+- [Shared] Remediate cargo audit advisories via dependency bumps, including quinn-proto, quinn-udp, libp2p-quic, and openssl
+
 ## [v0.8.5]
 
 **Changes:** [v0.8.4...v0.8.5](https://github.com/circlefin/arc-node/compare/v0.8.4...v0.8.5) -- [release notes](https://github.com/circlefin/arc-node/releases/tag/v0.8.5)
