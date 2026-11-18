@@ -1,7 +1,7 @@
 ###############
 # cargo chef
 ###############
-FROM public.ecr.aws/docker/library/rust:1.93.0-bookworm AS chef
+FROM public.ecr.aws/docker/library/rust:1.93.0-trixie AS chef
 
 # Install any custom CA certificates from the certs named context.
 RUN --mount=type=bind,from=certs,target=/usr/local/share/ca-certificates/ \
@@ -52,7 +52,7 @@ WORKDIR /app
 COPY --from=planner /src/arc-node-execution-recipe.json arc-node-execution-recipe.json
 RUN --mount=type=cache,id=reth-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=reth-cargo-git,sharing=locked,target=/usr/local/cargo/git \
-    --mount=type=cache,id=reth-cargo-target,sharing=locked,target=/app/target \
+    --mount=type=cache,id=reth-cargo-target-trixie,sharing=locked,target=/app/target \
     --mount=type=secret,id=github_token,required=false \
     # Cook the recipe produced by the planner, namely compile dependencies
     set -eu; \
@@ -83,7 +83,7 @@ COPY . .
 # - Build target directory (compiled artifacts)
 RUN --mount=type=cache,id=reth-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=reth-cargo-git,sharing=locked,target=/usr/local/cargo/git \
-    --mount=type=cache,id=reth-cargo-target,sharing=locked,target=/app/target \
+    --mount=type=cache,id=reth-cargo-target-trixie,sharing=locked,target=/app/target \
     --mount=type=secret,id=github_token,required=false \
     set -eu; \
     if [ -s /run/secrets/github_token ]; then \
@@ -100,7 +100,7 @@ RUN --mount=type=cache,id=reth-cargo-registry,sharing=locked,target=/usr/local/c
 #######################
 # release runtime image
 #######################
-FROM gcr.io/distroless/cc-debian12:nonroot AS release-runtime
+FROM gcr.io/distroless/cc-debian13:nonroot AS release-runtime
 
 COPY --from=chef /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
@@ -121,12 +121,13 @@ ENTRYPOINT ["/usr/local/bin/arc-node-execution"]
 ###################
 # dev runtime image
 ###################
-FROM public.ecr.aws/docker/library/debian:bookworm-slim AS dev-runtime
+FROM public.ecr.aws/docker/library/debian:trixie-slim AS dev-runtime
 
 COPY --from=chef /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 # Configure apt-get with retry logic and fallback mirrors for CI reliability
 COPY assets/apt/apt-retry.conf /etc/apt/apt.conf.d/apt-retry.conf
+COPY assets/apt/apt-https-cainfo.conf /etc/apt/apt.conf.d/apt-https-cainfo.conf
 COPY assets/apt/debian.sources /etc/apt/sources.list.d/debian.sources
 
 # Install iptables and tc for chaos testing

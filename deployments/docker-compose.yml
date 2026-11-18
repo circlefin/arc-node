@@ -50,7 +50,7 @@ services:
 
   # Set ownership on the shared sockets volume so the EL (UID 999) can write
   arc-sockets-init:
-    image: debian:bookworm-slim
+    image: debian:trixie-slim
     entrypoint: ["/bin/sh", "-c"]
     command: ["rm -f /sockets/*.ipc && chown 999:999 /sockets"]
     volumes:

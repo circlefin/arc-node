@@ -9,18 +9,18 @@
 # blips are handled by Acquire::Retries in apt-retry.conf; a size mismatch is not retryable.
 #
 # NOTE: Uses HTTPS because HTTP port 80 is blocked by StepSecurity egress policy.
-# NOTE: The suite "bookworm" must match the Debian version in the Dockerfiles.
+# NOTE: The suite "trixie" must match the Debian version in the Dockerfiles.
 # If Dockerfile.execution or Dockerfile.consensus change their base images to a
-# different Debian release (e.g., rust:X.Y.Z-trixie), update the Suites below.
+# different Debian release (e.g., rust:X.Y.Z-forky), update the Suites below.
 
 Types: deb
 URIs: https://deb.debian.org/debian
-Suites: bookworm bookworm-updates
+Suites: trixie trixie-updates
 Components: main
 Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 
 Types: deb
 URIs: https://deb.debian.org/debian-security
-Suites: bookworm-security
+Suites: trixie-security
 Components: main
 Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
